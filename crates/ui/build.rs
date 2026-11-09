@@ -19,6 +19,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-env-changed=CAMCRAFT_SOURCE_SHA");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+
+    let label = match std::env::var("GITHUB_REF_NAME").ok().as_deref() {
+        Some("0.15-Sgt_Hindsight") => "0.15-Sgt_Hindsight",
+        _ => env!("CARGO_PKG_VERSION"),
+    };
+    println!("cargo:rustc-env=CAMCRAFT_BUILD_LABEL={label}");
 
     // A source archive has no .git directory. Its packager can provide the
     // exact source commit; an ordinary checkout reads its own HEAD.
