@@ -59,6 +59,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repository", help="owner/name")
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--baseline", type=Path, action="append", default=[],
+        help="archive directory whose issue and PR numbers should be skipped (repeatable)",
+    )
     args = parser.parse_args()
     repo = args.repository
     out = args.output
@@ -69,6 +73,17 @@ def main() -> int:
     meta = api(f"repos/{repo}")
     issues = [item for item in api_list(f"repos/{repo}/issues?state=all&per_page=100") if "pull_request" not in item]
     pulls = api_list(f"repos/{repo}/pulls?state=all&per_page=100")
+    if args.baseline:
+        old_issues = {
+            item["number"] for baseline in args.baseline
+            for item in json.loads((baseline / "issues.json").read_text())
+        }
+        old_pulls = {
+            item["number"] for baseline in args.baseline
+            for item in json.loads((baseline / "pulls.json").read_text())
+        }
+        issues = [item for item in issues if item["number"] not in old_issues]
+        pulls = [item for item in pulls if item["number"] not in old_pulls]
     labels = api_list(f"repos/{repo}/labels?per_page=100")
     milestones = api_list(f"repos/{repo}/milestones?state=all&per_page=100")
     save_json(out / "repository.json", meta)
@@ -116,7 +131,7 @@ def main() -> int:
                 save_json(folder / "review_comments.json", api_list(f"repos/{repo}/pulls/{number}/comments?per_page=100"))
             except Exception as error:
                 errors.append(f"PR {number} review comments: {error}")
-        if pull["state"] == "open" and not (folder / "changes.patch").exists():
+        if not (folder / "changes.patch").exists():
             try:
                 save_json(folder / "commits.json", api_list(f"repos/{repo}/pulls/{number}/commits?per_page=100"))
                 save_json(folder / "files.json", api_list(f"repos/{repo}/pulls/{number}/files?per_page=100"))
@@ -131,6 +146,7 @@ def main() -> int:
     summary = {
         "source": repo,
         "source_url": meta["html_url"],
+        "baselines": [str(path) for path in args.baseline],
         "started_utc": started,
         "finished_utc": datetime.now(timezone.utc).isoformat(),
         "issues": len(issues),
@@ -140,14 +156,20 @@ def main() -> int:
         "errors": errors,
     }
     save_json(out / "manifest.json", summary)
+    baseline_note = (
+        "This incremental archive contains records absent from the baseline "
+        "archives listed in `manifest.json`. Earlier records remain there.\n\n"
+        if args.baseline else ""
+    )
     (out / "README.md").write_text(
         f"# {repo} GitHub metadata archive\n\n"
         f"Captured {summary['finished_utc']} from GitHub's public API.\n\n"
+        f"{baseline_note}"
         f"- {summary['issues']} issues ({summary['open_issues']} open)\n"
         f"- {summary['pull_requests']} pull requests ({summary['open_pull_requests']} open)\n"
         f"- {len(errors)} export errors (details in `manifest.json`)\n\n"
         "`issues.csv` and `pulls.csv` are indexes. The JSON files retain the API's "
-        "original authors, timestamps, labels, links, and text. Open PR folders "
+        "original authors, timestamps, labels, links, and text. PR folders "
         "also contain commit and file lists and a patch. Attached files remain "
         "external links; this archive does not download them. This is a snapshot, "
         "not a live mirror.\n"
