@@ -15,3 +15,6 @@ authenticated GitHub CLI to capture a later snapshot. Use a new output
 directory for each run so changes to upstream state remain visible.
 Pass `--baseline` once per earlier archive to export only records not
 already saved; earlier issue and PR discussions remain in those archives.
+The fork's `Preserve upstream` workflow checks every 15 minutes and uses
+`--baseline-root --include-updates` to keep later edits and comments too.
+Run it manually from Actions whenever an immediate capture is needed.

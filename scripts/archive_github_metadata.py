@@ -63,27 +63,66 @@ def main() -> int:
         "--baseline", type=Path, action="append", default=[],
         help="archive directory whose issue and PR numbers should be skipped (repeatable)",
     )
+    parser.add_argument(
+        "--baseline-root", type=Path,
+        help="include every completed archive directly under this directory",
+    )
+    parser.add_argument(
+        "--include-updates", action="store_true",
+        help="also capture older records updated since the latest archive began",
+    )
+    parser.add_argument(
+        "--skip-empty", action="store_true",
+        help="leave no output directory when no issues or PRs changed",
+    )
     args = parser.parse_args()
     repo = args.repository
     out = args.output
-    out.mkdir(parents=True, exist_ok=True)
+    baselines = list(args.baseline)
+    if args.baseline_root:
+        baselines.extend(
+            path for path in sorted(args.baseline_root.iterdir())
+            if path.is_dir() and (path / "manifest.json").is_file()
+        )
+    baselines = list(dict.fromkeys(baselines))
+    if args.include_updates and not baselines:
+        parser.error("--include-updates requires at least one baseline archive")
+    latest_started = max(
+        (datetime.fromisoformat(json.loads((path / "manifest.json").read_text())["started_utc"])
+         for path in baselines),
+        default=None,
+    )
 
     errors: list[str] = []
     started = datetime.now(timezone.utc).isoformat()
     meta = api(f"repos/{repo}")
     issues = [item for item in api_list(f"repos/{repo}/issues?state=all&per_page=100") if "pull_request" not in item]
     pulls = api_list(f"repos/{repo}/pulls?state=all&per_page=100")
-    if args.baseline:
+    if baselines:
         old_issues = {
-            item["number"] for baseline in args.baseline
+            item["number"] for baseline in baselines
             for item in json.loads((baseline / "issues.json").read_text())
         }
         old_pulls = {
-            item["number"] for baseline in args.baseline
+            item["number"] for baseline in baselines
             for item in json.loads((baseline / "pulls.json").read_text())
         }
-        issues = [item for item in issues if item["number"] not in old_issues]
-        pulls = [item for item in pulls if item["number"] not in old_pulls]
+        issues = [
+            item for item in issues
+            if item["number"] not in old_issues
+            or (args.include_updates and
+                datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")) >= latest_started)
+        ]
+        pulls = [
+            item for item in pulls
+            if item["number"] not in old_pulls
+            or (args.include_updates and
+                datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")) >= latest_started)
+        ]
+    if args.skip_empty and not issues and not pulls:
+        print("No new or updated issues or pull requests", flush=True)
+        return 0
+    out.mkdir(parents=True, exist_ok=True)
     labels = api_list(f"repos/{repo}/labels?per_page=100")
     milestones = api_list(f"repos/{repo}/milestones?state=all&per_page=100")
     save_json(out / "repository.json", meta)
@@ -146,7 +185,9 @@ def main() -> int:
     summary = {
         "source": repo,
         "source_url": meta["html_url"],
-        "baselines": [str(path) for path in args.baseline],
+        "baselines": [str(path) for path in baselines],
+        "latest_baseline_started_utc": latest_started.isoformat() if latest_started else None,
+        "includes_updates": args.include_updates,
         "started_utc": started,
         "finished_utc": datetime.now(timezone.utc).isoformat(),
         "issues": len(issues),
@@ -158,8 +199,12 @@ def main() -> int:
     save_json(out / "manifest.json", summary)
     baseline_note = (
         "This incremental archive contains records absent from the baseline "
+        "archives listed in `manifest.json`, and records updated since the latest "
+        "baseline began. Earlier versions remain in those archives.\n\n"
+        if baselines and args.include_updates else
+        "This incremental archive contains records absent from the baseline "
         "archives listed in `manifest.json`. Earlier records remain there.\n\n"
-        if args.baseline else ""
+        if baselines else ""
     )
     (out / "README.md").write_text(
         f"# {repo} GitHub metadata archive\n\n"
