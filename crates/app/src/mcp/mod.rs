@@ -15,8 +15,13 @@
 //! and every failure is an MCP tool error (`isError: true`) naming the
 //! reason - never a panic, never a silent success.
 
+mod area;
 mod edit;
+mod features;
+mod fixture_tools;
 mod job;
+mod pick;
+mod setup_tools;
 mod tools;
 
 use crate::script::Env;
