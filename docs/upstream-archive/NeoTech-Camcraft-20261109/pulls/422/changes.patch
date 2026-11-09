@@ -1,0 +1,1155 @@
+From b89bd113d57448ec52e67e025df057868a6e107a Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 18:50:00 -0800
+Subject: [PATCH] feat(mcp): pick faces, edge chains and loops for an
+ operation's area
+
+Four MCP tools so an agent can choose what an operation machines:
+
+- list_features: a model's planar faces (each boundary loop with the
+  tangent edge chains that run it), edge chains, welded smooth faces
+  and corner vertices, under their stable geometry-hash ids, written
+  as "<kind>:0x<hex>" strings (a JSON number cannot carry a 64-bit
+  hash exactly through every client).
+- set_operation_geometry: the op's source becomes the picked features
+  through SetOperationGeometry - one undo step, so undo restores the
+  previous source. A loop is picked by the chains list_features names
+  for it.
+- get_operation_geometry: source, picks, area controls and the
+  selection notes.
+- set_operation_area: the area controls through
+  EditOperationParams::with_area, one undo step.
+
+Refusals are tool errors: malformed or unknown ids, a non-model, an
+empty pick list, and a feature kind the op cannot take (a vertex for a
+kind whose picks author its region, anything but a chain for
+Multi-Axis Contour - generation's own refusals, said at the pick;
+selection_drives_region becomes pub(crate) for it). Everything else is
+the commands' own doors.
+
+The handlers live in new modules (mcp/features.rs, pick.rs, area.rs);
+tools.rs and mod.rs only gain the registration lines. Pinned by the new
+mcp_pick suite: a pocket's floor loop picked off an imported STL,
+generated, verified and posted inside the ring down to the floor, the
+area set and undone, the pick undone back to the model source.
+
+Fixes #180
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/mcp/area.rs                  | 187 ++++++++++++
+ crates/app/src/mcp/features.rs              | 255 ++++++++++++++++
+ crates/app/src/mcp/mod.rs                   |   3 +
+ crates/app/src/mcp/pick.rs                  | 204 +++++++++++++
+ crates/app/src/mcp/tools.rs                 |   6 +-
+ crates/app/src/operation/material_region.rs |   2 +-
+ crates/app/src/operation/mod.rs             |   1 +
+ crates/app/tests/mcp_pick.rs                | 303 ++++++++++++++++++++
+ docs/decisions/180-mcp-pick-features.md     |  56 ++++
+ 9 files changed, 1015 insertions(+), 2 deletions(-)
+ create mode 100644 crates/app/src/mcp/area.rs
+ create mode 100644 crates/app/src/mcp/features.rs
+ create mode 100644 crates/app/src/mcp/pick.rs
+ create mode 100644 crates/app/tests/mcp_pick.rs
+ create mode 100644 docs/decisions/180-mcp-pick-features.md
+
+diff --git a/crates/app/src/mcp/area.rs b/crates/app/src/mcp/area.rs
+new file mode 100644
+index 00000000..5ad9285e
+--- /dev/null
++++ b/crates/app/src/mcp/area.rs
+@@ -0,0 +1,187 @@
++//! `set_operation_area` (#180): an operation's area controls - tool
++//! containment, offset, corner style, extension, extra include / exclude
++//! boundaries and the open boundary - written through
++//! `EditOperationParams::with_area`, one undoable step whose door is the
++//! same one the operation page's Apply goes through.
++//!
++//! Provenance: our own JSON surface over `operation::AreaControls`
++//! (this repo's M11.5 design); no vendor material consulted.
++
++use super::edit::find_op;
++use super::pick::{picks_of, picks_view, pick_list_schema};
++use super::tools::req_str;
++use crate::commands::EditOperationParams;
++use crate::model;
++use crate::operation::{
++    AreaControls, BoundaryMode, BoundaryShape, ChainSide, Containment, CornerStyle, ExtraBoundary, OpenBoundary,
++};
++use crate::script::{fnum, Env};
++
++use serde_json::{json, Map, Value};
++
++/// The controls as the tools show and take them.
++pub(super) fn area_view(a: &AreaControls) -> Value {
++    json!({
++        "containment": a.containment.map(|c| match c {
++            Containment::Inside => "inside",
++            Containment::On => "on",
++            Containment::Outside => "outside",
++        }),
++        "offset": fnum(a.offset),
++        "corner": match a.corner { CornerStyle::Round => "round", CornerStyle::Sharp => "sharp" },
++        "extension": fnum(a.extension),
++        "extra": a.extra.iter().map(|b| {
++            let mode = match b.mode { BoundaryMode::Include => "include", BoundaryMode::Exclude => "exclude" };
++            match &b.shape {
++                BoundaryShape::Picks(p) => json!({ "mode": mode, "from": "picks", "picks": picks_view(p) }),
++                BoundaryShape::Stock => json!({ "mode": mode, "from": "stock" }),
++                BoundaryShape::Silhouette => json!({ "mode": mode, "from": "silhouette" }),
++            }
++        }).collect::<Vec<_>>(),
++        "open": a.open.as_ref().map(|o| json!({
++            "picks": picks_view(&o.picks),
++            "side": match o.side { ChainSide::Inside => "inside", ChainSide::Outside => "outside" },
++        })),
++    })
++}
++
++/// Refuse a key the shape does not name: a typo must not read as done.
++fn only_keys(m: &Map<String, Value>, known: &[&str], what: &str) -> Result<(), String> {
++    match m.keys().find(|k| !known.contains(&k.as_str())) {
++        Some(k) => Err(format!("{what} has no field \"{k}\" - fields: {}", known.join(", "))),
++        None => Ok(()),
++    }
++}
++
++fn word<'a>(m: &'a Map<String, Value>, key: &str, words: &[&str]) -> Result<Option<&'a str>, String> {
++    match m.get(key) {
++        None | Some(Value::Null) => Ok(None),
++        Some(Value::String(s)) if words.contains(&s.as_str()) => Ok(Some(s)),
++        Some(other) => Err(format!("\"{key}\" is one of {}, got {other}", words.join(", "))),
++    }
++}
++
++fn number(m: &Map<String, Value>, key: &str) -> Result<f64, String> {
++    match m.get(key) {
++        None | Some(Value::Null) => Ok(0.0),
++        Some(v) => v.as_f64().ok_or_else(|| format!("\"{key}\" must be a number in mm, got {v}")),
++    }
++}
++
++fn extra_of(env: &Env, v: &Value) -> Result<ExtraBoundary, String> {
++    let Value::Object(m) = v else {
++        return Err(format!("an extra boundary is an object, got {v}"));
++    };
++    only_keys(m, &["mode", "from", "picks"], "an extra boundary")?;
++    let mode = match word(m, "mode", &["include", "exclude"])? {
++        Some("exclude") => BoundaryMode::Exclude,
++        Some(_) => BoundaryMode::Include,
++        None => return Err("an extra boundary needs \"mode\": include or exclude".into()),
++    };
++    let shape = match word(m, "from", &["picks", "stock", "silhouette"])?.unwrap_or("picks") {
++        "stock" | "silhouette" if m.get("picks").is_some_and(|p| !p.is_null()) => {
++            return Err("\"picks\" belongs to a boundary from picks only".into());
++        }
++        "stock" => BoundaryShape::Stock,
++        "silhouette" => BoundaryShape::Silhouette,
++        _ => BoundaryShape::Picks(picks_of(env, m.get("picks"), "picks")?),
++    };
++    Ok(ExtraBoundary { mode, shape })
++}
++
++/// The whole controls from the tool's object; omitted keys take their
++/// defaults, so `{}` is the identity (every control off).
++fn controls_of(env: &Env, v: &Value) -> Result<AreaControls, String> {
++    let Value::Object(m) = v else {
++        return Err(format!("\"area\" must be an object, got {v}"));
++    };
++    only_keys(m, &["containment", "offset", "corner", "extension", "extra", "open"], "\"area\"")?;
++    let containment = word(m, "containment", &["inside", "on", "outside"])?.map(|c| match c {
++        "inside" => Containment::Inside,
++        "on" => Containment::On,
++        _ => Containment::Outside,
++    });
++    let corner = match word(m, "corner", &["round", "sharp"])? {
++        Some("sharp") => CornerStyle::Sharp,
++        _ => CornerStyle::Round,
++    };
++    let extra = match m.get("extra") {
++        None | Some(Value::Null) => Vec::new(),
++        Some(Value::Array(items)) => items.iter().map(|b| extra_of(env, b)).collect::<Result<_, _>>()?,
++        Some(other) => return Err(format!("\"extra\" must be an array of boundaries, got {other}")),
++    };
++    let open = match m.get("open") {
++        None | Some(Value::Null) => None,
++        Some(Value::Object(o)) => {
++            only_keys(o, &["picks", "side"], "\"open\"")?;
++            let side = match word(o, "side", &["inside", "outside"])? {
++                Some("outside") => ChainSide::Outside,
++                Some(_) => ChainSide::Inside,
++                None => return Err("\"open\" needs \"side\": inside or outside".into()),
++            };
++            Some(OpenBoundary { picks: picks_of(env, o.get("picks"), "open.picks")?, side })
++        }
++        Some(other) => return Err(format!("\"open\" must be an object, got {other}")),
++    };
++    Ok(AreaControls {
++        containment,
++        offset: number(m, "offset")?,
++        corner,
++        extension: number(m, "extension")?,
++        extra,
++        open,
++    })
++}
++
++/// `set_operation_area`: replace the op's area controls, its parameters
++/// as they stand - one undo step, refused by the command's own door
++/// (a kind without an area, bad distances, an open chain spelled as a
++/// closed boundary) with its text.
++pub(super) fn set_operation_area(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let key = find_op(env, req_str(a, "operation")?)?;
++    let area = controls_of(env, a.get("area").ok_or("\"area\" is required")?)?;
++    let e = model::find_by_name(&env.world, &key).ok_or_else(|| format!("no operation named '{key}'"))?;
++    let op = model::operation_of(&env.world, &e).ok_or_else(|| format!("'{key}' is not an operation"))?;
++    let cmd = EditOperationParams::with_area(&env.world, &key, op.params, area).map_err(|e| e.to_string())?;
++    env.history.execute(&env.world, cmd);
++    super::pick::geometry_view(env, &key)
++}
++
++pub(super) fn s_set_area() -> Value {
++    json!({
++        "type": "object",
++        "properties": {
++            "operation": { "type": "string", "description": "Operation name (key or label)." },
++            "area": {
++                "type": "object",
++                "description": "The whole area controls; omitted fields take their defaults ({} turns every control off).",
++                "properties": {
++                    "containment": { "type": "string", "enum": ["inside", "on", "outside"], "description": "Tool against the boundary; omit for the kind's own rule." },
++                    "offset": { "type": "number", "description": "Grow (+) or shrink (-) the boundary, mm." },
++                    "corner": { "type": "string", "enum": ["round", "sharp"] },
++                    "extension": { "type": "number", "minimum": 0, "description": "Extend past exterior edges, mm; 0 is off." },
++                    "extra": { "type": "array", "description": "Extra include / exclude boundaries.", "items": {
++                        "type": "object",
++                        "properties": {
++                            "mode": { "type": "string", "enum": ["include", "exclude"] },
++                            "from": { "type": "string", "enum": ["picks", "stock", "silhouette"], "description": "Default picks." },
++                            "picks": pick_list_schema("The boundary's features (from: picks).")
++                        },
++                        "required": ["mode"],
++                        "additionalProperties": false
++                    } },
++                    "open": { "type": "object", "description": "An open (or closed) chain boundary with the side to machine.",
++                        "properties": {
++                            "picks": pick_list_schema("The boundary's edge chains."),
++                            "side": { "type": "string", "enum": ["inside", "outside"] }
++                        },
++                        "required": ["picks", "side"],
++                        "additionalProperties": false }
++                },
++                "additionalProperties": false
++            }
++        },
++        "required": ["operation", "area"],
++        "additionalProperties": false
++    })
++}
+diff --git a/crates/app/src/mcp/features.rs b/crates/app/src/mcp/features.rs
+new file mode 100644
+index 00000000..62fe85fb
+--- /dev/null
++++ b/crates/app/src/mcp/features.rs
+@@ -0,0 +1,255 @@
++//! `list_features` (#180): a model's pickable features - faces with their
++//! boundary loops, tangent edge chains, welded smooth faces and corner
++//! vertices - each under the stable geometry-hash id the pick tools take.
++//!
++//! Provenance: our own read-only view over `geometry::feature`'s topology
++//! (this repo's M1.5 / M13.4 design); no vendor material consulted.
++
++use super::pick::{feature_id, req_model};
++use super::tools::req_str;
++use crate::geometry::feature::{self, FaceKind, Features, LoopKind};
++use crate::geometry::{transform_point, Point3};
++use crate::model;
++use crate::operation::FeatureSel;
++use crate::schema::Location;
++use crate::script::{fnum, Env};
++
++use serde_json::{json, Map, Value};
++use std::collections::HashMap;
++
++/// Rows per feature kind unless `limit` says otherwise: enough for any
++/// machined part an agent reasons about, small enough for one reply.
++const DEFAULT_LIMIT: usize = 500;
++/// The ceiling `limit` may ask for.
++const MAX_LIMIT: usize = 20_000;
++
++const KINDS: [&str; 4] = ["faces", "chains", "patches", "vertices"];
++
++fn world_pt(loc: &Location, p: [f64; 3]) -> Point3 {
++    transform_point(Point3::new(p[0], p[1], p[2]), loc.pos, loc.rot)
++}
++
++fn pt(p: Point3) -> Value {
++    json!([fnum(p.x), fnum(p.y), fnum(p.z)])
++}
++
++/// World bounds of local points; `null` for none.
++fn bounds(loc: &Location, pts: impl IntoIterator<Item = [f64; 3]>) -> Value {
++    let mut lo = [f64::INFINITY; 3];
++    let mut hi = [f64::NEG_INFINITY; 3];
++    let mut any = false;
++    for p in pts {
++        let w = world_pt(loc, p);
++        for (i, v) in [w.x, w.y, w.z].into_iter().enumerate() {
++            if v.is_finite() {
++                lo[i] = lo[i].min(v);
++                hi[i] = hi[i].max(v);
++                any = true;
++            }
++        }
++    }
++    if !any || lo.iter().chain(hi.iter()).any(|v| !v.is_finite()) {
++        return Value::Null;
++    }
++    json!({ "min": [fnum(lo[0]), fnum(lo[1]), fnum(lo[2])], "max": [fnum(hi[0]), fnum(hi[1]), fnum(hi[2])] })
++}
++
++/// A local direction turned into the world frame (rigid placement).
++fn world_dir(loc: &Location, n: [f64; 3]) -> [f64; 3] {
++    let o = world_pt(loc, [0.0; 3]);
++    let t = world_pt(loc, n);
++    [t.x - o.x, t.y - o.y, t.z - o.z]
++}
++
++/// Which way a face looks, in the words a 2.5D pick is chosen by.
++fn facing(n: [f64; 3]) -> &'static str {
++    const LEVEL: f64 = 0.999_999;
++    if n[2] >= LEVEL {
++        "up"
++    } else if n[2] <= -LEVEL {
++        "down"
++    } else if n[2].abs() < 1e-6 {
++        "side"
++    } else {
++        "inclined"
++    }
++}
++
++/// Feature edge -> tangent chain id, keyed by its welded end pair, so a
++/// face's boundary ring can name the chains that run it.
++fn edge_chains(f: &Features) -> HashMap<(u32, u32), u64> {
++    let mut out = HashMap::new();
++    for c in feature::chains(f) {
++        for &ei in &c.edges {
++            if let Some(e) = f.edges.get(ei as usize) {
++                out.insert((e.a.min(e.b), e.a.max(e.b)), c.id);
++            }
++        }
++    }
++    out
++}
++
++fn loop_view(lp: &feature::Loop, by_edge: &HashMap<(u32, u32), u64>, loc: &Location, f: &Features) -> Value {
++    let closed = !matches!(lp.kind, LoopKind::Open);
++    let n = lp.verts.len();
++    let spans = if closed { n } else { n.saturating_sub(1) };
++    let mut ids: Vec<u64> = Vec::new();
++    let mut complete = n >= 2;
++    for k in 0..spans {
++        let (Some(&a), Some(&b)) = (lp.verts.get(k), lp.verts.get((k + 1) % n.max(1))) else {
++            complete = false;
++            continue;
++        };
++        match by_edge.get(&(a.min(b), a.max(b))) {
++            Some(id) if !ids.contains(id) => ids.push(*id),
++            Some(_) => {}
++            None => complete = false,
++        }
++    }
++    let chains: Vec<String> = ids.into_iter().map(|id| feature_id(FeatureSel::Chain(id))).collect();
++    json!({
++        "kind": match lp.kind { LoopKind::Outer => "outer", LoopKind::Hole => "hole", LoopKind::Open => "open" },
++        "vertices": n,
++        "bounds": bounds(loc, lp.verts.iter().filter_map(|&v| f.verts.get(v as usize).copied())),
++        // Picking every chain listed picks this ring; `complete` is false
++        // when some span of it is no feature edge (then pick the face).
++        "chains": chains,
++        "complete": complete,
++    })
++}
++
++fn faces_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let by_edge = edge_chains(f);
++    // Strip -> welded smooth face, so a strip names the logical face too.
++    let mut patch_of: HashMap<u64, u64> = HashMap::new();
++    for p in feature::patches(f) {
++        for fid in p.faces {
++            patch_of.insert(fid, p.id);
++        }
++    }
++    let planar: Vec<&feature::Face> = f.faces.iter().filter(|fa| matches!(fa.kind, FaceKind::Planar)).collect();
++    let rows = planar
++        .iter()
++        .take(limit)
++        .map(|fa| {
++            let n = world_dir(loc, fa.normal);
++            let verts = fa.loops.iter().flat_map(|l| l.verts.iter()).filter_map(|&v| f.verts.get(v as usize).copied());
++            json!({
++                "id": feature_id(FeatureSel::Face(fa.id)),
++                "normal": [fnum(n[0]), fnum(n[1]), fnum(n[2])],
++                "facing": facing(n),
++                "area": fnum(fa.area),
++                "bounds": bounds(loc, verts),
++                "patch": patch_of.get(&fa.id).map(|p| feature_id(FeatureSel::Patch(*p))),
++                "loops": fa.loops.iter().map(|l| loop_view(l, &by_edge, loc, f)).collect::<Vec<_>>(),
++            })
++        })
++        .collect();
++    (rows, planar.len())
++}
++
++fn chains_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let all = feature::chains(f);
++    let rows = all
++        .iter()
++        .take(limit)
++        .map(|c| {
++            let pts = feature::chain_points(f, c);
++            let length: f64 = pts
++                .windows(2)
++                .map(|w| {
++                    let d = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
++                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
++                })
++                .filter(|l| l.is_finite())
++                .sum();
++            json!({
++                "id": feature_id(FeatureSel::Chain(c.id)),
++                "closed": c.closed,
++                "edges": c.edges.len(),
++                "length": fnum(length),
++                "start": pts.first().map(|p| pt(world_pt(loc, *p))),
++                "end": pts.last().map(|p| pt(world_pt(loc, *p))),
++                "bounds": bounds(loc, pts.iter().copied()),
++            })
++        })
++        .collect();
++    (rows, all.len())
++}
++
++fn patches_view(f: &Features, limit: usize) -> (Vec<Value>, usize) {
++    let all = feature::patches(f);
++    let rows = all
++        .iter()
++        .take(limit)
++        .map(|p| {
++            let faces: Vec<String> = p.faces.iter().map(|id| feature_id(FeatureSel::Face(*id))).collect();
++            json!({ "id": feature_id(FeatureSel::Patch(p.id)), "faces": faces })
++        })
++        .collect();
++    (rows, all.len())
++}
++
++fn vertices_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let all: Vec<Value> = feature::corner_verts(f)
++        .iter()
++        .filter_map(|&vi| {
++            let id = feature::vertex_id(f, vi)?;
++            let p = f.verts.get(vi as usize)?;
++            Some(json!({ "id": feature_id(FeatureSel::Vertex(id)), "at": pt(world_pt(loc, *p)) }))
++        })
++        .collect();
++    let total = all.len();
++    (all.into_iter().take(limit).collect(), total)
++}
++
++fn wanted_kinds(a: &Map<String, Value>) -> Result<Vec<&'static str>, String> {
++    match a.get("kinds") {
++        None | Some(Value::Null) => Ok(KINDS.to_vec()),
++        Some(Value::Array(items)) => items
++            .iter()
++            .map(|v| {
++                v.as_str()
++                    .and_then(|s| KINDS.iter().find(|k| **k == s).copied())
++                    .ok_or_else(|| format!("\"kinds\" entries are {}; got {v}", KINDS.join(", ")))
++            })
++            .collect(),
++        Some(other) => Err(format!("\"kinds\" must be an array, got {other}")),
++    }
++}
++
++fn limit_of(a: &Map<String, Value>) -> Result<usize, String> {
++    match a.get("limit") {
++        None | Some(Value::Null) => Ok(DEFAULT_LIMIT),
++        Some(v) => v
++            .as_u64()
++            .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
++            .map(|n| n as usize)
++            .ok_or_else(|| format!("\"limit\" must be a whole number from 1 to {MAX_LIMIT}, got {v}")),
++    }
++}
++
++pub(super) fn list_features(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let name = req_str(a, "model")?;
++    let kinds = wanted_kinds(a)?;
++    let limit = limit_of(a)?;
++    let e = req_model(env, name)?;
++    let w = &env.world;
++    let f = model::features_of(w, &e).ok_or_else(|| format!("'{name}' has no geometry to pick from"))?;
++    let loc = model::transform_of(w, &e).unwrap_or_default();
++    let mut out = json!({ "model": name, "frame": "world", "truncated": false });
++    let mut truncated = false;
++    for k in kinds {
++        let (rows, total) = match k {
++            "faces" => faces_view(&f, &loc, limit),
++            "chains" => chains_view(&f, &loc, limit),
++            "patches" => patches_view(&f, limit),
++            _ => vertices_view(&f, &loc, limit),
++        };
++        truncated |= rows.len() < total;
++        out[k] = Value::Array(rows);
++        out[format!("{k}_total")] = json!(total);
++    }
++    out["truncated"] = json!(truncated);
++    Ok(out)
++}
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index cadb7823..f32c7de0 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -15,8 +15,11 @@
+ //! and every failure is an MCP tool error (`isError: true`) naming the
+ //! reason - never a panic, never a silent success.
+ 
++mod area;
+ mod edit;
++mod features;
+ mod job;
++mod pick;
+ mod tools;
+ 
+ use crate::script::Env;
+diff --git a/crates/app/src/mcp/pick.rs b/crates/app/src/mcp/pick.rs
+new file mode 100644
+index 00000000..55b4ad93
+--- /dev/null
++++ b/crates/app/src/mcp/pick.rs
+@@ -0,0 +1,204 @@
++//! The MCP pick tools (#180): read an operation's machined features and
++//! set them - faces, edge chains, loops (a face ring's chains) - through
++//! `SetOperationGeometry`, so a pick is one undoable History step like a
++//! click in the app. Feature ids are the geometry-hash ids `list_features`
++//! prints, written as `"<kind>:0x<hex>"` strings: a JSON number cannot
++//! carry a 64-bit hash through every client exactly.
++//!
++//! Provenance: our own tool surface over this repo's pick commands.
++
++use super::edit::find_op;
++use super::tools::req_str;
++use crate::commands::SetOperationGeometry;
++use crate::model;
++use crate::operation::{self, FeatureSel, GeoSel, OpParams, SrcRef};
++use crate::script::Env;
++
++use flecs_ecs::prelude::Entity;
++use serde_json::{json, Map, Value};
++
++/// The string form of a feature id: `face:0x…`, `chain:0x…`,
++/// `patch:0x…` (a welded smooth face), `vertex:0x…`.
++pub(super) fn feature_id(f: FeatureSel) -> String {
++    let kind = match f {
++        FeatureSel::Face(_) => "face",
++        FeatureSel::Chain(_) => "chain",
++        FeatureSel::Patch(_) => "patch",
++        FeatureSel::Vertex(_) => "vertex",
++    };
++    format!("{kind}:{:#018x}", f.id())
++}
++
++/// [`feature_id`]'s inverse; anything else is refused by its text.
++pub(super) fn parse_feature_id(s: &str) -> Result<FeatureSel, String> {
++    let bad = || format!("bad feature id '{s}' - use an id list_features prints, like \"face:0x00ab…\"");
++    let (kind, hex) = s.trim().split_once(':').ok_or_else(bad)?;
++    let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
++    if hex.is_empty() || hex.len() > 16 {
++        return Err(bad());
++    }
++    let id = u64::from_str_radix(hex, 16).map_err(|_| bad())?;
++    match kind {
++        "face" => Ok(FeatureSel::Face(id)),
++        "chain" => Ok(FeatureSel::Chain(id)),
++        "patch" => Ok(FeatureSel::Patch(id)),
++        "vertex" => Ok(FeatureSel::Vertex(id)),
++        _ => Err(bad()),
++    }
++}
++
++/// A part by name: a model the user imported, never stock, a tool, an
++/// operation, a setup, a work offset or a fixture.
++pub(super) fn req_model(env: &Env, name: &str) -> Result<Entity, String> {
++    let w = &env.world;
++    let e = model::find_by_name(w, name).ok_or_else(|| format!("no model named '{name}'"))?;
++    if !model::is_model(w, &e) {
++        return Err(format!("'{name}' is not a model"));
++    }
++    if model::is_fixture(w, &e) {
++        return Err(format!("'{name}' is a fixture - workholding is checked for collisions, not machined"));
++    }
++    Ok(e)
++}
++
++/// One `{model, id}` pick, the model checked to be a part.
++fn pick_of(env: &Env, v: &Value) -> Result<GeoSel, String> {
++    let Value::Object(m) = v else {
++        return Err(format!("a pick is an object {{\"model\", \"id\"}}, got {v}"));
++    };
++    if let Some(k) = m.keys().find(|k| *k != "model" && *k != "id") {
++        return Err(format!("a pick has \"model\" and \"id\" only, not \"{k}\""));
++    }
++    let entity = req_str(m, "model")?;
++    req_model(env, entity)?;
++    let feature = parse_feature_id(req_str(m, "id")?)?;
++    Ok(GeoSel { entity: entity.to_owned(), feature })
++}
++
++/// A pick list: a non-empty array of `{model, id}`.
++pub(super) fn picks_of(env: &Env, v: Option<&Value>, key: &str) -> Result<Vec<GeoSel>, String> {
++    match v {
++        Some(Value::Array(items)) if !items.is_empty() => items.iter().map(|p| pick_of(env, p)).collect(),
++        Some(Value::Array(_)) => Err(format!("\"{key}\" needs at least one pick")),
++        None | Some(Value::Null) => Err(format!("\"{key}\" is required")),
++        Some(other) => Err(format!("\"{key}\" must be an array of picks, got {other}")),
++    }
++}
++
++pub(super) fn picks_view(items: &[GeoSel]) -> Vec<Value> {
++    items.iter().map(|g| json!({ "model": g.entity, "id": feature_id(g.feature) })).collect()
++}
++
++/// The feature-kind door: refusals the generation walks make by name,
++/// said at the pick instead, before anything lands in the History.
++fn kind_door(label: &str, params: &OpParams, items: &[GeoSel]) -> Result<(), String> {
++    let first = |pred: fn(&FeatureSel) -> bool| items.iter().find(|g| pred(&g.feature));
++    if matches!(params, OpParams::MultiAxisContour { .. }) {
++        // Its picks ARE the path: curves only (selection's drive_chains).
++        if let Some(g) = first(|f| !matches!(f, FeatureSel::Chain(_))) {
++            return Err(format!(
++                "{} of '{}' is not an edge chain - a {label} operation machines picked edge chains",
++                g.feature, g.entity
++            ));
++        }
++    } else if operation::selection_drives_region(params)
++        && let Some(g) = first(|f| matches!(f, FeatureSel::Vertex(_)))
++    {
++        // A point bounds no region (the selection walk's own refusal).
++        return Err(format!(
++            "{} of '{}' is a point - a {label} operation's area needs faces or edge chains",
++            g.feature, g.entity
++        ));
++    }
++    Ok(())
++}
++
++/// `set_operation_geometry`: the op's source becomes the picked
++/// features (`SrcRef::Selection`), one undo step.
++pub(super) fn set_operation_geometry(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let key = find_op(env, req_str(a, "operation")?)?;
++    let items = picks_of(env, a.get("picks"), "picks")?;
++    let e = model::find_by_name(&env.world, &key).ok_or_else(|| format!("no operation named '{key}'"))?;
++    let op = model::operation_of(&env.world, &e).ok_or_else(|| format!("'{key}' is not an operation"))?;
++    kind_door(op.params.kind().info().label, &op.params, &items)?;
++    let cmd = SetOperationGeometry::new(&env.world, &key, items).map_err(|e| e.to_string())?;
++    env.history.execute(&env.world, cmd);
++    geometry_view(env, &key)
++}
++
++/// `get_operation_geometry`: what an op machines - its source, the
++/// picks, the area controls, and what the picks resolve to.
++pub(super) fn get_operation_geometry(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let key = find_op(env, req_str(a, "operation")?)?;
++    geometry_view(env, &key)
++}
++
++pub(super) fn geometry_view(env: &Env, key: &str) -> Result<Value, String> {
++    let w = &env.world;
++    let e = model::find_by_name(w, key).ok_or_else(|| format!("no operation named '{key}'"))?;
++    let op = model::operation_of(w, &e).ok_or_else(|| format!("'{key}' is not an operation"))?;
++    let (source, notes) = match &op.src {
++        SrcRef::Stock => (json!("stock"), Vec::new()),
++        SrcRef::Entity(n) => (json!({ "model": n }), Vec::new()),
++        SrcRef::Selection(items) => (
++            json!({ "picks": picks_view(items) }),
++            operation::selection_notes(w, op.setup.as_deref(), items, &op.params),
++        ),
++    };
++    Ok(json!({
++        "operation": key,
++        "kind": op.params.kind().info().label,
++        "source": source,
++        "area": super::area::area_view(&op.area),
++        "area_applies": operation::area_unsupported(op.params.kind()).is_none(),
++        "notes": notes,
++    }))
++}
++
++// ---- input schemas ----------------------------------------------------
++
++fn obj(props: Value, required: &[&str]) -> Value {
++    json!({ "type": "object", "properties": props, "required": required, "additionalProperties": false })
++}
++
++pub(super) fn pick_list_schema(what: &str) -> Value {
++    json!({
++        "type": "array",
++        "description": what,
++        "items": {
++            "type": "object",
++            "properties": {
++                "model": { "type": "string", "description": "The model the feature is on." },
++                "id": { "type": "string", "description": "A feature id from list_features: face:0x…, chain:0x…, patch:0x… or vertex:0x…." }
++            },
++            "required": ["model", "id"],
++            "additionalProperties": false
++        }
++    })
++}
++
++pub(super) fn s_list_features() -> Value {
++    obj(
++        json!({
++            "model": { "type": "string", "description": "Model name (see get_job)." },
++            "kinds": { "type": "array", "items": { "type": "string", "enum": ["faces", "chains", "patches", "vertices"] },
++                "description": "Which feature kinds to list; default all." },
++            "limit": { "type": "integer", "minimum": 1, "description": "Rows per kind (default 500)." }
++        }),
++        &["model"],
++    )
++}
++
++pub(super) fn s_op() -> Value {
++    obj(json!({ "operation": { "type": "string", "description": "Operation name (key or label)." } }), &["operation"])
++}
++
++pub(super) fn s_set_geometry() -> Value {
++    obj(
++        json!({
++            "operation": { "type": "string", "description": "Operation name (key or label)." },
++            "picks": pick_list_schema("The features to machine, in order. A loop is picked by every chain list_features names for it.")
++        }),
++        &["operation", "picks"],
++    )
++}
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index a97bf915..c0f1efdc 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -6,7 +6,7 @@
+ //! Provenance: our own tool surface over this repo's commands and the
+ //! script verbs; schemas are JSON Schema as the MCP spec carries them.
+ 
+-use super::{edit, job};
++use super::{area, edit, features, job, pick};
+ use crate::script::{api, Env};
+ 
+ use serde_json::{json, Map, Value};
+@@ -33,6 +33,10 @@ const TOOLS: &[Tool] = &[
+     Tool { name: "edit_operation", description: "Patch an operation's parameters: the given fields replace the current ones (JSON merge patch over the kind's fields; null clears an optional field). One undo step.", schema: s_edit_op, run: edit::edit_operation },
+     Tool { name: "delete_operation", description: "Delete an operation and its cached toolpath.", schema: s_name, run: edit::delete_operation },
+     Tool { name: "set_tool", description: "Assign a document tool to an operation (the tool must suit the operation's kind).", schema: s_set_tool, run: edit::set_tool },
++    Tool { name: "list_features", description: "A model's pickable features with stable ids: faces (each boundary loop with the edge chains that run it), edge chains, welded smooth faces and vertices, in world coordinates.", schema: pick::s_list_features, run: features::list_features },
++    Tool { name: "get_operation_geometry", description: "What an operation machines: its source (stock, a model, or picked features), its area controls, and what the picks resolve to.", schema: pick::s_op, run: pick::get_operation_geometry },
++    Tool { name: "set_operation_geometry", description: "Set the features an operation machines (faces, edge chains, loops) by list_features ids. One undo step; undo restores the previous source.", schema: pick::s_set_geometry, run: pick::set_operation_geometry },
++    Tool { name: "set_operation_area", description: "Replace an operation's area controls (containment, offset, corner, extension, extra include/exclude boundaries, open boundary). One undo step.", schema: area::s_set_area, run: area::set_operation_area },
+     Tool { name: "undo", description: "Undo the last document change.", schema: s_empty, run: edit::undo },
+     Tool { name: "redo", description: "Redo the last undone change.", schema: s_empty, run: edit::redo },
+     Tool { name: "generate", description: "Generate toolpaths: one named operation (always regenerated) or, with no name, every operation that is not current.", schema: s_opt_name, run: generate },
+diff --git a/crates/app/src/operation/material_region.rs b/crates/app/src/operation/material_region.rs
+index 78f0197e..d107cc93 100644
+--- a/crates/app/src/operation/material_region.rs
++++ b/crates/app/src/operation/material_region.rs
+@@ -220,7 +220,7 @@ pub(super) fn drive_chains_of(world: &World, op: &Operation) -> Result<Vec<Vec<P
+ /// (Contour, Pocket, Face's picked loops) take the region from the
+ /// picks; every kind listed here is mesh-driven, and a picked loop
+ /// could only disagree with the path the model authors.
+-pub(super) fn selection_drives_region(params: &OpParams) -> bool {
++pub(crate) fn selection_drives_region(params: &OpParams) -> bool {
+     !matches!(
+         params,
+         OpParams::Slot { .. }
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index c4cb392c..4ffb2ea6 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -83,6 +83,7 @@ pub(crate) use stamp_stock::write_setup_stock;
+ mod material;
+ pub use material::*;
+ mod material_region;
++pub(crate) use material_region::selection_drives_region;
+ mod circle_fit;
+ pub use circle_fit::{CIRCLE_FIT_TOL, circle_of_region, circular_fit_of};
+ mod material_source;
+diff --git a/crates/app/tests/mcp_pick.rs b/crates/app/tests/mcp_pick.rs
+new file mode 100644
+index 00000000..4a1a2db9
+--- /dev/null
++++ b/crates/app/tests/mcp_pick.rs
+@@ -0,0 +1,303 @@
++//! The MCP pick tools (#180): list a model's features under their stable
++//! geometry-hash ids, pick a pocket's floor loop off an imported STL as
++//! an operation's source through `SetOperationGeometry`, generate and
++//! verify it, set the area controls through `EditOperationParams::
++//! with_area`, and undo back to the previous source - every refusal a
++//! tool error, never a panic.
++//!
++//! Gate map (#180): covers app::mcp (pick, features, area, tools),
++//! app::commands (SetOperationGeometry, EditOperationParams).
++
++use camcraft_app::mcp::Server;
++
++use serde_json::{json, Value};
++use std::path::{Path, PathBuf};
++
++fn tmp_dir(tag: &str) -> PathBuf {
++    let mut p = std::env::temp_dir();
++    p.push(format!("camcraft-mcp-pick-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&p);
++    std::fs::create_dir_all(&p).expect("temp dir");
++    p
++}
++
++type P = [f64; 3];
++
++fn sub(a: P, b: P) -> P {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn cross(a: P, b: P) -> P {
++    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
++}
++
++/// Two triangles of the quad a-b-c-d, wound so their normal agrees with
++/// `n` (the fixture states which way each face looks, not its winding).
++fn quad(out: &mut Vec<[P; 3]>, q: [P; 4], n: P) {
++    let c = cross(sub(q[1], q[0]), sub(q[2], q[0]));
++    let along = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
++    let q = if along < 0.0 { [q[0], q[3], q[2], q[1]] } else { q };
++    out.push([q[0], q[1], q[2]]);
++    out.push([q[0], q[2], q[3]]);
++}
++
++/// A 40 x 40 x [0, 20] block with a 20 x 20 blind pocket from the top,
++/// floor at z 10, as ASCII STL. Written by the test so the fixture is
++/// the code (the mcp suite's box precedent).
++fn write_pocket_stl(path: &Path) {
++    let (o, i, top, floor) = (20.0, 10.0, 20.0, 10.0);
++    let sq = |h: f64, z: f64| -> [P; 4] { [[-h, -h, z], [h, -h, z], [h, h, z], [-h, h, z]] };
++    let mut t: Vec<[P; 3]> = Vec::new();
++    quad(&mut t, sq(o, 0.0), [0.0, 0.0, -1.0]);
++    quad(&mut t, sq(i, floor), [0.0, 0.0, 1.0]);
++    let (ob, ot, ib, it) = (sq(o, 0.0), sq(o, top), sq(i, floor), sq(i, top));
++    for k in 0..4 {
++        let n = (k + 1) % 4;
++        // Side k runs corner k -> n; its outward normal points away from
++        // the axis, the pocket's wall normal toward it.
++        let mid = [(ob[k][0] + ob[n][0]) / 2.0, (ob[k][1] + ob[n][1]) / 2.0, 0.0];
++        let out = [mid[0].signum() * (mid[0].abs() > 1.0) as i32 as f64, mid[1].signum() * (mid[1].abs() > 1.0) as i32 as f64, 0.0];
++        quad(&mut t, [ob[k], ob[n], ot[n], ot[k]], out);
++        quad(&mut t, [ib[k], ib[n], it[n], it[k]], [-out[0], -out[1], 0.0]);
++        quad(&mut t, [ot[k], ot[n], it[n], it[k]], [0.0, 0.0, 1.0]);
++    }
++    let mut s = String::from("solid pocket\n");
++    for tri in &t {
++        s.push_str(" facet normal 0 0 0\n  outer loop\n");
++        for p in tri {
++            s.push_str(&format!("   vertex {} {} {}\n", p[0], p[1], p[2]));
++        }
++        s.push_str("  endloop\n endfacet\n");
++    }
++    s.push_str("endsolid pocket\n");
++    std::fs::write(path, s).expect("write stl");
++}
++
++/// Bounds of the X / Y / Z words of a posted program's motion blocks
++/// (the machine-home return, G28, is not a toolpath position).
++fn posted_extent(path: &Path) -> ([f64; 3], [f64; 3]) {
++    let text = std::fs::read_to_string(path).expect("posted program");
++    let mut lo = [f64::INFINITY; 3];
++    let mut hi = [f64::NEG_INFINITY; 3];
++    for line in text.lines().filter(|l| !l.contains("G28") && !l.starts_with('(')) {
++        for w in line.split_whitespace() {
++            let Some(axis) = "XYZ".find(w.chars().next().unwrap_or(' ')) else { continue };
++            let Ok(v) = w[1..].parse::<f64>() else { continue };
++            lo[axis] = lo[axis].min(v);
++            hi[axis] = hi[axis].max(v);
++        }
++    }
++    (lo, hi)
++}
++
++struct Client {
++    server: Server,
++    next: i64,
++}
++
++impl Client {
++    fn new() -> Self {
++        Self { server: Server::new(), next: 1 }
++    }
++
++    fn call(&mut self, name: &str, args: Value) -> (bool, Value) {
++        let id = self.next;
++        self.next += 1;
++        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
++            "params": { "name": name, "arguments": args } });
++        let reply = self.server.handle(&msg).expect("a request gets a response");
++        let result = &reply["result"];
++        assert!(result.is_object(), "tools/call answers with a result: {reply}");
++        let is_err = result["isError"] == json!(true);
++        let body = if is_err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() };
++        (is_err, body)
++    }
++
++    fn ok(&mut self, name: &str, args: Value) -> Value {
++        let (err, body) = self.call(name, args);
++        assert!(!err, "{name} refused: {body}");
++        body
++    }
++
++    fn refused(&mut self, name: &str, args: Value) -> String {
++        let (err, body) = self.call(name, args);
++        assert!(err, "{name} should have refused, got {body}");
++        body.as_str().unwrap_or_default().to_owned()
++    }
++}
++
++/// A document with the pocketed part, a stock box over it, a 4 mm end
++/// mill, and a 2D Pocket whose source is the whole part, its floor at
++/// the bottom of whatever it is given to machine.
++fn pocket_job(tag: &str) -> (Client, PathBuf) {
++    let dir = tmp_dir(tag);
++    let stl = dir.join("part.stl");
++    write_pocket_stl(&stl);
++    let mut c = Client::new();
++    let imp = c.ok("import_model", json!({ "path": stl.display().to_string() }));
++    assert_eq!(imp["model"], json!("part"));
++    c.ok("set_stock", json!({ "box": { "dx": 40.0, "dy": 40.0, "dz": 20.0 } }));
++    c.ok("add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    let add = c.ok("add_operation", json!({
++        "kind": "pocket", "tool": "EM-0400-2FL", "name": "P1", "source": "part",
++        "params": {
++            "top_z": { "reference": "top_of_stock", "offset": 0.0 },
++            "bottom_z": { "reference": "bottom_of_selection", "offset": 0.0 },
++            "stepdown": 2.5,
++        },
++    }));
++    assert_eq!(add["operation"], json!("P1"));
++    (c, dir)
++}
++
++/// The pocket floor: the one face looking up from below the top, and the
++/// chain ids that run its outer ring.
++fn floor_loop(c: &mut Client) -> (String, Vec<String>) {
++    let f = c.ok("list_features", json!({ "model": "part", "kinds": ["faces", "chains"] }));
++    let faces = f["faces"].as_array().expect("faces");
++    let floors: Vec<&Value> = faces
++        .iter()
++        .filter(|fa| fa["facing"] == json!("up") && fa["bounds"]["max"][2].as_f64().is_some_and(|z| (z - 10.0).abs() < 1e-9))
++        .collect();
++    assert_eq!(floors.len(), 1, "one floor face at z 10: {f}");
++    let floor = floors[0];
++    let outer = floor["loops"].as_array().and_then(|l| l.iter().find(|l| l["kind"] == json!("outer"))).expect("an outer ring");
++    assert_eq!(outer["complete"], json!(true), "every span of the ring is a feature edge: {outer}");
++    let chains: Vec<String> = outer["chains"].as_array().expect("chains").iter().filter_map(|c| c.as_str().map(str::to_owned)).collect();
++    // A square ring: four straight chains, each listed among the model's.
++    assert_eq!(chains.len(), 4, "{outer}");
++    let listed: Vec<&str> = f["chains"].as_array().expect("chains").iter().filter_map(|c| c["id"].as_str()).collect();
++    assert!(chains.iter().all(|id| listed.contains(&id.as_str())), "{chains:?} vs {listed:?}");
++    (floor["id"].as_str().expect("face id").to_owned(), chains)
++}
++
++#[test]
++fn a_picked_pocket_floor_loop_generates_verifies_and_undoes() {
++    let (mut c, dir) = pocket_job("floor");
++    let names: Vec<String> = c.server.handle(&json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/list" }))
++        .and_then(|r| r["result"]["tools"].as_array().cloned())
++        .map(|t| t.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect())
++        .unwrap_or_default();
++    for want in ["list_features", "get_operation_geometry", "set_operation_geometry", "set_operation_area"] {
++        assert!(names.iter().any(|n| n == want), "missing tool {want}: {names:?}");
++    }
++
++    let (face, chains) = floor_loop(&mut c);
++    assert!(face.starts_with("face:0x"), "{face}");
++    // The ids are the geometry hashes: listing again says the same.
++    assert_eq!(floor_loop(&mut c), (face, chains.clone()));
++
++    let before = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(before["source"], json!({ "model": "part" }));
++    let picks: Vec<Value> = chains.iter().map(|id| json!({ "model": "part", "id": id })).collect();
++    let set = c.ok("set_operation_geometry", json!({ "operation": "P1", "picks": picks }));
++    assert_eq!(set["source"]["picks"], json!(picks), "{set}");
++    let job = c.ok("get_job", json!({}));
++    assert_eq!(job["operations"][0]["source"], json!({ "selection": 4 }), "{job}");
++
++    let generated = c.ok("generate", json!({ "name": "P1" }));
++    assert_eq!(generated["generated"][0]["status"], json!("ok"), "{generated}");
++    let ver = c.ok("verify", json!({}));
++    assert_eq!(ver["ok"], json!(true), "{ver}");
++    let blocking = ver["findings"].as_array().is_some_and(|f| f.iter().any(|f| f["blocks_post"] == json!(true)));
++    assert!(!blocking, "{ver}");
++    // The path stays inside the 20 x 20 ring and on or above its floor.
++    let posted = dir.join("p1.nc");
++    let out = c.ok("post", json!({ "output": posted.display().to_string(), "post": "Fanuc" }));
++    assert!(out["lines"].as_u64().is_some_and(|n| n > 0), "{out}");
++    let (lo, hi) = posted_extent(&posted);
++    // A 4 mm end mill inside the 20 x 20 ring: centres within +-8.
++    assert!(lo[0] >= -8.0 - 1e-6 && hi[0] <= 8.0 + 1e-6 && lo[1] >= -8.0 - 1e-6 && hi[1] <= 8.0 + 1e-6, "{lo:?} {hi:?}");
++    assert!((lo[2] - 10.0).abs() < 1e-6, "the deepest cut is the picked floor, z 10: {lo:?}");
++
++    // The area controls: one undo step through the same door.
++    let area = c.ok("set_operation_area", json!({ "operation": "P1", "area": { "offset": -0.5, "corner": "sharp" } }));
++    assert_eq!(area["area"]["offset"], json!(-0.5), "{area}");
++    assert_eq!(area["area"]["corner"], json!("sharp"));
++    c.ok("undo", json!({}));
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["area"]["offset"], json!(0.0), "{g}");
++    assert_eq!(g["area"]["corner"], json!("round"));
++    assert_eq!(g["source"]["picks"], json!(picks));
++
++    // Undo the generation, then the pick: the previous source is back.
++    c.ok("undo", json!({}));
++    c.ok("undo", json!({}));
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["source"], json!({ "model": "part" }), "{g}");
++    c.ok("redo", json!({}));
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["source"]["picks"], json!(picks), "{g}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn bad_picks_are_tool_errors_never_a_panic() {
++    let (mut c, dir) = pocket_job("refuse");
++    let (face, chains) = floor_loop(&mut c);
++    let vertex = c.ok("list_features", json!({ "model": "part", "kinds": ["vertices"] }))["vertices"][0]["id"]
++        .as_str()
++        .expect("a vertex")
++        .to_owned();
++    let pick = |id: &str| json!([{ "model": "part", "id": id }]);
++
++    // Unknown feature: a well-formed id the model does not hold.
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": pick("face:0x0000000000000001") }));
++    assert!(msg.contains("not in the model"), "{msg}");
++    for bad in ["face:", "face:zz", "edge:0x12", "0x12", "chain:0x1234567890abcdef0"] {
++        let msg = c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": pick(bad) }));
++        assert!(msg.contains("bad feature id"), "{bad}: {msg}");
++    }
++    // Wrong operation, wrong model, an empty or malformed pick list.
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "Nope", "picks": pick(&face) }));
++    assert!(msg.contains("no operation named"), "{msg}");
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "EM-0400-2FL", "picks": pick(&face) }));
++    assert!(msg.contains("no operation named"), "{msg}");
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": [{ "model": "EM-0400-2FL", "id": face }] }));
++    assert!(msg.contains("is not a model"), "{msg}");
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": [{ "model": "ghost", "id": face }] }));
++    assert!(msg.contains("no model named"), "{msg}");
++    c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": [] }));
++    c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": "all" }));
++    c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": [{ "model": "part", "id": face, "x": 1 }] }));
++    // A feature kind the op cannot take: a point bounds no pocket.
++    let msg = c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": pick(&vertex) }));
++    assert!(msg.contains("is a point"), "{msg}");
++    // A wall's rim seen from above is a line: the command's own door.
++    let wall = c.ok("list_features", json!({ "model": "part", "kinds": ["faces"] }))["faces"]
++        .as_array()
++        .and_then(|f| f.iter().find(|f| f["facing"] == json!("side")).cloned())
++        .expect("a wall");
++    c.refused("set_operation_geometry", json!({ "operation": "P1", "picks": pick(wall["id"].as_str().expect("id")) }));
++
++    // Area refusals: unknown keys, bad words and numbers, a kind without an area.
++    for bad in [
++        json!({ "ofset": 1.0 }),
++        json!({ "corner": "chamfer" }),
++        json!({ "offset": "wide" }),
++        json!({ "extension": -1.0 }),
++        json!({ "extra": [{ "mode": "include", "from": "picks", "picks": [] }] }),
++        json!({ "extra": [{ "mode": "include", "from": "stock", "picks": pick(&chains[0]) }] }),
++        json!({ "open": { "picks": pick(&chains[0]) } }),
++        json!([1]),
++    ] {
++        c.refused("set_operation_area", json!({ "operation": "P1", "area": bad }));
++    }
++    c.ok("add_tool", json!({ "catalog": "DR-0400" }));
++    c.ok("add_operation", json!({ "kind": "drill", "tool": "DR-0400", "name": "D1" }));
++    c.refused("set_operation_area", json!({ "operation": "D1", "area": { "offset": 1.0 } }));
++
++    // list_features refusals.
++    c.refused("list_features", json!({ "model": "ghost" }));
++    c.refused("list_features", json!({ "model": "EM-0400-2FL" }));
++    c.refused("list_features", json!({ "model": "part", "kinds": ["edges"] }));
++    c.refused("list_features", json!({ "model": "part", "limit": 0 }));
++    let few = c.ok("list_features", json!({ "model": "part", "kinds": ["vertices"], "limit": 2 }));
++    assert_eq!(few["vertices"].as_array().map(Vec::len), Some(2));
++    assert_eq!(few["truncated"], json!(true));
++
++    // No refusal reached the History: the op still machines the part.
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["source"], json!({ "model": "part" }), "{g}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/docs/decisions/180-mcp-pick-features.md b/docs/decisions/180-mcp-pick-features.md
+new file mode 100644
+index 00000000..06eb9c8b
+--- /dev/null
++++ b/docs/decisions/180-mcp-pick-features.md
+@@ -0,0 +1,56 @@
++## #180 - MCP: pick faces, edges and loops for an operation's area
++
++**Decided.** Four new MCP tools, in their own modules under
++`crates/app/src/mcp/` (`features.rs`, `pick.rs`, `area.rs`) with only the
++registration rows added to `tools.rs` / `mod.rs`:
++
++- `list_features {model, kinds?, limit?}` - a model's planar faces (normal,
++  up/down/side/inclined, area, bounds, the welded smooth face it belongs
++  to, and each boundary loop with the edge chains that run it), tangent
++  edge chains (closed flag, length, ends, bounds), welded smooth faces
++  ("patches") and corner vertices. World coordinates.
++- `set_operation_geometry {operation, picks: [{model, id}]}` - through
++  `SetOperationGeometry`, one undo step.
++- `get_operation_geometry {operation}` - source, picks, area controls and
++  the selection notes the page shows.
++- `set_operation_area {operation, area}` - through
++  `EditOperationParams::with_area` with the op's params as they stand.
++
++- **Ids are strings, `"<kind>:0x<16 hex>"`** (`face:`, `chain:`, `patch:`,
++  `vertex:`). The geometry hashes are full 64-bit values; a JSON number
++  loses everything past 2^53 in JavaScript-based MCP clients, and a
++  rounded id would silently name nothing (or, worse, something else).
++  The kind prefix also makes the `FeatureSel` variant explicit. Dropped:
++  the project file's `{chain: {id: <u64>}}` shape (exact in Rust, lossy
++  in the clients that matter here).
++- **A loop is its chains, not a new pick kind.** `SrcRef::Selection` has
++  no "loop" variant, and the region walk already stitches open runs into
++  rings. So each face loop in `list_features` lists the tangent-chain ids
++  that cover it (`complete: false` if some span of the ring is not a
++  feature edge - then the face itself is the pick). A square pocket floor
++  is four chains; a round one is one closed chain. Dropped: a synthetic
++  `loop:` id expanded at the door (a second id family that is not
++  stored, so `get_operation_geometry` could never echo it back).
++- **Feature-kind door at the tool, mirroring generation's own
++  refusals:** Multi-Axis Contour takes edge chains only, and every kind
++  whose picks author its region (`operation::selection_drives_region`,
++  now `pub(crate)`) refuses a vertex ("a point bounds no region"). The
++  rest (unknown ids, non-solids, a wall rim that is a line from above,
++  heights that the new picks cannot answer) is `SetOperationGeometry`'s
++  own construction door. Dropped: an MCP-only per-kind acceptance table
++  (a second law that could drift from the generators').
++- **`set_operation_area` replaces the whole controls**; omitted keys take
++  their defaults, so `{}` resets. A merge patch over nested pick lists
++  has no clean meaning for "remove the second include boundary", and the
++  op page's Apply also writes the whole group. Unknown keys are refused by
++  name, like `edit_operation`'s patches.
++- **`list_features` is capped at 500 rows per kind by default** (`limit`
++  up to 20 000, `truncated` says when rows were cut), so a dense STEP
++  import cannot flood one reply.
++- **Test fixture written by the test.** No existing STL fixture has a
++  pocket (`testdata/models/cube.stl` is a plain cube), so
++  `tests/mcp_pick.rs` writes a 40 x 40 x 20 block with a 20 x 20 blind
++  pocket as ASCII STL, as `tests/mcp.rs` does for its box.
++
++Cost to change later: the id string format is the tool contract; changing
++it breaks agents that cached ids, so it should stay.

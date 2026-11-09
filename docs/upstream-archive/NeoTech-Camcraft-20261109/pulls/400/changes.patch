@@ -1,0 +1,274 @@
+From 16a4f3be5768ee6f5746ffb0b24d5cf3f6bdb47e Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 16:33:24 -0800
+Subject: [PATCH] fix(world): finish flecs' OS API setup once, before the first
+ world
+
+flecs keeps its OS API (malloc, free, abort, the clock) in one
+process-global C struct, and the first world fills it in without a lock.
+flecs_ecs's ensure_initialized writes it after its claim mutex is
+released, while ecs_mini copies the struct and writes it back. Two test
+threads building their first worlds at once could therefore copy a
+half-written struct. Then ecs_mini aborted on the ECS_MISSING_OS_API
+check (SIGABRT, flecs.c:21288, captured under lldb) or called a NULL
+hook (SIGSEGV).
+
+new_world now runs ensure_initialized behind a std::sync::Once before it
+builds any world, so the struct is complete and marked initialised
+before any concurrent construction reads it.
+
+Stress results, scripting suite, 8 copies x --test-threads=32: 7 crashes
+in 1200 runs before the fix, 0 in 1600 after. The new world_init_race
+binary re-runs itself as children that release 32 threads at a barrier
+on loaded cores: 6 crashed children in 1920 before, 0 in 3840 after.
+
+Fixes #379
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/world.rs                 |  31 +++++++
+ crates/app/tests/world_init_race.rs     | 111 ++++++++++++++++++++++++
+ docs/decisions/379-scripting-sigsegv.md |  68 +++++++++++++++
+ 3 files changed, 210 insertions(+)
+ create mode 100644 crates/app/tests/world_init_race.rs
+ create mode 100644 docs/decisions/379-scripting-sigsegv.md
+
+diff --git a/crates/app/src/world.rs b/crates/app/src/world.rs
+index b5d829d5..7be7b691 100644
+--- a/crates/app/src/world.rs
++++ b/crates/app/src/world.rs
+@@ -1,12 +1,43 @@
+ //! World construction: one blessed entry point so schema registration can
+ //! never be forgotten in a new binary.
++//!
++//! Provenance: our own wrapper over flecs_ecs; the first-world race note
++//! below comes from reading the vendored flecs C source (MIT), #379.
+ 
++use flecs_ecs::core::ecs_os_api;
+ use flecs_ecs::prelude::World;
++use std::sync::Once;
+ 
+ use crate::schema;
+ 
++/// Every world goes through here: no other code may call `World::new`
++/// (a world made elsewhere on another thread would bring back #379).
+ pub fn new_world() -> World {
++    init_flecs_os_api();
+     let world = World::new();
+     schema::register_schema(&world);
+     world
+ }
++
++/// Fill in flecs' process-global OS API (malloc, free, abort, the clock)
++/// once, before any world exists.
++///
++/// flecs fills that struct in without a lock on the first world.
++/// `flecs_ecs::ecs_os_api::ensure_initialized` claims it under a mutex,
++/// but writes it after the mutex is released. Meanwhile `ecs_mini` (the
++/// C side of `World::new`) copies the struct and writes it back. So a
++/// second thread building its first world at that moment could copy a
++/// half-written struct. Then `ecs_mini` aborted (ECS_MISSING_OS_API) or
++/// called a NULL hook (SIGSEGV). Under load, the test binaries that
++/// build worlds on many threads crashed this way about once in 170
++/// runs (#379).
++///
++/// Once the first initialisation has finished, flecs marks the API
++/// initialised. After that, a world's construction only reads it (the
++/// write-back is refused). So finishing it once here, while every
++/// other caller waits, closes the race. `ensure_initialized` can panic
++/// only if its own mutex is poisoned, and nothing else takes that mutex.
++fn init_flecs_os_api() {
++    static FLECS_OS_API: Once = Once::new();
++    FLECS_OS_API.call_once(ecs_os_api::ensure_initialized);
++}
+diff --git a/crates/app/tests/world_init_race.rs b/crates/app/tests/world_init_race.rs
+new file mode 100644
+index 00000000..a6877ce5
+--- /dev/null
++++ b/crates/app/tests/world_init_race.rs
+@@ -0,0 +1,111 @@
++//! The first-world race (#379): flecs keeps its OS API (malloc, free,
++//! abort, the clock) in one process-global struct, and the first world
++//! a process creates fills it in without a lock. Two threads creating
++//! their first worlds at the same moment could see it half-written:
++//! `ecs_mini` aborted with ECS_MISSING_OS_API (SIGABRT) or called a NULL
++//! hook (SIGSEGV). Under load, the scripting suite crashed that way in
++//! about 1 run out of 170. project_roundtrip's one SIGABRT looks the
++//! same. `world::new_world` now finishes that
++//! initialisation once, behind a `Once`, before any world exists.
++//!
++//! The race only happens on a process's FIRST worlds, so one in-process
++//! test proves nothing once any world exists. This binary therefore
++//! re-runs itself as child processes. Each child releases a crowd of
++//! threads at one barrier, and every thread builds its first world at
++//! once. Every child must exit cleanly.
++//!
++//! Gate map (M4.4): covers app::world.
++
++use camcraft_app::world::new_world;
++use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Barrier};
++
++const CHILD_ENV: &str = "CAMCRAFT_WORLD_RACE_CHILD";
++/// Before the fix, about 3 children in 1000 crashed under this load
++/// (6 of 1920). With 720 children, a run took about 4 s and failed in 4
++/// of 6 runs. After the fix, 3840 of 3840 children passed. It is a
++/// stress test, so a pass is evidence, not proof. The scripting
++/// suite's stress loop in docs/decisions/379-scripting-sigsegv.md is
++/// the larger check.
++const CHILDREN: usize = 720;
++/// How many children run at once.
++const WAVE: usize = 24;
++const THREADS: usize = 32;
++
++/// One child's whole job: a crowd of threads released at one barrier,
++/// each building the first world it sees.
++fn crowd() {
++    let gate = Arc::new(Barrier::new(THREADS));
++    let handles: Vec<_> = (0..THREADS)
++        .map(|_| {
++            let gate = Arc::clone(&gate);
++            std::thread::spawn(move || {
++                gate.wait();
++                drop(new_world());
++            })
++        })
++        .collect();
++    for h in handles {
++        h.join().expect("a world-building thread panicked");
++    }
++}
++
++#[test]
++fn first_worlds_on_many_threads_never_crash() {
++    if std::env::var_os(CHILD_ENV).is_some() {
++        crowd();
++        return;
++    }
++    let exe = std::env::current_exe().expect("own test binary");
++    // Spinners keep every core busy while the children run, so a thread
++    // can be preempted in the middle of the first initialisation. That
++    // is how the gate's concurrent suites hit the race.
++    let stop = Arc::new(AtomicBool::new(false));
++    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
++    let spinners: Vec<_> = (0..cores)
++        .map(|_| {
++            let stop = Arc::clone(&stop);
++            std::thread::spawn(move || {
++                while !stop.load(Ordering::Relaxed) {
++                    std::hint::spin_loop();
++                }
++            })
++        })
++        .collect();
++    let mut crashed = Vec::new();
++    for wave in 0..CHILDREN / WAVE {
++        let children: Vec<_> = (0..WAVE)
++            .map(|_| {
++                Command::new(&exe)
++                    .args(["--exact", "first_worlds_on_many_threads_never_crash", "--test-threads=1", "-q"])
++                    .env(CHILD_ENV, "1")
++                    .stdout(Stdio::piped())
++                    .stderr(Stdio::piped())
++                    .spawn()
++                    .expect("spawn child")
++            })
++            .collect();
++        for (i, child) in children.into_iter().enumerate() {
++            let out = child.wait_with_output().expect("child output");
++            if !out.status.success() {
++                crashed.push(format!(
++                    "wave {wave} child {i}: {:?}\n{}{}",
++                    out.status,
++                    String::from_utf8_lossy(&out.stdout),
++                    String::from_utf8_lossy(&out.stderr)
++                ));
++            }
++        }
++    }
++    stop.store(true, Ordering::Relaxed);
++    for s in spinners {
++        s.join().expect("spinner thread panicked");
++    }
++    assert!(
++        crashed.is_empty(),
++        "{} of {CHILDREN} children crashed building their first worlds:\n{}",
++        crashed.len(),
++        crashed.join("\n")
++    );
++}
+diff --git a/docs/decisions/379-scripting-sigsegv.md b/docs/decisions/379-scripting-sigsegv.md
+new file mode 100644
+index 00000000..c7871449
+--- /dev/null
++++ b/docs/decisions/379-scripting-sigsegv.md
+@@ -0,0 +1,68 @@
++## #379 - the scripting suite's SIGSEGV was flecs' first-world race
++
++**Decided:** `world::new_world` now calls
++`flecs_ecs::core::ecs_os_api::ensure_initialized` once, behind a
++`std::sync::Once`, before it builds any world. A new test binary,
++`crates/app/tests/world_init_race.rs`, pins the fix with a stress test.
++
++**Why:** flecs keeps its OS API (malloc, free, abort, the clock) in one
++process-global C struct, and the first world fills it in without a lock.
++`ensure_initialized` claims that first fill under a mutex but writes the
++struct after the mutex is released. Meanwhile `ecs_mini`, the C side of
++`World::new`, copies the struct and writes it back. So a second thread
++building its first world at that moment could copy a half-written
++struct. Then `ecs_mini` hit `ecs_os_has_heap() == false` and aborted
++(SIGABRT), or later called a NULL hook (SIGSEGV).
++
++Stack under lldb, scripting binary, aarch64-apple-darwin:
++`abort <- ecs_mini.cold.1 <- ecs_mini (flecs.c:21288, the
++ECS_MISSING_OS_API check) <- ecs_init <- World::default <-
++camcraft_app::world::new_world <- script::Env::fresh <- script::run`. At
++the same moment, a sibling test thread was inside another world's
++`ecs_set_hooks_id`.
++
++After that first fill, flecs marks the API initialised. From then on a
++world's construction only reads the struct, because the write-back is
++refused. Finishing the fill once while every other caller waits
++therefore closes the race. Every world in the repo is built through
++`new_world` (grep: no other `World::new`).
++
++**Evidence:**
++
++| Run | Before the fix | After the fix |
++|---|---|---|
++| Scripting suite: 8 copies of `--test-threads=32` running in parallel | 7 crashes in 1200 runs (6 exit 139, 1 exit 134), all before the first test finished | 0 in 1600 runs |
++| `world_init_race`: 32 threads at a barrier per child, all cores spinning | 6 crashed children in 1920 | 0 in 3840 |
++| `world_init_race` test, 720 children | failed 4 of 6 runs | passes |
++| project_roundtrip, 6 copies x 60 runs | not measured | 0 in 360 |
++
++project_roundtrip's earlier one-off SIGABRT has the same signature, an
++abort at startup under load. It is very likely the same race, but it was
++not reproduced before the fix.
++
++**Considered and dropped:**
++- Retrying or ignoring the crash, or running the tests with
++  `--test-threads=1`. That hides a real crash that a multi-threaded host
++  (the MCP server or batch jobs) could also hit.
++- Patching the vendored flecs C source. We would carry a fork for a
++  one-line ordering fix that the Rust side can enforce.
++- Calling `ecs_set_os_api_impl` through FFI. That is unsafe code for no
++  gain over the crate's own safe `ensure_initialized`.
++- Creating and dropping a throwaway world inside the `Once`. It works
++  too, but it costs more than the init call alone.
++
++**Not fixed here, noted:**
++- flecs' `ecs_os_api_init_count` is a plain `int`, and each world's
++  creation and destruction changes it without atomics. On POSIX the
++  init and fini hooks it guards are NULL, so it is harmless. On Windows
++  a lost update could call `win_fini` early. Nothing has been seen, so
++  this is a candidate for a future issue.
++- A separate observation, not the cause: in debug, every script run
++  needs about 950 KB of stack (boa's `Context` setup plus the world).
++  Test threads have 2 MiB, so the headroom is about 2x. With
++  `RUST_MIN_STACK=786432` it overflows deterministically, and Rust
++  reports that as "has overflowed its stack" (SIGABRT), not SIGSEGV.
++
++**Cost to change:** none. It is one `Once` at the single world entry
++point. If flecs_ecs makes `ensure_initialized` race-free upstream, the
++guard is still harmless.

@@ -1,0 +1,1149 @@
+From 8c66d5c71ea9f9b0b40cd4971958042a30588ebe Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 17:49:50 -0800
+Subject: [PATCH] fix(sim): sweep XY arcs exactly in the column engine, not as
+ inscribed chords
+
+The program sim's column engine cut each XY arc as chords drawn inside
+the arc (chord_tol = cell/4). On a convex corner the arc's centre is the
+part's corner, so the chords brought the simulated tool up to one
+sagitta closer to the part than the real G2/G3. The issue's L-block
+contour clipped one column 0.088 mm inside the riser's corner, and the
+height verdict read that as a 10 mm gouge, so the post gate refused a
+correct program. On a concave corner the same chords stopped a sagitta
+short of the wall and hid a real gouge.
+
+New stock_sim::dexel_arc: disc, ball, cone and bull atoms swept along
+the true circle. The per-column reach window is closed-form. The bottom
+is exact for discs and level arcs, and helical non-disc arcs are split
+at their curvature bends and searched by golden section (real
+evaluations only, so it never cuts past the tool). Arc end discs are
+judged too. XZ/YZ arcs keep their chords. The gouge verdict is
+unchanged.
+
+Tests: the L-block repro over MCP (contour_arc_sim), an exact-reach and
+dense-scan check per atom, the issue's column, and planted convex and
+concave gouges (arc_sweep). stock_sim's chord law is rewritten to the
+exact law. Bull column/field parity on the helix arc is bounded by the
+field's own chord error, because the field engine still chords (follow-up).
+
+Fixes #402
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/contour_arc_sim.rs     | 126 ++++++++++
+ crates/sim/src/stock_sim/dexel.rs       |  75 ++----
+ crates/sim/src/stock_sim/dexel_arc.rs   | 302 ++++++++++++++++++++++++
+ crates/sim/src/stock_sim/dexel_bull.rs  |  21 +-
+ crates/sim/src/stock_sim/mod.rs         |  13 +-
+ crates/sim/tests/arc_sweep.rs           | 259 ++++++++++++++++++++
+ crates/sim/tests/stock_bull_nose.rs     |  30 ++-
+ crates/sim/tests/stock_sim.rs           |  32 ++-
+ docs/decisions/402-arc-chord-sagitta.md |  71 ++++++
+ 9 files changed, 833 insertions(+), 96 deletions(-)
+ create mode 100644 crates/app/tests/contour_arc_sim.rs
+ create mode 100644 crates/sim/src/stock_sim/dexel_arc.rs
+ create mode 100644 crates/sim/tests/arc_sweep.rs
+ create mode 100644 docs/decisions/402-arc-chord-sagitta.md
+
+diff --git a/crates/app/tests/contour_arc_sim.rs b/crates/app/tests/contour_arc_sim.rs
+new file mode 100644
+index 00000000..b19d14a6
+--- /dev/null
++++ b/crates/app/tests/contour_arc_sim.rs
+@@ -0,0 +1,126 @@
++//! #402: a clean 2D Contour around an L-shaped block must post. The
++//! program sim's column engine used to cut each XY arc as chords drawn
++//! INSIDE the arc; on a convex corner (arc centre = the part's corner)
++//! that brought the simulated tool up to one sagitta closer to the part
++//! than the real G2/G3, and one lattice column 0.088 mm inside the
++//! riser's corner was clipped - read by the height verdict as a 10 mm
++//! gouge, so the post gate refused a correct program. The arc sweep is
++//! now exact (`stock_sim::dexel_arc`); this file is the issue's own
++//! repro, driven over the MCP tools the way it was reported (the
++//! planted gouges, convex and concave, live with the kernel in
++//! `crates/sim/tests/arc_sweep.rs`).
++//!
++//! The part is our own geometry (the issue's XZ profile extruded
++//! y -30..30), written as an STL by the test so the fixture is the code.
++//!
++//! Gate map (M4.4): covers app::mcp, app::posting, app::posting_sim,
++//! app::stock_sim, app::machining2d.
++
++use camcraft_app::mcp::Server;
++
++use serde_json::{json, Value};
++use std::path::{Path, PathBuf};
++
++fn tmp_dir(tag: &str) -> PathBuf {
++    let mut p = std::env::temp_dir();
++    p.push(format!("camcraft-402-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&p);
++    std::fs::create_dir_all(&p).expect("temp dir");
++    p
++}
++
++/// The issue's L-block: in XZ (-40,0) (40,0) (40,15) (10,15) (10,25)
++/// (-40,25), extruded y -30..30 - a 25 mm riser over x -40..10 and a
++/// step at z 15 over x 10..40. ASCII STL, wound outward.
++fn write_l_block(path: &Path) {
++    let prof = [(-40.0, 0.0), (40.0, 0.0), (40.0, 15.0), (10.0, 15.0), (10.0, 25.0), (-40.0, 25.0)];
++    let at = |i: usize, y: f64| -> [f64; 3] { [prof[i].0, y, prof[i].1] };
++    let (yf, yb) = (-30.0, 30.0);
++    let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
++    // Caps: the profile is star-shaped from vertex 0, CCW seen from -y.
++    for i in 1..prof.len() - 1 {
++        tris.push([at(0, yf), at(i, yf), at(i + 1, yf)]);
++        tris.push([at(0, yb), at(i + 1, yb), at(i, yb)]);
++    }
++    // Walls: one quad per profile edge, normal pointing out of the CCW loop.
++    for i in 0..prof.len() {
++        let j = (i + 1) % prof.len();
++        tris.push([at(i, yf), at(j, yb), at(j, yf)]);
++        tris.push([at(i, yf), at(i, yb), at(j, yb)]);
++    }
++    let mut s = String::from("solid lblock\n");
++    for t in tris {
++        s.push_str(" facet normal 0 0 0\n  outer loop\n");
++        for v in t {
++            s.push_str(&format!("   vertex {} {} {}\n", v[0], v[1], v[2]));
++        }
++        s.push_str("  endloop\n endfacet\n");
++    }
++    s.push_str("endsolid lblock\n");
++    std::fs::write(path, s).expect("write stl");
++}
++
++fn call(server: &mut Server, id: &mut i64, name: &str, args: Value) -> (bool, Value) {
++    *id += 1;
++    let msg = json!({ "jsonrpc": "2.0", "id": *id, "method": "tools/call",
++        "params": { "name": name, "arguments": args } });
++    let reply = server.handle(&msg).expect("a request gets a response");
++    let result = &reply["result"];
++    let is_err = result["isError"] == json!(true);
++    let body = if is_err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() };
++    (is_err, body)
++}
++
++fn ok(server: &mut Server, id: &mut i64, name: &str, args: Value) -> Value {
++    let (err, body) = call(server, id, name, args);
++    assert!(!err, "{name} refused: {body}");
++    body
++}
++
++/// The issue's job, step for step: L-block, 90x70x28 box stock, a 6 mm
++/// end mill, a default 2D Contour around the model, generated and
++/// verified. Returns the verify report.
++fn contour_job(tag: &str) -> Value {
++    let dir = tmp_dir(tag);
++    let stl = dir.join("lblock.stl");
++    write_l_block(&stl);
++    let (mut s, mut id) = (Server::new(), 0);
++    let init = json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
++        "params": { "protocolVersion": "2025-06-18" } });
++    let _ = s.handle(&init);
++    ok(&mut s, &mut id, "import_model", json!({ "path": stl.display().to_string(), "name": "StepBlock" }));
++    ok(&mut s, &mut id, "set_stock", json!({ "box": { "dx": 90.0, "dy": 70.0, "dz": 28.0 } }));
++    ok(&mut s, &mut id, "add_tool", json!({ "catalog": "EM-0600-4FL" }));
++    let add = json!({ "kind": "2D Contour", "tool": "EM-0600-4FL", "name": "Contour1", "source": "StepBlock" });
++    ok(&mut s, &mut id, "add_operation", add);
++    let generated = ok(&mut s, &mut id, "generate", json!({}));
++    assert_eq!(generated["generated"][0]["status"], json!("ok"), "{generated}");
++    let ver = ok(&mut s, &mut id, "verify", json!({}));
++    let _ = std::fs::remove_dir_all(&dir);
++    ver
++}
++
++fn post_gate_findings(ver: &Value) -> Vec<String> {
++    ver["findings"]
++        .as_array()
++        .map(|f| {
++            f.iter()
++                .filter(|f| f["kind"] == json!("post_gate"))
++                .map(|f| f["message"].as_str().unwrap_or("").to_owned())
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++#[test]
++fn a_clean_contour_around_the_l_block_reads_no_gouge() {
++    // The issue's exact job. The one legitimate finding is the rapid
++    // below the clearance plane (top of model 25 under stock top 28,
++    // nothing faced it); the post gate must carry no gouge.
++    let ver = contour_job("clean");
++    let gates = post_gate_findings(&ver);
++    assert!(
++        gates.iter().all(|m| !m.contains("gouge")),
++        "a correct contour reads as a gouge: {gates:?}\n{ver}"
++    );
++}
+diff --git a/crates/sim/src/stock_sim/dexel.rs b/crates/sim/src/stock_sim/dexel.rs
+index 79033994..c6f93996 100644
+--- a/crates/sim/src/stock_sim/dexel.rs
++++ b/crates/sim/src/stock_sim/dexel.rs
+@@ -1,5 +1,6 @@
+ //! Split from `stock_sim.rs` by M5.0.1; structure only.
+ 
++use super::dexel_arc::Atom;
+ use super::kernel::{MAX_CELLS_PER_AXIS, StockError};
+ use super::tiles::{Tile, TILE};
+ 
+@@ -285,8 +286,8 @@ impl Dexel {
+     /// positions, the codebase's tip-first convention read on the cone
+     /// the chamfer mill actually is, so the axis path IS the move path
+     /// and no center lift applies (a ball's center is above its tip;
+-    /// a cone's apex is its tip). Arcs reduce to chords under the same
+-    /// uniform-Z law as `subtract`.
++    /// a cone's apex is its tip). XY arcs sweep the true arc under the
++    /// same helix law as `subtract` (`dexel_arc`).
+     pub fn subtract_cone(&mut self, m: &Move, r: f64, cot: f64, chord_tol: f64) {
+         if m.kind == MoveKind::Rapid || !m.is_finite() {
+             return;
+@@ -299,31 +300,16 @@ impl Dexel {
+                     self.cut_cone(a, b, r, cot);
+                 }
+             }
+-            Some(arc) => {
+-                let a2 = Point2::new(m.from.x, m.from.y);
+-                let b2 = Point2::new(m.to.x, m.to.y);
+-                let cs = crate::cl::arc_chords(a2, b2, arc, chord_tol);
+-                let n = cs.len().max(1) as f64;
+-                let dz = m.to.z - m.from.z;
+-                for (j, (ca, cb)) in cs.into_iter().enumerate() {
+-                    let za = m.from.z + dz * (j as f64 / n);
+-                    let zb = m.from.z + dz * ((j + 1) as f64 / n);
+-                    self.cut_cone(
+-                        Point3::new(ca.x, ca.y, za),
+-                        Point3::new(cb.x, cb.y, zb),
+-                        r,
+-                        cot,
+-                    );
+-                }
+-            }
++            // XY arcs sweep the true arc (#402), not chords.
++            Some(arc) => self.cut_xy_arc(m, arc, r, Atom::Cone(cot)),
+         }
+     }
+ 
+     /// Ball-nose version of `subtract`: moves carry TIP positions (the
+     /// whole codebase stores toolpaths tip-first), so the CENTER path
+     /// is the tip path lifted by `r` in Z and the swept solid is a
+-    /// sphere at every instant. Arcs reduce to chords under the same
+-    /// uniform-Z helix law as `subtract`.
++    /// sphere at every instant. XY arcs sweep the true arc under the
++    /// same helix law as `subtract` (`dexel_arc`).
+     pub fn subtract_ball(&mut self, m: &Move, r: f64, chord_tol: f64) {
+         if m.kind == MoveKind::Rapid || !m.is_finite() {
+             return;
+@@ -344,29 +330,18 @@ impl Dexel {
+                     );
+                 }
+             }
+-            Some(arc) => {
+-                let a2 = Point2::new(m.from.x, m.from.y);
+-                let b2 = Point2::new(m.to.x, m.to.y);
+-                let cs = crate::cl::arc_chords(a2, b2, arc, chord_tol);
+-                let n = cs.len().max(1) as f64;
+-                let dz = m.to.z - m.from.z;
+-                for (j, (ca, cb)) in cs.into_iter().enumerate() {
+-                    let za = m.from.z + dz * (j as f64 / n) + r;
+-                    let zb = m.from.z + dz * ((j + 1) as f64 / n) + r;
+-                    self.cut_ball(
+-                        Point3::new(ca.x, ca.y, za),
+-                        Point3::new(cb.x, cb.y, zb),
+-                        r,
+-                    );
+-                }
+-            }
++            // XY arcs sweep the true arc (#402), not chords.
++            Some(arc) => self.cut_xy_arc(m, arc, r, Atom::Ball),
+         }
+     }
+ 
+     /// Subtract one move: rapids touch nothing, straight moves are one
+-    /// chord, arcs reduce to their sagitta chords with Z interpolated
+-    /// at each chord endpoint (a helix descends uniformly with its
+-    /// sweep - the same reading `sim::path_len` takes).
++    /// chord, XY arcs sweep the true arc with Z linear in the swept
++    /// angle (a helix descends uniformly with its sweep - the same
++    /// reading `sim::path_len` takes; `dexel_arc`, #402: inscribed
++    /// chords stood a sagitta inside the arc, a false gouge on a convex
++    /// corner and a hidden one on a concave corner). XZ / YZ arcs keep
++    /// their in-plane chords.
+     pub fn subtract(&mut self, m: &Move, r: f64, chord_tol: f64) {
+         if m.kind == MoveKind::Rapid || !m.is_finite() {
+             return;
+@@ -379,24 +354,8 @@ impl Dexel {
+                     self.cut_chord(a, b, r);
+                 }
+             }
+-            Some(arc) => {
+-                let a2 = Point2::new(m.from.x, m.from.y);
+-                let b2 = Point2::new(m.to.x, m.to.y);
+-                let cs = crate::cl::arc_chords(a2, b2, arc, chord_tol);
+-                let n = cs.len().max(1) as f64;
+-                let dz = m.to.z - m.from.z;
+-                for (k, (ca, cb)) in cs.into_iter().enumerate() {
+-                    let f0 = k as f64 / n;
+-                    let f1 = (k + 1) as f64 / n;
+-                    let za = m.from.z + dz * f0;
+-                    let zb = m.from.z + dz * f1;
+-                    self.cut_chord(
+-                        Point3::new(ca.x, ca.y, za),
+-                        Point3::new(cb.x, cb.y, zb),
+-                        r,
+-                    );
+-                }
+-            }
++            // XY arcs sweep the true arc (#402), not chords.
++            Some(arc) => self.cut_xy_arc(m, arc, r, Atom::Flat),
+         }
+     }
+ 
+diff --git a/crates/sim/src/stock_sim/dexel_arc.rs b/crates/sim/src/stock_sim/dexel_arc.rs
+new file mode 100644
+index 00000000..87791d0d
+--- /dev/null
++++ b/crates/sim/src/stock_sim/dexel_arc.rs
+@@ -0,0 +1,302 @@
++//! The column engine's exact XY-arc sweep (#402): every atom - disc,
++//! ball, cone, bull nose - swept along the true circular arc of a G2 /
++//! G3, the lowest steel above every column found from the arc itself,
++//! never from chords. Split beside `dexel.rs` by the 400-line law.
++//!
++//! Provenance: the circle-point distance law of elementary plane
++//! geometry (`d^2 = (R - rho)^2 + 4 R rho sin^2(u/2)` for a point at
++//! `rho` from the centre and angle `u` off the arc point), RS-274's
++//! helical interpolation (Z linear in the swept angle), the cutter
++//! profiles of the machine-tool handbooks, and elementary convex
++//! analysis for the search law below. Nothing from vendor material.
++//!
++//! ## The law here
++//!
++//! - **Why not chords.** A chord drawn inside the arc stands one
++//!   sagitta nearer the arc's centre than the arc. On a convex corner
++//!   the centre IS the part's corner, so the chord's disc reached a
++//!   column the real tool never touches (a false gouge the post gate
++//!   refused, #402); on a concave corner the part lies outside the
++//!   arc, and the same chord stayed a sagitta short of the wall (a
++//!   real gouge hidden). No chord placement is right on both sides at
++//!   once - circumscribed chords just swap which side lies - so the
++//!   sweep reads the arc exactly.
++//! - **The reach window is closed-form.** A column at `rho` from the
++//!   centre is within `r` of the arc point at angle `u` off its own
++//!   bearing iff `4 R rho sin^2(u/2) <= r^2 - (R - rho)^2`: one window
++//!   `|u| <= h` centred on the column's bearing, met by the travelled
++//!   sweep `[0, span]` in up to two pieces (three bearings tried, so a
++//!   window straddling the sweep's start angle is never lost). The
++//!   arc's end points are judged as discs too, so an end whose radius
++//!   disagrees with the arc's by rounding still cuts what it touches.
++//! - **The bottom is exact.** Over a window the lowest steel is
++//!   `z(tau) + lift(d(tau))`, `lift` nondecreasing in `d` and `d`
++//!   nondecreasing in `|u|`. A level arc (and every disc, whose lift is
++//!   zero) has its minimum at the clamped bearing or a window end -
++//!   evaluated directly. A helical non-disc arc is split where the
++//!   bottom's curvature can change sign (the distance's own bend at
++//!   `cos u = min(R,rho)/max(R,rho)`, the ball's at its closed-form
++//!   root, the bull's flat-disc edge), each piece searched by samples
++//!   and a golden section (`dexel_bull::golden`). Every value is a
++//!   real evaluation, so a search can only stop at or ABOVE the true
++//!   minimum: the column is never lowered past where the tool went.
++
++use super::dexel::Dexel;
++use super::dexel_bull::golden;
++
++use crate::cl::{ArcMove, Move};
++use crate::geometry::Point3;
++use std::f64::consts::{FRAC_PI_2, PI, TAU};
++
++/// Interior samples per search piece before the golden section: enough
++/// that the piece's minimum is bracketed beside the best sample for
++/// any piece that is convex or concave, as the split law makes them.
++const SAMPLES: usize = 8;
++
++/// Which steel sweeps the arc. Moves carry TIP positions for all four
++/// (the codebase's convention); `lift` is the profile above the tip.
++#[derive(Clone, Copy, Debug)]
++pub(super) enum Atom {
++    /// The flat end mill's disc.
++    Flat,
++    /// The ball nose: a sphere of the tool radius, centre `r` above the tip.
++    Ball,
++    /// The chamfer cone: `cot` of its half-angle from the axis.
++    Cone(f64),
++    /// The bull nose: its corner radius `c`, `0 < c <= r`.
++    Bull(f64),
++}
++
++impl Atom {
++    /// Height of the lowest steel above the tip at horizontal distance
++    /// `d` (`0 <= d <= r`) from the axis.
++    fn lift(self, d: f64, r: f64) -> f64 {
++        match self {
++            Atom::Flat => 0.0,
++            Atom::Ball => r - (r * r - d * d).max(0.0).sqrt(),
++            Atom::Cone(cot) => cot * d,
++            Atom::Bull(c) => {
++                let e = (d - (r - c)).max(0.0);
++                c - (c * c - e * e).max(0.0).sqrt()
++            }
++        }
++    }
++
++    /// The `|u|` values (angle off the column's bearing) inside which
++    /// the bottom along a helical arc may change curvature: the split
++    /// points that leave each search piece convex or concave.
++    fn bends(self, rad: f64, rho: f64, r: f64) -> [Option<f64>; 2] {
++        let (lo, hi) = (rad.min(rho), rad.max(rho));
++        // The distance to a circle point is convex in u up to here,
++        // concave past it.
++        let dist_bend = (hi > 0.0).then(|| (lo / hi).clamp(-1.0, 1.0).acos());
++        match self {
++            Atom::Flat => [None, None],
++            Atom::Cone(_) => [dist_bend, None],
++            Atom::Ball => {
++                // z - sqrt(C + B cos u): convex wherever
++                // B cos^2 u + 2 C cos u + B >= 0, which only fails
++                // (for cos u below one root in (-1, 0)) when C > B.
++                let (b, c) = (2.0 * rad * rho, r * r - rad * rad - rho * rho);
++                let root = (b > 0.0 && c > b).then(|| ((-c + (c * c - b * b).sqrt()) / b).clamp(-1.0, 1.0).acos());
++                [root, None]
++            }
++            Atom::Bull(c) => {
++                let flat = r - c;
++                let s = (flat * flat - (rad - rho).powi(2)) / (4.0 * rad * rho);
++                let edge = (s > 0.0 && s < 1.0 && s.is_finite()).then(|| 2.0 * s.sqrt().asin());
++                [dist_bend, edge]
++            }
++        }
++    }
++}
++
++/// One XY arc read as a circle: centre, radius, start bearing, travel
++/// direction and swept angle, with its tip end points.
++struct ArcSweep {
++    ox: f64,
++    oy: f64,
++    rad: f64,
++    a0: f64,
++    dir: f64,
++    span: f64,
++    from: Point3,
++    to: Point3,
++}
++
++impl ArcSweep {
++    /// The arc of `m`, read the way `cl::arc_chords` reads it (the
++    /// larger end radius, the sweep in `(0, 2 pi]` in `arc.ccw`'s
++    /// direction); `None` for the degenerate arcs `arc_chords` hands
++    /// back as one straight chord.
++    fn of(m: &Move, arc: ArcMove) -> Option<Self> {
++        let o = arc.center;
++        if !(o.x.is_finite() && o.y.is_finite()) {
++            return None;
++        }
++        let rad = (m.from.x - o.x).hypot(m.from.y - o.y).max((m.to.x - o.x).hypot(m.to.y - o.y));
++        if !(rad > f64::EPSILON && rad.is_finite()) {
++            return None;
++        }
++        let a0 = (m.from.y - o.y).atan2(m.from.x - o.x);
++        let a1 = (m.to.y - o.y).atan2(m.to.x - o.x);
++        let d = if arc.ccw { a1 - a0 } else { a0 - a1 };
++        if !d.is_finite() {
++            return None;
++        }
++        let span = d.rem_euclid(TAU);
++        if span <= 0.0 {
++            return None;
++        }
++        let dir = if arc.ccw { 1.0 } else { -1.0 };
++        Some(ArcSweep { ox: o.x, oy: o.y, rad, a0, dir, span, from: m.from, to: m.to })
++    }
++
++    /// Tip Z after `tau` radians of travel (the helix law).
++    fn z(&self, tau: f64) -> f64 {
++        self.from.z + (self.to.z - self.from.z) * (tau / self.span)
++    }
++
++    /// The XY box the arc's path covers: its ends and every axis
++    /// extreme the sweep passes.
++    fn bbox(&self) -> (f64, f64, f64, f64) {
++        let (mut x0, mut x1) = (self.from.x.min(self.to.x), self.from.x.max(self.to.x));
++        let (mut y0, mut y1) = (self.from.y.min(self.to.y), self.from.y.max(self.to.y));
++        for (k, ang) in [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2].into_iter().enumerate() {
++            if (self.dir * (ang - self.a0)).rem_euclid(TAU) <= self.span {
++                match k {
++                    0 => x1 = x1.max(self.ox + self.rad),
++                    1 => y1 = y1.max(self.oy + self.rad),
++                    2 => x0 = x0.min(self.ox - self.rad),
++                    _ => y0 = y0.min(self.oy - self.rad),
++                }
++            }
++        }
++        (x0, x1, y0, y1)
++    }
++}
++
++impl Dexel {
++    /// Sweep `atom` (tool radius `r`) along the XY arc of `m`, exactly.
++    /// A degenerate arc is the straight chord `arc_chords` would have
++    /// made of it, cut by the atom's own straight kernel.
++    pub(super) fn cut_xy_arc(&mut self, m: &Move, arc: ArcMove, r: f64, atom: Atom) {
++        if !(r.is_finite() && r >= 0.0) {
++            return; // the cut_chord gate: validation lives upstream
++        }
++        let Some(sw) = ArcSweep::of(m, arc) else {
++            match atom {
++                Atom::Flat => self.cut_chord(m.from, m.to, r),
++                Atom::Ball => self.cut_ball(
++                    Point3::new(m.from.x, m.from.y, m.from.z + r),
++                    Point3::new(m.to.x, m.to.y, m.to.z + r),
++                    r,
++                ),
++                Atom::Cone(cot) => self.cut_cone(m.from, m.to, r, cot),
++                Atom::Bull(c) => self.cut_bull(m.from, m.to, r, c),
++            }
++            return;
++        };
++        let (bx0, bx1, by0, by1) = sw.bbox();
++        let fx = |v: f64| ((v - self.x0) / self.cell).floor();
++        let fy = |v: f64| ((v - self.y0) / self.cell).floor();
++        let lo_x = fx(bx0 - r).max(0.0) as usize;
++        let hi_x = fx(bx1 + r).clamp(0.0, self.nx as f64 - 1.0) as usize;
++        let lo_y = fy(by0 - r).max(0.0) as usize;
++        let hi_y = fy(by1 + r).clamp(0.0, self.ny as f64 - 1.0) as usize;
++        if lo_x >= self.nx || lo_y >= self.ny {
++            return;
++        }
++        for iy in lo_y..=hi_y {
++            for ix in lo_x..=hi_x {
++                let q = self.center(ix, iy);
++                let cut = column_cut(&sw, q.x, q.y, r, atom);
++                if cut.is_finite() {
++                    self.lower(ix + iy * self.nx, cut);
++                }
++            }
++        }
++    }
++}
++
++/// The lowest steel the arc sweep puts above the column at `(qx, qy)`,
++/// or `+inf` when the tool never reaches it.
++fn column_cut(sw: &ArcSweep, qx: f64, qy: f64, r: f64, atom: Atom) -> f64 {
++    let mut cut = f64::INFINITY;
++    // The end discs, judged from the move's own end points.
++    for (p, tau) in [(sw.from, 0.0), (sw.to, sw.span)] {
++        let d = (qx - p.x).hypot(qy - p.y);
++        if d <= r {
++            cut = cut.min(sw.z(tau) + atom.lift(d, r));
++        }
++    }
++    let (wx, wy) = (qx - sw.ox, qy - sw.oy);
++    let rho = wx.hypot(wy);
++    let gap = sw.rad - rho;
++    if gap.abs() > r {
++        return cut; // the whole circle is out of reach
++    }
++    let rr = 4.0 * sw.rad * rho;
++    let s2 = if rr > 0.0 { (r * r - gap * gap) / rr } else { f64::INFINITY };
++    // Half-width of the reach window about the column's bearing.
++    let h = if s2 >= 1.0 { PI } else { 2.0 * s2.max(0.0).sqrt().asin() };
++    // The column's bearing, as travel angle from the arc's start.
++    let u0 = if rho > 0.0 { (sw.dir * (wy.atan2(wx) - sw.a0)).rem_euclid(TAU) } else { 0.0 };
++    let dist = |tau: f64, cc: f64| {
++        let s = ((tau - cc) * 0.5).sin();
++        (gap * gap + rr * s * s).max(0.0).sqrt()
++    };
++    for k in [-1.0, 0.0, 1.0] {
++        let cc = u0 + k * TAU;
++        let (lo, hi) = ((cc - h).max(0.0), (cc + h).min(sw.span));
++        if lo > hi {
++            continue;
++        }
++        let f = |tau: f64| sw.z(tau) + atom.lift(dist(tau, cc).min(r), r);
++        cut = cut.min(f(lo)).min(f(hi)).min(f(cc.clamp(lo, hi)));
++        let level = sw.to.z == sw.from.z;
++        if level || matches!(atom, Atom::Flat) {
++            // Disc: Z linear, lift zero - the ends hold the minimum.
++            // Level: lift grows with |u| - the clamped bearing does.
++            continue;
++        }
++        let mut cuts = vec![lo, hi];
++        if cc > lo && cc < hi {
++            cuts.push(cc);
++        }
++        for b in atom.bends(sw.rad, rho, r).into_iter().flatten() {
++            for t in [cc - b, cc + b] {
++                if t > lo && t < hi {
++                    cuts.push(t);
++                }
++            }
++        }
++        cuts.sort_by(f64::total_cmp);
++        for w in cuts.windows(2) {
++            cut = cut.min(piece_min(&f, w[0], w[1]));
++        }
++    }
++    cut
++}
++
++/// The minimum of `f` on `[lo, hi]` for a piece that is convex or
++/// concave: its ends, then a golden section bracketed around the best
++/// of `SAMPLES` interior samples. Only real evaluations are returned.
++fn piece_min(f: &impl Fn(f64) -> f64, lo: f64, hi: f64) -> f64 {
++    let mut best = f(lo).min(f(hi));
++    if hi <= lo || hi.is_nan() || lo.is_nan() {
++        return best;
++    }
++    let step = (hi - lo) / (SAMPLES + 1) as f64;
++    let (mut bi, mut bv) = (1usize, f64::INFINITY);
++    for i in 1..=SAMPLES {
++        let v = f(lo + step * i as f64);
++        if v < bv {
++            (bi, bv) = (i, v);
++        }
++    }
++    best = best.min(bv);
++    let a = lo + step * (bi - 1) as f64;
++    let b = (lo + step * (bi + 1) as f64).min(hi);
++    best.min(golden(f, a, b))
++}
+diff --git a/crates/sim/src/stock_sim/dexel_bull.rs b/crates/sim/src/stock_sim/dexel_bull.rs
+index c30ddf73..0b0a3897 100644
+--- a/crates/sim/src/stock_sim/dexel_bull.rs
++++ b/crates/sim/src/stock_sim/dexel_bull.rs
+@@ -30,9 +30,9 @@
+ //!   conservative, the law `cut_ball` keeps.
+ 
+ use super::dexel::{reach, Dexel};
++use super::dexel_arc::Atom;
+ 
+ use crate::cl::{Move, MoveKind};
+-use crate::geo2d::Point2;
+ use crate::geometry::Point3;
+ 
+ /// Golden-section rounds for the oblique stationary point.
+@@ -89,7 +89,7 @@ impl Dexel {
+ 
+     /// Bull-nose version of `subtract`: moves carry TIP positions and
+     /// the tip IS the profile's anchor (no lift, the cone's
+-    /// convention); arcs reduce to chords under the uniform-Z law.
++    /// convention); XY arcs sweep the true arc (`dexel_arc`).
+     pub fn subtract_bull(&mut self, m: &Move, r: f64, c: f64, chord_tol: f64) {
+         if m.kind == MoveKind::Rapid || !m.is_finite() {
+             return;
+@@ -102,18 +102,8 @@ impl Dexel {
+                     self.cut_bull(a, b, r, c);
+                 }
+             }
+-            Some(arc) => {
+-                let a2 = Point2::new(m.from.x, m.from.y);
+-                let b2 = Point2::new(m.to.x, m.to.y);
+-                let cs = crate::cl::arc_chords(a2, b2, arc, chord_tol);
+-                let n = cs.len().max(1) as f64;
+-                let dz = m.to.z - m.from.z;
+-                for (j, (ca, cb)) in cs.into_iter().enumerate() {
+-                    let za = m.from.z + dz * (j as f64 / n);
+-                    let zb = m.from.z + dz * ((j + 1) as f64 / n);
+-                    self.cut_bull(Point3::new(ca.x, ca.y, za), Point3::new(cb.x, cb.y, zb), r, c);
+-                }
+-            }
++            // XY arcs sweep the true arc (#402), not chords.
++            Some(arc) => self.cut_xy_arc(m, arc, r, Atom::Bull(c)),
+         }
+     }
+ }
+@@ -121,7 +111,7 @@ impl Dexel {
+ /// The minimum of a convex `f` on `[lo, hi]` by golden section: every
+ /// value it returns is a real `f` evaluation, so it can only sit at or
+ /// above the true minimum.
+-fn golden(f: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
++pub(super) fn golden(f: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
+     const PHI: f64 = 0.6180339887498949;
+     let mut c = hi - PHI * (hi - lo);
+     let mut d = lo + PHI * (hi - lo);
+@@ -147,6 +137,7 @@ fn golden(f: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::geo2d::Point2;
+ 
+     fn p3(x: f64, y: f64, z: f64) -> Point3 {
+         Point3::new(x, y, z)
+diff --git a/crates/sim/src/stock_sim/mod.rs b/crates/sim/src/stock_sim/mod.rs
+index 3b7f63ef..d1bd6e2a 100644
+--- a/crates/sim/src/stock_sim/mod.rs
++++ b/crates/sim/src/stock_sim/mod.rs
+@@ -19,11 +19,13 @@
+ //! - **Subtraction is conservative.** A move removes, per cell, the
+ //!   LOWEST Z the tool bottom reaches while its disc touches the cell
+ //!   center - computed from the exact interval of the move that is in
+-//!   reach, not from the endpoints. Arcs ride their `chords` (the same
+-//!   sagitta law as everywhere else): chords sweep a hair LESS than
+-//!   the true arc, so a sim reports a touch more rest than exists and
+-//!   never a gouge the tool did not commit. A silent wrong answer is
+-//!   the one failure mode; over-reporting rest is honest noise.
++//!   reach, not from the endpoints. XY arcs sweep the TRUE arc
++//!   (`dexel_arc`, #402): inscribed chords stand a sagitta nearer the
++//!   arc's centre, which over-cuts toward a convex corner (a gouge the
++//!   tool never committed, refusing a correct post) and under-cuts
++//!   away from it (a concave wall's real gouge hidden) - no chord
++//!   placement is honest on both sides at once. XZ / YZ arcs still
++//!   ride their in-plane chords.
+ //! - **Rapids touch nothing** (RS-274 G0 practice: no material contacts
+ //!   a tool moving at rapid). Feeds and plunges cut.
+ //! - **The ball atom is exact, not sampled** (`cut_ball`): a sphere's
+@@ -59,6 +61,7 @@ mod carry;
+ mod columns;
+ mod cut;
+ mod dexel;
++mod dexel_arc;
+ mod dexel_bull;
+ mod deviate;
+ mod display;
+diff --git a/crates/sim/tests/arc_sweep.rs b/crates/sim/tests/arc_sweep.rs
+new file mode 100644
+index 00000000..9bc473af
+--- /dev/null
++++ b/crates/sim/tests/arc_sweep.rs
+@@ -0,0 +1,259 @@
++//! #402: the column engine sweeps XY arcs EXACTLY. Inscribed chords
++//! stood a sagitta nearer the arc's centre than the real G2/G3: on a
++//! convex corner (centre = the part's corner) that clipped a column the
++//! tool never touched and the height verdict read it as a full-wall
++//! gouge; on a concave corner (the part outside the arc) the same chord
++//! stayed short of the wall and hid a real gouge. The laws pinned here:
++//! a column is cut iff the true arc's tool reaches it, to the depth a
++//! dense scan of the true arc finds, for every atom, level or helical,
++//! either direction; the issue's own column stands; and real gouges on
++//! convex and concave arcs are still convicted.
++//! Provenance: plane geometry and RS-274 helical interpolation; our own
++//! code, per the Clean-Room Protocol.
++//!
++//! Gate map (M4.4): covers camcraft_sim::stock_sim.
++
++use camcraft_sim::cl::{ArcMove, Move, MoveKind};
++use camcraft_sim::geo2d::Point2;
++use camcraft_sim::geometry::{cube, Point3, Triangle};
++use camcraft_sim::stock_sim::{deviate, Dexel, DEV_TOL};
++use std::f64::consts::PI;
++
++#[derive(Clone, Copy, Debug)]
++enum Kind {
++    Flat,
++    Ball,
++    Cone(f64),
++    Bull(f64),
++}
++
++/// Lowest steel above the tip at horizontal distance `d <= r`.
++fn lift(k: Kind, d: f64, r: f64) -> f64 {
++    match k {
++        Kind::Flat => 0.0,
++        Kind::Ball => r - (r * r - d * d).max(0.0).sqrt(),
++        Kind::Cone(cot) => cot * d,
++        Kind::Bull(c) => {
++            let e = (d - (r - c)).max(0.0);
++            c - (c * c - e * e).max(0.0).sqrt()
++        }
++    }
++}
++
++/// An XY arc about `(ox, oy)` of radius `rad`, from bearing `a0` swept
++/// `sweep` radians (positive = CCW), Z from `z0` to `z1`.
++fn arc(ox: f64, oy: f64, rad: f64, a0: f64, sweep: f64, z0: f64, z1: f64) -> Move {
++    let a1 = a0 + sweep;
++    Move {
++        rotary: None,
++        kind: MoveKind::Feed,
++        from: Point3::new(ox + rad * a0.cos(), oy + rad * a0.sin(), z0),
++        to: Point3::new(ox + rad * a1.cos(), oy + rad * a1.sin(), z1),
++        feed: Some(500.0),
++        arc: Some(ArcMove::xy(Point2::new(ox, oy), sweep > 0.0)),
++        axis: None,
++    }
++}
++
++fn subtract(d: &mut Dexel, m: &Move, r: f64, k: Kind) {
++    // A coarse chord budget on purpose: XY arcs no longer read it.
++    let tol = 0.5;
++    match k {
++        Kind::Flat => d.subtract(m, r, tol),
++        Kind::Ball => d.subtract_ball(m, r, tol),
++        Kind::Cone(cot) => d.subtract_cone(m, r, cot, tol),
++        Kind::Bull(c) => d.subtract_bull(m, r, c, tol),
++    }
++}
++
++/// XY distance from `(qx, qy)` to the arc's path (independent of the
++/// kernel: bearing inside the sweep -> radial gap, else nearest end).
++fn dist_to_arc(qx: f64, qy: f64, ox: f64, oy: f64, rad: f64, a0: f64, sweep: f64) -> f64 {
++    let (wx, wy) = (qx - ox, qy - oy);
++    let b = wy.atan2(wx);
++    let off = if sweep > 0.0 { b - a0 } else { a0 - b }.rem_euclid(2.0 * PI);
++    let ends = [a0, a0 + sweep].map(|a| (qx - ox - rad * a.cos()).hypot(qy - oy - rad * a.sin()));
++    let e = ends[0].min(ends[1]);
++    if off <= sweep.abs() { (wx.hypot(wy) - rad).abs().min(e) } else { e }
++}
++
++#[test]
++fn a_level_disc_arc_cuts_exactly_the_columns_within_reach() {
++    // CCW and CW, short and long sweeps, one straddling the +-pi seam:
++    // a column drops iff its centre is within r of the TRUE arc, with
++    // no sagitta band on either side.
++    let cases = [(0.3, 1.2), (2.9, 0.8), (-2.0, -1.5), (1.0, 5.5), (-0.4, -4.0)];
++    for (a0, sweep) in cases {
++        for (rad, r) in [(6.0, 1.5), (3.0, 3.0), (1.2, 2.0)] {
++            let mut d = Dexel::block(-10.0, -10.0, 10.0, 10.0, 5.0, 0.13).unwrap();
++            d.subtract(&arc(0.07, -0.11, rad, a0, sweep, 1.0, 1.0), r, 0.5);
++            for iy in 0..d.ny {
++                for ix in 0..d.nx {
++                    let q = d.center(ix, iy);
++                    let dist = dist_to_arc(q.x, q.y, 0.07, -0.11, rad, a0, sweep);
++                    if (dist - r).abs() < 1e-9 {
++                        continue;
++                    }
++                    let got = d.top_at(ix + iy * d.nx);
++                    let want = if dist < r { 1.0 } else { 5.0 };
++                    assert_eq!(got, want, "a0 {a0} sweep {sweep} R {rad} r {r} at {q:?}: dist {dist}");
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn every_atom_matches_a_dense_scan_of_the_true_arc() {
++    // Level and helical arcs, CW and CCW, an arc wider than the tool
++    // and one narrower (the ball's C > B bend): every column's cut is
++    // the minimum over the true arc a brute-force scan finds - never
++    // above it (no rest invented), never measurably below (no gouge).
++    let atoms = [Kind::Flat, Kind::Ball, Kind::Cone(1.0 / 0.6), Kind::Bull(1.0)];
++    let arcs = [
++        (5.0, 0.4, 2.3, 2.0, 2.0),
++        (5.0, 0.4, 2.3, 4.0, 1.0),
++        (4.0, 2.5, -3.6, 0.5, 3.5),
++        (1.5, -1.0, 5.0, 3.0, 0.0),
++    ];
++    let r = 2.5;
++    for k in atoms {
++        for (rad, a0, sweep, z0, z1) in arcs {
++            let mut d = Dexel::block(-9.0, -9.0, 9.0, 9.0, 50.0, 0.29).unwrap();
++            subtract(&mut d, &arc(0.0, 0.0, rad, a0, sweep, z0, z1), r, k);
++            let (mut n, mut tight) = (0, 0);
++            for iy in 0..d.ny {
++                for ix in 0..d.nx {
++                    let q = d.center(ix, iy);
++                    let g = |t: f64| {
++                        let a = a0 + sweep * t;
++                        let dd = (q.x - rad * a.cos()).hypot(q.y - rad * a.sin());
++                        if dd <= r { z0 + (z1 - z0) * t + lift(k, dd, r) } else { f64::INFINITY }
++                    };
++                    let (mut want, mut ts) = (f64::INFINITY, 0.0);
++                    for s in 0..=6000 {
++                        let t = s as f64 / 6000.0;
++                        if g(t) < want {
++                            (want, ts) = (g(t), t);
++                        }
++                    }
++                    for s in 0..=4000 {
++                        let t = (ts - 1.0 / 6000.0 + s as f64 / 2.0e6).clamp(0.0, 1.0);
++                        want = want.min(g(t));
++                    }
++                    let got = d.top_at(ix + iy * d.nx);
++                    if want.is_finite() {
++                        assert!(
++                            got <= want + 1e-9 && got >= want - 1e-2,
++                            "{k:?} arc {rad}/{a0}/{sweep} z {z0}->{z1} at {q:?}: {got} vs scan {want}"
++                        );
++                        n += 1;
++                        // The fine scan steps 5e-7 in t: a helix's
++                        // window end is resolved to ~1e-5 in Z.
++                        if (got - want).abs() < 1e-5 {
++                            tight += 1;
++                        }
++                    } else if got != 50.0 {
++                        // Only a window-edge graze the scan stepped over.
++                        let dist = dist_to_arc(q.x, q.y, 0.0, 0.0, rad, a0, sweep);
++                        assert!(dist <= r + 1e-9, "{k:?}: phantom cut at {q:?} ({dist} from the arc): {got}");
++                    }
++                }
++            }
++            assert!(n > 200, "{k:?}: {n} columns compared");
++            assert!(tight * 10 >= n * 9, "{k:?} arc {rad}/{sweep}: {tight} of {n} within 1e-5 of the scan");
++        }
++    }
++}
++
++/// The issue's lattice and part: stock 90x70 from (-45,-35), cell
++/// 0.375, top 28; the riser x < 10, y > -30, 25 high. The contour's
++/// corner arc about the riser's corner (10,-30), R = r = 3, at `z`.
++fn riser() -> Vec<Triangle> {
++    cube(Point3::new(-45.0, -30.0, 0.0), Point3::new(10.0, 35.0, 25.0)).facets.to_vec()
++}
++
++fn corner_arc(rad: f64, z: f64) -> Move {
++    // The issue's move 4 starts at (10.346, -32.980) on the R = 3 circle.
++    let a0 = (-2.980f64).atan2(0.346);
++    arc(10.0, -30.0, rad, a0, -a0, z, z)
++}
++
++#[test]
++fn the_issue_402_convex_corner_column_stands() {
++    let mut d = Dexel::block(-45.0, -35.0, 45.0, 35.0, 28.0, 0.375).unwrap();
++    for z in [25.0, 20.0, 15.0] {
++        d.subtract(&corner_arc(3.0, z), 3.0, d.cell * 0.25);
++    }
++    // Column (146, 13), centre (9.9375, -29.9375): 0.088 mm inside the
++    // corner, 3.06 mm from the nearest true tool centre.
++    let q = d.center(146, 13);
++    assert!((q.x - 9.9375).abs() < 1e-12 && (q.y + 29.9375).abs() < 1e-12);
++    assert_eq!(d.top_at(146 + 13 * d.nx), 28.0, "the real arc never reaches this column");
++    let dev = deviate(&d, &riser(), DEV_TOL).unwrap();
++    assert_eq!(dev.gouge_cells, 0, "a clean corner arc reads a gouge: {:?}", dev.max_gouge_at);
++}
++
++#[test]
++fn a_convex_corner_arc_cut_too_tight_is_still_a_gouge() {
++    // The planted twin: the same corner swept at R = 2.5 with r = 3,
++    // the tool 0.5 mm into the riser's corner. Convicted, located at
++    // the corner, the full 10 mm the riser stands above the cut.
++    let mut d = Dexel::block(-45.0, -35.0, 45.0, 35.0, 28.0, 0.375).unwrap();
++    d.subtract(&corner_arc(2.5, 15.0), 3.0, d.cell * 0.25);
++    let dev = deviate(&d, &riser(), DEV_TOL).unwrap();
++    assert!(dev.gouge_cells > 0, "a corner cut into the part must convict");
++    assert!((dev.max_gouge - 10.0).abs() < 1e-9, "{}", dev.max_gouge);
++    let at = dev.max_gouge_at.unwrap();
++    assert!((at.x - 10.0).hypot(at.y + 30.0) < 3.0, "located at the corner: {at:?}");
++}
++
++/// A pocket corner's wall: material outside the radius `rw` about the
++/// origin in the first quadrant, as the count of columns the cut put
++/// below `wall_z` there (columns hugging `rw` within 1e-9 are skipped).
++fn wall_hits(d: &Dexel, rw: f64, wall_z: f64) -> usize {
++    let mut n = 0;
++    for iy in 0..d.ny {
++        for ix in 0..d.nx {
++            let q = d.center(ix, iy);
++            let rho = q.x.hypot(q.y);
++            if q.x > 0.0 && q.y > 0.0 && rho > rw + 1e-9 && d.top_at(ix + iy * d.nx) < wall_z {
++                n += 1;
++            }
++        }
++    }
++    n
++}
++
++#[test]
++fn a_concave_corner_arc_is_exact_on_the_wall_side() {
++    // A 6 mm fillet wall, a 4 mm-radius cutter: the clean path is the
++    // R = 2 quarter arc, which touches the wall and never crosses it.
++    // Over-cut by 0.06 mm - under the 0.094 mm sagitta budget the
++    // chords had at this cell, and on the side the inscribed chords
++    // fell short of - the columns in that band are convicted, every
++    // one the true arc reaches and no other.
++    let (rw, r, cell) = (6.0, 4.0, 0.375);
++    let clean = {
++        let mut d = Dexel::block(-8.0, -8.0, 10.0, 10.0, 20.0, cell).unwrap();
++        d.subtract(&arc(0.0, 0.0, rw - r, 0.0, PI / 2.0, 5.0, 5.0), r, cell * 0.25);
++        d
++    };
++    assert_eq!(wall_hits(&clean, rw, 20.0), 0, "the clean fillet path crosses the wall");
++    let over = 0.06;
++    let mut d = Dexel::block(-8.0, -8.0, 10.0, 10.0, 20.0, cell).unwrap();
++    d.subtract(&arc(0.0, 0.0, rw - r + over, 0.0, PI / 2.0, 5.0, 5.0), r, cell * 0.25);
++    let mut want = 0;
++    for iy in 0..d.ny {
++        for ix in 0..d.nx {
++            let q = d.center(ix, iy);
++            let rho = q.x.hypot(q.y);
++            let dist = dist_to_arc(q.x, q.y, 0.0, 0.0, rw - r + over, 0.0, PI / 2.0);
++            if q.x > 0.0 && q.y > 0.0 && rho > rw + 1e-9 && dist <= r {
++                want += 1;
++            }
++        }
++    }
++    assert!(want > 0, "the lattice must put a column in the over-cut band");
++    assert_eq!(wall_hits(&d, rw, 20.0), want, "every wall column the true arc reaches, and no other");
++}
+diff --git a/crates/sim/tests/stock_bull_nose.rs b/crates/sim/tests/stock_bull_nose.rs
+index 140f5b34..e9b51557 100644
+--- a/crates/sim/tests/stock_bull_nose.rs
++++ b/crates/sim/tests/stock_bull_nose.rs
+@@ -283,8 +283,35 @@ fn both_engines_cut_a_bull_nose_alike() {
+         let (c, f) = both(&moves, 2.0, Some(0.75));
+         let dc = c.deviate(&plate(plate_z), DEV_TOL).expect("column deviate");
+         let df = f.deviate(&plate(plate_z), DEV_TOL).expect("field deviate");
+-        parity(&dc, &df, 1e-5, label);
+         assert!(dc.gouge_cells + dc.rest_cells > 0, "{label}: the fixture judges something");
++        if moves.iter().any(|m| m.arc.is_some()) {
++            arc_parity(&dc, &df, label);
++        } else {
++            parity(&dc, &df, 1e-5, label);
++        }
++    }
++}
++
++/// #402: the column engine sweeps an XY arc exactly; the field engine
++/// still rides inscribed chords at a quarter cell, so on the helix arc
++/// (centre (6,6), R 3, upper half) the two agree only to that chord's
++/// error. Columns whose true distance to the arc keeps a sagitta clear
++/// of the rim differ by at most the bull's profile change across one
++/// sagitta (its slope at `r - sag` times `sag`); the rim band itself is
++/// where one engine reaches and the other does not - the column
++/// engine's answer there is pinned against a dense scan of the true arc
++/// in `arc_sweep.rs`.
++fn arc_parity(a: &Deviation, b: &Deviation, label: &str) {
++    let (r, c, sag) = (2.0f64, 0.75f64, a.cell * 0.25);
++    let e = c - sag; // the corner offset at d = r - sag
++    let bound = sag * e / (c * c - e * e).sqrt() + 1e-5;
++    for (k, (x, y)) in a.dev.iter().zip(&b.dev).enumerate() {
++        let (qx, qy) = ((k % a.cells_x) as f64 * a.cell + 0.5 * a.cell, (k / a.cells_x) as f64 * a.cell + 0.5 * a.cell);
++        let ends = (qx - 9.0).hypot(qy - 6.0).min((qx - 3.0).hypot(qy - 6.0));
++        let d = if qy >= 6.0 { ((qx - 6.0).hypot(qy - 6.0) - 3.0).abs().min(ends) } else { ends };
++        if x.is_finite() && y.is_finite() && d < r - sag {
++            assert!((x - y).abs() <= bound, "{label}: column {k} ({qx}, {qy}): {x} vs {y}, bound {bound}");
++        }
+     }
+ }
+ 
+@@ -351,3 +378,4 @@ fn bull_refusals_say_the_same_words_either_way() {
+         assert!(a.contains("corner") || a.contains("no tool is both"), "{what}: {a}");
+     }
+ }
++
+diff --git a/crates/sim/tests/stock_sim.rs b/crates/sim/tests/stock_sim.rs
+index 513e9fa5..8f169794 100644
+--- a/crates/sim/tests/stock_sim.rs
++++ b/crates/sim/tests/stock_sim.rs
+@@ -1,7 +1,7 @@
+ //! M2.1b: the dexel material model. The laws here are the ones the rest
+ //! pass and the stock report stand on: the exact reach-interval cut of a
+-//! chord, rapids touching nothing, chord conservatism for arcs (over-
+-//! report rest, never invent a gouge), the `above` mask in region
++//! chord, rapids touching nothing, XY arcs swept exactly (no chord
++//! sagitta on either side, #402), the `above` mask in region
+ //! clothing, and the part surface read straight off the mesh.
+ //! Provenance: published CAM simulation practice (Z-map subtraction),
+ //! our own code, per the Clean-Room Protocol.
+@@ -111,14 +111,15 @@ fn rapids_touch_nothing_and_non_finite_touches_nothing() {
+ }
+ 
+ #[test]
+-fn arc_chords_under_sweep_so_the_sim_only_over_reports() {
+-    // A quarter arc R = 5 about the origin at z = -1, cut coarse: a
+-    // tol of 2.0 exceeds the quarter's sagitta of 1.46, so the arc
+-    // rides its single sagitta chord (5,0)-(0,5). The cell center at
+-    // (3.5,3.5) sits ~0.05 under the true arc but 1.41 from the chord:
+-    // a real tool would have cut it to -1, the chord sim leaves it
+-    // standing. That is the conservatism law made visible - rest
+-    // reported that isn't there, never a gouge that isn't.
++fn xy_arcs_sweep_the_true_arc_whatever_the_chord_budget() {
++    // A quarter arc R = 5 about the origin at z = -1, handed a chord
++    // budget of 2.0 - more than the quarter's whole sagitta of 1.46.
++    // The chord sim rode the one chord (5,0)-(0,5) and left the cell
++    // at (3.5,3.5) standing, ~0.05 under the true arc. That was never
++    // conservative: the same sagitta band cut toward the arc's centre
++    // where the tool never went (#402's false gouge on a convex
++    // corner) and stopped short of a concave wall (a real gouge
++    // hidden). XY arcs now sweep the true arc: the budget is unread.
+     let mut d = Dexel::block(0.0, 0.0, 6.0, 6.0, 2.0, 1.0).unwrap();
+     let m = Move {
+         rotary: None,
+@@ -130,14 +131,11 @@ fn arc_chords_under_sweep_so_the_sim_only_over_reports() {
+         axis: None,
+     };
+     d.subtract(&m, 1.0, 2.0);
++    assert!(near(top_of(&d, 3, 3), -1.0), "the true arc cuts its midline");
++    assert!(near(top_of(&d, 4, 0), -1.0), "and the cell beside its start");
+     assert!(
+-        near(top_of(&d, 3, 3), 2.0),
+-        "the chord never reaches the arc's midline - rest over-reported"
+-    );
+-    assert!(
+-        top_of(&d, 4, 0) < 2.0,
+-        "on the chord line the cell IS cut: {:?}",
+-        top_of(&d, 4, 0)
++        near(top_of(&d, 0, 0), 2.0) && near(top_of(&d, 1, 1), 2.0),
++        "the centre side beyond r stands: no sagitta band inward"
+     );
+     assert!(
+         d.tops().all(|z| z >= -1.0),
+diff --git a/docs/decisions/402-arc-chord-sagitta.md b/docs/decisions/402-arc-chord-sagitta.md
+new file mode 100644
+index 00000000..85e33e41
+--- /dev/null
++++ b/docs/decisions/402-arc-chord-sagitta.md
+@@ -0,0 +1,71 @@
++## #402 - the column sim sweeps XY arcs exactly, not as inscribed chords
++
++- **Chosen:** The column engine (`Dexel`, the program sim that the post
++  gate reads) sweeps every XY arc along the true circle, for all four
++  atoms (disc, ball, cone, bull nose): `stock_sim::dexel_arc`. For each
++  column, the reach window on the arc has a closed form
++  (`4 R rho sin^2(u/2) <= r^2 - (R - rho)^2`, met by the travelled sweep
++  in up to two pieces). The bottom over the window is then exact. A
++  disc or a level arc takes its minimum at a window end or at the
++  clamped bearing. A helical ball, cone or bull is split where its
++  bottom's curvature can change sign, and each piece is searched by
++  samples and a golden section that only returns real evaluations. The
++  arc's end discs are judged too. XZ and YZ arcs keep their in-plane
++  chords. The gouge verdict (`deviate`) is unchanged.
++- **Why this is conservative both ways:** The swept set is the set the
++  real G2/G3 sweeps, so neither side of the arc is biased.
++  - Inscribed chords stand one sagitta nearer the arc's centre. On a
++    convex corner (centre = the part's corner) that over-cut toward the
++    part. The issue's false 10 mm gouge came from a column 0.088 mm
++    inside the riser's corner.
++  - On a concave corner (part outside the arc) the same chords stopped
++    a sagitta short of the wall, so a real gouge of up to `cell/4`
++    (0.094 mm here) was hidden. `arc_sweep.rs`'s concave case fails on
++    the chord code for exactly that reason.
++  - A helix arc in `stock_bull_nose.rs` showed the field engine (still
++    chorded) missing a column the true arc cuts 2.5 mm deep. The
++    chords under-cut on the outer side, too.
++  - The old module doc said chords "only over-report rest". That was
++    true only on the convex arc's outer side.
++- **Considered and dropped:**
++  - *Circumscribed chords* (vertices at `R / cos(theta/2)`): these fix
++    the convex side but under-cut a concave wall by up to the sagitta,
++    swapping a false positive for a hidden gouge. No single chord
++    placement is honest on both sides, because the part can be on
++    either side of an arc.
++  - *Chords with tool-radius compensation* (inscribed chords for the
++    centre side, circumscribed for the outer side): this is two sweeps
++    whose union over-cuts both sides by the sagitta, so the false
++    positive comes back.
++  - *Judging contact against the exact arc only in the verdict, near
++    arcs*: this moves geometry into the verdict and needs the move
++    list inside `deviate`. It also leaves the sim's stock (display,
++    rest, later ops' prior stock) wrong. It is close to the lateral
++    slack of #299 / #303, which is the owner's call and not touched
++    here.
++  - *Finer chords*: these shrink the error without removing it. The
++    lattice phase still decides which corner convicts, and they cost
++    more per arc.
++- **Behaviour changes:**
++  - XY arcs are no longer affected by the chord budget (`chord_tol`) in
++    the column engine. `stock_sim.rs`'s old law
++    (`arc_chords_under_sweep_so_the_sim_only_over_reports`) is rewritten
++    as `xy_arcs_sweep_the_true_arc_whatever_the_chord_budget`.
++  - Column and field engines now agree exactly only on straight moves.
++    On an arc, the bull parity test checks them against the field's
++    chord error (`arc_parity`).
++  - Rest material and 3D roughing's prior stock (`machining3d::feed`
++    uses `Dexel::subtract`) read the exact arc too.
++- **Left open (follow-up):** The field engine (`field_cut::chords`,
++  used for display and the lathe/rotary eye) and the generator-time
++  envelope scan (`scan.rs`) still ride inscribed XY-arc chords. The
++  same two-sided sagitta error applies there, but neither feeds the
++  post gate's column verdict. An exact arc sweep for the field's SDF
++  sweeps is a separate piece of work and should get its own issue.
++- **Cost:**
++  - Level arcs and every disc arc cost one closed-form window per
++    column (cheaper than about 20 chords each).
++  - Helical ball, cone and bull arcs cost a few hundred evaluations
++    per column in reach.
++  - Reverting means restoring the four chord loops. The module is
++    self-contained.
