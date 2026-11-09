@@ -64,6 +64,15 @@ pub fn resolve_height(
         HeightReference::TopOfModel => model::solid_world_aabb(world)?.max.z,
         HeightReference::BottomOfModel => model::solid_world_aabb(world)?.min.z,
         HeightReference::WorkOffset(i) => {
+            if crate::machine::kind_of(world) == crate::machine::Kind::Mill
+                && crate::setup::effective(world, setup)
+                .as_deref()
+                .and_then(|name| crate::setup::def_of(world, name))
+                .is_some_and(|def| def.modern_cs)
+            {
+                return (i < crate::schema::WCS_SLOTS.len() && h.offset.is_finite())
+                    .then_some(h.offset);
+            }
             let entity = crate::setup::wcs_entity(world, setup, i)?;
             model::transform_of(world, &entity).unwrap_or_default().pos.z
         }
@@ -97,6 +106,13 @@ pub fn missing_source(
         HeightReference::TopOfModel | HeightReference::BottomOfModel => {
             model::solid_world_aabb(world).is_none().then_some("no model loaded")
         }
+        HeightReference::WorkOffset(i) if crate::machine::kind_of(world) == crate::machine::Kind::Mill
+            && crate::setup::effective(world, setup)
+            .as_deref()
+            .and_then(|name| crate::setup::def_of(world, name)).is_some_and(|def| def.modern_cs) => {
+                (i >= crate::schema::WCS_SLOTS.len())
+                    .then_some("work offset slot out of range (G54..G59)")
+            }
         HeightReference::WorkOffset(i) => match crate::setup::wcs_entity_name(world, setup, i) {
             None => Some("work offset slot out of range (G54..G59)"),
             Some(name) => model::find_by_name(world, &name)

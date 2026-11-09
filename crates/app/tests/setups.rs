@@ -3,8 +3,8 @@
 //! resolves through them by the laws in `crate::setup` and the commands'
 //! module headers: materialization never renames, furniture is private
 //! and lazily spawned, datum transfer clones, a setup with operations
-//! does not delete, activation is inert, and moving an operation keeps
-//! its stamp and lets the staleness machinery answer.
+//! does not delete, activation preserves operation membership, and
+//! each operation stays in the setup where it was created.
 //!
 //! Gate map (M4.4): covers app::commands, app::geometry, app::model, app::operation, app::posting, app::rest, app::schema, app::setup, app::stock, app::tools, app::world.
 
@@ -12,13 +12,15 @@ use flecs_ecs::prelude::World;
 
 use camcraft_app::commands::{
     ActivateSetup, AddTool, CommandError, CreateOperation, CreateSetup, DeleteOperation,
-    DeleteSetup, GenerateOperation, History, SetOperationSetup, SetStock, SetWcsOrigin,
+    DeleteSetup, GenerateOperation, History, MoveModel, SetSetupMachineCs, SetStock, SetWcsOrigin,
 };
-use camcraft_app::geometry::{IDENTITY_Q, Point3};
+use camcraft_app::geometry::{IDENTITY_Q, Point3, quat_from_axis_angle};
 use camcraft_app::model;
 use camcraft_app::operation::{self, Height, HeightReference, OpParams, OpStatus, SrcRef};
+use camcraft_app::project;
+use camcraft_app::posting;
 use camcraft_app::rest;
-use camcraft_app::schema::{Location, STOCK_NAME, WCS_SLOTS};
+use camcraft_app::schema::{Location, PostRef, STOCK_NAME, WCS_SLOTS};
 use camcraft_app::setup;
 use camcraft_app::stock::StockShape;
 use camcraft_app::tools::{catalog, Tool};
@@ -98,6 +100,87 @@ fn status(world: &World, name: &str) -> OpStatus {
     operation::status_of(world, &e)
 }
 
+#[test]
+fn part_placements_and_stock_follow_only_their_own_setup() {
+    let world = new_world();
+    let mut history = History::default();
+    let part = model::spawn(&world, "part");
+    let stock_pose = |context: &str| {
+        let stock = setup::stock_entity(&world, Some(context)).expect("stock");
+        model::transform_of(&world, &stock).expect("stock pose")
+    };
+    box_stock(&world, &mut history, 20.0, 20.0, 10.0);
+    run(&world, &mut history, CreateSetup::new(&world, None, None), "first setup");
+    run(&world, &mut history, CreateSetup::new(&world, None, Some("Setup1")), "second setup");
+
+    let second_pose = at(30.0, 0.0, 0.0);
+    run(&world, &mut history, MoveModel::new(&world, "part", second_pose), "place second setup");
+    posting::post_set(&world, &PostRef::Named("second-post".into()));
+    assert_eq!(model::transform_of(&world, &part), Some(second_pose));
+    assert_eq!(stock_pose("Setup2").pos.x, 30.0);
+    assert_eq!(face_stock(&world, Some("Setup1")), face_stock(&world, Some("Setup2")),
+        "both setups use the same stock entity");
+
+    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup1")), "show first setup");
+    assert_eq!(model::transform_of(&world, &part), Some(Location::default()));
+    assert_eq!(stock_pose("Setup1").pos.x, 0.0);
+    assert_eq!(posting::post_of(&world), PostRef::Builtin);
+    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup2")), "show second setup");
+    assert_eq!(model::transform_of(&world, &part), Some(second_pose));
+    assert_eq!(stock_pose("Setup2").pos.x, 30.0);
+    assert_eq!(posting::post_of(&world), PostRef::Named("second-post".into()));
+    assert!(history.undo(&world));
+    assert_eq!(model::transform_of(&world, &part), Some(Location::default()), "undo restores the previous view");
+    assert_eq!(posting::post_of(&world), PostRef::Builtin);
+    assert!(history.redo(&world));
+    assert_eq!(model::transform_of(&world, &part), Some(second_pose));
+    assert_eq!(posting::post_of(&world), PostRef::Named("second-post".into()));
+
+    let path = std::env::temp_dir().join(format!("camcraft_setup_poses_{}.camproj", std::process::id()));
+    project::save(&world, &path).expect("save setup poses");
+    let reopened = new_world();
+    project::load(&reopened, &path).expect("load setup poses");
+    let _ = std::fs::remove_file(path);
+    let loaded_part = model::find_by_name(&reopened, "part").expect("loaded part");
+    assert_eq!(model::transform_of(&reopened, &loaded_part), Some(second_pose));
+    assert_eq!(setup::stock_entity(&reopened, Some("Setup2"))
+        .and_then(|entity| model::transform_of(&reopened, &entity)).map(|pose| pose.pos.x), Some(30.0));
+    assert_eq!(posting::post_of(&reopened), PostRef::Named("second-post".into()));
+    let back = ActivateSetup::new(&reopened, Some("Setup1")).expect("activate loaded first setup");
+    camcraft_app::commands::Command::apply(&back, &reopened);
+    assert_eq!(model::transform_of(&reopened, &loaded_part), Some(Location::default()));
+    assert_eq!(setup::stock_entity(&reopened, Some("Setup1"))
+        .and_then(|entity| model::transform_of(&reopened, &entity)).map(|pose| pose.pos.x), Some(0.0));
+    assert_eq!(posting::post_of(&reopened), PostRef::Builtin);
+}
+
+#[test]
+fn rotating_a_setup_turns_shared_stock_and_its_height_references() {
+    let world = new_world();
+    let mut history = History::default();
+    model::spawn(&world, "part");
+    box_stock(&world, &mut history, 60.0, 20.0, 10.0);
+    run(&world, &mut history, CreateSetup::new(&world, None, None), "first setup");
+    run(&world, &mut history, CreateSetup::new(&world, None, None), "second setup");
+    let turned = Location {
+        pos: Point3::new(0.0, 0.0, 0.0),
+        rot: quat_from_axis_angle(1, std::f64::consts::FRAC_PI_2),
+    };
+    run(&world, &mut history, MoveModel::new(&world, "part", turned), "turn Setup2");
+    let stock = face_stock(&world, Some("Setup2"));
+    assert_eq!(model::transform_of(&world, &stock).expect("stock pose").rot, turned.rot);
+    let top = Height::of(HeightReference::TopOfStock, 0.0);
+    assert!((top.z_for(&world, Some("Setup2")).expect("top") - 30.0).abs() < 1e-6);
+
+    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup1")), "first setup");
+    assert_eq!(face_stock(&world, Some("Setup1")), stock);
+    assert_eq!(model::transform_of(&world, &stock).expect("stock pose").rot, IDENTITY_Q);
+    assert!((top.z_for(&world, Some("Setup1")).expect("top") - 10.0).abs() < 1e-6);
+    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup2")), "second setup");
+    assert_eq!(model::transform_of(&world, &stock).expect("stock pose").rot, turned.rot);
+    assert!((top.z_for(&world, Some("Setup2")).expect("top") - 30.0).abs() < 1e-6);
+}
+
 fn op_setup(world: &World, name: &str) -> Option<String> {
     let e = model::find_by_name(world, name).expect("entity");
     model::operation_of(world, &e).expect("operation").setup
@@ -163,15 +246,16 @@ fn face_stock(world: &World, setup: Option<&str>) -> flecs_ecs::prelude::Entity 
 }
 
 #[test]
-fn new_setups_own_private_furniture_spawned_on_first_use() {
+fn new_setups_share_stock_and_keep_private_legacy_offsets() {
     let (world, mut history) = two_setup_world();
     assert_eq!(setup::names(&world), vec!["Setup1".to_string(), "Setup2".to_string()]);
     let def = setup::def_of(&world, "Setup2").expect("def");
-    assert_eq!(def.stock, "Setup2/Stock");
+    assert_eq!(def.stock, STOCK_NAME);
     assert_eq!(def.wcs[0], "Setup2/G54");
-    // Laziness: Setup2's stock exists (box_stock ran with it active), its
-    // offsets do not until placed.
+    // Stock is one shared solid; the old placed-offset entities remain
+    // private when explicitly edited.
     assert!(setup::stock_entity(&world, Some("Setup2")).is_some());
+    assert_eq!(face_stock(&world, Some("Setup1")), face_stock(&world, Some("Setup2")));
     assert!(setup::wcs_entity(&world, Some("Setup2"), 0).is_none());
     assert!(setup::wcs_entity(&world, None, 0).is_none(), "legacy G54 never placed");
 
@@ -190,23 +274,17 @@ fn new_setups_own_private_furniture_spawned_on_first_use() {
     assert_eq!(setup::wcs_entity_name(&world, Some("Setup2"), 0).as_deref(), Some("Setup2/G54"));
     assert!(model::find_by_name(&world, "G54").is_none());
 
-    // And the STOCK edit lands on the private entity, not the legacy one.
+    // A stock edit changes the one shared definition.
     run(&world, &mut history, SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 40.0, dz: 30.0 }, Location::default()), "grow Setup2 stock");
-    let legacy = model::find_by_name(&world, STOCK_NAME).expect("legacy stock");
-    let legacy_shape = model::stock_def_of(&world, &legacy).expect("shape");
-    assert_eq!(legacy_shape, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 });
-    let priv_e = setup::stock_entity(&world, Some("Setup2")).expect("private stock");
-    assert_ne!(priv_e, legacy);
+    let shared = model::find_by_name(&world, STOCK_NAME).expect("shared stock");
     assert_eq!(
-        model::stock_def_of(&world, &priv_e).expect("shape"),
+        model::stock_def_of(&world, &shared).expect("shape"),
         StockShape::Box { dx: 40.0, dy: 40.0, dz: 30.0 }
     );
 }
 
 #[test]
-fn heights_resolve_through_the_operations_setup_not_the_cursor() {
-    // The same G54 word reads a different plane per setup - and an
-    // operation echoes what ITS setup says, wherever the cursor is.
+fn explicit_setups_use_toolpath_zero_for_work_offset_heights() {
     let (world, mut history) = two_setup_world();
     run(
         &world,
@@ -215,15 +293,27 @@ fn heights_resolve_through_the_operations_setup_not_the_cursor() {
         "place G54 in Setup2",
     );
     let h = Height::of(HeightReference::WorkOffset(0), 0.0);
-    assert_eq!(h.z_for(&world, Some("Setup2")), Some(5.0));
-    assert_eq!(h.z_for(&world, None), None, "Setup1's G54 was never placed");
-    // Switching the cursor cannot switch the reading: the lookup takes
-    // the declared setup, and activation is inert data.
+    assert_eq!(h.z_for(&world, Some("Setup2")), Some(0.0));
+    assert_eq!(h.z_for(&world, None), Some(0.0));
+    // A physical register is selected at the machine; it does not add
+    // another virtual translation to the setup's Toolpath CS.
     run(&world, &mut history, ActivateSetup::new(&world, Some("Setup1")), "activate Setup1");
-    assert_eq!(h.z_for(&world, Some("Setup2")), Some(5.0));
+    assert_eq!(h.z_for(&world, Some("Setup2")), Some(0.0));
     let top = Height::of(HeightReference::TopOfStock, 0.0);
     assert_eq!(top.z_for(&world, None), Some(20.0));
     assert_eq!(top.z_for(&world, Some("Setup2")), Some(20.0), "same box, same top");
+}
+
+#[test]
+fn materializing_a_legacy_offset_keeps_its_origin_arithmetic() {
+    let world = new_world();
+    let mut history = History::default();
+    box_stock(&world, &mut history, 60.0, 60.0, 20.0);
+    run(&world, &mut history, SetWcsOrigin::new(&world, "G55", at(0.0, 0.0, 5.0)), "legacy G55");
+    run(&world, &mut history, CreateSetup::new(&world, None, None), "materialize");
+    assert!(!setup::def_of(&world, "Setup1").expect("setup").modern_cs);
+    let h = Height::of(HeightReference::WorkOffset(1), 2.0);
+    assert_eq!(h.z_for(&world, Some("Setup1")), Some(7.0));
 }
 
 #[test]
@@ -238,13 +328,41 @@ fn program_order_is_setup_rank_then_name() {
     let order: Vec<String> = setup::operation_order(&world).into_iter().map(|(n, _)| n).collect();
     assert_eq!(order, vec!["Y_Face".to_string(), "Z_Face".to_string()]);
     assert!(setup::active(&world).as_deref() == Some("Setup1"));
-    // The order law is the POST's order law - by call, one function.
+    // Each setup's post contains only its own operations, in that order.
     let posted: Vec<String> = camcraft_app::posting::program_ops(&world)
         .expect("program")
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(posted, order);
+    assert_eq!(posted, vec!["Y_Face".to_string()]);
+    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup2")), "post Setup2");
+    let posted: Vec<String> = camcraft_app::posting::program_ops(&world)
+        .expect("second program").into_iter().map(|(n, _)| n).collect();
+    assert_eq!(posted, vec!["Z_Face".to_string()]);
+}
+
+#[test]
+fn machine_cs_selects_the_posted_register_without_moving_the_toolpath() {
+    let (world, mut history) = two_setup_world();
+    create_face(&world, &mut history, "Face2", 19.5);
+    let before = model::find_by_name(&world, "Face2")
+        .and_then(|entity| model::toolpath_of(&world, &entity))
+        .expect("generated path");
+    run(&world, &mut history, SetSetupMachineCs::new(&world, "Setup2", 1), "choose G55");
+    let records = posting::stream_records(&world).expect("active setup stream");
+    assert!(records.iter().any(|record| matches!(record,
+        camcraft_app::post::cnc::Record::Param { name, value }
+            if name == "WorkOffset" && value.as_str() == Some("G55"))));
+    let after = model::find_by_name(&world, "Face2")
+        .and_then(|entity| model::toolpath_of(&world, &entity))
+        .expect("same path");
+    assert_eq!(before.path, after.path);
+    let path = std::env::temp_dir().join(format!("camcraft_machine_cs_{}.camproj", std::process::id()));
+    project::save(&world, &path).expect("save machine CS");
+    let reopened = new_world();
+    project::load(&reopened, &path).expect("load machine CS");
+    let _ = std::fs::remove_file(path);
+    assert_eq!(setup::def_of(&reopened, "Setup2").expect("setup").machine_wcs, 1);
 }
 
 #[test]
@@ -261,11 +379,11 @@ fn datum_transfer_clones_the_world_and_undoes_exactly() {
     assert_eq!(setup::active(&world).as_deref(), Some("Setup3"));
     let def = setup::def_of(&world, "Setup3").expect("def");
     assert_eq!(def.datum_from, "Setup2", "provenance rides the setup");
-    assert_eq!(def.stock, "Setup3/Stock");
-    // Clone, not alias: own entities, same placement and shape.
-    let s3 = setup::stock_entity(&world, Some("Setup3")).expect("cloned stock");
+    assert_eq!(def.stock, STOCK_NAME);
+    // The setup inherits the active placement but references the same stock.
+    let s3 = setup::stock_entity(&world, Some("Setup3")).expect("shared stock");
     let s2 = setup::stock_entity(&world, Some("Setup2")).expect("source stock");
-    assert_ne!(s3, s2);
+    assert_eq!(s3, s2);
     assert_eq!(
         model::stock_def_of(&world, &s3).expect("shape"),
         model::stock_def_of(&world, &s2).expect("shape")
@@ -281,7 +399,7 @@ fn datum_transfer_clones_the_world_and_undoes_exactly() {
 
     assert!(history.undo(&world));
     assert_eq!(setup::names(&world), vec!["Setup1".to_string(), "Setup2".to_string()]);
-    assert!(model::find_by_name(&world, "Setup3/Stock").is_none());
+    assert!(model::find_by_name(&world, STOCK_NAME).is_some());
     assert!(model::find_by_name(&world, "Setup3/G54").is_none());
     // The SOURCE's furniture survived the inverse untouched - a clone
     // removes only its own copies.
@@ -310,9 +428,9 @@ fn a_setup_with_operations_does_not_delete() {
     }
     assert!(setup::exists(&world, "Setup1"), "refusal writes nothing");
 
-    // Move Face1 out and the first setup deletes - its furniture is the
-    // SHARED legacy names, which must survive.
-    run(&world, &mut history, SetOperationSetup::new(&world, "Face1", Some("Setup2")), "move");
+    // Operations stay in their creating setup. Once Face1 is deleted,
+    // the first setup can be deleted while the shared stock survives.
+    run(&world, &mut history, DeleteOperation::new(&world, "Face1"), "empty Setup1");
     run(&world, &mut history, DeleteSetup::new(&world, "Setup1"), "delete");
     assert_eq!(setup::names(&world), vec!["Setup2".to_string()]);
     assert!(model::find_by_name(&world, STOCK_NAME).is_some(), "shared furniture stays");
@@ -322,24 +440,17 @@ fn a_setup_with_operations_does_not_delete() {
         "a dangling cursor reads as the first that exists"
     );
 
-    // The private setup's OWN furniture goes with it, and undo brings
-    // the whole setup back. Emptied first - and note Face1's move to
-    // None made it an IMPLICIT member (the first-setup law reads None
-    // as the first setup by name, which is now Setup2), so emptying
-    // means deleting the operations, not just un-declaring them.
-    run(&world, &mut history, DeleteOperation::new(&world, "Face1"), "drop the implicit");
+    // Once Setup2's operation is removed, it is the last setup and
+    // must remain. The shared stock stays with the document.
     run(&world, &mut history, DeleteOperation::new(&world, "Face2"), "empty it");
-    run(&world, &mut history, DeleteSetup::new(&world, "Setup2"), "delete Setup2");
-    assert!(model::find_by_name(&world, "Setup2").is_none());
-    assert!(model::find_by_name(&world, "Setup2/Stock").is_none(), "owned furniture goes");
-    assert!(model::find_by_name(&world, "Setup2/G54").is_none());
+    assert!(matches!(refused(DeleteSetup::new(&world, "Setup2")), CommandError::Invalid(_)));
+    assert!(model::find_by_name(&world, "Setup2").is_some());
     assert!(model::find_by_name(&world, STOCK_NAME).is_some());
-    assert!(history.undo(&world));
-    let priv_stock = model::find_by_name(&world, "Setup2/Stock").expect("restored");
+    let shared_stock = model::find_by_name(&world, STOCK_NAME).expect("shared stock remains");
     assert_eq!(
-        model::stock_def_of(&world, &priv_stock).expect("shape"),
+        model::stock_def_of(&world, &shared_stock).expect("shape"),
         StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 },
-        "the snapshot restores the stock exactly"
+        "deleting an operation leaves the stock alone"
     );
     assert_eq!(setup::names(&world), vec!["Setup2".to_string()]);
 }
@@ -372,46 +483,6 @@ fn activation_is_inert_data() {
     assert!(history.undo(&world)); // the activation
     assert_eq!(setup::stored_active(&world).as_deref(), Some("Setup2"));
     assert!(model::find_by_name(&world, "Face3").is_none(), "Face3 gone");
-}
-
-#[test]
-fn moving_an_operation_keeps_the_stamp_and_the_machinery_answers() {
-    let (world, mut history) = two_setup_world();
-    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup1")), "Setup1 active");
-    create_face(&world, &mut history, "Face1", 19.5);
-    let face_e = model::find_by_name(&world, "Face1").expect("entity");
-    let stamp_before = model::operation_of(&world, &face_e).expect("op").stamp;
-
-    // Both setups place the same box in the same spot: the move changes
-    // nothing the digest reads, so the path is still the current truth.
-    run(&world, &mut history, SetOperationSetup::new(&world, "Face1", Some("Setup2")), "move");
-    let face_e = model::find_by_name(&world, "Face1").expect("entity");
-    let op = model::operation_of(&world, &face_e).expect("op");
-    assert_eq!(op.setup.as_deref(), Some("Setup2"));
-    assert_eq!(op.stamp, stamp_before, "the command keeps the stamp, never recomputes");
-    assert_eq!(status(&world, "Face1"), OpStatus::Ok, "identical placements say Ok");
-
-    // Now Setup2's block moves: the SAME stamp answers Stale, by the
-    // resolution machinery, not by anything the move command assumed.
-    // SetStock writes the ACTIVE setup's block, so activate into Setup2
-    // first - the cursor moves, the op's membership (and stamp) do not.
-    run(&world, &mut history, ActivateSetup::new(&world, Some("Setup2")), "raise where Face1 lives");
-    run(&world, &mut history, SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, at(0.0, 0.0, 1.0)), "raise Setup2 stock");
-    assert_eq!(status(&world, "Face1"), OpStatus::Stale);
-    assert!(history.undo(&world));
-    assert_eq!(status(&world, "Face1"), OpStatus::Ok);
-
-    // Construction refuses before any of this: a nonexistent op, a
-    // nonexistent target, and a move that is not a move.
-    assert!(
-        matches!(refused(SetOperationSetup::new(&world, "Nope", Some("Setup2"))), CommandError::NotFound(_))
-    );
-    assert!(
-        matches!(refused(SetOperationSetup::new(&world, "Face1", Some("Nope"))), CommandError::NotFound(_))
-    );
-    assert!(
-        matches!(refused(SetOperationSetup::new(&world, "Face1", Some("Setup2"))), CommandError::Invalid(_))
-    );
 }
 
 #[test]
@@ -497,13 +568,12 @@ fn rest_masks_are_same_setup_only() {
 
 #[test]
 fn deleting_the_active_furniture_owner_falls_the_cursor() {
-    // DeleteSetup leaves the singleton alone; `active`'s existence
-    // fallback is what keeps a document with setups always having one.
+    // Deleting the active setup selects the first remaining setup.
     let (world, mut history) = two_setup_world();
     assert_eq!(setup::active(&world).as_deref(), Some("Setup2"));
     run(&world, &mut history, DeleteSetup::new(&world, "Setup2"), "delete active");
-    assert_eq!(setup::stored_active(&world).as_deref(), Some("Setup2"), "left dangling");
-    assert_eq!(setup::active(&world).as_deref(), Some("Setup1"), "resolves to the first");
+    assert_eq!(setup::stored_active(&world).as_deref(), Some("Setup1"));
+    assert_eq!(setup::active(&world).as_deref(), Some("Setup1"));
     assert!(history.undo(&world));
     assert_eq!(setup::active(&world).as_deref(), Some("Setup2"));
 }

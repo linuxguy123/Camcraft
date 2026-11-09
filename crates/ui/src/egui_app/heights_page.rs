@@ -106,9 +106,18 @@ fn height_tag_is_bottom(tag: &str) -> bool {
 fn height_rows(ui: &mut Ui, world: &flecs_ecs::prelude::World, setup: Option<&str>, h: &mut Height, bottom: bool) {
     let u = units::of(world);
     let src = op_src(ui);
+    let modern_cs = camcraft_app::machine::kind_of(world) == camcraft_app::machine::Kind::Mill
+        && camcraft_app::setup::effective(world, setup)
+            .as_deref()
+            .and_then(|name| camcraft_app::setup::def_of(world, name))
+            .is_some_and(|def| def.modern_cs);
+    let mut kinds = HeightReference::KIND_LABELS;
+    if modern_cs {
+        kinds[5] = "Toolpath CS zero";
+    }
     let mut idx = h.reference.kind_index().min(HeightReference::KIND_LABELS.len() - 1);
     let before = idx;
-    prop_row(ui, "From", |ui| combo(ui, "h_kind", &mut idx, &HeightReference::KIND_LABELS));
+    prop_row(ui, "From", |ui| combo(ui, "h_kind", &mut idx, &kinds));
     if idx != before {
         h.reference = match idx {
             0 => HeightReference::Fixed,
@@ -127,7 +136,9 @@ fn height_rows(ui: &mut Ui, world: &flecs_ecs::prelude::World, setup: Option<&st
             h.offset = 0.0;
         }
     }
-    if matches!(h.reference, HeightReference::WorkOffset(_)) {
+    if matches!(h.reference, HeightReference::WorkOffset(_)) && modern_cs {
+        h.reference = HeightReference::WorkOffset(0);
+    } else if matches!(h.reference, HeightReference::WorkOffset(_)) {
         let mut slot = h.reference.wcs_slot().min(WCS_SLOTS.len() - 1);
         prop_row(ui, "WCS", |ui| combo(ui, "h_wcs", &mut slot, &WCS_SLOTS));
         h.reference = HeightReference::WorkOffset(slot.min(WCS_SLOTS.len() - 1));

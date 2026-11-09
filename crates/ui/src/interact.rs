@@ -30,7 +30,7 @@ use camcraft_app::units;
 use camcraft_app::{model, operation, pick};
 use winit::keyboard::ModifiersState;
 
-use crate::state::{CommandKind, GeoPick, HoverHit, State};
+use crate::state::{CommandKind, GeoPick, HoverHit, State, ToolpathMarker, UiTarget};
 
 /// Keyboard modifiers as the pick law reads them - the winit state or the
 /// egui `Modifiers`, converted at the shell's edge so the law itself names
@@ -88,6 +88,15 @@ fn ray_at(state: &State, p: [f32; 2]) -> Option<([f64; 3], [f64; 3])> {
 /// A click inside the viewport, routed by the pick mode: models,
 /// feature faces, or edge chains.
 pub(crate) fn pick_at(state: &mut State, p: [f32; 2], mods: Mods) {
+    if state.toolpath_pick_markers
+        && state.pane_target() == UiTarget::ToolpathCs
+        && let Some((index, point)) = toolpath_hit(state, p, 12.0)
+        && let Some(name) = state.toolpath_part.clone()
+    {
+        let kind = state.toolpath_markers[index].kind;
+        state.pending.push_back(CommandKind::SetToolpathOrigin { name, point, kind });
+        return;
+    }
     // Anchor picking wins over entity picking: in pick mode a click ON a
     // marker places the origin there (same command the pane grid
     // queues); a click beside one still picks normally, so the viewport
@@ -381,6 +390,7 @@ pub(crate) fn edge_nearest(state: &State, p: [f32; 2], radius: f32) -> Option<(S
     let mvp = state.cam.mvp(f64::from(w / h));
     let mut entities: Vec<(String, flecs_ecs::prelude::Entity)> = model::model_entities(&state.world)
         .into_iter()
+        .filter(|(_, entity)| state.model_in_active_setup(entity))
         .filter(|(name, _)| !state.hidden_models.iter().any(|hid| hid == name))
         .collect();
     // The stock that stands in the viewport is the ACTIVE setup's - the
@@ -519,6 +529,125 @@ pub(crate) fn anchor_hit(state: &State, p: [f32; 2], radius: f32) -> Option<(usi
     best.map(|(_, k)| (k, pts[k].0))
 }
 
+/// Model feature points for the Toolpath CS origin picker. Feature corners
+/// and straight edge runs avoid tessellation seams; planar face centroids
+/// use facet area, and circular edge runs supply bore centres.
+pub(crate) fn toolpath_points(state: &State, name: &str) -> Vec<ToolpathMarker> {
+    use std::collections::HashSet;
+
+    let Some(entity) = model::find_by_name(&state.world, name) else { return Vec::new() };
+    let Some(features) = model::features_of(&state.world, &entity) else { return Vec::new() };
+    let Some(facets) = model::facets_of(&state.world, &entity) else { return Vec::new() };
+    let loc = model::transform_of(&state.world, &entity).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let chains = feature::chains(&features);
+    let mut circle_vertices = HashSet::new();
+    let mut circles = Vec::new();
+    for chain in &chains {
+        if !chain.closed { continue; }
+        let points = feature::chain_points(&features, chain);
+        if let Some(center) = circle_center(&points) {
+            for point in points {
+                circle_vertices.insert(point.map(|v| (v * 100_000.0).round() as i64));
+            }
+            circles.push(center);
+        }
+    }
+    let mut add = |local: [f64; 3], kind: &'static str| {
+        if !local.iter().all(|v| v.is_finite()) { return; }
+        let p = transform_point(Point3::new(local[0], local[1], local[2]), loc.pos, loc.rot);
+        let point = [p.x, p.y, p.z];
+        if !point.iter().all(|v| v.is_finite()) { return; }
+        let key = point.map(|v| (v * 100_000.0).round() as i64);
+        if seen.insert(key) {
+            out.push(ToolpathMarker { point, kind });
+        }
+    };
+    for vi in feature::corner_verts(&features) {
+        if let Some(&p) = features.verts.get(vi as usize) {
+            if !circle_vertices.contains(&p.map(|v| (v * 100_000.0).round() as i64)) {
+                add(p, "corner");
+            }
+        }
+    }
+    for chain in chains {
+        let points = feature::chain_points(&features, &chain);
+        if !chain.closed && let (Some(&first), Some(&last)) = (points.first(), points.last()) {
+            let v = [last[0] - first[0], last[1] - first[1], last[2] - first[2]];
+            let len2 = v.iter().map(|x| x * x).sum::<f64>();
+            if len2 <= 1e-12 { continue; }
+            let straight = points.iter().all(|p| {
+                let d = [p[0] - first[0], p[1] - first[1], p[2] - first[2]];
+                let t = d.iter().zip(v).map(|(a, b)| *a * b).sum::<f64>() / len2;
+                let gap2 = (0..3).map(|i| (d[i] - t * v[i]).powi(2)).sum::<f64>();
+                gap2 <= (0.01_f64.max(len2.sqrt() * 0.001)).powi(2)
+            });
+            if straight {
+                add([(first[0] + last[0]) * 0.5, (first[1] + last[1]) * 0.5,
+                    (first[2] + last[2]) * 0.5], "edge midpoint");
+            }
+        }
+    }
+    for center in circles {
+        add(center, "circle center");
+    }
+    for face in &features.faces {
+        if face.kind == feature::FaceKind::Planar
+            && let Some(center) = pick::facets_centroid(&facets,
+                face.facets.iter().map(|&i| i as usize))
+        {
+            add(center, "face center");
+        }
+    }
+    out
+}
+
+/// A closed feature chain is a circle only when all its points share a
+/// plane and radius. Three spread points establish the candidate centre.
+fn circle_center(points: &[[f64; 3]]) -> Option<[f64; 3]> {
+    if points.len() < 8 { return None; }
+    let a = points[0];
+    let b = points[points.len() / 3];
+    let c = points[2 * points.len() / 3];
+    let sub = |x: [f64; 3], y: [f64; 3]| [x[0] - y[0], x[1] - y[1], x[2] - y[2]];
+    let u = sub(b, a);
+    let v = sub(c, a);
+    let cross = |x: [f64; 3], y: [f64; 3]| [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    let w = cross(u, v);
+    let dot = |x: [f64; 3], y: [f64; 3]| x.iter().zip(y).map(|(a, b)| *a * b).sum::<f64>();
+    let w2 = dot(w, w);
+    if !w2.is_finite() || w2 < 1e-18 { return None; }
+    let vw = cross(v, w);
+    let wu = cross(w, u);
+    let u2 = dot(u, u);
+    let v2 = dot(v, v);
+    let center = [0, 1, 2].map(|i| a[i] + (u2 * vw[i] + v2 * wu[i]) / (2.0 * w2));
+    let radius = dot(sub(a, center), sub(a, center)).sqrt();
+    if !radius.is_finite() || radius < 1e-6 { return None; }
+    let normal = w.map(|x| x / w2.sqrt());
+    let tolerance = 0.02_f64.max(radius * 0.01);
+    points.iter().all(|&p| {
+        let d = sub(p, center);
+        let r = dot(d, d).sqrt();
+        (r - radius).abs() <= tolerance && dot(d, normal).abs() <= tolerance
+    }).then_some(center)
+}
+
+pub(crate) fn toolpath_hit(state: &State, p: [f32; 2], radius: f32) -> Option<(usize, [f64; 3])> {
+    let ([x0, y0], [x1, y1]) = state.viewport_rect;
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w <= 1.0 || h <= 1.0 { return None; }
+    let mvp = state.cam.mvp(f64::from(w) / f64::from(h));
+    state.toolpath_markers.iter().enumerate().filter_map(|(i, mark)| {
+        let uv = project_uv(&mvp, mark.point)?;
+        let dx = x0 + uv[0] * w - p[0];
+        let dy = y0 + uv[1] * h - p[1];
+        let d2 = dx * dx + dy * dy;
+        (d2 <= radius * radius).then_some((d2, i, mark.point))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, i, point)| (i, point))
+}
+
 /// Clip-projection of a world point through the column-major `mvp` to
 /// viewport uv (x right, y down from the top edge); None behind the camera
 /// or at degenerate `w`. Shared by the gizmo labels and anchor picking.
@@ -541,12 +670,11 @@ pub(crate) fn project_uv(mvp: &[[f32; 4]; 4], p: [f64; 3]) -> Option<[f32; 2]> {
 }
 
 /// One origin gizmo to draw: a triad at `pos`/`rot`; the dimmed variant is
-/// the neutral world origin shown while no work offset claims that corner.
+/// the active setup's Toolpath CS at program zero.
 pub(crate) struct Gizmo {
     pub pos: [f64; 3],
     pub rot: [f64; 4],
-    /// Triad axes sit on X/Y/Z at this exact position with no rotation.
-    pub world_axes: bool,
+    pub toolpath_cs: bool,
 }
 
 /// Axis colors and tip offsets shared by the line overlay and the labels.
@@ -554,13 +682,13 @@ const AXES: [([f32; 3], [f64; 3]); 3] = [
     ([0.90, 0.25, 0.20], [1.0, 0.0, 0.0]),
     ([0.25, 0.82, 0.35], [0.0, 1.0, 0.0]),
     // #195: the old 0.28/0.48/0.95 blue all but vanished on the dark
-    // viewport ground once dimmed for the world axes.
+    // viewport ground once dimmed for the Toolpath CS.
     ([0.38, 0.64, 1.0], [0.0, 0.0, 1.0]),
 ];
 
-/// How much the neutral world axes are dimmed against a work offset's
+/// How much the Toolpath CS is dimmed against a work offset's
 /// triad (#195: was 0.55 for the lines - too dark to read).
-const WORLD_DIM: f32 = 0.8;
+const TOOLPATH_DIM: f32 = 0.8;
 
 /// Screen-space stroke widths of a gizmo axis, px (#195): the coloured
 /// line over a dark outline that keeps it readable on any ground.
@@ -582,20 +710,14 @@ fn gizmo_len(state: &State) -> f64 {
     (extent * 0.15).max(8.0)
 }
 
-/// Reference-geometry overlay: world origin axes (dimmed) plus one colored
-/// triad per defined work offset. Length scales with the model extent, with
-/// a floor so an empty or tiny document still shows orientation.
-///
-/// Which origin gizmos to draw (feedback 6): a triad per defined work
-/// offset, plus the dimmed world axes - unless some triad already sits
-/// exactly on the world origin, in which case its own lines are the world
-/// axes and drawing both reads as a duplicated gizmo, or the Models panel
-/// has the axes hidden: two gizmos around a moved G5x read as clutter, and
-/// the world axes are context furniture, not setup. The triads stay: they
-/// are the work offsets themselves.
+/// Reference geometry: the active setup's Toolpath CS at program zero,
+/// plus the placed work offsets of an implicit legacy setup. The Toolpath
+/// CS eye controls only its own triad, never the work offsets.
 fn gizmos(state: &State) -> Vec<Gizmo> {
     let mut out: Vec<Gizmo> = Vec::new();
+    let explicit_setup = camcraft_app::setup::active(&state.world).is_some();
     for (name, entity) in model::named_entities(&state.world) {
+        if explicit_setup { continue; }
         if state.hidden_offsets.contains(&name) || !model::is_wcs(&state.world, &entity) {
             continue;
         }
@@ -605,23 +727,14 @@ fn gizmos(state: &State) -> Vec<Gizmo> {
         out.push(Gizmo {
             pos: [loc.pos.x, loc.pos.y, loc.pos.z],
             rot: loc.rot,
-            world_axes: false,
+            toolpath_cs: false,
         });
     }
-    let claims_origin = out.iter().any(|g| {
-        let on_spot = g.pos[0].abs() < 1e-3 && g.pos[1].abs() < 1e-3 && g.pos[2].abs() < 1e-3;
-        // Unit quaternion up to sign: [0,0,0,±1] is identity rotation.
-        let unrotated = g.rot[0].abs() < 1e-6
-            && g.rot[1].abs() < 1e-6
-            && g.rot[2].abs() < 1e-6
-            && (1.0 - g.rot[3].abs()).abs() < 1e-6;
-        on_spot && unrotated
-    });
-    if !claims_origin && state.show_world_axes {
+    if !state.toolpath_cs_hidden() {
         out.push(Gizmo {
             pos: [0.0, 0.0, 0.0],
             rot: [0.0, 0.0, 0.0, 1.0],
-            world_axes: true,
+            toolpath_cs: true,
         });
     }
     out
@@ -818,8 +931,8 @@ pub(crate) fn overlay_labels(state: &State, aspect: f64) -> Vec<([f32; 2], [f32;
             let Some(uv) = project_uv(&mvp, [p.x, p.y, p.z]) else {
                 continue;
             };
-            let c = if gizmo.world_axes {
-                [rgb[0] * WORLD_DIM, rgb[1] * WORLD_DIM, rgb[2] * WORLD_DIM]
+            let c = if gizmo.toolpath_cs {
+                [rgb[0] * TOOLPATH_DIM, rgb[1] * TOOLPATH_DIM, rgb[2] * TOOLPATH_DIM]
             } else {
                 *rgb
             };
@@ -847,8 +960,8 @@ pub(crate) fn gizmo_segments(state: &State, aspect: f64) -> Vec<([f32; 2], [f32;
             let Some(tip) = project_uv(&mvp, [p.x, p.y, p.z]) else {
                 continue;
             };
-            let c = if gizmo.world_axes {
-                [rgb[0] * WORLD_DIM, rgb[1] * WORLD_DIM, rgb[2] * WORLD_DIM]
+            let c = if gizmo.toolpath_cs {
+                [rgb[0] * TOOLPATH_DIM, rgb[1] * TOOLPATH_DIM, rgb[2] * TOOLPATH_DIM]
             } else {
                 *rgb
             };
@@ -876,8 +989,8 @@ pub(crate) fn collect_overlay(state: &State) -> Vec<[f32; 6]> {
                 Point3::new(gizmo.pos[0], gizmo.pos[1], gizmo.pos[2]),
                 gizmo.rot,
             );
-            let c = if gizmo.world_axes {
-                [rgb[0] * WORLD_DIM, rgb[1] * WORLD_DIM, rgb[2] * WORLD_DIM]
+            let c = if gizmo.toolpath_cs {
+                [rgb[0] * TOOLPATH_DIM, rgb[1] * TOOLPATH_DIM, rgb[2] * TOOLPATH_DIM]
             } else {
                 *rgb
             };
@@ -902,6 +1015,25 @@ pub(crate) fn collect_overlay(state: &State) -> Vec<[f32; 6]> {
                 b[axis] += arm;
                 out.push([ftoz(a[0]), ftoz(a[1]), ftoz(a[2]), c[0], c[1], c[2]]);
                 out.push([ftoz(b[0]), ftoz(b[1]), ftoz(b[2]), c[0], c[1], c[2]]);
+            }
+        }
+    }
+    if state.toolpath_pick_markers && state.pane_target() == UiTarget::ToolpathCs {
+        let arm = (gizmo_len(state) * 0.09).max(0.5);
+        for mark in &state.toolpath_markers {
+            if out.len() + 6 > MAX_OVERLAY_VERTICES { break; }
+            let color = match mark.kind {
+                "circle center" => [0.98, 0.83, 0.25],
+                "face center" => [0.68, 0.95, 0.54],
+                "edge midpoint" => [0.98, 0.65, 0.25],
+                _ => [0.90, 0.83, 0.38],
+            };
+            for axis in 0..3 {
+                let (mut a, mut b) = (mark.point, mark.point);
+                a[axis] -= arm;
+                b[axis] += arm;
+                out.push([ftoz(a[0]), ftoz(a[1]), ftoz(a[2]), color[0], color[1], color[2]]);
+                out.push([ftoz(b[0]), ftoz(b[1]), ftoz(b[2]), color[0], color[1], color[2]]);
             }
         }
     }
@@ -956,7 +1088,7 @@ pub(crate) fn toolpath_lines(state: &State) -> Vec<[f32; 6]> {
     // M13.4: the move kinds wear the viewer's colour-vision palette
     // (Off = the three consts above, unchanged).
     let pal = crate::egui_app::colorvision::palette_of(&state.world);
-    for (name, entity) in camcraft_app::setup::operation_order(&state.world) {
+    for (name, entity) in camcraft_app::setup::active_operation_order(&state.world) {
         // Browser-eye hidden: the cache still exists and still posts, it
         // just does not draw (display state, never a geometry change).
         if state.hidden_paths.contains(&name) {

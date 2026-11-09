@@ -1,4 +1,4 @@
-//! SetStock: define or replace the setup's raw-material solid.
+//! SetStock: define or replace the shared raw-material solid.
 //!
 //! Parameters are validated and the mesh is resolved at construction, so
 //! undo/redo replays a finished world write and malformed stock never enters
@@ -15,12 +15,9 @@ use crate::schema::{Location, StockDef};
 use crate::stock::{self, MAX_STOCK_DIM, StockShape};
 
 pub struct SetStock {
-    /// The stock ENTITY this command targets - resolved from the active
-    /// setup at construction (M3.2 A): `Stock` while setups are implicit,
-    /// `Setup2/Stock` (or the setup's own name) once the user declares
-    /// them. Undo replays against this name, not against a re-read of
-    /// the active-setup singleton, so activating another setup mid-
-    /// history cannot move an undo's target.
+    /// The stock entity this command targets, resolved at construction.
+    /// New setups share `Stock`; an older project may still name private
+    /// stock. Undo replays against this name after a setup switch.
     stock_name: String,
     shape: StockShape,
     location: Location,

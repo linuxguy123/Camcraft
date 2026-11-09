@@ -56,6 +56,10 @@ use super::shell::{Tab, build_dock, headless, shell_layout};
 use super::viewcube;
 use super::{theme, world};
 
+// The browser's painted rows begin after the Paths checkbox, Solids radios
+// and separator. Keep pointer tests on that same tree when controls change.
+const BROWSER_TREE_TOP: f32 = 158.0;
+
 #[test]
 fn empty_egui_meshes_are_filtered_before_gpu_submission() {
     let empty = egui::ClippedPrimitive {
@@ -334,12 +338,8 @@ fn browser_show_and_hide_all_toolpaths_update_operation_eyes() {
     assert!(operation_names.iter().all(|name| state.hidden_paths.contains(name)));
 }
 
-/// M-d's startup law, proven in pixels: the window opens on a plain
-/// empty document - the seed left `Shell::new` for real file ops - and
-/// the whole shell renders it without a hiccup. Then a bare FrameAll on
-/// the blank world must refuse by name ("nothing to frame", the camera
-/// untouched) instead of fitting a bogus box: Prime Directive on the one
-/// command the empty startup actually receives.
+/// Startup has Setup1 but no model or stock geometry. FrameAll must
+/// still report that there is nothing to frame.
 #[test]
 fn blank_startup_renders_and_frames_honestly() {
     let mut harness = Harness::builder()
@@ -348,10 +348,10 @@ fn blank_startup_renders_and_frames_honestly() {
     harness.run_steps(3);
     let st = &harness.state().state;
     assert_eq!(st.status, "ready", "startup must not run any command");
-    assert!(
-        model::named_entities(&st.world).is_empty(),
-        "the window must start on an empty document"
-    );
+    assert_eq!(camcraft_app::setup::names(&st.world), vec!["Setup1".to_owned()]);
+    assert_eq!(camcraft_app::setup::active(&st.world).as_deref(), Some("Setup1"));
+    assert_eq!(model::model_entities(&st.world).len(), 0, "startup has no model");
+    assert!(camcraft_app::setup::stock_entity(&st.world, Some("Setup1")).is_none());
     harness
         .state_mut().state.pending
         .push_back(CommandKind::FrameAll);
@@ -412,6 +412,8 @@ fn file_ops_round_trip_through_commands() {
     );
     assert!(!st.history.can_undo(), "New must retire the timeline");
     assert_eq!(st.status, "new document");
+    assert_eq!(camcraft_app::setup::names(&st.world), vec!["Setup1".to_owned()]);
+    assert_eq!(camcraft_app::setup::active(&st.world).as_deref(), Some("Setup1"));
     assert_eq!(st.project_path, None);
     assert_eq!(st.window_title(), "CamCraft - Untitled");
 
@@ -1986,6 +1988,51 @@ fn ribbon_click_creates_through_the_actions_law() {
     );
 }
 
+#[test]
+fn ribbon_operation_joins_the_setup_selected_in_the_browser() {
+    let mut harness = shell_harness();
+    harness.state_mut().state.pending.push_back(CommandKind::CreateSetup {
+        name: None, datum_from: None,
+    });
+    harness.run_steps(2);
+    harness.state_mut().state.pending.push_back(CommandKind::ActivateSetup(Some("Setup1".into())));
+    harness.run_steps(2);
+
+    let (_, leaves) = panes::browser_rows(&harness.state().state);
+    let row = leaves.iter().position(|leaf| matches!(leaf,
+        panes::Leaf::SetupName(Some(name)) if name == "Setup2"))
+        .expect("Setup2 in browser");
+    let row_h = theme::current().row_height;
+    let setup2 = egui::pos2(90.0, BROWSER_TREE_TOP + (row as f32 + 0.5) * row_h);
+    set_pos(&mut harness, setup2);
+    button_at(&mut harness, egui::PointerButton::Primary, setup2, true);
+    button_at(&mut harness, egui::PointerButton::Primary, setup2, false);
+    harness.run_steps(2);
+    assert_eq!(camcraft_app::setup::active(&harness.state().state.world).as_deref(), Some("Setup2"));
+
+    camcraft_app::ribbon::pinned_set(&harness.state().state.world, &[2]);
+    harness.run();
+    let (cells, _, _, _) = panes::ribbon_cells(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, super::shell::RIBBON_H)),
+        &theme::current(),
+        &panes::ribbon_plan(camcraft_app::machine::Kind::Mill, &[2]),
+    );
+    let pocket = cells.iter().find(|cell| cell.cmd == Cmd::Create(2)).expect("Pocket cell");
+    let at = pocket.rect.center();
+    set_pos(&mut harness, at);
+    button_at(&mut harness, egui::PointerButton::Primary, at, true);
+    button_at(&mut harness, egui::PointerButton::Primary, at, false);
+    harness.run_steps(2);
+
+    let st = &harness.state().state;
+    let entity = model::find_by_name(&st.world, "2D Pocket1")
+        .unwrap_or_else(|| panic!("operation was not created: {}", st.status));
+    let op = model::operation_of(&st.world, &entity).expect("operation");
+    assert_eq!(op.setup.as_deref(), Some("Setup2"));
+    assert!(panes::browser_rows(st).1.iter().any(|leaf| matches!(leaf,
+        panes::Leaf::Op(name) if name == "2D Pocket1")));
+}
+
 /// The quick-add naming law (M9.1): a press names its operation after the
 /// kind's own label, and the number runs past the TAKEN names, not the
 /// count - a document holding "2D Pocket1" and "2D Pocket3" must land the
@@ -2549,8 +2596,9 @@ fn tips_match_the_imgui_table() {
         (Cmd::Save, "Save the project\tCtrl+S"),
         (Cmd::SaveAs, "Save the project under a new name\tCtrl+Shift+S"),
         (Cmd::Post, "Post NC program (validation gate), then review it\tCtrl+P"),
+        (Cmd::Setups, "Create and select machining setups"),
         (Cmd::Stock, "Stock definition"),
-        (Cmd::Origin, "Work offset (WCS)"),
+        (Cmd::Origin, "Place the model in this setup's toolpath coordinate system"),
         (Cmd::Tools, "Tool library"),
         (
             Cmd::Machine,
@@ -2896,23 +2944,16 @@ fn the_nav_bar_drives_view_state() {
         crate::state::DisplayMode::ShadedEdges
     );
 
-    // Paths and Axes flip their booleans, twice each, queueing nothing -
-    // counting from their defaults (State::new: axes on, paths off).
-    for (kind, want_paths, want_axes) in [
-        (viewcube::Nav::Paths, true, true),
-        (viewcube::Nav::Paths, false, true),
-        (viewcube::Nav::Axes, false, false),
-        (viewcube::Nav::Axes, false, true),
-    ] {
+    // Paths flips the display flag twice without queueing a document command.
+    for want_paths in [true, false] {
         let p = {
             let h = hud(harness.state());
-            h.nav_rect(kind).center()
+            h.nav_rect(viewcube::Nav::Paths).center()
         };
         click_viewport(&mut harness, p);
         let sh = harness.state();
         assert_eq!(sh.state.show_all_paths, want_paths);
-        assert_eq!(sh.state.show_world_axes, want_axes);
-        assert!(sh.state.pending.is_empty(), "{kind:?} queued a command");
+        assert!(sh.state.pending.is_empty(), "Paths queued a command");
     }
 }
 
@@ -3022,7 +3063,7 @@ fn a_create_cell_darkens_with_the_tool_laws_reason() {
     harness.run();
     let label = camcraft_app::operation::KindInfo::ALL[kind].label;
     let reason = format!(
-        "No drill, tap or boring bar in the setup's tools - a {label} operation cuts with one; add it to the tool library - add 'DR-0600' (6 mm drill) from the catalog?"
+        "No drill, tap or boring bar in Setup1's tools - a {label} operation cuts with one; add it to the tool library - add 'DR-0600' (6 mm drill) from the catalog?"
     );
     {
         let st = &harness.state().state;
@@ -4341,7 +4382,7 @@ fn stock_eye_hides_the_viewport_stock_without_removing_it_from_the_document() {
     let stock_name = camcraft_app::setup::stock_entity_name(&harness.state().state.world, None);
     let (_, leaves) = panes::browser_rows(&harness.state().state);
     let row = leaves.iter().position(|leaf| matches!(leaf, panes::Leaf::Stock)).expect("stock row");
-    let eye = egui::pos2(216.0, 179.0 + (row as f32 + 0.5) * theme::current().row_height);
+    let eye = egui::pos2(216.0, BROWSER_TREE_TOP + (row as f32 + 0.5) * theme::current().row_height);
     assert!(world::collect(&harness.state().state).parts.iter().any(|part| part.stock));
 
     set_pos(&mut harness, eye);
@@ -4456,29 +4497,30 @@ fn a_deleted_tool_marks_the_row_and_the_page_blocked() {
 }
 
 #[test]
-fn setup_navigation_is_conditional_and_operations_keep_a_flat_browser() {
+fn setup_navigation_groups_operations_under_the_active_setup() {
     let plan = panes::ribbon_plan(camcraft_app::machine::Kind::Mill, &[]);
     let setup_group = plan.iter().find(|group| group.title == "Setup").expect("setup group");
     assert_eq!(
         setup_group.cells.as_slice(),
-        &[Cmd::Stock, Cmd::Origin, Cmd::Tools, Cmd::Machine],
-        "the Setup toolbar matches its original cells"
+        &[Cmd::Setups, Cmd::Stock, Cmd::Origin, Cmd::Tools, Cmd::Machine],
+        "the Setup toolbar exposes setup creation"
     );
 
     let blank = State::new();
     let (rows, leaves) = panes::browser_rows(&blank);
-    assert!(!leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Setups)));
-    assert!(!rows.iter().any(|row| row.label == "Global Setup"));
+    assert!(leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Setups)));
+    assert!(rows.iter().any(|row| row.label == "Setup1"));
+    assert_eq!(camcraft_app::setup::active(&blank.world).as_deref(), Some("Setup1"));
     assert!(rows.iter().any(|row| row.label == "Operations"));
+    assert_eq!(rows.iter().filter(|row| row.depth == 0).map(|row| row.label.as_str()).collect::<Vec<_>>(), ["Model", "Stock", "Setups"]);
 
-    let mut with_setup = State::new();
-    with_setup.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
-    with_setup.drain_actions();
+    let with_setup = State::new();
     let (rows, leaves) = panes::browser_rows(&with_setup);
     let manager = leaves.iter().position(|leaf| matches!(leaf, panes::Leaf::Setups))
         .expect("the browser shows Setups after the first setup exists");
-    assert_eq!(rows[manager].label, "Setups");
+    assert_eq!(rows[manager].label, "Manage setups");
     assert_eq!(rows[manager].depth, 1);
+    assert!(rows.iter().any(|row| row.label == "Setup1" && row.depth == 1));
 
     let mut seeded = ShellUi::seeded();
     seeded.state.pending.push_back(CommandKind::RenameOperation {
@@ -4489,8 +4531,8 @@ fn setup_navigation_is_conditional_and_operations_keep_a_flat_browser() {
     let op = leaves.iter().position(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "Contour1"))
         .expect("stable operation key in browser");
     assert_eq!(rows[op].label, "Finish contour");
-    assert_eq!(rows[op].depth, 1, "operation sits directly beneath Operations");
-    assert!(!rows.iter().any(|row| row.label == "Global Setup"));
+    assert_eq!(rows[op].depth, 3, "operation sits beneath its setup's Operations row");
+    assert!(rows.iter().any(|row| row.label == "Setup1"));
 
     let source = model::find_by_name(&seeded.state.world, "Contour1").expect("seed op");
     let definition = model::operation_of(&seeded.state.world, &source).expect("definition");
@@ -4510,6 +4552,82 @@ fn setup_navigation_is_conditional_and_operations_keep_a_flat_browser() {
     }).collect();
     assert_eq!(order, [("Contour2", "Contour2"), ("Contour1", "Finish contour")],
         "browser order follows the shared program order, labels stay independent");
+}
+
+#[test]
+fn toolpath_cs_eye_and_setup_caret_keep_per_setup_view_state() {
+    let mut state = State::new();
+    state.toggle_toolpath_cs();
+    let (rows, leaves) = panes::browser_rows(&state);
+    let cs = leaves.iter().position(|leaf| matches!(leaf, panes::Leaf::ToolpathCs))
+        .expect("Toolpath CS row");
+    assert!(matches!(rows[cs].kind, painted::Kind::Wcs));
+    assert!(rows[cs].hidden, "the eye hides Setup1's triad");
+
+    state.toggle_setup_expanded(Some("Setup1"));
+    let (rows, leaves) = panes::browser_rows(&state);
+    assert!(!leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::ToolpathCs)));
+    assert!(rows.iter().any(|row| row.label == "Setup1" && matches!(row.kind, painted::Kind::Parent(false))));
+
+    state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
+    state.drain_actions();
+    assert!(!state.toolpath_cs_hidden(), "Setup2 starts with its triad visible");
+    assert!(state.setup_expanded(Some("Setup2")), "the new setup opens by default");
+    state.pending.push_back(CommandKind::ActivateSetup(Some("Setup1".into())));
+    state.drain_actions();
+    assert!(state.toolpath_cs_hidden(), "Setup1 keeps its eye setting");
+    assert!(!state.setup_expanded(Some("Setup1")), "Setup1 keeps its caret setting");
+}
+
+#[test]
+fn both_setup_branches_remain_open_and_active_setup_has_its_own_color() {
+    let mut state = ShellUi::seeded().state;
+    state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
+    state.drain_actions();
+    crate::actions::add_operation(&mut state, 2);
+    state.drain_actions();
+
+    let (rows, leaves) = panes::browser_rows(&state);
+    let index = |find: fn(&panes::Leaf) -> bool| leaves.iter().position(find).expect("browser row");
+    let first = index(|leaf| matches!(leaf, panes::Leaf::SetupName(Some(name)) if name == "Setup1"));
+    let second = index(|leaf| matches!(leaf, panes::Leaf::SetupName(Some(name)) if name == "Setup2"));
+    let first_op = index(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "Contour1"));
+    let second_op = index(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "2D Pocket1"));
+    assert!(first < first_op && first_op < second && second < second_op);
+    assert!(!rows[first].active_setup);
+    assert!(rows[second].active_setup);
+
+    state.toggle_setup_expanded(Some("Setup1"));
+    let (_, leaves) = panes::browser_rows(&state);
+    assert!(!leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "Contour1")));
+    assert!(leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "2D Pocket1")));
+
+    state.toggle_setup_expanded(Some("Setup1"));
+    state.toggle_setup_group(false, Some("Setup1"));
+    let (_, leaves) = panes::browser_rows(&state);
+    assert!(!leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "Contour1")));
+    assert!(leaves.iter().any(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "2D Pocket1")),
+        "closing Setup1 Operations leaves Setup2 Operations open");
+}
+
+#[test]
+fn clicking_an_operation_in_an_inactive_open_setup_activates_and_opens_it() {
+    let mut harness = shell_harness();
+    harness.state_mut().state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
+    harness.run_steps(2);
+    assert_eq!(camcraft_app::setup::active(&harness.state().state.world).as_deref(), Some("Setup2"));
+    let (_, leaves) = panes::browser_rows(&harness.state().state);
+    let row = leaves.iter().position(|leaf| matches!(leaf, panes::Leaf::Op(name) if name == "Contour1"))
+        .expect("Setup1 operation remains visible");
+    let pos = egui::pos2(100.0, BROWSER_TREE_TOP + (row as f32 + 0.5) * theme::current().row_height);
+    set_pos(&mut harness, pos);
+    button_at(&mut harness, egui::PointerButton::Primary, pos, true);
+    button_at(&mut harness, egui::PointerButton::Primary, pos, false);
+    harness.run_steps(2);
+    let state = &harness.state().state;
+    assert_eq!(camcraft_app::setup::active(&state.world).as_deref(), Some("Setup1"));
+    assert_eq!(state.pane_target(), UiTarget::Operation("Contour1".into()));
+    assert!(state.setup_expanded(Some("Setup2")), "Setup2 remains open");
 }
 
 #[test]
@@ -4536,8 +4654,8 @@ fn dragging_an_operation_row_reorders_within_global_setup() {
     // 1280x720 shell. The row indices come from the current flat browser,
     // so the drag follows the rows after setup nesting was removed.
     let row_h = theme::current().row_height;
-    let from = egui::pos2(120.0, 179.0 + (second as f32 + 0.5) * row_h);
-    let to = egui::pos2(120.0, 179.0 + (first as f32 + 0.25) * row_h);
+    let from = egui::pos2(120.0, BROWSER_TREE_TOP + (second as f32 + 0.5) * row_h);
+    let to = egui::pos2(120.0, BROWSER_TREE_TOP + (first as f32 + 0.25) * row_h);
     set_pos(&mut harness, from);
     button_at(&mut harness, egui::PointerButton::Primary, from, true);
     set_pos(&mut harness, to);
@@ -4679,19 +4797,36 @@ fn operations_heading_menu_pastes_the_copied_operation() {
         panes::Leaf::Parent(panes::BrowserSection::Operations)))
         .expect("Operations heading");
     let row_height = theme::current().row_height;
-    let heading = egui::pos2(90.0, 179.0 + (row as f32 + 0.5) * row_height);
+    let heading = egui::pos2(90.0, BROWSER_TREE_TOP + (row as f32 + 0.5) * row_height);
     set_pos(&mut harness, heading);
     button_at(&mut harness, egui::PointerButton::Secondary, heading, true);
     button_at(&mut harness, egui::PointerButton::Secondary, heading, false);
     assert_eq!(harness.state().state.tree_menu, Some(TreeMenuTarget::Operations));
 
     let paste = egui::pos2(90.0,
-        179.0 + (row as f32 + 1.0) * row_height + panes::DROP_GAP + 1.5 * row_height);
+        BROWSER_TREE_TOP + (row as f32 + 1.0) * row_height + panes::DROP_GAP + 1.5 * row_height);
     set_pos(&mut harness, paste);
     button_at(&mut harness, egui::PointerButton::Primary, paste, true);
     button_at(&mut harness, egui::PointerButton::Primary, paste, false);
     harness.run_steps(2);
     assert!(model::find_by_name(&harness.state().state.world, "Contour1 Copy").is_some());
+}
+
+#[test]
+fn pasting_into_another_setup_joins_that_setup() {
+    let mut state = ShellUi::seeded().state;
+    state.copy_operation("Contour1");
+    state.pending.push_back(CommandKind::CreateSetup {
+        name: None, datum_from: Some("Setup1".into()),
+    });
+    state.drain_actions();
+    state.paste_operation();
+    state.drain_actions();
+    let pasted = model::find_by_name(&state.world, "Contour1 Copy").expect("pasted operation");
+    let op = model::operation_of(&state.world, &pasted).expect("operation definition");
+    assert_eq!(op.setup.as_deref(), Some("Setup2"));
+    assert!(camcraft_app::setup::active_operation_order(&state.world)
+        .iter().any(|(name, _)| name == "Contour1 Copy"));
 }
 
 #[test]
@@ -4703,7 +4838,7 @@ fn operation_type_menu_requires_confirmation() {
         panes::Leaf::Op(name) if name == "Contour1"))
         .expect("operation row");
     let row_height = theme::current().row_height;
-    let operation = egui::pos2(90.0, 179.0 + (row as f32 + 0.5) * row_height);
+    let operation = egui::pos2(90.0, BROWSER_TREE_TOP + (row as f32 + 0.5) * row_height);
     set_pos(&mut harness, operation);
     button_at(&mut harness, egui::PointerButton::Secondary, operation, true);
     button_at(&mut harness, egui::PointerButton::Secondary, operation, false);
@@ -4712,7 +4847,7 @@ fn operation_type_menu_requires_confirmation() {
 
     // Operation, Rename, Copy, Paste, Clear, Delete, section header, Face.
     let face = egui::pos2(90.0,
-        179.0 + (row as f32 + 1.0) * row_height + panes::DROP_GAP + 7.5 * row_height);
+        BROWSER_TREE_TOP + (row as f32 + 1.0) * row_height + panes::DROP_GAP + 7.5 * row_height);
     set_pos(&mut harness, face);
     button_at(&mut harness, egui::PointerButton::Primary, face, true);
     button_at(&mut harness, egui::PointerButton::Primary, face, false);
@@ -4853,7 +4988,7 @@ fn a_lathe_over_a_mill_post_offers_the_lathe_post_and_rides_undo() {
     use camcraft_app::posting;
     use camcraft_app::schema::PostRef;
     let mut harness = shell_harness();
-    harness.state_mut().state.ui_target = UiTarget::Stock;
+    harness.state_mut().state.ui_target = UiTarget::Machine;
     harness.run();
     assert!(
         harness.query_by_label_contains("the current post serves").is_none(),

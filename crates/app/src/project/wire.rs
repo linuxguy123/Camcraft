@@ -37,6 +37,9 @@ pub(super) fn dto_to_facets(v: Vec<[[f64; 3]; 3]>) -> Vec<Triangle> {
 }
 
 pub fn collect(world: &World) -> ProjectFile {
+    let active_setup = crate::setup::active(world);
+    let active_poses = crate::setup::model_poses(world);
+    let active_context = crate::setup::current_context(world);
     let entities = model::named_entities(world)
         .into_iter()
         .map(|(name, entity)| {
@@ -68,6 +71,25 @@ pub fn collect(world: &World) -> ProjectFile {
                         stock: d.stock.clone(),
                         wcs: d.wcs.clone(),
                         datum_from: d.datum_from.clone(),
+                        model_poses: if active_setup.as_deref() == Some(name.as_str()) {
+                            active_poses.clone()
+                        } else {
+                            d.model_poses.clone()
+                        }
+                        .into_iter()
+                        .map(|(name, loc)| SetupModelPoseDto {
+                            name,
+                            translation: [loc.pos.x, loc.pos.y, loc.pos.z],
+                            rotation: loc.rot,
+                        })
+                        .collect(),
+                        machine_wcs: d.machine_wcs,
+                        modern_cs: d.modern_cs,
+                        context: if active_setup.as_deref() == Some(name.as_str()) {
+                            Some(active_context.clone())
+                        } else {
+                            d.context.clone()
+                        },
                     })
             } else {
                 None

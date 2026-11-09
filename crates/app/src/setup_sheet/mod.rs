@@ -102,6 +102,15 @@ pub fn render(world: &World, setup_name: Option<&str>) -> Result<String, String>
     let target = setup::effective(world, setup_name);
     let ctx = target.as_deref();
     let title = target.clone().unwrap_or_else(|| "Implicit".to_string());
+    if target != setup::active(world)
+        && let Some(def) = ctx.and_then(|name| setup::def_of(world, name))
+        && !def.model_poses.is_empty()
+        && def.model_poses != setup::model_poses(world)
+    {
+        return Err(format!(
+            "activate setup '{title}' before printing its sheet so operation depths use its Toolpath CS"
+        ));
+    }
 
     let mut out = String::new();
     out.push_str(&format!("SETUP SHEET - {title}\n"));
@@ -125,9 +134,8 @@ pub fn render(world: &World, setup_name: Option<&str>) -> Result<String, String>
 
 /// The flip chart: one entry per named setup in program order, or the
 /// single `Implicit` entry of a setup-less document. Entries are
-/// `(title, sheet)`; a setup whose sheet cannot render (it exists by
-/// construction here, so it can only fail defensively) is skipped, never
-/// panicked on.
+/// `(title, sheet)`; a sheet that cannot render carries its refusal text
+/// so another setup's model placement cannot produce plausible wrong depths.
 #[must_use]
 pub fn render_all(world: &World) -> Vec<(String, String)> {
     let names = setup::names(world);
@@ -137,10 +145,11 @@ pub fn render_all(world: &World) -> Vec<(String, String)> {
             render(world, None).unwrap_or_else(|e| format!("(render failed: {e})")),
         )];
     }
-    names
-        .into_iter()
-        .filter_map(|n| render(world, Some(&n)).ok().map(|sheet| (n, sheet)))
-        .collect()
+    names.into_iter().map(|n| {
+        let sheet = render(world, Some(&n))
+            .unwrap_or_else(|e| format!("SETUP SHEET - {n}\n\nUnavailable: {e}\n"));
+        (n, sheet)
+    }).collect()
 }
 
 /// The "program simulation" verdict line a sheet builder may opt into.

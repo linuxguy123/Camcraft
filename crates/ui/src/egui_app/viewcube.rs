@@ -95,11 +95,9 @@ pub(crate) enum Nav {
     Wire,
     /// Draw every cached path, not just the selected op's.
     Paths,
-    /// The dimmed world origin axes.
-    Axes,
 }
 
-pub(crate) const NAVS: [Nav; 5] = [Nav::Frame, Nav::Iso, Nav::Wire, Nav::Paths, Nav::Axes];
+pub(crate) const NAVS: [Nav; 4] = [Nav::Frame, Nav::Iso, Nav::Wire, Nav::Paths];
 
 impl Hud {
     /// Top-right corner furniture of `pane`, or None when the pane is
@@ -272,7 +270,6 @@ fn act(state: &mut State, kind: Nav) {
             };
         }
         Nav::Paths => state.toggle_all_toolpaths(),
-        Nav::Axes => state.show_world_axes = !state.show_world_axes,
     }
 }
 
@@ -356,7 +353,6 @@ pub(crate) fn draw(
             Nav::Frame | Nav::Iso => false,
             Nav::Wire => state.display == DisplayMode::Wireframe,
             Nav::Paths => state.show_all_paths,
-            Nav::Axes => state.show_world_axes,
         };
         let hov = hover.is_some_and(|p| r.contains(p));
         ui.painter()
@@ -435,20 +431,6 @@ pub(crate) fn draw(
                     })
                     .collect();
                 ui.painter().add(egui::Shape::line(pts, s));
-            }
-            Nav::Axes => {
-                // The origin triad: X down-right, Y left, Z up - the
-                // palette the world axes themselves use.
-                let o = r.center() + egui::vec2(-1.0, 4.0);
-                let l = NAV_PX * 0.30;
-                for (dir, col) in [
-                    (egui::vec2(l, l * 0.30), egui::Color32::from_rgb(230, 100, 100)),
-                    (egui::vec2(-l * 0.45, l * 0.50), egui::Color32::from_rgb(120, 210, 120)),
-                    (egui::vec2(0.0, -l * 1.05), egui::Color32::from_rgb(130, 160, 255)),
-                ] {
-                    ui.painter()
-                        .line_segment([o, o + dir], egui::Stroke::new(1.4, col));
-                }
             }
         }
     }

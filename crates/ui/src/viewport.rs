@@ -148,7 +148,7 @@ fn fs_region(in: VSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(0.95, 0.58, 0.15, 0.22);
 }
 
-// Overlay lines (WCS triads, world axes): position + explicit color, no
+// Overlay lines (work offsets and Toolpath CS): position + explicit color, no
 // lighting - reference geometry must stay legible at any zoom.
 struct LineOut {
     @builtin(position) clip: vec4<f32>,
@@ -495,7 +495,7 @@ impl View3D {
             cache: None,
         });
 
-        // Non-indexed lines for the WCS triads and world axes: their own
+        // Non-indexed lines for work offsets and Toolpath CS: their own
         // vertex layout (pos + rgb), no lighting, depth-tested but never
         // occluded-by-write.
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -708,7 +708,7 @@ impl View3D {
     }
 
     /// Replace the overlay line set: pairs of `[x, y, z, r, g, b]` vertices
-    /// drawn non-indexed after every solid - the WCS triads, world axes and
+    /// drawn non-indexed after every solid - work offsets, Toolpath CS and
     /// cached toolpaths (the producers cap the list before it gets here).
     pub fn set_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lines: &[[f32; 6]]) {
         if lines.is_empty() {

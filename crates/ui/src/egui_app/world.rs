@@ -202,6 +202,7 @@ fn world_verts(state: &State, entity: &flecs_ecs::prelude::Entity) -> Vec<[f32; 
 fn collect_parts(state: &State) -> Vec<GpuPart> {
     let mut parts: Vec<GpuPart> = model::model_entities(&state.world)
         .into_iter()
+        .filter(|(_, entity)| state.model_in_active_setup(entity))
         .filter(|(name, _)| !state.hidden_models.iter().any(|h| h == name))
         .map(|(_, entity)| GpuPart {
             verts: world_verts(state, &entity),

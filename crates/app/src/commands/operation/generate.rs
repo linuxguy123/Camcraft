@@ -43,6 +43,14 @@ fn stage_generation(world: &World, name: &str) -> Result<Staged, CommandError> {
     };
     let prev_operation = model::operation_of(world, &entity)
         .ok_or_else(|| CommandError::Invalid(format!("'{name}' is not an operation")))?;
+    let active = crate::setup::active(world);
+    if active.is_some()
+        && crate::setup::effective(world, prev_operation.setup.as_deref()) != active
+    {
+        return Err(CommandError::Machining(format!(
+            "{name}: activate its setup before generating its toolpath"
+        )));
+    }
     // M10.1 C: a tool gone or of the wrong family blocks generation by
     // name, before the generator runs - the generators' shape doors stay
     // the backstop behind this one, never the first word.
@@ -158,7 +166,7 @@ impl RegenerateAll {
     pub fn new(world: &World) -> Self {
         let mut parts: Vec<GenerateOperation> = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
-        let cap = crate::setup::operation_order(world).len().max(1);
+        let cap = crate::setup::active_operation_order(world).len().max(1);
         let mut rounds = 0;
         while rounds < cap {
             let (round, staged_any) = Self::round(world, &mut skipped);
@@ -177,7 +185,7 @@ impl RegenerateAll {
         }
         // Still Stale after the cap (a cycle no order converges): named,
         // never silent - the post refuses it anyway.
-        for (name, entity) in crate::setup::operation_order(world) {
+        for (name, entity) in crate::setup::active_operation_order(world) {
             if operation::status_of(world, &entity) == operation::OpStatus::Stale
                 && !skipped.iter().any(|(n, _)| *n == name)
             {
@@ -202,7 +210,7 @@ impl RegenerateAll {
         let mut staged = Vec::new();
         let mut staged_setups: Vec<Option<String>> = Vec::new();
         let mut attempted = false;
-        for (name, entity) in crate::setup::operation_order(world) {
+        for (name, entity) in crate::setup::active_operation_order(world) {
             if operation::status_of(world, &entity) != operation::OpStatus::Stale
                 || skipped.iter().any(|(n, _)| *n == name)
             {

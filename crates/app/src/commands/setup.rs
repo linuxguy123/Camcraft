@@ -1,5 +1,4 @@
-//! Setup commands: create, delete, activate, and move operations
-//! between setups (M3.2 stage A).
+//! Setup commands: create, delete, activate, and choose a machine CS.
 //!
 //! Provenance: our own design; one clamping = one datum system is
 //! standard machine-shop practice, specced from general machining
@@ -26,16 +25,11 @@
 //!   by declaration or by the first/implicit position), naming the
 //!   operation. Furniture the setup alone owns goes with it; names the
 //!   legacy world or another setup also points at stay.
-//! - **Activation is inert data** (AGENTS.md, M1.6): which setup is
-//!   ACTIVE changes no path, no stamp, no staleness - it only decides
-//!   where NEW things join. Commands write the singleton; readers
-//!   (`setup::active`) fall back to the first setup when it names
-//!   nothing that exists.
-//! - **Moving an operation between setups keeps its stamp.** The
-//!   digest covers the RESOLVED heights and the stock's identity, so
-//!   the machinery that already exists says Ok when the two setups
-//!   place their stock identically, and Stale when they do not - no
-//!   forced invalidation either way.
+//! - **Activation restores the setup context.** The shared model gets
+//!   the selected setup's part placements; machine and post choices
+//!   follow it. The other setup's cached paths stay in their entities.
+//! - **Operation membership is fixed at creation.** Each operation
+//!   belongs to the setup active when it was created.
 
 use flecs_ecs::core::EntityViewGet; // try_get is not re-exported in prelude (0.2.2)
 use flecs_ecs::prelude::World;
@@ -43,9 +37,7 @@ use flecs_ecs::prelude::World;
 use crate::commands::{Command, CommandError};
 use crate::geometry::Triangle;
 use crate::model;
-use crate::schema::{
-    Location, Operation, OperationMeta, SetupDef, StockDef, Wcs, STOCK_NAME, WCS_SLOTS,
-};
+use crate::schema::{Location, SetupDef, StockDef, Wcs, STOCK_NAME, WCS_SLOTS};
 use crate::setup;
 use crate::stock::StockShape;
 
@@ -58,26 +50,23 @@ struct StockSnap {
     facets: std::sync::Arc<[Triangle]>,
 }
 
-/// Create a setup, optionally transferring a datum: cloning the named
-/// source setup's stock and `G54`..`G59` placements into the new
-/// setup's own entities. With no source the new setup starts with empty
-/// furniture (lazily spawned by `SetStock`/`SetWcsOrigin` when used).
+/// Create a setup using the global stock, with an independent placement
+/// of the workpiece. An optional datum source copies placed legacy offsets.
 pub struct CreateSetup {
     name: String,
     def: SetupDef,
-    /// Furniture the datum transfer clones in (owned names only - the
-    /// materialization case clones nothing; it points at what exists).
-    stock: Option<StockSnap>,
     wcs: Vec<(String, Location)>,
     /// The active setup before this command, restored by its inverse.
     prev_active: Option<String>,
+    prev_def: Option<(String, SetupDef)>,
+    current_poses: Vec<(String, Location)>,
+    current_context: crate::schema::SetupContext,
 }
 
 impl CreateSetup {
     /// `name` defaults to the next free `SetupN`. `datum_from` names an
-    /// existing setup to clone; `None` means a fresh, empty context -
-    /// except on a document with no setups at all, where creation is by
-    /// law the MATERIALIZATION and points at the legacy entities.
+    /// existing setup for legacy offset placement; `None` keeps those
+    /// offsets unplaced. Stock is shared in either case.
     pub fn new(
         world: &World,
         name: Option<&str>,
@@ -108,6 +97,23 @@ impl CreateSetup {
             )));
         }
         let materializing = setup::names(world).is_empty();
+        let legacy_offsets_placed = (0..WCS_SLOTS.len())
+            .any(|slot| setup::wcs_entity(world, None, slot).is_some());
+        let current_poses = setup::model_poses(world);
+        let current_context = setup::current_context(world);
+        let inherited_context = datum_from
+            .filter(|from| setup::active(world).as_deref() != Some(*from))
+            .and_then(|from| setup::def_of(world, from))
+            .and_then(|def| def.context)
+            .unwrap_or_else(|| current_context.clone());
+        let inherited_poses = datum_from
+            .filter(|from| setup::active(world).as_deref() != Some(*from))
+            .and_then(|from| setup::def_of(world, from))
+            .map(|def| def.model_poses)
+            .filter(|poses| !poses.is_empty())
+            .unwrap_or_else(|| current_poses.clone());
+        let prev_def = setup::active(world)
+            .and_then(|active| setup::def_of(world, &active).map(|def| (active, def)));
         if materializing && datum_from.is_some() {
             return Err(CommandError::Invalid(
                 "there is nothing to transfer a datum from yet".into(),
@@ -118,29 +124,27 @@ impl CreateSetup {
                 stock: STOCK_NAME.to_string(),
                 wcs: WCS_SLOTS.iter().map(|s| s.to_string()).collect(),
                 datum_from: String::new(),
+                model_poses: inherited_poses.clone(),
+                machine_wcs: 0,
+                modern_cs: !legacy_offsets_placed,
+                context: Some(inherited_context.clone()),
             }
         } else {
             SetupDef {
-                stock: format!("{name}/Stock"),
+                stock: STOCK_NAME.to_string(),
                 wcs: WCS_SLOTS.iter().map(|w| format!("{name}/{w}")).collect(),
                 datum_from: datum_from.unwrap_or("").to_string(),
+                model_poses: inherited_poses,
+                machine_wcs: datum_from.and_then(|from| setup::def_of(world, from))
+                    .map_or(0, |def| def.machine_wcs),
+                modern_cs: true,
+                context: Some(inherited_context),
             }
         };
-        let mut stock = None;
         let mut wcs = Vec::new();
         if let Some(from) = datum_from {
             if !setup::exists(world, from) {
                 return Err(CommandError::NotFound(from.to_string()));
-            }
-            if let Some((entity, shape)) = setup::stock_entity(world, Some(from))
-                .and_then(|e| model::stock_def_of(world, &e).map(|s| (e, s)))
-            {
-                stock = Some(StockSnap {
-                    name: format!("{name}/Stock"),
-                    shape,
-                    location: model::transform_of(world, &entity).unwrap_or_default(),
-                    facets: model::facets_of(world, &entity).unwrap_or_default(),
-                });
             }
             for i in 0..WCS_SLOTS.len() {
                 let Some(entity) = setup::wcs_entity(world, Some(from), i) else {
@@ -157,9 +161,11 @@ impl CreateSetup {
         Ok(CreateSetup {
             name,
             def,
-            stock,
             wcs,
             prev_active: setup::active(world),
+            prev_def,
+            current_poses,
+            current_context,
         })
     }
 
@@ -170,22 +176,19 @@ impl CreateSetup {
 
 impl Command for CreateSetup {
     fn apply(&self, world: &World) {
+        if let Some((name, def)) = &self.prev_def
+            && let Some(entity) = model::find_by_name(world, name)
+        {
+            let mut updated = def.clone();
+            updated.model_poses = self.current_poses.clone();
+            updated.context = Some(self.current_context.clone());
+            entity.entity_view(world).set(updated);
+        }
         let entity = match model::find_by_name(world, &self.name) {
             Some(e) => e,
             None => model::spawn(world, &self.name),
         };
         entity.entity_view(world).set(self.def.clone());
-        if let Some(s) = &self.stock {
-            let e = match model::find_by_name(world, &s.name) {
-                Some(e) => e,
-                None => model::spawn(world, &s.name),
-            };
-            model::set_transform(world, &e, s.location);
-            model::set_facets(world, &e, s.facets.clone());
-            e.entity_view(world).set(StockDef {
-                shape: s.shape.clone(),
-            });
-        }
         for (wname, loc) in &self.wcs {
             let e = match model::find_by_name(world, wname) {
                 Some(e) => e,
@@ -196,15 +199,21 @@ impl Command for CreateSetup {
         }
         // The new setup is the one you work in (module header: creation
         // activates; undo restores what was active).
+        setup::restore_model_poses(world, &self.def.model_poses);
+        if let Some(context) = &self.def.context {
+            setup::restore_context(world, context);
+        }
         setup::set_active(world, Some(self.name.clone()));
     }
 
     fn invert(&self, world: &World) {
+        setup::restore_model_poses(world, &self.current_poses);
+        setup::restore_context(world, &self.current_context);
         setup::set_active(world, self.prev_active.clone());
-        if let Some(s) = &self.stock
-            && let Some(e) = model::find_by_name(world, &s.name)
+        if let Some((name, def)) = &self.prev_def
+            && let Some(entity) = model::find_by_name(world, name)
         {
-            model::remove(world, &e);
+            entity.entity_view(world).set(def.clone());
         }
         for (wname, _) in &self.wcs {
             if let Some(e) = model::find_by_name(world, wname) {
@@ -228,6 +237,11 @@ pub struct DeleteSetup {
     stock: Option<StockSnap>,
     wcs: Vec<(String, Location)>,
     prev_active: Option<String>,
+    previous_poses: Vec<(String, Location)>,
+    previous_context: crate::schema::SetupContext,
+    next_active: Option<String>,
+    next_poses: Vec<(String, Location)>,
+    next_context: crate::schema::SetupContext,
 }
 
 impl DeleteSetup {
@@ -244,9 +258,12 @@ impl DeleteSetup {
             let declared = model::operation_of(world, &op_e).and_then(|o| o.setup);
             if setup::belongs(world, declared.as_deref(), name) {
                 return Err(CommandError::Invalid(format!(
-                    "'{op_name}' machines in '{name}' - move or delete it first"
+                    "'{op_name}' machines in '{name}' - delete the operation first"
                 )));
             }
+        }
+        if setup::names(world).len() == 1 {
+            return Err(CommandError::Invalid("the last setup cannot be deleted".into()));
         }
         let owned = |n: &str| {
             n != STOCK_NAME && !WCS_SLOTS.contains(&n) && !setup::is_furniture_of_other(world, n, name)
@@ -275,12 +292,36 @@ impl DeleteSetup {
                 wcs.push((wname.clone(), loc));
             }
         }
+        let prev_active = setup::active(world);
+        let next_active = if prev_active.as_deref() == Some(name) {
+            setup::names(world).into_iter().find(|candidate| candidate != name)
+        } else {
+            prev_active.clone()
+        };
+        let previous_poses = setup::model_poses(world);
+        let previous_context = setup::current_context(world);
+        let next_poses = next_active.as_deref()
+            .filter(|_| prev_active.as_deref() == Some(name))
+            .and_then(|candidate| setup::def_of(world, candidate))
+            .map(|def| def.model_poses)
+            .filter(|poses| !poses.is_empty())
+            .unwrap_or_else(|| previous_poses.clone());
+        let next_context = next_active.as_deref()
+            .filter(|_| prev_active.as_deref() == Some(name))
+            .and_then(|candidate| setup::def_of(world, candidate))
+            .and_then(|def| def.context)
+            .unwrap_or_else(|| previous_context.clone());
         Ok(DeleteSetup {
             name: name.to_string(),
             def,
             stock,
             wcs,
-            prev_active: setup::active(world),
+            prev_active,
+            previous_poses,
+            previous_context,
+            next_active,
+            next_poses,
+            next_context,
         })
     }
 }
@@ -300,9 +341,13 @@ impl Command for DeleteSetup {
         if let Some(e) = model::find_by_name(world, &self.name) {
             model::remove(world, &e);
         }
-        // The active-setup singleton is left pointing where it pointed:
-        // `setup::active`'s existence fallback makes a deleted name read
-        // as the first remaining setup, exactly the law.
+        if self.prev_active.as_deref() == Some(self.name.as_str()) {
+            setup::restore_model_poses(world, &self.next_poses);
+            setup::restore_context(world, &self.next_context);
+            setup::set_active(world, self.next_active.clone());
+        }
+        // The cursor follows the first remaining setup when its current
+        // setup is deleted.
     }
 
     fn invert(&self, world: &World) {
@@ -321,16 +366,23 @@ impl Command for DeleteSetup {
             e.entity_view(world).add(Wcs);
             model::set_transform(world, &e, *loc);
         }
+        setup::restore_model_poses(world, &self.previous_poses);
+        setup::restore_context(world, &self.previous_context);
         setup::set_active(world, self.prev_active.clone());
     }
 }
 
-/// Choose the ACTIVE setup: where new operations and new furniture
-/// join. Inert for every stamp (module header) - this command moves a
-/// cursor, not geometry.
+/// Choose the active setup and restore its part placement, machine and
+/// post context. Undo restores the previous context exactly.
 pub struct ActivateSetup {
     name: Option<String>,
     prev: Option<String>,
+    before_poses: Vec<(String, Location)>,
+    target_poses: Vec<(String, Location)>,
+    prev_def: Option<SetupDef>,
+    target_def: Option<SetupDef>,
+    before_context: crate::schema::SetupContext,
+    target_context: crate::schema::SetupContext,
 }
 
 impl ActivateSetup {
@@ -340,88 +392,104 @@ impl ActivateSetup {
         {
             return Err(CommandError::NotFound(n.to_string()));
         }
+        let prev = setup::active(world);
+        let target = name.map(str::to_string).or_else(|| setup::first(world));
+        let before_poses = setup::model_poses(world);
+        let before_context = setup::current_context(world);
+        let prev_def = prev.as_deref().and_then(|s| setup::def_of(world, s));
+        let target_def = target.as_deref().and_then(|s| setup::def_of(world, s));
+        let target_poses = target_def.as_ref()
+            .filter(|_| target != prev)
+            .map(|def| def.model_poses.clone())
+            .filter(|poses| !poses.is_empty())
+            .unwrap_or_else(|| before_poses.clone());
+        let target_context = target_def.as_ref()
+            .filter(|_| target != prev)
+            .and_then(|def| def.context.clone())
+            .unwrap_or_else(|| before_context.clone());
         Ok(ActivateSetup {
-            name: name.map(str::to_string),
-            prev: setup::active(world),
+            name: name.map(str::to_string), prev, before_poses,
+            target_poses, prev_def, target_def,
+            before_context, target_context,
         })
     }
 }
 
 impl Command for ActivateSetup {
     fn apply(&self, world: &World) {
+        if self.name != self.prev {
+            if let (Some(name), Some(def)) = (&self.prev, &self.prev_def)
+                && let Some(entity) = model::find_by_name(world, name)
+            {
+                let mut updated = def.clone();
+                updated.model_poses = self.before_poses.clone();
+                updated.context = Some(self.before_context.clone());
+                entity.entity_view(world).set(updated);
+            }
+            setup::restore_model_poses(world, &self.target_poses);
+            setup::restore_context(world, &self.target_context);
+        }
         setup::set_active(world, self.name.clone());
     }
 
     fn invert(&self, world: &World) {
+        if self.name != self.prev {
+            setup::restore_model_poses(world, &self.before_poses);
+            setup::restore_context(world, &self.before_context);
+            if let (Some(name), Some(def)) = (&self.prev, &self.prev_def)
+                && let Some(entity) = model::find_by_name(world, name)
+            {
+                entity.entity_view(world).set(def.clone());
+            }
+            if let (Some(name), Some(def)) = (&self.name, &self.target_def)
+                && let Some(entity) = model::find_by_name(world, name)
+            {
+                entity.entity_view(world).set(def.clone());
+            }
+        }
         setup::set_active(world, self.prev.clone());
     }
 }
 
-/// Move an operation into another setup (or into the implicit first
-/// position with `None`). The stamp is KEPT: resolved heights and the
-/// stock's identity re-digest on the next question, so the operation
-/// reads Ok when the placements match and Stale when they do not - the
-/// staleness law answering, not this command assuming.
-pub struct SetOperationSetup {
+/// Select the controller's G54-G59 register for one setup. This changes
+/// the posted work-offset word, never the virtual Toolpath CS placement.
+pub struct SetSetupMachineCs {
     name: String,
-    prev: Operation,
-    next: Operation,
-    prev_meta: OperationMeta,
-    next_meta: OperationMeta,
+    before: SetupDef,
+    after: SetupDef,
 }
 
-impl SetOperationSetup {
-    pub fn new(
-        world: &World,
-        op_name: &str,
-        target: Option<&str>,
-    ) -> Result<Self, CommandError> {
-        let entity = model::find_by_name(world, op_name)
-            .ok_or_else(|| CommandError::NotFound(op_name.to_string()))?;
-        let prev = model::operation_of(world, &entity)
-            .ok_or_else(|| CommandError::Invalid(format!("'{op_name}' is not an operation")))?;
-        if let Some(t) = target
-            && !setup::exists(world, t)
-        {
-            return Err(CommandError::NotFound(t.to_string()));
+impl SetSetupMachineCs {
+    pub fn new(world: &World, name: &str, slot: usize) -> Result<Self, CommandError> {
+        if slot >= WCS_SLOTS.len() {
+            return Err(CommandError::Invalid("machine CS must be G54 through G59".into()));
         }
-        if target == prev.setup.as_deref() {
-            return Err(CommandError::Invalid(format!(
-                "'{op_name}' already machines in {}",
-                target.map_or_else(|| "the first setup".to_string(), str::to_string)
-            )));
+        let before = setup::def_of(world, name)
+            .ok_or_else(|| CommandError::NotFound(name.to_owned()))?;
+        if !before.modern_cs && setup::operation_order(world).into_iter().any(|(_, entity)| {
+            model::operation_of(world, &entity).is_some_and(|op| setup::belongs(world, op.setup.as_deref(), name))
+        }) {
+            return Err(CommandError::Invalid(
+                "this v0.14 setup uses placed work offsets; its existing operations cannot change setups".into()
+            ));
         }
-        let next = Operation {
-            setup: target.map(str::to_string),
-            ..prev.clone()
-        };
-        let prev_meta = model::operation_meta_of(world, &entity);
-        let mut next_meta = prev_meta.clone();
-        // A rank belongs to its old setup. A moved operation joins the
-        // target's unranked tail until the user places it there.
-        next_meta.order = None;
-        Ok(SetOperationSetup {
-            name: op_name.to_string(),
-            prev,
-            next,
-            prev_meta,
-            next_meta,
-        })
+        let mut after = before.clone();
+        after.machine_wcs = slot;
+        after.modern_cs = true;
+        Ok(Self { name: name.to_owned(), before, after })
     }
 }
 
-impl Command for SetOperationSetup {
+impl Command for SetSetupMachineCs {
     fn apply(&self, world: &World) {
         if let Some(entity) = model::find_by_name(world, &self.name) {
-            entity.entity_view(world).set(self.next.clone());
-            entity.entity_view(world).set(self.next_meta.clone());
+            entity.entity_view(world).set(self.after.clone());
         }
     }
 
     fn invert(&self, world: &World) {
         if let Some(entity) = model::find_by_name(world, &self.name) {
-            entity.entity_view(world).set(self.prev.clone());
-            entity.entity_view(world).set(self.prev_meta.clone());
+            entity.entity_view(world).set(self.before.clone());
         }
     }
 }

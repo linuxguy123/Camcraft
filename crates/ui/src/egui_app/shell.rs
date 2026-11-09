@@ -1444,7 +1444,7 @@ pub(crate) fn cached_script(state: &mut State) -> std::sync::Arc<camcraft_app::s
 pub(crate) fn sim_script(state: &State) -> camcraft_app::sim::Script {
     use camcraft_app::{model, posting, setup, sim};
     let tr = sim::Traverse::from_machine(&posting::machine_value(&state.world));
-    let paths: Vec<(String, camcraft_app::cl::Toolpath)> = setup::operation_order(&state.world)
+    let paths: Vec<(String, camcraft_app::cl::Toolpath)> = setup::active_operation_order(&state.world)
         .into_iter()
         .filter_map(|(n, e)| model::toolpath_of(&state.world, &e).map(|tp| (n, tp.path)))
         .collect();

@@ -40,7 +40,10 @@ use super::*;
 /// before (the arrival law).
 /// v50: operation labels and within-setup order become persisted. An old
 /// reader must refuse the file rather than silently post in name order.
-pub const PROJECT_VERSION: u32 = 50;
+/// v51: each setup stores part placement, machine, post and its one
+/// machine work-offset register. A v50 setup inherits the document-wide
+/// choices when opened; the first switch records an independent copy.
+pub const PROJECT_VERSION: u32 = 51;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {

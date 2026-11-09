@@ -139,6 +139,8 @@ pub struct Row {
     pub icon: Option<Icon>,
     /// Selection band - the WORLD's selection mirrored, never a local flag.
     pub selected: bool,
+    /// This row names the active setup, distinct from an entity selection.
+    pub active_setup: bool,
     pub hidden: bool,
     /// Indent level (sections 0, children 1).
     pub depth: usize,
@@ -177,6 +179,7 @@ pub(crate) fn has_eye(kind: Kind) -> bool {
 /// Hit result for one frame of the tree.
 pub struct TreeHit {
     pub row: Option<usize>,
+    pub caret: Option<usize>,
     pub eye: Option<usize>,
     /// The row a secondary click landed on this frame (M9.1): the
     /// retype menu's channel, a hit like the others - never state.
@@ -199,7 +202,7 @@ pub fn tree(
     pal: &Tokens,
     icons: Option<&IconSet>,
 ) -> TreeHit {
-    let mut hit = TreeHit { row: None, eye: None, menu: None, drag_started: None };
+    let mut hit = TreeHit { row: None, caret: None, eye: None, menu: None, drag_started: None };
     let mut eye_resps: Vec<(usize, Response)> = Vec::new();
     let row_h = pal.row_height;
     for (ix, row) in rows.iter().enumerate() {
@@ -213,6 +216,13 @@ pub fn tree(
         // row+eye (browser.rs reaches the same law by submitting the eye's
         // invisible button before the Selectable).
         let row_resp = ui.interact(rr, ui.id().with(("tree-row", ix)), Sense::click_and_drag());
+        let gx = rr.left() + 10.0 + row.depth as f32 * 14.0;
+        if matches!(row.kind, Kind::Parent(_)) {
+            let caret_rect = Rect::from_center_size(Pos2::new(gx, rr.center().y), Vec2::new(13.0, 16.0));
+            if ui.interact(caret_rect, ui.id().with(("tree-caret", ix)), Sense::click()).clicked() {
+                hit.caret = Some(ix);
+            }
+        }
         let eye_rect = if has_eye(row.kind) {
             let er = Rect::from_center_size(
                 Pos2::new(rr.right() - 12.0, rr.center().y),
@@ -228,26 +238,34 @@ pub fn tree(
             None
         };
         let painter = ui.painter();
-        if row.selected {
+        if row.active_setup {
+            painter.add(Shape::rect_filled(rr.shrink(1.0), pal.radius_widget, pal.field_active));
+            painter.add(Shape::rect_filled(
+                Rect::from_min_max(rr.left_top(), Pos2::new(rr.left() + 3.0, rr.bottom())),
+                0.0,
+                pal.accent,
+            ));
+        } else if row.selected {
             painter.add(Shape::rect_filled(rr.shrink(1.0), pal.radius_widget, pal.selection_bg));
         } else if row_resp.hovered() {
             painter.add(Shape::rect_filled(rr.shrink(1.0), pal.radius_widget, pal.field_hover));
         }
-        let gx = rr.left() + 10.0 + row.depth as f32 * 14.0;
+        let is_parent = matches!(row.kind, Kind::Parent(_));
         // PNG first (browser.rs: the tree icon rides the row, dimmed to
         // 0.55 when hidden), the painted glyph as the no-GPU twin.
         let tex = icons.and_then(|s| row.icon.map(|i| s.texture(i))).flatten();
+        let icon_x = if is_parent && tex.is_some() { gx + 13.0 } else { gx };
         if let Some(tex) = tex {
             let dim = if row.hidden { 140 } else { 255 };
             painter.image(
                 tex.id(),
-                Rect::from_center_size(Pos2::new(gx, rr.center().y), Vec2::splat(TREE_INK)),
+                Rect::from_center_size(Pos2::new(icon_x, rr.center().y), Vec2::splat(TREE_INK)),
                 UV_FULL,
                 Color32::from_white_alpha(dim),
             );
         }
         let mut shapes = Vec::new();
-        if tex.is_none() {
+        if tex.is_none() || is_parent {
             glyph(&mut shapes, Pos2::new(gx, rr.center().y), row.kind, pal);
         }
         if let Some(er) = eye_rect {
@@ -276,10 +294,17 @@ pub fn tree(
         // The column model: one galley, label + suffix, truncated into the
         // text column - everything right of it belongs to the eye, never
         // to overflowing ink (divergence 1's fix).
-        let ink = if row.hidden { pal.text_faint } else { pal.text };
+        let ink = if row.hidden {
+            pal.text_faint
+        } else if row.active_setup {
+            pal.accent
+        } else {
+            pal.text
+        };
         let suffix_ink = if row.hidden { pal.text_faint } else { pal.text_dim };
         let reserve = if has_eye(row.kind) { EYE_RESERVE } else { 6.0 };
-        let max_w = (rr.right() - reserve - (gx + 12.0)).max(0.0);
+        let label_x = icon_x + 12.0;
+        let max_w = (rr.right() - reserve - label_x).max(0.0);
         let mut job = LayoutJob {
             wrap: TextWrapping::truncate_at_width(max_w),
             ..LayoutJob::default()
@@ -298,17 +323,17 @@ pub fn tree(
         }
         let galley = painter.layout_job(job);
         painter.galley(
-            Pos2::new(gx + 12.0, rr.center().y - galley.size().y * 0.5),
+            Pos2::new(label_x, rr.center().y - galley.size().y * 0.5),
             galley,
             ink,
         );
-        if row_resp.clicked() && hit.eye != Some(ix) {
+        if row_resp.clicked() && hit.eye != Some(ix) && hit.caret != Some(ix) {
             hit.row = Some(ix);
         }
-        if row_resp.secondary_clicked() && hit.eye != Some(ix) {
+        if row_resp.secondary_clicked() && hit.eye != Some(ix) && hit.caret != Some(ix) {
             hit.menu = Some(ix);
         }
-        if row_resp.drag_started() && hit.eye != Some(ix) {
+        if row_resp.drag_started() && hit.eye != Some(ix) && hit.caret != Some(ix) {
             hit.drag_started = Some(ix);
         }
     }

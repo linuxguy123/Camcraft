@@ -114,7 +114,7 @@ pub fn properties(ui: &mut Ui, state: &mut State, pal: &Tokens) {
         super::op_page::operation_page(ui, state, n.as_str(), pal);
         return;
     }
-    let has_close = matches!(&t, UiTarget::Tool(_) | UiTarget::Stock | UiTarget::WcsSlot(_) | UiTarget::Model(_));
+    let has_close = matches!(&t, UiTarget::Tool(_) | UiTarget::Stock | UiTarget::WcsSlot(_) | UiTarget::Model(_) | UiTarget::Machine | UiTarget::ToolpathCs | UiTarget::MachineCs | UiTarget::Workholders);
     let content_height = (ui.available_height() - if has_close { 40.0 } else { 0.0 }).max(80.0);
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -129,6 +129,99 @@ pub fn properties(ui: &mut Ui, state: &mut State, pal: &Tokens) {
                 ui.separator();
                 stock_page(ui, state);
                 setup_error(ui, state);
+            }
+            UiTarget::Machine => {
+                ui.heading("Machine");
+                ui.separator();
+                machine_section(ui, state);
+                ui.separator();
+                post_section(ui, state);
+            }
+            UiTarget::ToolpathCs => {
+                ui.heading("Toolpath CS");
+                ui.label("Place the model for this setup. Its origin is the zero used by generated toolpaths.");
+                ui.separator();
+                let parts: Vec<String> = model::model_entities(&state.world)
+                    .into_iter()
+                    .filter(|(_, entity)| !model::is_fixture(&state.world, entity))
+                    .map(|(name, _)| name)
+                    .collect();
+                if parts.is_empty() {
+                    state.toolpath_pick_markers = false;
+                    ui.label("Import a model to place it in this setup.");
+                } else {
+                    let mut selected = if state.toolpath_part.as_ref().is_some_and(|part| parts.contains(part)) {
+                        state.toolpath_part.clone().unwrap_or_default()
+                    } else {
+                        parts[0].clone()
+                    };
+                    if parts.len() > 1 {
+                        ui.horizontal_wrapped(|ui| {
+                            for part in &parts {
+                                if ui.selectable_label(*part == selected, part).clicked() {
+                                    selected = part.clone();
+                                }
+                            }
+                        });
+                    }
+                    state.toolpath_part = Some(selected.clone());
+                    if ui.checkbox(&mut state.toolpath_pick_markers, "Pick origin markers in viewport").changed()
+                        && state.toolpath_pick_markers
+                    {
+                        state.wcs_ui.pick_anchor = false;
+                    }
+                    if state.toolpath_pick_markers {
+                        state.refresh_toolpath_markers(&selected);
+                        ui.label(format!("{} model points available. Click a marker to place it at Toolpath CS zero.",
+                            state.toolpath_markers.len()));
+                        if state.toolpath_markers.is_empty() {
+                            ui.label("This model has no usable corners, edges, faces, or circles.");
+                        }
+                    }
+                    ui.separator();
+                    model_page(ui, state, selected);
+                }
+                setup_error(ui, state);
+            }
+            UiTarget::MachineCs => {
+                ui.heading("Machine CS");
+                ui.label("Choose the controller register to probe at this setup's Toolpath CS zero.");
+                ui.separator();
+                if let Some(active) = camcraft_app::setup::active(&state.world) {
+                    let def = camcraft_app::setup::def_of(&state.world, &active);
+                    if camcraft_app::machine::kind_of(&state.world) != camcraft_app::machine::Kind::Mill {
+                        ui.label("This selector is available for milling setups. Turning still uses placed work offsets.");
+                        for (slot, word) in WCS_SLOTS.iter().enumerate() {
+                            if ui.button(format!("Edit {word}")).clicked() {
+                                actions::target(state, UiTarget::WcsSlot(slot));
+                            }
+                        }
+                    } else if def.as_ref().is_some_and(|def| !def.modern_cs) {
+                        ui.label("Legacy setup: its placed work offsets are still used by existing operations.");
+                        ui.label("New operations can use one Machine CS and Toolpath CS zero in a new setup.");
+                        for (slot, word) in WCS_SLOTS.iter().enumerate() {
+                            if ui.button(format!("Edit legacy {word}")).clicked() {
+                                actions::target(state, UiTarget::WcsSlot(slot));
+                            }
+                        }
+                    } else {
+                        let selected = def.map_or(0, |def| def.machine_wcs);
+                        for (slot, word) in WCS_SLOTS.iter().enumerate() {
+                            if ui.radio(selected == slot, *word).clicked() && selected != slot {
+                                state.pending.push_back(CommandKind::SetSetupMachineCs {
+                                    name: active.clone(), slot,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    ui.label("Create a setup to select its machine CS.");
+                }
+                setup_error(ui, state);
+            }
+            UiTarget::Workholders => {
+                ui.heading("Workholders");
+                ui.label("Not implemented, coming soon");
             }
             UiTarget::WcsSlot(i) => {
                 state.sync_setup_ui();
@@ -309,15 +402,6 @@ fn stock_page(ui: &mut Ui, state: &mut State) {
                 .push_back(CommandKind::DeleteByName(stock_name.clone()));
         }
     });
-    ui.add_space(10.0);
-    ui.separator();
-    machine_section(ui, state);
-    ui.add_space(10.0);
-    ui.separator();
-    post_section(ui, state);
-    ui.add_space(10.0);
-    ui.separator();
-    theme_section(ui, state);
 }
 
 /// The document's theme (M6.1 C): setup furniture, read live off the
@@ -543,7 +627,7 @@ fn wcs_page(ui: &mut Ui, state: &mut State, slot: usize) {
     field(ui, "Turn about Z (yaw)");
     num_plain(ui, &mut state.wcs_ui.yaw_deg);
     ui.add_space(6.0);
-    ui.label("Quarter-turns about world axes (apply immediately):");
+    ui.label("Quarter-turns about Toolpath CS axes (apply immediately):");
     const TURNS: [(&str, usize, f64); 6] = [
         ("X+", 0, 1.0),
         ("X-", 0, -1.0),
@@ -606,7 +690,11 @@ fn wcs_page(ui: &mut Ui, state: &mut State, slot: usize) {
                     ui.radio_value(&mut state.wcs_ui.anchor_z, i, *name);
                 }
             });
-            ui.checkbox(&mut state.wcs_ui.pick_anchor, "Pick markers in viewport");
+            if ui.checkbox(&mut state.wcs_ui.pick_anchor, "Pick markers in viewport").changed()
+                && state.wcs_ui.pick_anchor
+            {
+                state.toolpath_pick_markers = false;
+            }
             if state.wcs_ui.pick_anchor {
                 ui.label("Click a yellow marker in the viewport to set the origin.");
             }
@@ -732,17 +820,14 @@ fn turn_model(state: &mut State, axis: usize, sign: f64) {
 
 /// The setups list (M3.2 A): the contexts a clamping creates. Clicking a
 /// row activates it (undoable - it is the ActiveSetup command), New
-/// creates the next named setup, optionally carrying the current one's
-/// stock and placed offsets across (the shop's datum transfer, the
-/// re-clamp law). The Stock and Work-offset pages always edit the ACTIVE
-/// row's furniture, so this page manages context, never geometry.
+/// creates the next named setup with the shared stock and a copy of the
+/// current workpiece placement. The page manages context, not geometry.
 fn setups_page(ui: &mut Ui, state: &mut State) {
     let names = camcraft_app::setup::names(&state.world);
     let active = camcraft_app::setup::active(&state.world);
     if names.is_empty() {
         ui.label(
-            "No setups in this document: the one global stock and the \
-             G54-G59 offsets act as the first setup.",
+            "This project has no setup. Create Setup1 to begin.",
         );
         ui.add_space(6.0);
         if ui.button("Create first setup").clicked() {
@@ -759,6 +844,8 @@ fn setups_page(ui: &mut Ui, state: &mut State) {
         ui.separator();
         tool_list_section(ui, state, None);
         sheet_footer(ui, state);
+        ui.separator();
+        theme_section(ui, state);
         return;
     }
     for name in &names {
@@ -773,7 +860,7 @@ fn setups_page(ui: &mut Ui, state: &mut State) {
                 ui.label("(active)");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Delete").clicked() {
+                if ui.add_enabled_ui(names.len() > 1, |ui| ui.small_button("Delete")).inner.clicked() {
                     state
                         .pending
                         .push_back(CommandKind::DeleteSetup(name.clone()));
@@ -781,12 +868,7 @@ fn setups_page(ui: &mut Ui, state: &mut State) {
             });
         });
         if let Some(def) = camcraft_app::setup::def_of(&state.world, name) {
-            let placed = (0..WCS_SLOTS.len())
-                .filter(|i| {
-                    camcraft_app::setup::wcs_entity(&state.world, Some(name.as_str()), *i).is_some()
-                })
-                .count();
-            let mut line = format!("    stock {}, offsets placed {placed}", def.stock);
+            let mut line = format!("    machine CS {}", WCS_SLOTS[def.machine_wcs]);
             if !def.datum_from.is_empty() {
                 line.push_str(&format!(", datum from {}", def.datum_from));
             }
@@ -794,27 +876,20 @@ fn setups_page(ui: &mut Ui, state: &mut State) {
         }
     }
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut state.setups_ui.datum, "Carry stock and offsets over");
-        if ui.button("New setup").clicked() {
-            let datum_from = if state.setups_ui.datum {
-                active.clone()
-            } else {
-                None
-            };
-            state.pending.push_back(CommandKind::CreateSetup {
-                name: None,
-                datum_from,
-            });
-            state.setups_ui.datum = false;
-        }
-    });
+    if ui.button("New setup").clicked() {
+        state.pending.push_back(CommandKind::CreateSetup {
+            name: None,
+            datum_from: None,
+        });
+    }
+    ui.label("Setups share the stock shape. Each setup keeps its own stock orientation; removed material is not carried forward yet.");
     ui.separator();
     fixtures_section(ui, state, active.as_deref());
     ui.separator();
     tool_list_section(ui, state, active.as_deref());
     sheet_footer(ui, state);
-    ui.label("The Stock and Work-offset pages edit the active setup's furniture.");
+    ui.separator();
+    theme_section(ui, state);
 }
 
 /// The tool list of one setup context (M3.2 stage C): what goes into
@@ -1695,7 +1770,7 @@ fn model_page(ui: &mut Ui, state: &mut State, name: String) {
     num_plain(ui, &mut state.model_ui.pitch_deg);
     field(ui, "Turn about Z (yaw)");
     num_plain(ui, &mut state.model_ui.yaw_deg);
-    ui.label("Quarter-turns about world axes (apply immediately):");
+    ui.label("Quarter-turns about Toolpath CS axes (apply immediately):");
     const TURNS: [(&str, usize, f64); 6] = [
         ("X+", 0, 1.0),
         ("X-", 0, -1.0),

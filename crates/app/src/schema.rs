@@ -120,13 +120,31 @@ pub struct ToolDef {
 /// `wcs` is indexed by [`WCS_SLOTS`]; an entry naming an entity that does
 /// not exist yet means "this slot is not placed in this setup", exactly
 /// as a missing `G55` entity means today. `datum_from` records the setup
-/// whose stock and G54 a new setup was cloned from - provenance for the
-/// sheet, inert for every stamp (the clones themselves carry the data).
+/// whose placed legacy offsets a new setup was copied from - provenance
+/// for the sheet, inert for every stamp. New setups share one stock entity.
 #[derive(Component, Debug, Clone, PartialEq)]
 pub struct SetupDef {
     pub stock: String,
     pub wcs: Vec<String>,
     pub datum_from: String,
+/// Part and stock placements restored when this setup becomes active.
+/// Their shared geometry stays in one entity each.
+    pub model_poses: Vec<(String, Location)>,
+    /// Controller register selected for this setup (0=G54 through 5=G59).
+    pub machine_wcs: usize,
+    /// New setups separate virtual Toolpath CS from the physical G5x
+    /// register. Pre-v51 setups retain their old WCS-origin arithmetic.
+    pub modern_cs: bool,
+    /// Machine and post used when this setup is active. None is the
+    /// migration value for v50 files, which inherited document choices.
+    pub context: Option<SetupContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SetupContext {
+    pub machine: MachineDef,
+    pub post: PostRef,
+    pub post_options: PostOptions,
 }
 
 /// The M3.2 stage B marker turning a model entity into a FIXTURE: the
@@ -237,7 +255,7 @@ pub struct Units(pub crate::geometry::units::Unit);
 /// lookup, or a saved entity. `machine: None` means no definition was
 /// loaded and the limit checker checks nothing; `path` names the `.mch`
 /// it was read from (empty when not read from disk) for display only.
-#[derive(Component, Debug, Clone, Default, PartialEq)]
+#[derive(Component, Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MachineDef {
     pub path: String,
     pub machine: Option<crate::machine::def::Machine>,
@@ -254,7 +272,7 @@ pub struct MachineDef {
 /// files, checks names against the registry), re-read at post time and
 /// refused by name if they went missing, never silently swapped back
 /// to the default.
-#[derive(Component, Debug, Clone, Default, PartialEq)]
+#[derive(Component, Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PostRef {
     #[default]
     Builtin,
@@ -268,7 +286,7 @@ pub enum PostRef {
 /// ones it knows from its `postOptions` global and ignores the rest;
 /// the default is every post's own default, so a document that never
 /// chose writes no key.
-#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PostOptions {
     /// How a lathe post writes a thread (Fanuc Lathe: G32 passes, the
     /// default, or the two-block G76 cycle from the thread record).
@@ -276,7 +294,7 @@ pub struct PostOptions {
 }
 
 /// The thread-output choice of [`PostOptions`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadingOutput {
     /// Every pass as synchronized G32 moves - the stream's own passes.
     #[default]

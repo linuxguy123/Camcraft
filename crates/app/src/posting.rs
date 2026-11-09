@@ -378,9 +378,18 @@ fn viewer_map(records: &[cnc::Record], out: &engine::PostOutput) -> Vec<Option<[
 /// what would post* holds by construction, not by two copies of the
 /// law agreeing (stage D makes the agreement load-bearing).
 pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
+    if crate::setup::active(world).is_some() {
+        for (name, entity) in crate::setup::operation_order(world) {
+            if let Some(declared) = model::operation_of(world, &entity).and_then(|op| op.setup)
+                && !crate::setup::exists(world, &declared)
+            {
+                return Err(format!("{name}: setup '{declared}' no longer exists"));
+            }
+        }
+    }
     // THE order law by call (M3.2 A): setup rank, then operation position - the same
     // walk re-machining, the sim and the machine-limit check make.
-    let ops: Vec<(String, Entity)> = crate::setup::operation_order(world);
+    let ops: Vec<(String, Entity)> = crate::setup::active_operation_order(world);
     if ops.is_empty() {
         return Err("no operations to post".into());
     }
@@ -703,6 +712,18 @@ pub(crate) fn wcs_context<'a>(
     setup: Option<&str>,
     params: &'a OpParams,
 ) -> (&'a str, [f64; 3]) {
+    if crate::machine::kind_of(world) == crate::machine::Kind::Mill
+        && let Some(def) = crate::setup::effective(world, setup)
+        .as_deref()
+        .and_then(|name| crate::setup::def_of(world, name))
+        && def.modern_cs
+    {
+        // The Toolpath CS places the model in program coordinates. G54-G59
+        // identifies the matching physical register on the controller;
+        // the machine operator probes its zero and no second virtual
+        // translation is applied by the post.
+        return (WCS_SLOTS[def.machine_wcs.min(WCS_SLOTS.len() - 1)], [0.0; 3]);
+    }
     let slot = params
         .heights()
         .into_iter()

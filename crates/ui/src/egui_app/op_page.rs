@@ -1,6 +1,6 @@
 //! The operation page's frame (reorganised on the user's 2026-11-06
 //! review: "interface is hard to read, badly organised"): a compact
-//! label | control header for Tool, Source and Setup; ONE coloured status
+//! label | control header for Tool and Source; ONE coloured status
 //! banner that expands to the warning list on click; the section tab bar;
 //! the open tab's content in its own scroll; and a fixed action bar at
 //! the bottom, outside the scroll - Generate primary, Apply, Clear
@@ -134,7 +134,7 @@ pub(super) fn operation_page(ui: &mut Ui, state: &mut State, name: &str, pal: &T
     actions(ui, state, &target, live.as_ref(), exists, pal);
 }
 
-/// Tool, Source and Setup as label | control rows of the header grid.
+/// Tool and Source as label | control rows of the header grid.
 fn header_rows(ui: &mut Ui, state: &mut State, target: &str, live: Option<&Operation>, exists: bool) {
     let mut tools = state.tool_names();
     if !state.op_ui.tool.is_empty() && !tools.contains(&state.op_ui.tool) {
@@ -215,25 +215,6 @@ fn header_rows(ui: &mut Ui, state: &mut State, target: &str, live: Option<&Opera
     }
     ui.end_row();
 
-    // Setup membership (M3.2 A): moving is never a stamp edit -
-    // SetOperationSetup keeps the stamp and lets the resolved-Z digest
-    // say whether the op went Stale.
-    ui.label("Setup");
-    let setups = camcraft_app::setup::names(&state.world);
-    if setups.is_empty() {
-        ui.label("global (no setups)").on_hover_text("this document has no setups yet - the global stock and offsets apply");
-    } else {
-        let cur = live.and_then(|o| o.setup.clone()).or_else(|| setups.first().cloned());
-        let mut s_idx = setups.iter().position(|n| Some(n) == cur.as_ref()).unwrap_or(0);
-        let before = s_idx;
-        combo_owned(ui, "op_setup", &mut s_idx, &setups);
-        if s_idx != before
-            && let Some(n) = setups.get(s_idx)
-        {
-            state.pending.push_back(CommandKind::SetOperationSetup { name: target.to_owned(), setup: Some(n.clone()) });
-        }
-    }
-    ui.end_row();
 }
 
 /// The Coolant row (#112), under the tool it feeds: the fluid the post

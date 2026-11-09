@@ -248,6 +248,27 @@ pub(super) fn validate_kind(dto: &EntityDto, kind: EntityKind) -> Result<(), Pro
                     dto.name
                 )));
             }
+            if s.machine_wcs >= WCS_SLOTS.len() {
+                return Err(corrupt(format!("'{}' selects an unknown machine work offset", dto.name)));
+            }
+            if let Some(context) = &s.context
+                && context.machine.machine.as_ref().is_some_and(|machine| !machine.is_sane())
+            {
+                return Err(corrupt(format!("'{}' has invalid machine limits", dto.name)));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for pose in &s.model_poses {
+                let norm = pose.rotation.iter().map(|v| v * v).sum::<f64>();
+                if pose.name.is_empty()
+                    || !seen.insert(&pose.name)
+                    || !pose.translation.iter().all(|v| v.is_finite())
+                    || !pose.rotation.iter().all(|v| v.is_finite())
+                    || !norm.is_finite()
+                    || norm < 1e-12
+                {
+                    return Err(corrupt(format!("'{}' has an invalid part placement", dto.name)));
+                }
+            }
         }
     }
     Ok(())

@@ -19,7 +19,7 @@ use camcraft_app::commands::{
     ClearToolpath, CreateSetup, DeleteEntity, DeleteFixture, DeleteOperation, DeleteSetup, DeleteTool,
     EditOperationLinks, EditOperationParams, GenerateOperation, History, ImportModel, LoadMachine,
     MoveFixture, MoveModel, PasteOperation, RegenerateAll, RenameOperation, ReorderOperation, RepairModel, SelectEntity, SelectPost, SetOperationGeometry,
-    SetColorVision, SetFixtureFixed, SetOperationSetup, SetStock, SetTheme, SetToolNumber, SetUnits, SetWcsOrigin,
+    SetColorVision, SetFixtureFixed, SetSetupMachineCs, SetStock, SetTheme, SetToolNumber, SetUnits, SetWcsOrigin,
     SetWorkMaterial, TagFixture, UntagFixture,
     UpdateModel, theme_of, theme_set,
 };
@@ -59,6 +59,8 @@ pub enum CommandKind {
     DeleteSelected,
     DeleteByName(String),
     Select(Option<String>),
+    /// Retarget a pane after an earlier queued setup activation.
+    Focus(UiTarget),
     FrameAll,
     Quit,
     /// The answer to the unsaved-changes prompt (#107): New, Open or Quit
@@ -232,16 +234,9 @@ pub enum CommandKind {
         datum_from: Option<String>,
     },
     DeleteSetup(String),
-    /// Move the active-setup cursor. Inert for every stamp - it decides
-    /// where NEW things join, never what already cuts.
+    /// Activate a setup and restore its model, machine and post context.
     ActivateSetup(Option<String>),
-    /// Which setup an operation machines in (the Properties page's Setup
-    /// combo). Keeps the operation's stamp; the resolved-Z digest answers
-    /// Ok-or-Stale from the two setups' placements.
-    SetOperationSetup {
-        name: String,
-        setup: Option<String>,
-    },
+    SetSetupMachineCs { name: String, slot: usize },
     /// Fixtures (M3.2 stage B): the marker is the whole fixture, so these
     /// are the marker and placement verbs a model already knows - tag
     /// marks one as the setup context's workholding steel, untag demotes
@@ -279,6 +274,8 @@ pub enum CommandKind {
         pitch_deg: f64,
         yaw_deg: f64,
     },
+    /// Translate a part so one of its feature points becomes Toolpath CS zero.
+    SetToolpathOrigin { name: String, point: [f64; 3], kind: &'static str },
     /// Mesh repair (M13.11): weld within `weld_tol` (mm) and fill every
     /// boundary loop of at most `max_hole_edges` edges, one undo unit
     /// over the model's facets. Only ever by this verb - never on
@@ -383,18 +380,6 @@ pub struct WcsUi {
     pub(crate) placed: bool,
 }
 
-/// Editable fields of the Setups page (M3.2 A). Transient like [`StockUi`]:
-/// the world's SetupDef entities and the active singleton are the truth.
-/// `pick` indexes the page's setup list (clamped at draw, like
-/// `wcs_ui.slot`); `datum` rides the New button's checkbox - transfer the
-/// current setup's stock and offsets into the new one, the shop's
-/// re-clamp law.
-#[derive(Clone, Debug, Default)]
-pub struct SetupsUi {
-    pub pick: usize,
-    pub datum: bool,
-}
-
 /// The fixtures section's placement draft (M3.2 stage B): one fixture's
 /// pose, editable before Apply queues the `MoveFixture` - the [`StockUi`]
 /// law, and re-synced from the world whenever the row or document moves
@@ -423,6 +408,12 @@ pub struct ModelUi {
     pub roll_deg: f64,
     pub pitch_deg: f64,
     pub yaw_deg: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolpathMarker {
+    pub point: [f64; 3],
+    pub kind: &'static str,
 }
 
 /// The Model page's repair draft (M13.11): the weld tolerance (mm) and
@@ -1030,19 +1021,20 @@ pub struct State {
     pub hidden_stocks: Vec<String>,
     /// Work-offset gizmos hidden by their browser eyes.
     pub hidden_offsets: Vec<String>,
+    /// Toolpath CS triads hidden by setup. None covers legacy documents without a setup.
+    pub hidden_toolpath_cs: Vec<Option<String>>,
     /// Operations whose cached path stays undrawn (eye toggle per op).
     /// Same rule: the path still exists and posts.
     pub hidden_paths: Vec<String>,
     pub operation_clipboard: Option<OperationClipboard>,
-    /// Expanded state of Setup, Models, Tools, and Operations in the browser.
+    /// Expanded state of the top-level Model and Setups branches. The
+    /// remaining slots retain the older array shape for view compatibility.
     pub browser_expanded: [bool; 4],
-
-    /// Show the dimmed world origin axes in the viewport. View state like
-    /// the camera - not undoable, not saved - toggled from the Models panel;
-    /// the triads of real work offsets are always shown, because they are
-    /// setup, not decoration. Hiding the world axes is for the moment a
-    /// G5x offset sits away from machine zero and two gizmos read as clutter.
-    pub show_world_axes: bool,
+    /// An active setup can collapse without changing which setup is shown.
+    pub collapsed_setups: Vec<String>,
+    pub implicit_setup_collapsed: bool,
+    pub collapsed_setup_tools: Vec<Option<String>>,
+    pub collapsed_setup_operations: Vec<Option<String>>,
     /// Show cached toolpaths beyond the selected operation's: with this on,
     /// every generated path draws (dimmed where unselected) instead of only
     /// the one the tree highlights. View state like the camera - not
@@ -1135,8 +1127,6 @@ pub struct State {
     /// Setup pane drafts (ephemeral; see [`StockUi`]).
     pub stock_ui: StockUi,
     pub wcs_ui: WcsUi,
-    /// Setups page draft (ephemeral; see [`SetupsUi`]).
-    pub setups_ui: SetupsUi,
     /// Fixtures section placement draft (ephemeral; see [`FixtureUi`]).
     pub fixture_ui: FixtureUi,
     /// Model page placement draft (ephemeral; see [`ModelUi`]).
@@ -1214,6 +1204,12 @@ pub struct State {
     /// its own. Replaces the old per-pane show-flags and the `.opened()`
     /// dance: the panes are persistent, what changes is their subject.
     pub ui_target: UiTarget,
+    /// Part currently edited by the setup's Toolpath CS page.
+    pub toolpath_part: Option<String>,
+    pub toolpath_pick_markers: bool,
+    pub toolpath_markers: Vec<ToolpathMarker>,
+    pub toolpath_marker_source: String,
+    pub toolpath_marker_version: u64,
     /// The last command's refusal, tagged with the pane it belongs to, so
     /// the failing pane can show the reason inline. The bottom status strip
     /// alone was invisible enough that "Add does nothing" read as a dead
@@ -1248,6 +1244,10 @@ pub enum UiTarget {
     None,
     /// The stock solid (its page doubles as the creation form).
     Stock,
+    Machine,
+    ToolpathCs,
+    MachineCs,
+    Workholders,
     /// One of [`camcraft_app::schema::WCS_SLOTS`], by index.
     WcsSlot(usize),
     /// A model entity: the info page.
@@ -1273,6 +1273,7 @@ impl UiTarget {
         match self {
             UiTarget::None => false,
             UiTarget::Stock => true,
+            UiTarget::Machine | UiTarget::ToolpathCs | UiTarget::MachineCs | UiTarget::Workholders => true,
             UiTarget::WcsSlot(i) => *i < WCS_SLOTS.len(),
             UiTarget::Model(name) => model::model_entities(world)
                 .into_iter()
@@ -1289,6 +1290,14 @@ impl UiTarget {
     }
 }
 
+/// A new document has a real first setup before any model is imported.
+/// The initial setup is the clean starting state, not an undo step.
+fn create_initial_setup(world: &World) {
+    let command = CreateSetup::new(world, None, None)
+        .expect("a new document accepts Setup1");
+    camcraft_app::commands::Command::apply(&command, world);
+}
+
 impl State {
     #[must_use]
     pub fn new() -> Self {
@@ -1300,8 +1309,10 @@ impl State {
             Ok(_) => String::from("ready"),
             Err(why) => why.clone(),
         };
+        let world = new_world();
+        create_initial_setup(&world);
         State {
-            world: new_world(),
+            world,
             history: History::default(),
             status,
             project_path: None,
@@ -1319,11 +1330,15 @@ impl State {
             hidden_models: Vec::new(),
             hidden_stocks: Vec::new(),
             hidden_offsets: Vec::new(),
+            hidden_toolpath_cs: Vec::new(),
             hidden_paths: Vec::new(),
             operation_clipboard: None,
             browser_expanded: [true; 4],
+            collapsed_setups: Vec::new(),
+            implicit_setup_collapsed: false,
+            collapsed_setup_tools: Vec::new(),
+            collapsed_setup_operations: Vec::new(),
             cam: Camera::default(),
-            show_world_axes: true,
             show_all_paths: false,
             display: DisplayMode::default(),
             sim: None,
@@ -1358,7 +1373,6 @@ impl State {
                 anchor_z: 1,
                 ..WcsUi::default()
             },
-            setups_ui: SetupsUi::default(),
             fixture_ui: FixtureUi::default(),
             model_ui: ModelUi::default(),
             repair_ui: RepairUi::default(),
@@ -1386,6 +1400,11 @@ impl State {
             op_synced: (String::new(), 0),
             tool_synced: (String::new(), 0),
             ui_target: UiTarget::None,
+            toolpath_part: None,
+            toolpath_pick_markers: false,
+            toolpath_markers: Vec::new(),
+            toolpath_marker_source: String::new(),
+            toolpath_marker_version: u64::MAX,
             feedback: None,
             feedback_ctx: None,
         }
@@ -1458,6 +1477,23 @@ impl State {
         }
         self.feedback_ctx = self.feedback_ctx_for(scope);
         self.feedback = Some((scope, msg));
+    }
+
+    /// Drop view state tied to the previous setup's model placement and
+    /// program. Undo and redo use this too when they switch setups.
+    fn clear_setup_view(&mut self) {
+        self.toolpath_pick_markers = false;
+        self.model_ui.name.clear();
+        self.program_sim = None;
+        self.sim = None;
+        self.field_view = None;
+        self.field_play = None;
+        self.stock_mesh.clear();
+        self.sim_script_cache = None;
+        self.post_view = None;
+        self.ui_target = UiTarget::Setups;
+        History::execute_ephemeral(&self.world, SelectEntity::new(&self.world, None));
+        self.selection_version = self.selection_version.wrapping_add(1);
     }
 
     /// Refetch the Setup pane's drafts from the world after any document
@@ -2041,13 +2077,20 @@ impl State {
     pub fn selected_operation(&self) -> Option<String> {
         model::selected_names(&self.world).into_iter().find(|name| {
             model::find_by_name(&self.world, name)
-                .is_some_and(|e| model::is_operation(&self.world, &e))
+                .is_some_and(|e| {
+                    model::is_operation(&self.world, &e)
+                        && model::operation_of(&self.world, &e).is_some_and(|op| {
+                            let active = camcraft_app::setup::active(&self.world);
+                            active.is_none() || camcraft_app::setup::effective(&self.world, op.setup.as_deref()) == active
+                        })
+                })
         })
     }
 
     /// Dismiss the current properties page without changing the document.
     /// Clear selection so pane_target cannot reopen a selected operation.
     pub(crate) fn close_property_editor(&mut self) {
+        self.toolpath_pick_markers = false;
         self.ui_target = UiTarget::None;
         self.pending.push_back(CommandKind::Select(None));
         self.op_ui.name.clear();
@@ -2082,10 +2125,11 @@ impl State {
     }
 
     pub(crate) fn paste_operation(&mut self) {
-        let Some(clip) = self.operation_clipboard.clone() else {
+        let Some(mut clip) = self.operation_clipboard.clone() else {
             self.status = String::from("nothing to paste: copy an operation first");
             return;
         };
+        clip.operation.setup = camcraft_app::setup::active(&self.world);
         let base = format!("{} Copy", clip.label);
         let mut suffix = 1usize;
         let name = loop {
@@ -2125,9 +2169,84 @@ impl State {
     }
 
     #[must_use]
+    pub(crate) fn toolpath_cs_hidden(&self) -> bool {
+        self.toolpath_cs_hidden_for(camcraft_app::setup::active(&self.world).as_deref())
+    }
+
+    #[must_use]
+    pub(crate) fn toolpath_cs_hidden_for(&self, setup: Option<&str>) -> bool {
+        self.hidden_toolpath_cs.contains(&setup.map(str::to_owned))
+    }
+
+    pub(crate) fn toggle_toolpath_cs(&mut self) {
+        let active = camcraft_app::setup::active(&self.world);
+        self.toggle_toolpath_cs_for(active.as_deref());
+    }
+
+    pub(crate) fn toggle_toolpath_cs_for(&mut self, setup: Option<&str>) {
+        let setup = setup.map(str::to_owned);
+        if let Some(index) = self.hidden_toolpath_cs.iter().position(|name| name == &setup) {
+            self.hidden_toolpath_cs.remove(index);
+        } else {
+            self.hidden_toolpath_cs.push(setup);
+        }
+    }
+
+    pub(crate) fn refresh_toolpath_markers(&mut self, name: &str) {
+        if self.toolpath_marker_source != name || self.toolpath_marker_version != self.doc_version {
+            self.toolpath_markers = crate::interact::toolpath_points(self, name);
+            self.toolpath_marker_source = name.to_owned();
+            self.toolpath_marker_version = self.doc_version;
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn setup_expanded(&self, name: Option<&str>) -> bool {
+        match name {
+            Some(name) => !self.collapsed_setups.iter().any(|collapsed| collapsed == name),
+            None => !self.implicit_setup_collapsed,
+        }
+    }
+
+    pub(crate) fn toggle_setup_expanded(&mut self, name: Option<&str>) {
+        match name {
+            Some(name) => Self::toggle_visibility(&mut self.collapsed_setups, name),
+            None => self.implicit_setup_collapsed = !self.implicit_setup_collapsed,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn setup_group_expanded(&self, tools: bool, name: Option<&str>) -> bool {
+        let collapsed = if tools { &self.collapsed_setup_tools } else { &self.collapsed_setup_operations };
+        !collapsed.contains(&name.map(str::to_owned))
+    }
+
+    pub(crate) fn toggle_setup_group(&mut self, tools: bool, name: Option<&str>) {
+        let collapsed = if tools { &mut self.collapsed_setup_tools } else { &mut self.collapsed_setup_operations };
+        let name = name.map(str::to_owned);
+        if let Some(index) = collapsed.iter().position(|item| item == &name) {
+            collapsed.remove(index);
+        } else {
+            collapsed.push(name);
+        }
+    }
+
+    #[must_use]
     pub(crate) fn hidden_in_view(&self, name: &str) -> bool {
-        self.hidden_models.iter().any(|n| n == name)
+        if self.hidden_models.iter().any(|n| n == name)
             || self.hidden_stocks.iter().any(|n| n == name)
+        {
+            return true;
+        }
+        let Some(entity) = model::find_by_name(&self.world, name) else {
+            return false;
+        };
+        if model::is_stock(&self.world, &entity) {
+            return name != camcraft_app::setup::stock_entity_name(
+                &self.world, camcraft_app::setup::active(&self.world).as_deref()
+            );
+        }
+        model::is_fixture(&self.world, &entity) && !self.model_in_active_setup(&entity)
     }
 
     #[must_use]
@@ -2142,18 +2261,21 @@ impl State {
     /// Show every cached operation path, including paths hidden by their
     /// browser eyes. This only changes viewport state.
     pub(crate) fn show_all_toolpaths(&mut self) {
-        self.hidden_paths.clear();
+        let visible: std::collections::HashSet<String> =
+            camcraft_app::setup::active_operation_order(&self.world)
+                .into_iter().map(|(name, _)| name).collect();
+        self.hidden_paths.retain(|name| !visible.contains(name));
         self.show_all_paths = true;
     }
 
     /// Hide every operation path, including the selected operation's path.
     /// Keeping the names in the eye list makes each row reflect the result.
     pub(crate) fn hide_all_toolpaths(&mut self) {
-        self.hidden_paths = model::named_entities(&self.world)
-            .into_iter()
-            .filter(|(_, entity)| model::is_operation(&self.world, entity))
-            .map(|(name, _)| name)
-            .collect();
+        for (name, _) in camcraft_app::setup::active_operation_order(&self.world) {
+            if !self.hidden_paths.contains(&name) {
+                self.hidden_paths.push(name);
+            }
+        }
         self.show_all_paths = false;
     }
 
@@ -2244,6 +2366,13 @@ impl State {
                 posting::post_set(&self.world, &PostRef::Builtin);
                 theme_set(&self.world, &ThemeRef::Dark);
                 self.history.clear();
+                create_initial_setup(&self.world);
+                self.hidden_toolpath_cs.clear();
+                self.hidden_paths.clear();
+                self.collapsed_setups.clear();
+                self.collapsed_setup_tools.clear();
+                self.collapsed_setup_operations.clear();
+                self.implicit_setup_collapsed = false;
                 // Frozen evidence of the old document retires with it.
                 self.post_view = None;
                 self.program_sim = None;
@@ -2251,6 +2380,9 @@ impl State {
                 self.field_play = None;
                 self.stock_mesh.clear();
                 self.machine_editor = None;
+                self.model_ui.name.clear();
+                self.toolpath_part = None;
+                self.toolpath_pick_markers = false;
                 self.rename_draft = None;
                 self.dragging_op = None;
                 self.doc_version += 1;
@@ -2274,22 +2406,30 @@ impl State {
             }
             CommandKind::SaveProjectFile(path) => self.save_project_path(path),
             CommandKind::PostProgramDialog => {
-                if let Some(path) = post_program_dialog() {
+                if let Some(path) = post_program_dialog(self) {
                     self.post_program_path(path);
                 }
             }
             CommandKind::PostProgramFile(path) => self.post_program_path(path),
             CommandKind::Undo => {
+                let previous_setup = camcraft_app::setup::active(&self.world);
                 self.status = if self.history.undo(&self.world) {
                     self.doc_version += 1;
+                    if camcraft_app::setup::active(&self.world) != previous_setup {
+                        self.clear_setup_view();
+                    }
                     String::from("undo")
                 } else {
                     String::from("nothing to undo")
                 };
             }
             CommandKind::Redo => {
+                let previous_setup = camcraft_app::setup::active(&self.world);
                 self.status = if self.history.redo(&self.world) {
                     self.doc_version += 1;
+                    if camcraft_app::setup::active(&self.world) != previous_setup {
+                        self.clear_setup_view();
+                    }
                     String::from("redo")
                 } else {
                     String::from("nothing to redo")
@@ -2318,6 +2458,11 @@ impl State {
                     SelectEntity::new(&self.world, name.as_deref()),
                 );
                 self.selection_version = self.selection_version.wrapping_add(1);
+            }
+            CommandKind::Focus(target) => {
+                if target.resolves_in(&self.world) {
+                    self.ui_target = target;
+                }
             }
             CommandKind::FrameAll => self.frame_all(),
             CommandKind::Quit => self.request_quit = true,
@@ -2787,6 +2932,17 @@ impl State {
                         let made = command.name().to_owned();
                         self.history.execute(&self.world, command);
                         self.doc_version += 1;
+                        self.model_ui.name.clear();
+                        self.program_sim = None;
+                        self.sim = None;
+                        self.field_view = None;
+                        self.field_play = None;
+                        self.stock_mesh.clear();
+                        self.sim_script_cache = None;
+                        self.post_view = None;
+                        self.ui_target = UiTarget::Setups;
+                        History::execute_ephemeral(&self.world, SelectEntity::new(&self.world, None));
+                        self.selection_version = self.selection_version.wrapping_add(1);
                         self.status = format!("setup {made} created and active");
                     }
                     Err(err) => {
@@ -2798,6 +2954,17 @@ impl State {
                 Ok(command) => {
                     self.history.execute(&self.world, command);
                     self.doc_version += 1;
+                    self.model_ui.name.clear();
+                    self.program_sim = None;
+                    self.sim = None;
+                    self.field_view = None;
+                    self.field_play = None;
+                    self.stock_mesh.clear();
+                    self.sim_script_cache = None;
+                    self.post_view = None;
+                    self.ui_target = UiTarget::Setups;
+                    History::execute_ephemeral(&self.world, SelectEntity::new(&self.world, None));
+                    self.selection_version = self.selection_version.wrapping_add(1);
                     self.status = format!("deleted setup {name}");
                 }
                 Err(err) => {
@@ -2809,6 +2976,17 @@ impl State {
                     Ok(command) => {
                         self.history.execute(&self.world, command);
                         self.doc_version += 1;
+                        self.model_ui.name.clear();
+                        self.program_sim = None;
+                        self.sim = None;
+                        self.field_view = None;
+                        self.field_play = None;
+                        self.stock_mesh.clear();
+                        self.sim_script_cache = None;
+                        self.post_view = None;
+                        self.ui_target = UiTarget::Setups;
+                        History::execute_ephemeral(&self.world, SelectEntity::new(&self.world, None));
+                        self.selection_version = self.selection_version.wrapping_add(1);
                         self.status = match &name {
                             Some(n) => format!("setup {n} active"),
                             None => "active-setup cursor cleared".to_owned(),
@@ -2819,22 +2997,15 @@ impl State {
                     }
                 }
             }
-            CommandKind::SetOperationSetup { name, setup } => {
-                match SetOperationSetup::new(&self.world, &name, setup.as_deref()) {
+            CommandKind::SetSetupMachineCs { name, slot } => {
+                match SetSetupMachineCs::new(&self.world, &name, slot) {
                     Ok(command) => {
                         self.history.execute(&self.world, command);
                         self.doc_version += 1;
-                        self.status = format!(
-                            "moved {name} to {}",
-                            setup.as_deref().map_or_else(
-                                || "the first setup".to_owned(),
-                                |s| format!("'{s}'"),
-                            )
-                        );
+                        self.post_view = None;
+                        self.status = format!("{name} machine CS: {}", WCS_SLOTS[slot]);
                     }
-                    Err(err) => {
-                        self.refuse(ErrorScope::Operation, format!("setup not moved: {err}"));
-                    }
+                    Err(err) => self.refuse(ErrorScope::Setup, format!("machine CS unchanged: {err}")),
                 }
             }
             CommandKind::TagFixture { name, setup } => {
@@ -2947,6 +3118,31 @@ impl State {
                     Err(err) => self.refuse(ErrorScope::Setup, format!("part not moved: {err}")),
                 }
             }
+            CommandKind::SetToolpathOrigin { name, point, kind } => {
+                let Some(entity) = model::find_by_name(&self.world, &name) else {
+                    self.refuse(ErrorScope::Setup, format!("origin not set: model '{name}' is gone"));
+                    return;
+                };
+                let before = model::transform_of(&self.world, &entity).unwrap_or_default();
+                let next = Location {
+                    pos: Point3::new(
+                        before.pos.x - point[0],
+                        before.pos.y - point[1],
+                        before.pos.z - point[2],
+                    ),
+                    rot: before.rot,
+                };
+                match MoveModel::new(&self.world, &name, next) {
+                    Ok(command) => {
+                        self.history.execute(&self.world, command);
+                        self.doc_version += 1;
+                        self.model_ui.name.clear();
+                        self.toolpath_pick_markers = false;
+                        self.status = format!("{name}: Toolpath CS origin set from {kind}");
+                    }
+                    Err(err) => self.refuse(ErrorScope::Setup, format!("origin not set: {err}")),
+                }
+            }
             CommandKind::RepairModel { name, weld_tol, max_hole_edges } => {
                 match RepairModel::new(&self.world, &name, weld_tol, max_hole_edges) {
                     Ok(command) => {
@@ -2997,10 +3193,20 @@ impl State {
     /// program, not the picture.
     #[must_use]
     pub fn has_toolpaths(&self) -> bool {
-        model::named_entities(&self.world)
+        camcraft_app::setup::active_operation_order(&self.world)
             .into_iter()
-            .filter(|(_, e)| model::is_operation(&self.world, e))
             .any(|(_, e)| model::has_toolpath(&self.world, &e))
+    }
+
+    #[must_use]
+    pub fn model_in_active_setup(&self, entity: &flecs_ecs::prelude::Entity) -> bool {
+        if !model::is_fixture(&self.world, entity) {
+            return true;
+        }
+        let declared = camcraft_app::fixture::def_of(&self.world, entity)
+            .and_then(|def| def.setup);
+        camcraft_app::setup::effective(&self.world, declared.as_deref())
+            == camcraft_app::setup::active(&self.world)
     }
 
     /// Center the orbit camera on the document's bounding sphere.
@@ -3008,7 +3214,15 @@ impl State {
         let mut min = [f64::MAX; 3];
         let mut max = [f64::MIN; 3];
         let mut any = false;
-        for (_, entity) in model::named_entities(&self.world) {
+        let active = camcraft_app::setup::active(&self.world);
+        let active_stock = camcraft_app::setup::stock_entity_name(&self.world, active.as_deref());
+        for (name, entity) in model::named_entities(&self.world) {
+            if model::is_stock(&self.world, &entity) && name != active_stock {
+                continue;
+            }
+            if model::is_fixture(&self.world, &entity) && !self.model_in_active_setup(&entity) {
+                continue;
+            }
             let Some(tris) = model::facets_of(&self.world, &entity) else {
                 continue;
             };
@@ -3030,6 +3244,7 @@ impl State {
         // A work offset parked far from the parts is still "all": frame
         // their origins even though they carry no geometry.
         for (_, entity) in model::named_entities(&self.world) {
+            if active.is_some() { break; }
             if !model::is_wcs(&self.world, &entity) {
                 continue;
             }
@@ -3408,17 +3623,27 @@ impl State {
         self.field_play = None; // nor its playback
         self.stock_mesh.clear(); // nor the mesh extracted from it
         self.machine_editor = None; // nor a draft over its machine's numbers
+        self.model_ui.name.clear();
+        self.toolpath_part = None;
+        self.toolpath_pick_markers = false;
         self.rename_draft = None;
         self.dragging_op = None;
         match project::load(&self.world, &path) {
             Ok(()) => {
+                if camcraft_app::setup::names(&self.world).is_empty() {
+                    create_initial_setup(&self.world);
+                }
                 self.project_path = Some(path.clone());
                 // The loaded document is the new clean point (#107).
                 self.history.mark_clean();
                 self.doc_version += 1;
                 self.status = format!("opened {}", path.display());
             }
-            Err(err) => self.status = format!("open failed: {err}"),
+            Err(err) => {
+                model::clear_named(&self.world);
+                create_initial_setup(&self.world);
+                self.status = format!("open failed: {err}");
+            }
         }
     }
 
@@ -3630,12 +3855,18 @@ pub(crate) fn save_project_dialog(current: Option<&Path>) -> Option<PathBuf> {
     dialog.set_file_name(filename).save_file()
 }
 
-fn post_program_dialog() -> Option<PathBuf> {
+fn post_program_dialog(state: &State) -> Option<PathBuf> {
     // The extension law lives with the script (fanuc.cps's `extension`
-    // is "nc"); the dialog just offers it.
+    // is "nc"). Include the setup so posting another clamping does not
+    // silently suggest overwriting the first one's program.
+    let project = state.project_path.as_deref()
+        .and_then(Path::file_stem).and_then(|stem| stem.to_str())
+        .unwrap_or("camcraft");
+    let setup = camcraft_app::setup::active(&state.world)
+        .unwrap_or_else(|| "Setup1".to_owned());
     rfd::FileDialog::new()
         .add_filter("NC Program", &["nc"])
-        .set_file_name("program.nc")
+        .set_file_name(format!("{project}-{setup}.nc"))
         .save_file()
 }
 

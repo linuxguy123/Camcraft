@@ -52,7 +52,7 @@ pub use repair_model::RepairModel;
 pub use ribbon_pins::SetRibbonPins;
 pub use select_entity::SelectEntity;
 pub use set_stock::SetStock;
-pub use setup::{ActivateSetup, CreateSetup, DeleteSetup, SetOperationSetup};
+pub use setup::{ActivateSetup, CreateSetup, DeleteSetup, SetSetupMachineCs};
 pub use set_units::SetUnits;
 pub use theme::{theme_of, theme_set, SetTheme};
 pub use color_vision::{color_vision_of, color_vision_set, SetColorVision};

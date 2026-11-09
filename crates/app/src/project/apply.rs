@@ -479,6 +479,11 @@ pub(super) fn check_and_apply(world: &World, mut file: ProjectFile) -> Result<()
         // default to name order and the stable entity name respectively.
         file.version = 50;
     }
+    if file.version == 50 {
+        // A v50 setup has no separate part placement. Its shared model
+        // location remains the starting pose for every setup.
+        file.version = 51;
+    }
     if file.version != PROJECT_VERSION {
         return Err(ProjectError::UnsupportedVersion(file.version));
     }
@@ -695,6 +700,16 @@ pub(super) fn check_and_apply(world: &World, mut file: ProjectFile) -> Result<()
                     stock: sdto.stock,
                     wcs: sdto.wcs,
                     datum_from: sdto.datum_from,
+                    model_poses: sdto.model_poses.into_iter().map(|pose| (
+                        pose.name,
+                        Location {
+                            pos: Point3::new(pose.translation[0], pose.translation[1], pose.translation[2]),
+                            rot: pose.rotation,
+                        },
+                    )).collect(),
+                    machine_wcs: sdto.machine_wcs,
+                    modern_cs: sdto.modern_cs,
+                    context: sdto.context,
                 });
             }
         }

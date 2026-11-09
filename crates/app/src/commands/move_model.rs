@@ -74,8 +74,10 @@ impl MoveModel {
             .filter(|(_, entity)| !model::is_fixture(world, entity))
             .count()
             == 1;
+        let active_stock = crate::setup::stock_entity_name(world, crate::setup::active(world).as_deref());
         let stock = model::named_entities(world)
             .into_iter()
+            .filter(|(stock_name, _)| *stock_name == active_stock)
             .filter_map(|(stock_name, entity)| {
                 let shape = model::stock_def_of(world, &entity)?;
                 let follows = match shape {

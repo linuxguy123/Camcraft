@@ -20,7 +20,7 @@ use crate::interact::{
     gizmo_segments, hover_features, is_axis_label, overlay_labels, plane_corner, plane_rect, project_uv, queue_feature_pick,
     region_lines, selection_feature_lines, shown_regions, toolpath_lines,
 };
-use crate::state::{CommandKind, HoverHit, State};
+use crate::state::{CommandKind, HoverHit, State, UiTarget};
 use crate::viewport::GpuPart;
 
 /// The per-frame part collector the retired imgui shell kept private in
@@ -28,6 +28,68 @@ use crate::viewport::GpuPart;
 /// tests reach it under the name they have always used.
 fn collect_parts(state: &State) -> Vec<GpuPart> {
     world::collect(state).parts
+}
+
+/// Exercise the legacy work-offset display rules with a document that
+/// predates declared setups. New documents start with Setup1 instead.
+fn legacy_state() -> State {
+    let state = State::new();
+    let setup = model::find_by_name(&state.world, "Setup1").expect("initial setup");
+    model::remove(&state.world, &setup);
+    camcraft_app::setup::set_active(&state.world, None);
+    state
+}
+
+#[cfg(test)]
+mod toolpath_origin_tests {
+    use super::*;
+    use camcraft_app::commands::ImportModel;
+    use camcraft_app::geometry::{cube, cylinder};
+    use crate::interact::{pick_at, toolpath_points};
+
+    #[test]
+    fn model_features_supply_origin_markers() {
+        let mut state = State::new();
+        state.history.execute(&state.world,
+            ImportModel::from_mesh("block", cube(Point3::ZERO, Point3::new(20.0, 10.0, 5.0))));
+        let marks = toolpath_points(&state, "block");
+        let has = |kind: &str, point: [f64; 3]| marks.iter().any(|m|
+            m.kind == kind && (0..3).all(|i| (m.point[i] - point[i]).abs() < 1e-5));
+        assert!(has("corner", [0.0, 0.0, 0.0]));
+        assert!(has("edge midpoint", [10.0, 0.0, 0.0]));
+        assert!(has("face center", [10.0, 5.0, 5.0]));
+
+        state.ui_target = UiTarget::ToolpathCs;
+        state.toolpath_part = Some("block".into());
+        state.toolpath_pick_markers = true;
+        state.refresh_toolpath_markers("block");
+        assert!(collect_overlay(&state).len() >= 6 + 6 * state.toolpath_markers.len(),
+            "each point is drawn as a three-axis marker");
+        state.viewport_rect = ([0.0, 0.0], [800.0, 600.0]);
+        let uv = project_uv(&state.cam.mvp(800.0 / 600.0), [10.0, 5.0, 5.0])
+            .expect("face center projects");
+        pick_at(&mut state, [uv[0] * 800.0, uv[1] * 600.0], Default::default());
+        assert!(matches!(state.pending.front(), Some(CommandKind::SetToolpathOrigin { .. })));
+        state.drain_actions();
+        let model = model::find_by_name(&state.world, "block").expect("block");
+        let loc = model::transform_of(&state.world, &model).expect("placement");
+        assert_eq!([loc.pos.x, loc.pos.y, loc.pos.z], [-10.0, -5.0, -5.0]);
+        state.pending.push_back(CommandKind::Undo);
+        state.drain_actions();
+        let loc = model::transform_of(&state.world, &model).expect("undo placement");
+        assert_eq!([loc.pos.x, loc.pos.y, loc.pos.z], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn circular_rims_supply_centers() {
+        let mut state = State::new();
+        state.history.execute(&state.world,
+            ImportModel::from_mesh("round", cylinder(20.0, 5.0, 32)));
+        let marks = toolpath_points(&state, "round");
+        assert!(marks.iter().any(|m| m.kind == "circle center"
+            && m.point[0].abs() < 1e-5 && m.point[1].abs() < 1e-5
+            && (m.point[2] - 5.0).abs() < 1e-5), "top circle center: {marks:?}");
+    }
 }
 
 #[cfg(test)]
@@ -50,12 +112,12 @@ mod gizmo_tests {
     }
 
     #[test]
-    fn a_fresh_world_shows_only_the_world_axes() {
+    fn a_fresh_world_shows_the_toolpath_cs() {
         let state = State::new();
         let lines = collect_overlay(&state);
         assert_eq!(lines.len(), 6, "three dimmed axes");
         // #195: dimmed less than before (0.8 of the triad's 0.9 red), but dimmed.
-        assert!(lines[0][3] < 0.8, "world axes are dimmed");
+        assert!(lines[0][3] < 0.8, "toolpath axes are dimmed");
     }
 
     /// #195: the origin triads are stroked again in screen space (a wgpu
@@ -66,33 +128,33 @@ mod gizmo_tests {
     fn the_origin_triad_is_also_stroked_in_screen_space() {
         let mut state = State::new();
         let segs = gizmo_segments(&state, 1.0);
-        assert_eq!(segs.len(), 3, "the world axes, one stroke each: {segs:?}");
+        assert_eq!(segs.len(), 3, "the Toolpath CS, one stroke each: {segs:?}");
         assert!(segs.iter().all(|(a, b, _)| a != b), "each stroke has length on screen");
         let blue = segs[2].2;
         assert!(blue[2] >= 0.75, "Z is a readable blue on the dark ground: {blue:?}");
-        state.show_world_axes = false;
+        state.toggle_toolpath_cs();
         assert!(gizmo_segments(&state, 1.0).is_empty(), "hidden axes stroke nothing");
         assert!(is_axis_label("Z") && !is_axis_label("Operation1 · Top 30.00"));
     }
 
     #[test]
-    fn an_origin_placed_at_machine_zero_does_not_duplicate_the_gizmo() {
-        let mut state = State::new();
+    fn a_work_offset_at_program_zero_keeps_both_coordinate_systems() {
+        let mut state = legacy_state();
         set_origin(&mut state, "G54", [0.0, 0.0, 0.0], 0.0);
         let lines = collect_overlay(&state);
-        assert_eq!(lines.len(), 6, "the triad replaces the world axes");
+        assert_eq!(lines.len(), 12, "work offset and Toolpath CS each have a triad");
         assert!(lines[0][3] > 0.5, "the single gizmo is the bright triad");
         let labels = overlay_labels(&state, 1.0);
-        assert_eq!(labels.len(), 3, "one letter per triad axis, no ghost set");
+        assert_eq!(labels.len(), 6, "one letter per axis in each coordinate system");
         assert!(
             labels.iter().all(|(_, rgb, _)| rgb[0].max(rgb[1]).max(rgb[2]) > 0.5),
-            "all labels are bright"
+            "all labels are visible"
         );
     }
 
     #[test]
     fn a_moved_origin_shows_axes_and_triad_together() {
-        let mut state = State::new();
+        let mut state = legacy_state();
         set_origin(&mut state, "G54", [50.0, 0.0, 0.0], 0.0);
         assert_eq!(collect_overlay(&state).len(), 12, "both gizmos");
         let labels = overlay_labels(&state, 1.0);
@@ -110,7 +172,7 @@ mod gizmo_tests {
 
     #[test]
     fn moved_work_offset_letters_follow_their_axis_tips() {
-        let mut state = State::new();
+        let mut state = legacy_state();
         set_origin(&mut state, "G54", [50.0, 0.0, 0.0], 0.0);
         let lines = collect_overlay(&state);
         let labels = overlay_labels(&state, 1.0);
@@ -136,30 +198,28 @@ mod gizmo_tests {
 
     #[test]
     fn hidden_work_offset_removes_only_its_gizmo() {
-        let mut state = State::new();
+        let mut state = legacy_state();
         set_origin(&mut state, "G54", [0.0, 0.0, 0.0], 0.0);
         set_origin(&mut state, "G55", [50.0, 0.0, 0.0], 0.0);
-        assert_eq!(collect_overlay(&state).len(), 12);
+        assert_eq!(collect_overlay(&state).len(), 18);
         State::toggle_visibility(&mut state.hidden_offsets, "G54");
-        assert_eq!(collect_overlay(&state).len(), 12, "G55 and world axes remain");
+        assert_eq!(collect_overlay(&state).len(), 12, "G55 and Toolpath CS remain");
         assert!(model::find_by_name(&state.world, "G54").is_some());
         State::toggle_visibility(&mut state.hidden_offsets, "G55");
-        assert_eq!(collect_overlay(&state).len(), 6, "only world axes remain");
+        assert_eq!(collect_overlay(&state).len(), 6, "only Toolpath CS remains");
     }
 
     #[test]
-    fn a_rotated_offset_at_the_origin_still_shows_the_world_axes() {
-        // Yaw 90 moves the triad axes off X/Y/Z - the coincidence was about
-        // lines, not just the origin point.
-        let mut state = State::new();
+    fn a_rotated_offset_at_the_origin_still_shows_the_toolpath_cs() {
+        let mut state = legacy_state();
         set_origin(&mut state, "G54", [0.0, 0.0, 0.0], 90.0);
         assert_eq!(collect_overlay(&state).len(), 12, "the triad no longer claims the axes");
     }
 
     #[test]
-    fn hiding_the_world_axes_leaves_the_offset_triads_alone() {
-        let mut state = State::new();
-        state.show_world_axes = false;
+    fn hiding_the_toolpath_cs_leaves_the_offset_triads_alone() {
+        let mut state = legacy_state();
+        state.toggle_toolpath_cs();
         assert!(collect_overlay(&state).is_empty(), "nothing but hidden furniture");
         assert!(overlay_labels(&state, 1.0).is_empty(), "and no labels for it");
         set_origin(&mut state, "G54", [50.0, 0.0, 0.0], 0.0);
@@ -169,8 +229,23 @@ mod gizmo_tests {
             overlay_labels(&state, 1.0)
                 .iter()
                 .all(|(_, rgb, _)| rgb[0].max(rgb[1]).max(rgb[2]) > 0.5),
-            "only the bright triad labels remain, no dimmed world letters"
+            "only the work offset labels remain"
         );
+    }
+
+    #[test]
+    fn each_setup_has_its_own_toolpath_cs_eye() {
+        let mut state = State::new();
+        assert_eq!(collect_overlay(&state).len(), 6);
+        state.toggle_toolpath_cs();
+        assert!(collect_overlay(&state).is_empty());
+
+        state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
+        state.drain_actions();
+        assert_eq!(collect_overlay(&state).len(), 6, "Setup2 starts visible");
+        state.pending.push_back(CommandKind::ActivateSetup(Some("Setup1".into())));
+        state.drain_actions();
+        assert!(collect_overlay(&state).is_empty(), "Setup1 stays hidden");
     }
 }
 
@@ -1284,7 +1359,10 @@ mod height_plane_tests {
     /// and one operation - with the pane draft mirroring it exactly, the
     /// way sync_ops_ui leaves it when the op is opened.
     fn state_with(name: &str, params: OpParams) -> State {
-        let mut state = State::new();
+        state_with_start(State::new(), name, params)
+    }
+
+    fn state_with_start(mut state: State, name: &str, params: OpParams) -> State {
         state.pending.push_back(CommandKind::SetStock {
             shape: StockShape::Box { dx: 40.0, dy: 40.0, dz: 20.0 },
             pos: [0.0, 0.0, 0.0],
@@ -1606,7 +1684,7 @@ mod height_plane_tests {
             blend_turns: false,
             links: camcraft_app::links::Links::PLANAR,
         };
-        let mut state = state_with("C1", params);
+        let mut state = state_with_start(legacy_state(), "C1", params);
         // G54 at z 3.0: stock top (20) + 5 = 25, G54 - 1 = 2.
         state.pending.push_back(CommandKind::SetWcs {
             slot: "G54".into(),
@@ -1673,7 +1751,7 @@ mod height_plane_tests {
             blend_turns: false,
             links: camcraft_app::links::Links::PLANAR,
         };
-        let state = state_with("C1", params);
+        let state = state_with_start(legacy_state(), "C1", params);
         assert!(
             height_planes(&state).iter().all(|p| p.name != "Bottom"),
             "an unplaced G54 draws no bottom plane",
@@ -1854,13 +1932,13 @@ mod view_cube_tests {
 
     #[test]
     fn the_hud_is_laid_out_from_the_pane_alone() {
-        // Cube top-right (the hint owns bottom-right), five buttons
+        // Cube top-right (the hint owns bottom-right), four buttons
         // below it, right-aligned; and no room, no furniture.
         let pane = egui::Rect::from_min_max(egui::pos2(300.0, 100.0), egui::pos2(1200.0, 700.0));
         let h = Hud::new(pane).expect("900 x 600 has room");
         assert!((h.cube.max.x - (1200.0 - 10.0)).abs() < 1e-6);
         assert!((h.cube.min.y - 110.0).abs() < 1e-6, "the cube hugs the top");
-        let bottom = h.nav_rect(viewcube::Nav::Axes);
+        let bottom = h.nav_rect(viewcube::Nav::Paths);
         assert!(
             bottom.max.x <= h.cube.max.x + 1e-6 && bottom.min.x >= pane.min.x,
             "the nav column stays in the pane"

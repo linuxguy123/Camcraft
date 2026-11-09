@@ -247,13 +247,30 @@ impl CycleDto {
 /// exactly what a missing `G55` entity has always meant. `datum_from` is
 /// clone provenance for the setup sheet (stage D); every stamp ignores
 /// it, so it defaults and rides along for the reader, not the machinery.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct SetupDto {
     pub stock: String,
     #[serde(default)]
     pub wcs: Vec<String>,
     #[serde(default)]
     pub datum_from: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_poses: Vec<SetupModelPoseDto>,
+    #[serde(default, skip_serializing_if = "is_first_work_offset")]
+    pub machine_wcs: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub modern_cs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::schema::SetupContext>,
+}
+
+fn is_first_work_offset(slot: &usize) -> bool { *slot == 0 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SetupModelPoseDto {
+    pub name: String,
+    pub translation: [f64; 3],
+    pub rotation: [f64; 4],
 }
 
 /// The fixture marker as files hold it (M3.2 stage B): a tag on a model

@@ -1,4 +1,4 @@
-//! Multiple setups: who machines against which stock and which offsets
+//! Multiple setups: one stock with per-setup placement and machine context
 //! (M3.2 stage A).
 //!
 //! Provenance: our own design; the setup/WCS concept is standard
@@ -17,21 +17,15 @@
 //!   path, stamp and saved file predating setups keeps working
 //!   untouched. `None` anywhere a setup is expected means "the first
 //!   setup by name", which collapses to that same legacy behavior.
-//! - **One order law, shared by call.** [`operation_order`] is THE
-//!   program sequence: setup rank first, explicit operation position
+//! - **One order law, shared by call.** [`operation_order`] is the
+//!   document sequence: setup rank first, explicit operation position
 //!   within a setup (name order for legacy operations without a position)
-//!   (`Setup1` before `Setup2`, always). The post, re-machining, the
-//!   document sim and batch regenerate all call this one function,
-//!   upgrading M3.1 D's "shared by reference" to "shared by call" -
-//!   re-machining and the machine can still not disagree, now including
-//!   across setups.
-//! - **Placement is the flip.** Setup space IS model/world space in a
-//!   Z-up 2.5D engine: what changes between setups is where the stock
-//!   sits (its `Location`, quaternion included) and where the datum
-//!   sits - never a rotated machine axis. The axis-rotation form of a
-//!   flip belongs to M3.3's orientation law; until then a flipped
-//!   setup is a re-placed (or copied-and-flipped) stock, which is what
-//!   the datum-transfer command builds.
+//!   (`Setup1` before `Setup2`, always). [`active_operation_order`] is
+//!   the active setup's program; posting, simulation and batch regenerate
+//!   use it so one clamping produces one NC program.
+//! - **Placement is per setup.** Part and stock locations are saved with
+//!   each setup and restored on activation. Their geometry is shared;
+//!   the active placement is the generator's world frame.
 //! - **Inert until named** (AGENTS.md M1.6 law). The active-setup
 //!   singleton is read only at command creation (what setup new
 //!   furniture and new operations join); nothing digests it, so making
@@ -51,7 +45,7 @@ use flecs_ecs::core::{EntityViewGet, WorldGet}; // not in prelude (0.2.2)
 use flecs_ecs::prelude::World;
 
 use crate::model;
-use crate::schema::{SetupDef, STOCK_NAME, WCS_SLOTS};
+use crate::schema::{MachineDef, SetupContext, SetupDef, STOCK_NAME, WCS_SLOTS};
 
 /// Every setup entity, name-sorted: the program's setup order.
 #[must_use]
@@ -84,6 +78,52 @@ pub fn exists(world: &World, name: &str) -> bool {
 pub fn def_of(world: &World, name: &str) -> Option<SetupDef> {
     model::find_by_name(world, name)
         .and_then(|e| e.entity_view(world).try_get::<&SetupDef>(|d| d.clone()))
+}
+
+/// Current placements of the shared parts and stock. Their geometry is
+/// global, while each setup restores its own orientation of the workpiece.
+/// Fixtures have their own setup binding and are outside this list.
+#[must_use]
+pub fn model_poses(world: &World) -> Vec<(String, crate::schema::Location)> {
+    let mut poses: Vec<_> = model::model_entities(world)
+        .into_iter()
+        .filter(|(_, entity)| !model::is_fixture(world, entity))
+        .map(|(name, entity)| (name, model::transform_of(world, &entity).unwrap_or_default()))
+        .collect();
+    if let Some(stock) = stock_entity(world, active(world).as_deref()) {
+        let name = model::name_of(world, &stock).unwrap_or_else(|| STOCK_NAME.to_string());
+        poses.push((name, model::transform_of(world, &stock).unwrap_or_default()));
+    }
+    poses
+}
+
+/// Restore a setup's part placements. A part imported after the setup was
+/// made keeps its current placement until the user places it in that setup.
+pub fn restore_model_poses(world: &World, poses: &[(String, crate::schema::Location)]) {
+    for (name, pose) in poses {
+        if let Some(entity) = model::find_by_name(world, name)
+            && ((model::is_model(world, &entity) && !model::is_fixture(world, &entity))
+                || model::is_stock(world, &entity))
+        {
+            model::set_transform(world, &entity, *pose);
+        }
+    }
+}
+
+#[must_use]
+pub fn current_context(world: &World) -> SetupContext {
+    let (path, machine) = crate::machine::of(world);
+    SetupContext {
+        machine: MachineDef { path, machine },
+        post: crate::posting::post_of(world),
+        post_options: crate::posting::post_options(world),
+    }
+}
+
+pub fn restore_context(world: &World, context: &SetupContext) {
+    crate::machine::set(world, &context.machine.path, context.machine.machine.as_ref());
+    crate::posting::post_set(world, &context.post);
+    crate::posting::post_options_set(world, context.post_options);
 }
 
 /// The effective setup of an operation or piece of furniture: what the
@@ -156,6 +196,23 @@ pub fn operation_order(world: &World) -> Vec<(String, flecs_ecs::prelude::Entity
         .collect();
     ops.sort_by_key(|(r, position, _, _)| (*r, *position)); // stable: key order breaks ties
     ops.into_iter().map(|(_, _, n, e)| (n, e)).collect()
+}
+
+/// Operations visible, simulated and posted for the current setup. A
+/// setup-free legacy document still sees its whole program.
+#[must_use]
+pub fn active_operation_order(world: &World) -> Vec<(String, flecs_ecs::prelude::Entity)> {
+    let active = active(world);
+    if active.is_none() {
+        return operation_order(world);
+    }
+    operation_order(world)
+        .into_iter()
+        .filter(|(_, entity)| {
+            model::operation_of(world, entity)
+                .is_some_and(|op| effective(world, op.setup.as_deref()) == active)
+        })
+        .collect()
 }
 
 /// Does an operation with this declared setup machine in `target`? The

@@ -64,6 +64,31 @@ pub(super) fn render_stock(world: &World, ctx: Option<&str>, out: &mut String) {
 }
 
 pub(super) fn render_wcs(world: &World, ctx: Option<&str>, out: &mut String) {
+    if crate::machine::kind_of(world) == crate::machine::Kind::Mill
+        && let Some(def) = ctx.and_then(|name| setup::def_of(world, name))
+        && def.modern_cs
+    {
+        out.push_str("COORDINATE SYSTEMS\n");
+        out.push_str(&format!("  Machine CS: {} (probe this register at Toolpath CS zero)\n", WCS_SLOTS[def.machine_wcs]));
+        let poses = if setup::active(world).as_deref() == ctx {
+            setup::model_poses(world)
+        } else {
+            def.model_poses
+        };
+        if poses.is_empty() {
+            out.push_str("  Toolpath CS: shared model placement\n");
+        }
+        for (name, loc) in poses.into_iter().filter(|(name, _)| name != &def.stock) {
+            let (roll, pitch, yaw) = crate::geometry::quat_to_euler(loc.rot);
+            out.push_str(&format!(
+                "  Toolpath CS {name}: X {} Y {} Z {}  roll {:.1} pitch {:.1} yaw {:.1} deg\n",
+                mm(loc.pos.x), mm(loc.pos.y), mm(loc.pos.z),
+                roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()
+            ));
+        }
+        out.push('\n');
+        return;
+    }
     out.push_str("WCS OFFSETS\n");
     let mut any = false;
     for (slot, word) in WCS_SLOTS.iter().enumerate() {

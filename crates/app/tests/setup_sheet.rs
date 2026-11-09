@@ -171,7 +171,7 @@ fn sheet_is_deterministic_byte_identical_twice() {
 }
 
 #[test]
-fn sheet_names_stock_wcs_and_op_depths() {
+fn sheet_names_stock_machine_cs_and_op_depths() {
     let (world, mut history) = two_setup_world();
     run(
         &world,
@@ -183,10 +183,10 @@ fn sheet_names_stock_wcs_and_op_depths() {
 
     let sheet = setup_sheet::render(&world, Some("Setup2")).expect("Setup2 sheet");
     assert!(sheet.contains("SETUP SHEET - Setup2"), "{sheet}");
-    assert!(sheet.contains("G54"), "the slot prints its G-word:\n{sheet}");
+    assert!(sheet.contains("Machine CS: G54"), "the register prints its G-word:\n{sheet}");
     assert!(
-        sheet.contains("X 12.500") && sheet.contains("Y -3.000") && sheet.contains("Z 4.000"),
-        "the origin follows the entity transform:\n{sheet}"
+        !sheet.contains("X 12.500") && sheet.contains("Toolpath CS"),
+        "the physical register adds no virtual origin shift:\n{sheet}"
     );
     assert!(
         sheet.contains("X 60.000") && sheet.contains("Y 60.000") && sheet.contains("Z 20.000"),
