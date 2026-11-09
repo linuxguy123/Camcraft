@@ -1052,6 +1052,10 @@ pub struct State {
     /// M1.7d G-code viewer: None after any document switch or refused
     /// post, `Some` while a posted program is being reviewed.
     pub post_view: Option<PostView>,
+    /// Whether the Debug info window is open; view state, never saved.
+    pub debug_info_open: bool,
+    /// GPU adapter description from the windowed shell, absent headless.
+    pub gpu_line: Option<String>,
     /// M2.3 program material sim: None while the Deviate cell is dark,
     /// `Some` while its sheet paints the stock's place. Frozen evidence
     /// of one program state, exactly like [`PostView`]'s text - never a
@@ -1343,6 +1347,8 @@ impl State {
             display: DisplayMode::default(),
             sim: None,
             post_view: None,
+            debug_info_open: false,
+            gpu_line: None,
             program_sim: None,
             field_view: None,
             field_play: None,
