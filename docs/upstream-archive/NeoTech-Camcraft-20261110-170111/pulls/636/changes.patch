@@ -1,0 +1,319 @@
+From 80a3ce851df2abf1c74bd285f36d1877bb13a261 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 9 Nov 2026 17:59:35 -0800
+Subject: [PATCH] perf(sim): a field block stock builds in closed form, not by
+ band fill
+
+#633: the field engine took ~58 s (release) to BUILD a 120 mm block at
+a 0.375 mm cell - the floorless block is meshed ten spans deep and the
+BFS band fill sampled every cell along those walls - while its cuts
+took milliseconds. A block's mesh-layer magnitude is now the box's
+exact closed-form distance (field_box::AnalyticBox): SdfField::from_box
+stores no bricks and mag_at answers unstored cells from the box,
+clamped to cap. Build: 58 s -> 42 us; same cut cells (399/416).
+
+Pinned by field_block_cost: a block stores no band at build; the
+closed form reads the band-filled stock's sign everywhere within two
+cells; a heavy-lane budget (120 mm block + drill under 2 s, release).
+
+Fixes #633
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/sim/src/stock_sim/backend_build.rs     |  9 +--
+ crates/sim/src/stock_sim/field.rs             | 16 +++-
+ crates/sim/src/stock_sim/field_box.rs         | 75 +++++++++++++++++
+ crates/sim/src/stock_sim/field_gen.rs         |  1 +
+ crates/sim/src/stock_sim/mod.rs               |  1 +
+ crates/sim/tests/field_block_cost.rs          | 81 +++++++++++++++++++
+ docs/decisions/633-field-block-closed-form.md | 25 ++++++
+ 7 files changed, 199 insertions(+), 9 deletions(-)
+ create mode 100644 crates/sim/src/stock_sim/field_box.rs
+ create mode 100644 crates/sim/tests/field_block_cost.rs
+ create mode 100644 docs/decisions/633-field-block-closed-form.md
+
+diff --git a/crates/sim/src/stock_sim/backend_build.rs b/crates/sim/src/stock_sim/backend_build.rs
+index bee9f6ce..09ca0802 100644
+--- a/crates/sim/src/stock_sim/backend_build.rs
++++ b/crates/sim/src/stock_sim/backend_build.rs
+@@ -147,10 +147,7 @@ fn block_field(
+     // out-ran the per-facet seed ceiling and refused a block the
+     // column builds - a backend-dependent refusal, the law above's
+     // exact violation.
+-    let m = super::field_gen::box_shell(
+-        Point3::new(x0, y0, top_z - 10.0 * span),
+-        Point3::new(x1, y1, top_z),
+-        cell,
+-    );
+-    SdfField::from_mesh(&m, cell, band)
++    // #633: the box's distance is closed-form - no band fill along the
++    // ten-span walls (the BFS made a 120 mm block take a minute).
++    SdfField::from_box(Point3::new(x0, y0, top_z - 10.0 * span), Point3::new(x1, y1, top_z), cell, band)
+ }
+diff --git a/crates/sim/src/stock_sim/field.rs b/crates/sim/src/stock_sim/field.rs
+index b0a3b7c5..2a2a33cd 100644
+--- a/crates/sim/src/stock_sim/field.rs
++++ b/crates/sim/src/stock_sim/field.rs
+@@ -101,6 +101,10 @@ pub struct SdfField {
+     /// counters (`field_batch::CostLedger`), boxed so the `Stock`
+     /// enum's arms stay the same size class.
+     pub(crate) cost: Box<super::field_batch::CostLedger>,
++    /// #633: a block stock's exact box distance - the mesh layer's
++    /// magnitude wherever no brick was stored (`mag_at`), so a block
++    /// builds with no band fill. `None` for every mesh-seeded field.
++    pub(crate) analytic: Option<super::field_box::AnalyticBox>,
+ }
+ 
+ /// World cell of a point on the origin-locked lattice.
+@@ -176,18 +180,24 @@ impl SdfField {
+     }
+ 
+     /// The stored magnitude at a cell: out of band, in an unallocated
+-    /// brick, or in a brick's NaN cell, it is `cap` by one law.
++    /// brick, or in a brick's NaN cell, it is `cap` by one law - or,
++    /// for a block stock (#633), the box's exact distance, clamped to
++    /// `cap` by the same band law.
+     pub(crate) fn mag_at(&self, key: [i32; 3]) -> f64 {
++        let unstored = || match self.analytic {
++            Some(b) => b.at_cell(key, self.cell).min(self.cap),
++            None => self.cap,
++        };
+         match self.bricks.get(&brick_of(key)) {
+             Some(b) => {
+                 let v = b[in_brick(key)];
+                 if v.is_nan() {
+-                    self.cap
++                    unstored()
+                 } else {
+                     v
+                 }
+             }
+-            None => self.cap,
++            None => unstored(),
+         }
+     }
+ 
+diff --git a/crates/sim/src/stock_sim/field_box.rs b/crates/sim/src/stock_sim/field_box.rs
+new file mode 100644
+index 00000000..e9f3c3f1
+--- /dev/null
++++ b/crates/sim/src/stock_sim/field_box.rs
+@@ -0,0 +1,75 @@
++//! The analytic box stock (#633): an axis-aligned block's signed
++//! distance in closed form, so a block stock needs no band fill. The
++//! BFS of `field_gen::from_mesh` sampled every band cell along the
++//! block's walls - which run ten spans deep, the column engine's
++//! floorless block - and a 120 mm block at a 0.375 mm cell took ~58 s
++//! to build while its cuts took milliseconds. The box's distance is
++//! exact and O(1) per cell, so the mesh layer reads it wherever no
++//! brick was stored, and `SdfField::block` stores none.
++//! Provenance: the textbook signed distance of an axis-aligned box
++//! (component-wise exterior distance and inner max); our own design.
++
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use super::field::{center_of, SdfField};
++use super::kernel::StockError;
++use crate::geometry::Point3;
++
++/// An axis-aligned box `[lo, hi]`, read as an unsigned distance.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct AnalyticBox {
++    pub lo: Point3,
++    pub hi: Point3,
++}
++
++impl AnalyticBox {
++    /// The exact unsigned distance from `p` to the box's surface:
++    /// outside, the Euclidean distance to the box; inside, the
++    /// distance to the nearest face.
++    #[must_use]
++    pub fn distance(&self, p: Point3) -> f64 {
++        let (lo, hi) = ([self.lo.x, self.lo.y, self.lo.z], [self.hi.x, self.hi.y, self.hi.z]);
++        let q = [p.x, p.y, p.z];
++        let mut out2 = 0.0f64;
++        let mut inner = f64::INFINITY;
++        for a in 0..3 {
++            let below = lo[a] - q[a];
++            let above = q[a] - hi[a];
++            let d = below.max(above);
++            if d > 0.0 {
++                out2 += d * d;
++            }
++            inner = inner.min(-d); // depth inside along this axis
++        }
++        if out2 > 0.0 { out2.sqrt() } else { inner.max(0.0) }
++    }
++
++    /// The distance at lattice cell `key`'s centre.
++    #[must_use]
++    pub fn at_cell(&self, key: [i32; 3], cell: f64) -> f64 {
++        self.distance(Point3::new(center_of(key[0], cell), center_of(key[1], cell), center_of(key[2], cell)))
++    }
++}
++
++impl SdfField {
++    /// A block stock's field (#633): the box `[lo, hi]` as its shell
++    /// (the parity and bounds source, as for any field) with its band
++    /// magnitudes read in closed form - no brick is stored at build.
++    pub fn from_box(lo: Point3, hi: Point3, cell: f64, band: u32) -> Result<SdfField, StockError> {
++        let m = super::field_gen::box_shell(lo, hi, cell);
++        super::field::validate_shell(&m, cell, band)?;
++        let mut field = SdfField {
++            cell,
++            cap: band as f64 * cell,
++            mesh: Arc::new(m),
++            bricks: Arc::new(HashMap::new()),
++            cuts: HashMap::new(),
++            cut_ups: HashMap::new(),
++            cost: Box::default(),
++            analytic: Some(AnalyticBox { lo, hi }),
++        };
++        field.cost.region = super::field_batch::region_of(&field);
++        Ok(field)
++    }
++}
+diff --git a/crates/sim/src/stock_sim/field_gen.rs b/crates/sim/src/stock_sim/field_gen.rs
+index 604d6add..222fb654 100644
+--- a/crates/sim/src/stock_sim/field_gen.rs
++++ b/crates/sim/src/stock_sim/field_gen.rs
+@@ -149,6 +149,7 @@ impl SdfField {
+             cuts: HashMap::new(),
+             cut_ups: HashMap::new(),
+             cost: Box::default(),
++            analytic: None,
+         };
+         for (&key, &v) in &done {
+             // Clamped: a stored value past the band is `cap`, exactly
+diff --git a/crates/sim/src/stock_sim/mod.rs b/crates/sim/src/stock_sim/mod.rs
+index 686890e3..f1c6f344 100644
+--- a/crates/sim/src/stock_sim/mod.rs
++++ b/crates/sim/src/stock_sim/mod.rs
+@@ -73,6 +73,7 @@ mod dual;
+ mod field;
+ mod field_arc;
+ mod field_batch;
++mod field_box;
+ mod field_blade;
+ mod field_bull;
+ mod field_cut;
+diff --git a/crates/sim/tests/field_block_cost.rs b/crates/sim/tests/field_block_cost.rs
+new file mode 100644
+index 00000000..b2053884
+--- /dev/null
++++ b/crates/sim/tests/field_block_cost.rs
+@@ -0,0 +1,81 @@
++//! #633: a block stock on the field engine builds in closed form. The
++//! band fill along a floorless block's ten-span walls made a 120 mm
++//! block take ~58 s in release (its cuts took milliseconds); the box's
++//! exact distance now answers the mesh layer, so the build stores no
++//! band at all - and reads the same stock as the mesh-seeded field.
++//!
++//! Gate map (#633): covers sim::stock_sim::field_box (AnalyticBox,
++//! SdfField::from_box), field::mag_at, backend_build::block_field.
++//! Provenance: our own fixtures; the closed-form box distance.
++
++use std::time::Instant;
++
++use camcraft_sim::cl::{Move, MoveKind};
++use camcraft_sim::geometry::{cube, Point3};
++use camcraft_sim::stock_sim::{auto_cell, Backend, SdfField, SimOp, Stock, FIELD_BAND};
++
++fn field_block(x0: f64, y0: f64, x1: f64, y1: f64, top: f64, cell: f64) -> Stock {
++    match Stock::block(Backend::Field { band: FIELD_BAND }, x0, y0, x1, y1, top, cell) {
++        Ok(s) => s,
++        Err(e) => panic!("block: {e:?}"),
++    }
++}
++
++#[test]
++fn a_block_stores_no_band_at_build() {
++    // The case that took ~58 s: 120 mm square at a 0.375 mm cell.
++    let s = field_block(-60.0, -60.0, 60.0, 60.0, 0.0, 0.375);
++    let f = s.field().expect("a field stock");
++    assert_eq!(f.brick_count(), 0, "no band is filled at build - the box answers in closed form");
++}
++
++#[test]
++fn the_closed_form_reads_the_stock_the_band_fill_read() {
++    // A small block both ways: band-filled from its shell, and closed-form.
++    let (lo, hi, cell) = (Point3::new(0.0, 0.0, -6.0), Point3::new(10.0, 8.0, 0.0), 0.5);
++    let meshed = match SdfField::from_mesh(&cube(lo, hi).facets, cell, FIELD_BAND) {
++        Ok(f) => f,
++        Err(e) => panic!("mesh field: {e:?}"),
++    };
++    let boxed = match SdfField::from_box(lo, hi, cell, FIELD_BAND) {
++        Ok(f) => f,
++        Err(e) => panic!("box field: {e:?}"),
++    };
++    let mut worst = 0.0f64;
++    for i in -6..=26 {
++        for j in -6..=22 {
++            for k in -18..=6 {
++                let p = Point3::new(f64::from(i) * 0.5 + 0.25, f64::from(j) * 0.5 + 0.25, f64::from(k) * 0.5 + 0.25);
++                let (a, b) = (meshed.mesh_distance(p), boxed.mesh_distance(p));
++                // Same side of the surface everywhere (the verdicts' sign).
++                assert!(a.signum() == b.signum() || a == 0.0 || b == 0.0, "{p:?}: mesh {a} vs box {b}");
++                worst = worst.max((a - b).abs());
++            }
++        }
++    }
++    // The band fill is a graph-distance bound within a few cells of the
++    // truth; the closed form IS the truth, so they agree to that bound.
++    assert!(worst <= 2.0 * cell, "worst |mesh - box| = {worst}");
++}
++
++#[test]
++#[ignore = "heavy lane (#633 cost): a 120 mm field block, drill program, release ~ms - run with --release -- --ignored"]
++fn a_large_field_block_runs_a_drill_program_quickly() {
++    let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
++    let mut moves = Vec::new();
++    for (x, y) in [(-30.0, -30.0), (30.0, -30.0), (30.0, 30.0), (-30.0, 30.0)] {
++        moves.push(Move::new(MoveKind::Rapid, p(x, y, 5.0), p(x, y, 1.0), None));
++        moves.push(Move::new(MoveKind::Feed, p(x, y, 1.0), p(x, y, -5.0), Some(200.0)));
++        moves.push(Move::new(MoveKind::Rapid, p(x, y, -5.0), p(x, y, 5.0), None));
++    }
++    let cell = auto_cell(3.0, 120.0, 120.0);
++    let t0 = Instant::now();
++    let mut s = field_block(-60.0, -60.0, 60.0, 60.0, 0.0, cell);
++    if let Err(e) = s.simulate(&[SimOp { moves: &moves, radius: 3.0, ball: false, cone: None, corner: None }]) {
++        panic!("simulate: {e:?}");
++    }
++    let dt = t0.elapsed();
++    // Budget: the build plus four plunges, on a 320 x 320 lattice. Was
++    // ~58 s; a regression to a band fill blows through this at once.
++    assert!(dt.as_secs_f64() < 2.0, "field block + drill took {dt:?}");
++}
+diff --git a/docs/decisions/633-field-block-closed-form.md b/docs/decisions/633-field-block-closed-form.md
+new file mode 100644
+index 00000000..a4897ad2
+--- /dev/null
++++ b/docs/decisions/633-field-block-closed-form.md
+@@ -0,0 +1,25 @@
++## #633 - a field block stock builds in closed form
++
++**Profile** (release, `drill_plate.cl`, 120 mm box at the CLI's 0.375 mm auto cell, 320 × 320):
++
++| Phase | Column | Field, before | Field, after |
++|---|---|---|---|
++| Build the block | 27 µs | **58 s** | **42 µs** |
++| Cut (9 moves) | 23 µs | 3.4 ms | 2.6 ms |
++| Read all columns | 0.2 ms | 66 ms | 53 ms |
++| Cut cells | 399 | 399 | 399 |
++
++**Cause:** `block_field` meshed the floorless block as a box **ten spans deep** (1.2 m for a 120 mm block), and `SdfField::from_mesh` breadth-first-filled every band cell along those walls: tens of millions of hash-map cells, almost all far below any cut. The cut cost (the M7.3 per-brick law, #584) was never the problem.
++
++**Chosen:** a block's mesh-layer magnitude is the box's **exact closed-form distance** (`field_box::AnalyticBox`). `SdfField::from_box` stores no bricks, and `mag_at` answers unstored cells from the box, clamped to `cap` by the band law it already used.
++- **Unchanged:** the shell is still built (a handful of facets) and still answers parity and bounds. The cut layers (`cuts`, `cut_ups`) and every reader are untouched, since all of them go through `mag_at`.
++- **Why it's safe:** the closed form is the truth that the band fill's graph distance bounded. `field_block_cost::the_closed_form_reads_the_stock_the_band_fill_read` checks the same sign everywhere and agreement within two cells, and the cut-cell counts above are identical.
++
++**Dropped:**
++- **A shallower block (fewer spans deep):** the cost is linear in depth, so it would still take seconds, and it would change the floorless semantics.
++- **A coarser field auto cell:** it changes verdict resolution.
++- **Lazy band fill on first cut:** more machinery, for the same result the closed form gives for free.
++
++**Not covered:** cylinder and model stocks still band-fill from their meshes. They're bounded by their real size, not by a ten-span floor, so they don't have this pathology. A closed-form cylinder can follow if profiling shows a need.
++
++**Budget test:** `field_block_cost::a_large_field_block_runs_a_drill_program_quickly` (heavy lane, release): a 120 mm field block plus four plunges must finish under 2 s. It was 58 s.

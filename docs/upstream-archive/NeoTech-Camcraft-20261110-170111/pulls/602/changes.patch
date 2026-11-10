@@ -1,0 +1,687 @@
+From 0e1839fac2974d1314111848cded155b054816f5 Mon Sep 17 00:00:00 2001
+From: JSwetz <Johnswetz1982@gmail.com>
+Date: Mon, 9 Nov 2026 19:42:47 -0500
+Subject: [PATCH] feat(tools): align a vendor STEP by ISO 13399 tool coordinate
+ systems
+
+Wire the ISO 13399 coordinate system reader into the tool-body pipeline
+so vendor tool STEP packages carrying named coordinate systems align
+automatically without manual numeric offsets.
+
+- ToolCsysReport::align_tool_body() extracts the tool axis (from CIP
+  or CSIF) and calculates the tip offset (-dot(origin, axis)) so that
+  the cutting reference point sits at Z = 0 in the tool frame, pointing
+  up into the spindle along +Z.
+- ToolBodySpec::from_step_auto(&path) reads both mesh facets and coordinate
+  systems, aligning with no manual offsets.
+- SetToolBody::from_step_auto(&world, tool_name, &path) attaches the auto-aligned
+  tool body as one undoable command.
+- tool_body_view::load_aligned(&path) returns LoadedBody carrying the auto-alignment
+  result or fallback reason, preserving load backwards compatibility.
+- In the tool editor (ToolBodyUi), importing a STEP file with ISO 13399 coordinate
+  systems automatically sets the axis and tip offset with the note
+  'aligned by ISO 13399 coordinate systems'; files without them or with
+  degenerate/ambiguous coordinate systems fall back to default numeric placement
+  ([0, 0, 1] axis, 0 offset) with a note naming why.
+- Test fixture testdata/models/tool_csys_box_iso13399.step combining a B-rep box
+  and ISO 13399 placements.
+- docs/decisions/370-tool-csys-align.md.
+
+Fork synced at v0.16.0.
+
+Changelog: Tool bodies: align a vendor STEP by its ISO 13399 tool coordinate systems (#370)
+
+Fixes #370
+---
+ crates/app/src/commands/tool_body.rs        |  28 +++
+ crates/app/src/geometry/import/step_csys.rs |  29 +++
+ crates/app/src/tool_body_view.rs            |  38 +++-
+ crates/app/tests/tool_body.rs               |  81 ++++++++
+ crates/app/tests/tool_csys.rs               |  25 +++
+ crates/ui/src/egui_app/tests/tool_body.rs   |  37 ++++
+ crates/ui/src/egui_app/tool_body_page.rs    |   3 +
+ crates/ui/src/state_tool_body.rs            |  44 +++--
+ docs/decisions/370-tool-csys-align.md       |  16 ++
+ testdata/models/tool_csys_box_iso13399.step | 194 ++++++++++++++++++++
+ 10 files changed, 480 insertions(+), 15 deletions(-)
+ create mode 100644 docs/decisions/370-tool-csys-align.md
+ create mode 100644 testdata/models/tool_csys_box_iso13399.step
+
+diff --git a/crates/app/src/commands/tool_body.rs b/crates/app/src/commands/tool_body.rs
+index 104a4441..c4f3b103 100644
+--- a/crates/app/src/commands/tool_body.rs
++++ b/crates/app/src/commands/tool_body.rs
+@@ -22,6 +22,7 @@ use camcraft_tools::lathe_insert_zone::InsertZone;
+ 
+ /// A body as the caller states it: model-frame facets, where they came
+ /// from, and the numeric placement (`tool_body::place`).
++#[derive(Clone, Debug, PartialEq)]
+ pub struct ToolBodySpec {
+     pub source: String,
+     pub facets: Vec<Triangle>,
+@@ -32,6 +33,24 @@ pub struct ToolBodySpec {
+     pub offset: f64,
+ }
+ 
++impl ToolBodySpec {
++    /// Read a STEP file and align it automatically by its ISO 13399
++    /// coordinate systems (#370). Refuses by name if the file is unreadable,
++    /// holds no facets, or if coordinate systems are absent or ambiguous.
++    pub fn from_step_auto(path: &Path) -> Result<Self, String> {
++        let data = std::fs::read(path).map_err(|e| format!("I/O error: {e}"))?;
++        let mesh = crate::geometry::import::load_model(path).map_err(|e| e.to_string())?;
++        if mesh.facets.is_empty() {
++            return Err("the file holds no facets".into());
++        }
++        let report = crate::geometry::import::step_csys::read_tool_csys(&data)
++            .map_err(|e| format!("coordinate systems unreadable: {e}"))?;
++        let (axis, offset) = report.align_tool_body()?;
++        let source = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
++        Ok(ToolBodySpec { source, facets: mesh.facets.to_vec(), axis, offset })
++    }
++}
++
+ /// A lathe-held body as the caller states it (#369): model-frame
+ /// facets, where they came from, and the turning-frame placement (the
+ /// model directions that are radial and along the spindle, the model
+@@ -46,6 +65,7 @@ pub struct LatheBodySpec {
+ }
+ 
+ /// Set (`Some`) or clear (`None`) a tool's body.
++#[derive(Debug)]
+ pub struct SetToolBody {
+     name: String,
+     prev: Option<ToolBody>,
+@@ -103,6 +123,14 @@ impl SetToolBody {
+         Self::new(world, name, Some(ToolBodySpec { source, facets: mesh.facets.to_vec(), axis, offset }))
+     }
+ 
++    /// Read a STEP file, align it automatically by its ISO 13399
++    /// coordinate systems (#370), and place it on tool `name` with no
++    /// manual offsets.
++    pub fn from_step_auto(world: &World, name: &str, path: &Path) -> Result<Self, CommandError> {
++        let spec = ToolBodySpec::from_step_auto(path).map_err(CommandError::Invalid)?;
++        Self::new(world, name, Some(spec))
++    }
++
+     /// Place and judge a lathe body (#369) against tool `name` now;
+     /// `None` clears. Refused by name: no such tool, no lathe steel, a
+     /// placement that is no frame, a mesh that is no body.
+diff --git a/crates/app/src/geometry/import/step_csys.rs b/crates/app/src/geometry/import/step_csys.rs
+index 4fd4bb3a..2f7b30ce 100644
+--- a/crates/app/src/geometry/import/step_csys.rs
++++ b/crates/app/src/geometry/import/step_csys.rs
+@@ -200,6 +200,35 @@ impl ToolCsysReport {
+             names.join(", ")
+         ))
+     }
++
++    /// Attempt automatic tool body alignment from the file's ISO 13399
++    /// coordinate systems (#370): returns the unit tool axis (pointing from
++    /// the cutting point toward the spindle) and the model origin's height
++    /// above the tip.
++    ///
++    /// If CIP (or CSIF) is present, the cutting point is its origin and the
++    /// axis is its unit z. If absent, ambiguous or degenerate, returns `Err`
++    /// with the named reason to fall back to numeric placement.
++    pub fn align_tool_body(&self) -> Result<([f64; 3], f64), String> {
++        let csys = match self.find(CsysRole::InProcess) {
++            Ok(cip) => cip,
++            Err(e_cip) => match self.find(CsysRole::Interface) {
++                Ok(csif) => csif,
++                Err(_) => {
++                    if let Some(reason) = self.none_found() {
++                        return Err(reason);
++                    }
++                    return Err(e_cip);
++                }
++            },
++        };
++        let axis = csys.z;
++        let offset = -dot(csys.origin, axis);
++        if !offset.is_finite() {
++            return Err("calculated tip offset is not finite".into());
++        }
++        Ok((axis, offset))
++    }
+ }
+ 
+ /// Read every named coordinate system of a STEP file. `Err` only when
+diff --git a/crates/app/src/tool_body_view.rs b/crates/app/src/tool_body_view.rs
+index bfb2951f..722c30c0 100644
+--- a/crates/app/src/tool_body_view.rs
++++ b/crates/app/src/tool_body_view.rs
+@@ -41,15 +41,45 @@ pub fn axis_label(axis: [f64; 3]) -> Option<&'static str> {
+     AXIS_CHOICES.iter().find(|(_, d)| dot(a, *d) > 1.0 - 1e-9).map(|(n, _)| *n)
+ }
+ 
+-/// Read a STEP / STL / OBJ for a tool body: its file name and its
+-/// model-frame facets. Refuses an unreadable or empty file by name.
+-pub fn load(path: &Path) -> Result<(String, Vec<Triangle>), String> {
++/// What loading a body from disk found: the source name, its facets, and
++/// the auto-alignment from ISO 13399 coordinate systems (#370) if present.
++pub struct LoadedBody {
++    pub source: String,
++    pub facets: Vec<Triangle>,
++    /// `Ok((axis, offset))` when aligned from ISO 13399 coordinate
++    /// systems; `Err(why)` when falling back to numeric placement.
++    pub alignment: Result<([f64; 3], f64), String>,
++}
++
++/// Read a STEP / STL / OBJ for a tool body: its file name, its
++/// model-frame facets, and automatic placement from ISO 13399 coordinate
++/// systems (#370) if present.
++pub fn load_aligned(path: &Path) -> Result<LoadedBody, String> {
+     let mesh = crate::geometry::import::load_model(path).map_err(|e| e.to_string())?;
+     if mesh.facets.is_empty() {
+         return Err("the file holds no facets".into());
+     }
+     let source = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
+-    Ok((source, mesh.facets.to_vec()))
++    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
++    let alignment = if ext == "step" || ext == "stp" {
++        match std::fs::read(path) {
++            Ok(data) => match crate::geometry::import::step_csys::read_tool_csys(&data) {
++                Ok(report) => report.align_tool_body(),
++                Err(e) => Err(format!("coordinate systems unreadable: {e}")),
++            },
++            Err(e) => Err(format!("I/O error: {e}")),
++        }
++    } else {
++        Err("not a STEP file (no coordinate systems)".into())
++    };
++    Ok(LoadedBody { source, facets: mesh.facets.to_vec(), alignment })
++}
++
++/// Read a STEP / STL / OBJ for a tool body: its file name and its
++/// model-frame facets. Refuses an unreadable or empty file by name.
++pub fn load(path: &Path) -> Result<(String, Vec<Triangle>), String> {
++    let loaded = load_aligned(path)?;
++    Ok((loaded.source, loaded.facets))
+ }
+ 
+ /// The placement as `SetToolBody` would judge it, without landing it:
+diff --git a/crates/app/tests/tool_body.rs b/crates/app/tests/tool_body.rs
+index 5a9e2c8e..4a1f032b 100644
+--- a/crates/app/tests/tool_body.rs
++++ b/crates/app/tests/tool_body.rs
+@@ -365,3 +365,84 @@ fn a_body_reads_from_an_stl_and_is_placed_by_axis_and_offset() {
+     assert!((judged.holder_len - (90.0 - shank_top())).abs() < 1e-9);
+     assert!(judged.holder_d >= 24.0 - 1e-9 && judged.holder_d <= 24.0 + 1e-4);
+ }
++
++fn testdata(name: &str) -> std::path::PathBuf {
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../../testdata/models")
++        .join(name)
++}
++
++#[test]
++fn step_with_tool_coordinate_systems_aligns_automatically() {
++    let path = testdata("tool_csys_box_iso13399.step");
++    let spec = ToolBodySpec::from_step_auto(&path).expect("spec from step with CIP");
++    assert_eq!(spec.axis, [0.0, 0.0, 1.0]);
++    assert!((spec.offset - 75.0).abs() < 1e-9, "offset is 75 mm from CIP origin (0, 0, -75)");
++
++    let (world, mut history) = face_world();
++    let cmd = SetToolBody::from_step_auto(&world, TOOL, &path).expect("SetToolBody from step auto");
++    history.execute(&world, cmd);
++
++    let b = tool_body::body_of(&world, &tool_entity(&world)).expect("body landed on tool");
++    assert_eq!(b.source, "tool_csys_box_iso13399.step");
++    let profile = b.profile().expect("profile envelope");
++    // Model box z was [-40, 0], with offset 75 => tool frame z is [35, 75].
++    assert!((profile.bottom() - 35.0).abs() < 1e-6, "foot at 35 mm: {}", profile.bottom());
++    assert!((profile.top() - 75.0).abs() < 1e-6, "top at 75 mm: {}", profile.top());
++
++    // Undo removes the body, redo restores it.
++    history.undo(&world);
++    assert!(tool_body::body_of(&world, &tool_entity(&world)).is_none());
++    history.redo(&world);
++    assert!(tool_body::body_of(&world, &tool_entity(&world)).is_some());
++}
++
++#[test]
++fn step_without_tool_coordinate_systems_falls_back_by_name() {
++    let path = testdata("box.step");
++    let err = ToolBodySpec::from_step_auto(&path).expect_err("no csys falls back");
++    assert_eq!(err, "the file names no coordinate systems");
++
++    let (world, _) = face_world();
++    let cmd_err = SetToolBody::from_step_auto(&world, TOOL, &path).expect_err("command refuses by name");
++    match cmd_err {
++        CommandError::Invalid(msg) => assert!(msg.contains("the file names no coordinate systems"), "{msg}"),
++        other => panic!("expected CommandError::Invalid, got {other:?}"),
++    }
++}
++
++#[test]
++fn step_with_degenerate_coordinate_systems_falls_back_by_name() {
++    let text = std::fs::read_to_string(testdata("tool_csys_box_iso13399.step"))
++        .expect("fixture reads")
++        .replace(
++            "#220 = AXIS2_PLACEMENT_3D('CIP', #221, #202, #203);",
++            "#220 = AXIS2_PLACEMENT_3D('CIP', #221, #300, #203);\n#300 = DIRECTION('', (0.0, 0.0, 0.0));",
++        );
++    let path = std::env::temp_dir().join(format!("camcraft_degenerate_{}.step", std::process::id()));
++    std::fs::write(&path, text).expect("write temp step");
++    let err = ToolBodySpec::from_step_auto(&path).expect_err("degenerate csys falls back");
++    let _ = std::fs::remove_file(&path);
++    assert!(
++        err.contains("axis has no direction") || err.contains("every ISO 13399 coordinate system was refused"),
++        "{err}"
++    );
++}
++
++#[test]
++fn tool_body_view_load_aligned_handles_step_csys_and_fallback() {
++    use camcraft_app::tool_body_view;
++
++    let path_aligned = testdata("tool_csys_box_iso13399.step");
++    let loaded = tool_body_view::load_aligned(&path_aligned).expect("loads");
++    assert_eq!(loaded.source, "tool_csys_box_iso13399.step");
++    assert!(!loaded.facets.is_empty());
++    let (axis, offset) = loaded.alignment.expect("aligned");
++    assert_eq!(axis, [0.0, 0.0, 1.0]);
++    assert!((offset - 75.0).abs() < 1e-9);
++
++    let path_none = testdata("box.step");
++    let loaded_none = tool_body_view::load_aligned(&path_none).expect("loads");
++    let err = loaded_none.alignment.expect_err("no csys fallback");
++    assert_eq!(err, "the file names no coordinate systems");
++}
+diff --git a/crates/app/tests/tool_csys.rs b/crates/app/tests/tool_csys.rs
+index 8482fd68..8d8ee295 100644
+--- a/crates/app/tests/tool_csys.rs
++++ b/crates/app/tests/tool_csys.rs
+@@ -187,3 +187,28 @@ fn unreadable_input_is_a_clean_error_never_a_panic() {
+         r.refused
+     );
+ }
++
++#[test]
++fn iso_13399_tool_csys_aligns_automatically() {
++    let r = read("tool_csys_iso13399.step");
++    let (axis, offset) = r.align_tool_body().expect("aligns from CIP");
++    assert!(close(axis, [0.0, 0.0, 1.0]), "{axis:?}");
++    assert!((offset - 75.0).abs() < 1e-12, "{offset}");
++}
++
++#[test]
++fn a_file_without_tool_csys_falls_back_by_name() {
++    let r = read("tool_csys_none.step");
++    let err = r.align_tool_body().expect_err("no coordinate systems");
++    assert_eq!(err, "the file names no coordinate systems");
++}
++
++#[test]
++fn degenerate_tool_csys_falls_back_by_name() {
++    let r = read("tool_csys_degenerate.step");
++    let err = r.align_tool_body().expect_err("degenerate coordinate systems");
++    assert!(
++        err.starts_with("every ISO 13399 coordinate system was refused"),
++        "{err}"
++    );
++}
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index 45b4655f..ac6245de 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -314,3 +314,40 @@ fn the_preview_zoom_clamps_and_fit_resets_it() {
+     assert_eq!((d.zoom, d.pan, d.yaw, d.pitch), (0.0, [0.0; 2], 0.0, 0.0), "Fit restores the default view");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
++
++#[test]
++fn import_tool_body_from_step_auto_aligns_in_editor() {
++    let mut harness = editor();
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../../testdata/models/tool_csys_box_iso13399.step");
++    harness.state_mut().state.import_tool_body_from(&path);
++    harness.run();
++    let st = &harness.state().state;
++    assert_eq!(st.tool_body_ui.axis, [0.0, 0.0, 1.0]);
++    assert!((st.tool_body_ui.offset - 75.0).abs() < 1e-6);
++    assert_eq!(
++        st.tool_body_ui.align_note.as_deref(),
++        Some("aligned by ISO 13399 coordinate systems")
++    );
++    assert!(st.status.contains("aligned by ISO 13399 coordinate systems"));
++}
++
++#[test]
++fn import_tool_body_from_step_without_csys_falls_back_by_name_in_editor() {
++    let mut harness = editor();
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../../testdata/models/box.step");
++    harness.state_mut().state.import_tool_body_from(&path);
++    harness.run();
++    let st = &harness.state().state;
++    assert_eq!(st.tool_body_ui.axis, [0.0, 0.0, 1.0]);
++    assert_eq!(st.tool_body_ui.offset, 0.0);
++    assert!(
++        st.tool_body_ui
++            .align_note
++            .as_ref()
++            .unwrap()
++            .contains("the file names no coordinate systems")
++    );
++    assert!(st.status.contains("the file names no coordinate systems"));
++}
+diff --git a/crates/ui/src/egui_app/tool_body_page.rs b/crates/ui/src/egui_app/tool_body_page.rs
+index 4f70eb64..c1f8bd7b 100644
+--- a/crates/ui/src/egui_app/tool_body_page.rs
++++ b/crates/ui/src/egui_app/tool_body_page.rs
+@@ -83,6 +83,9 @@ pub(super) fn body_section(ui: &mut Ui, state: &mut State, exists: bool, u: Unit
+     axis_combo(ui, &mut state.tool_body_ui.axis);
+     field(ui, "Tip offset (model origin above the tip)");
+     num(ui, u, &mut state.tool_body_ui.offset);
++    if let Some(ref note) = state.tool_body_ui.align_note {
++        ui.label(note);
++    }
+     let pick = state.tool_body_ui.pick;
+     ui.horizontal(|ui| {
+         if ui
+diff --git a/crates/ui/src/state_tool_body.rs b/crates/ui/src/state_tool_body.rs
+index 33766a1e..3526935e 100644
+--- a/crates/ui/src/state_tool_body.rs
++++ b/crates/ui/src/state_tool_body.rs
+@@ -45,6 +45,9 @@ pub struct ToolBodyUi {
+     /// The model origin's height above the tip, along `axis`.
+     pub offset: f64,
+     pub pick: BodyPickMode,
++    /// Note on how the placement was determined (#370: auto-aligned by
++    /// ISO 13399 coordinate systems, or why it fell back to numeric).
++    pub align_note: Option<String>,
+     /// The preview's orbit, radians off its default view.
+     pub yaw: f32,
+     pub pitch: f32,
+@@ -139,21 +142,38 @@ impl State {
+         }
+     }
+ 
+-    /// Read a STEP / STL / OBJ into the draft (+Z axis, origin at the
++    /// Read a STEP / STL / OBJ into the draft (auto-aligned by ISO 13399
++    /// coordinate systems when present, otherwise +Z axis / origin at
+     /// tip until placed). Nothing reaches the world until Apply body.
+     pub(crate) fn import_tool_body_from(&mut self, path: &Path) {
+         self.sync_tool_body_ui();
+-        match tool_body_view::load(path) {
+-            Ok((source, facets)) => {
++        match tool_body_view::load_aligned(path) {
++            Ok(loaded) => {
+                 let d = &mut self.tool_body_ui;
+-                self.status = format!(
+-                    "body {source}: {} facets - set the axis and tip, then Apply body",
+-                    facets.len()
+-                );
+-                d.source = source;
+-                d.facets = Arc::from(facets);
+-                d.axis = [0.0, 0.0, 1.0];
+-                d.offset = 0.0;
++                d.source = loaded.source;
++                d.facets = Arc::from(loaded.facets);
++                match loaded.alignment {
++                    Ok((axis, offset)) => {
++                        d.axis = axis;
++                        d.offset = offset;
++                        d.align_note = Some("aligned by ISO 13399 coordinate systems".into());
++                        self.status = format!(
++                            "body {}: {} facets - aligned by ISO 13399 coordinate systems; Apply body",
++                            d.source,
++                            d.facets.len()
++                        );
++                    }
++                    Err(why) => {
++                        d.axis = [0.0, 0.0, 1.0];
++                        d.offset = 0.0;
++                        d.align_note = Some(format!("numeric placement ({why})"));
++                        self.status = format!(
++                            "body {}: {} facets - numeric placement ({why}); set axis and tip, then Apply body",
++                            d.source,
++                            d.facets.len()
++                        );
++                    }
++                }
+                 d.pick = BodyPickMode::Off;
+                 d.preview = None;
+             }
+@@ -185,6 +205,7 @@ impl State {
+             BodyPickMode::Tip => match tool_body_view::tip_offset_at(hit.vertex, d.axis) {
+                 Some(o) => {
+                     d.offset = o;
++                    d.align_note = Some("manual placement".into());
+                     self.status = format!("tip picked: offset {o:.3} mm along the axis");
+                 }
+                 None => self.status = "tip not picked: set a usable axis first".into(),
+@@ -192,6 +213,7 @@ impl State {
+             BodyPickMode::Axis => match hit.normal {
+                 Some(n) => {
+                     d.axis = n;
++                    d.align_note = Some("manual placement".into());
+                     self.status = format!(
+                         "axis picked: {}",
+                         tool_body_view::axis_label(n).map_or_else(|| format!("({:.3}, {:.3}, {:.3})", n[0], n[1], n[2]), str::to_owned)
+diff --git a/docs/decisions/370-tool-csys-align.md b/docs/decisions/370-tool-csys-align.md
+new file mode 100644
+index 00000000..ee506227
+--- /dev/null
++++ b/docs/decisions/370-tool-csys-align.md
+@@ -0,0 +1,16 @@
++## #370 - Tool bodies: align a vendor STEP by its tool coordinate systems (ISO 13399 / GTC)
++
++- **What was decided:**
++  - Auto-alignment wires the ISO 13399 `step_csys` coordinate system reader into the tool body pipeline (`ToolBodySpec`, `SetToolBody`, `tool_body_view`, and editor UI):
++    - `ToolCsysReport::align_tool_body()` extracts the tool axis (`cip.z`, or `csif.z` if CIP is absent) and calculates the tip offset (`-dot(origin, axis)`) so that the cutting reference point sits at $Z = 0$ in the tool frame, pointing up into the spindle along $+Z$.
++    - `ToolBodySpec::from_step_auto(&path)` reads both the mesh facets and coordinate systems from a vendor STEP file, aligning it with zero manual offsets.
++    - `SetToolBody::from_step_auto(&world, tool_name, &path)` attaches the auto-aligned tool body as one undoable command.
++    - `tool_body_view::load_aligned(&path)` returns `LoadedBody` carrying the auto-alignment result or fallback reason, preserving backwards compatibility for `tool_body_view::load`.
++    - In the tool editor (`ToolBodyUi`), importing a STEP file with ISO 13399 coordinate systems automatically sets the axis and tip offset with the note "aligned by ISO 13399 coordinate systems"; importing a file without them or with degenerate/ambiguous coordinate systems falls back to default numeric placement ([0, 0, 1] axis, 0 offset) with a note naming why.
++- **Why:**
++  - ISO 13399-303 §3.3 specifies CIP as the coordinate system located at the cutting part of the tool with its Z-axis pointing toward the PCS (collinear with spindle axis).
++  - This allows vendor STEP packages (Sandvik, Kennametal, etc.) containing standard tool coordinate systems to snap into place without requiring the user to manually measure or enter offsets or pick vertices.
++  - Degenerate, ambiguous, or absent coordinate systems fall back safely by name without panicking or creating invalid tool bodies, adhering to the Prime Directive.
++- **Considered and dropped:**
++  - Falling back to PCS or MCS when CIP is missing: dropped because PCS / MCS define mounting and part references, not the cutting point; attempting to deduce the tip from them without CIP would be heuristic guessing, which is forbidden.
++  - Automatically guessing axis from bounding boxes: dropped, numeric fallback with user review is safer and strictly deterministic.
+diff --git a/testdata/models/tool_csys_box_iso13399.step b/testdata/models/tool_csys_box_iso13399.step
+new file mode 100644
+index 00000000..a9ea50d7
+--- /dev/null
++++ b/testdata/models/tool_csys_box_iso13399.step
+@@ -0,0 +1,194 @@
++ISO-10303-21;
++HEADER;
++FILE_DESCRIPTION(('CamCraft test fixture, tool body with ISO 13399 coordinate systems'), '2;1');
++FILE_NAME('tool_csys_box_iso13399.step', '2026-11-09T00:00:00', (''), (''), 'camcraft', '', '');
++FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
++ENDSEC;
++DATA;
++#1 = APPLICATION_PROTOCOL_DEFINITION('international standard', 'automotive_design', 2000, #2);
++#2 = APPLICATION_CONTEXT('core data for automotive mechanical design processes');
++#3 = SHAPE_DEFINITION_REPRESENTATION(#4, #10);
++#4 = PRODUCT_DEFINITION_SHAPE('','', #5);
++#5 = PRODUCT_DEFINITION('design','', #6, #9);
++#6 = PRODUCT_DEFINITION_FORMATION('','', #7);
++#7 = PRODUCT('','','', (#8));
++#8 = PRODUCT_CONTEXT('', #2, 'mechanical');
++#9 = PRODUCT_DEFINITION_CONTEXT('part definition', #2, 'design');
++#10 = ADVANCED_BREP_SHAPE_REPRESENTATION('', (#16), #11);
++#11 = (
++    GEOMETRIC_REPRESENTATION_CONTEXT(3) 
++    GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#15))
++    GLOBAL_UNIT_ASSIGNED_CONTEXT((#12, #13, #14))
++    REPRESENTATION_CONTEXT('Context #1', '3D Context with UNIT and UNCERTAINTY')
++);
++#12 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );
++#13 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );
++#14 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );
++#15 = UNCERTAINTY_MEASURE_WITH_UNIT(1.0E-6, #12, 'distance_accuracy_value','confusion accuracy');
++#16 = MANIFOLD_SOLID_BREP('', #17);
++#17 = CLOSED_SHELL('', (#18, #25, #32, #39, #46, #53));
++#18 = FACE_SURFACE('', (#19), #80, .F.);
++#19 = FACE_BOUND('', #20, .F.);
++#20 = EDGE_LOOP('', (#21, #22, #23, #24));
++#21 = ORIENTED_EDGE('', *, *, #60, .T.);
++#22 = ORIENTED_EDGE('', *, *, #61, .T.);
++#23 = ORIENTED_EDGE('', *, *, #62, .T.);
++#24 = ORIENTED_EDGE('', *, *, #63, .T.);
++#25 = FACE_SURFACE('', (#26), #85, .T.);
++#26 = FACE_BOUND('', #27, .T.);
++#27 = EDGE_LOOP('', (#28, #29, #30, #31));
++#28 = ORIENTED_EDGE('', *, *, #60, .T.);
++#29 = ORIENTED_EDGE('', *, *, #64, .T.);
++#30 = ORIENTED_EDGE('', *, *, #65, .F.);
++#31 = ORIENTED_EDGE('', *, *, #66, .F.);
++#32 = FACE_SURFACE('', (#33), #90, .T.);
++#33 = FACE_BOUND('', #34, .T.);
++#34 = EDGE_LOOP('', (#35, #36, #37, #38));
++#35 = ORIENTED_EDGE('', *, *, #61, .T.);
++#36 = ORIENTED_EDGE('', *, *, #67, .T.);
++#37 = ORIENTED_EDGE('', *, *, #68, .F.);
++#38 = ORIENTED_EDGE('', *, *, #64, .F.);
++#39 = FACE_SURFACE('', (#40), #95, .T.);
++#40 = FACE_BOUND('', #41, .T.);
++#41 = EDGE_LOOP('', (#42, #43, #44, #45));
++#42 = ORIENTED_EDGE('', *, *, #62, .T.);
++#43 = ORIENTED_EDGE('', *, *, #69, .T.);
++#44 = ORIENTED_EDGE('', *, *, #70, .F.);
++#45 = ORIENTED_EDGE('', *, *, #67, .F.);
++#46 = FACE_SURFACE('', (#47), #100, .T.);
++#47 = FACE_BOUND('', #48, .T.);
++#48 = EDGE_LOOP('', (#49, #50, #51, #52));
++#49 = ORIENTED_EDGE('', *, *, #63, .T.);
++#50 = ORIENTED_EDGE('', *, *, #66, .T.);
++#51 = ORIENTED_EDGE('', *, *, #71, .F.);
++#52 = ORIENTED_EDGE('', *, *, #69, .F.);
++#53 = FACE_SURFACE('', (#54), #105, .T.);
++#54 = FACE_BOUND('', #55, .T.);
++#55 = EDGE_LOOP('', (#56, #57, #58, #59));
++#56 = ORIENTED_EDGE('', *, *, #65, .T.);
++#57 = ORIENTED_EDGE('', *, *, #68, .T.);
++#58 = ORIENTED_EDGE('', *, *, #70, .T.);
++#59 = ORIENTED_EDGE('', *, *, #71, .T.);
++#60 = EDGE_CURVE('', #72, #73, #110, .T.);
++#61 = EDGE_CURVE('', #73, #74, #114, .T.);
++#62 = EDGE_CURVE('', #74, #75, #118, .T.);
++#63 = EDGE_CURVE('', #75, #72, #122, .T.);
++#64 = EDGE_CURVE('', #73, #76, #126, .T.);
++#65 = EDGE_CURVE('', #77, #76, #130, .T.);
++#66 = EDGE_CURVE('', #72, #77, #134, .T.);
++#67 = EDGE_CURVE('', #74, #78, #138, .T.);
++#68 = EDGE_CURVE('', #76, #78, #142, .T.);
++#69 = EDGE_CURVE('', #75, #79, #146, .T.);
++#70 = EDGE_CURVE('', #78, #79, #150, .T.);
++#71 = EDGE_CURVE('', #79, #77, #154, .T.);
++#72 = VERTEX_POINT('', #158);
++#73 = VERTEX_POINT('', #159);
++#74 = VERTEX_POINT('', #160);
++#75 = VERTEX_POINT('', #161);
++#76 = VERTEX_POINT('', #162);
++#77 = VERTEX_POINT('', #163);
++#78 = VERTEX_POINT('', #164);
++#79 = VERTEX_POINT('', #165);
++#80 = PLANE('', #81);
++#81 = AXIS2_PLACEMENT_3D('', #82, #83, #84);
++#82 = CARTESIAN_POINT('', (10.0, 10.0, -40.0));
++#83 = DIRECTION('', (0.0, 0.0, 1.0));
++#84 = DIRECTION('', (-1.0, 0.0, 0.0));
++#85 = PLANE('', #86);
++#86 = AXIS2_PLACEMENT_3D('', #87, #88, #89);
++#87 = CARTESIAN_POINT('', (-10.0, -10.0, -40.0));
++#88 = DIRECTION('', (0.0, -1.0, 0.0));
++#89 = DIRECTION('', (1.0, 0.0, 0.0));
++#90 = PLANE('', #91);
++#91 = AXIS2_PLACEMENT_3D('', #92, #93, #94);
++#92 = CARTESIAN_POINT('', (10.0, -10.0, -40.0));
++#93 = DIRECTION('', (1.0, 0.0, 0.0));
++#94 = DIRECTION('', (0.0, 1.0, 0.0));
++#95 = PLANE('', #96);
++#96 = AXIS2_PLACEMENT_3D('', #97, #98, #99);
++#97 = CARTESIAN_POINT('', (10.0, 10.0, -40.0));
++#98 = DIRECTION('', (0.0, 1.0, 0.0));
++#99 = DIRECTION('', (-1.0, 0.0, 0.0));
++#100 = PLANE('', #101);
++#101 = AXIS2_PLACEMENT_3D('', #102, #103, #104);
++#102 = CARTESIAN_POINT('', (-10.0, 10.0, -40.0));
++#103 = DIRECTION('', (-1.0, 0.0, 0.0));
++#104 = DIRECTION('', (0.0, -1.0, 0.0));
++#105 = PLANE('', #106);
++#106 = AXIS2_PLACEMENT_3D('', #107, #108, #109);
++#107 = CARTESIAN_POINT('', (10.0, 10.0, 0.0));
++#108 = DIRECTION('', (0.0, 0.0, 1.0));
++#109 = DIRECTION('', (-1.0, 0.0, 0.0));
++#110 = LINE('', #111, #112);
++#111 = CARTESIAN_POINT('', (-10.0, -10.0, -40.0));
++#112 = VECTOR('', #113, 1.0);
++#113 = DIRECTION('', (1.0, 0.0, 0.0));
++#114 = LINE('', #115, #116);
++#115 = CARTESIAN_POINT('', (10.0, -10.0, -40.0));
++#116 = VECTOR('', #117, 1.0);
++#117 = DIRECTION('', (0.0, 1.0, 0.0));
++#118 = LINE('', #119, #120);
++#119 = CARTESIAN_POINT('', (10.0, 10.0, -40.0));
++#120 = VECTOR('', #121, 1.0);
++#121 = DIRECTION('', (-1.0, 0.0, 0.0));
++#122 = LINE('', #123, #124);
++#123 = CARTESIAN_POINT('', (-10.0, 10.0, -40.0));
++#124 = VECTOR('', #125, 1.0);
++#125 = DIRECTION('', (0.0, -1.0, 0.0));
++#126 = LINE('', #127, #128);
++#127 = CARTESIAN_POINT('', (10.0, -10.0, -40.0));
++#128 = VECTOR('', #129, 1.0);
++#129 = DIRECTION('', (0.0, 0.0, 1.0));
++#130 = LINE('', #131, #132);
++#131 = CARTESIAN_POINT('', (-10.0, -10.0, 0.0));
++#132 = VECTOR('', #133, 1.0);
++#133 = DIRECTION('', (1.0, 0.0, 0.0));
++#134 = LINE('', #135, #136);
++#135 = CARTESIAN_POINT('', (-10.0, -10.0, -40.0));
++#136 = VECTOR('', #137, 1.0);
++#137 = DIRECTION('', (0.0, 0.0, 1.0));
++#138 = LINE('', #139, #140);
++#139 = CARTESIAN_POINT('', (10.0, 10.0, -40.0));
++#140 = VECTOR('', #141, 1.0);
++#141 = DIRECTION('', (0.0, 0.0, 1.0));
++#142 = LINE('', #143, #144);
++#143 = CARTESIAN_POINT('', (10.0, -10.0, 0.0));
++#144 = VECTOR('', #145, 1.0);
++#145 = DIRECTION('', (0.0, 1.0, 0.0));
++#146 = LINE('', #147, #148);
++#147 = CARTESIAN_POINT('', (-10.0, 10.0, -40.0));
++#148 = VECTOR('', #149, 1.0);
++#149 = DIRECTION('', (0.0, 0.0, 1.0));
++#150 = LINE('', #151, #152);
++#151 = CARTESIAN_POINT('', (10.0, 10.0, 0.0));
++#152 = VECTOR('', #153, 1.0);
++#153 = DIRECTION('', (-1.0, 0.0, 0.0));
++#154 = LINE('', #155, #156);
++#155 = CARTESIAN_POINT('', (-10.0, 10.0, 0.0));
++#156 = VECTOR('', #157, 1.0);
++#157 = DIRECTION('', (0.0, -1.0, 0.0));
++#158 = CARTESIAN_POINT('', (-10.0, -10.0, -40.0));
++#159 = CARTESIAN_POINT('', (10.0, -10.0, -40.0));
++#160 = CARTESIAN_POINT('', (10.0, 10.0, -40.0));
++#161 = CARTESIAN_POINT('', (-10.0, 10.0, -40.0));
++#162 = CARTESIAN_POINT('', (10.0, -10.0, 0.0));
++#163 = CARTESIAN_POINT('', (-10.0, -10.0, 0.0));
++#164 = CARTESIAN_POINT('', (10.0, 10.0, 0.0));
++#165 = CARTESIAN_POINT('', (-10.0, 10.0, 0.0));
++/* ISO 13399 Tool Coordinate Systems */
++/* PCS: tool axis on z, workpiece side toward -z */
++#200 = AXIS2_PLACEMENT_3D('PCS', #201, #202, #203);
++#201 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#202 = DIRECTION('', (0.0, 0.0, 1.0));
++#203 = DIRECTION('', (1.0, 0.0, 0.0));
++/* MCS 40 mm down the tool axis */
++#210 = AXIS2_PLACEMENT_3D('MCS', #211, #202, #203);
++#211 = CARTESIAN_POINT('', (0.0, 0.0, -40.0));
++/* CIP at the cutting part 75 mm down, z pointing back to the PCS */
++#220 = AXIS2_PLACEMENT_3D('CIP', #221, #202, #203);
++#221 = CARTESIAN_POINT('', (0.0, 0.0, -75.0));
++/* CSW1_2 */
++#230 = AXIS2_PLACEMENT_3D('CSW1_2', #231, #202, #203);
++#231 = CARTESIAN_POINT('', (10.0, 0.0, -20.0));
++ENDSEC;
++END-ISO-10303-21;
+\ No newline at end of file

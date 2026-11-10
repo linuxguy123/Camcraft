@@ -1,0 +1,1450 @@
+From d85473361ee7637d663656759106874f5aee30b2 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 7 Nov 2026 21:11:07 +0100
+Subject: [PATCH 1/3] fix(app): drilling reads the stock the setup's earlier
+ operations left
+
+The axial drill's reach (#84), R-plane (#91) and holder laws read the
+stock top over each disk as min(raw stock, prior surface): #96's
+PriorPlan (the setup's stock grid cut by every earlier op's cached
+moves), read at the highest covered cell; unknown, ungenerated or
+posed predecessors leave the raw stock. The plan is simulated lazily,
+only when the raw reading refuses, and shared with verify's #96
+acquittal. A lathe axial drill reads the grid revolved about the axis,
+and turning predecessors are cut as their nose ball. Cross drills keep
+the raw stock (the column grid cannot be read along a radial line).
+The Drill stamp carries the ahead-ops digest, so a drill judged against
+an earlier pocket goes Stale when that pocket's path moves.
+
+Fixes #89
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ RECOMMENDED.md                          |  38 +++
+ crates/app/src/operation/drill_prior.rs |  91 ++++++
+ crates/app/src/operation/drill_reach.rs |  24 +-
+ crates/app/src/operation/drill_top.rs   |  53 +++-
+ crates/app/src/operation/generate.rs    |  25 +-
+ crates/app/src/operation/mod.rs         |   1 +
+ crates/app/src/operation/stamp.rs       |   9 +-
+ crates/app/src/rest.rs                  |  37 ++-
+ crates/app/tests/drill_prior.rs         | 357 ++++++++++++++++++++++++
+ crates/app/tests/posting.rs             |  11 +-
+ crates/sim/src/verify/mod.rs            |   2 +-
+ crates/sim/src/verify/prior.rs          |   4 +-
+ 12 files changed, 617 insertions(+), 35 deletions(-)
+ create mode 100644 crates/app/src/operation/drill_prior.rs
+ create mode 100644 crates/app/tests/drill_prior.rs
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index 180f4f3e..12582b98 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13127,3 +13127,41 @@ revolved (follow-up material if users hit it with long keyways).
+     #84 reach law passed (depth to the shank's meeting point <= flute
+     means the shank stands outside it at the feed entry); its test pins
+     the passing side on box stock.
++
++## #89 - drilling reads what the setup's earlier operations removed (2026-11-07)
++
++- **Chosen:** the axial drill's reach (#84), R-plane (#91) and holder
++  laws read the stock top over each disk as min(raw stock, prior
++  surface), the prior being #96's `rest::PriorPlan` - the setup's stock
++  grid cut by every earlier op's cached moves - read conservatively at
++  the highest covered cell (`verify::prior_surface`, now public); an
++  unknown cell, an ungenerated predecessor or a posed (tilted) one that
++  the column engine refuses all leave the raw stock. The hole's own
++  mouth is lowered by the same reading (a counterbore cut first is air).
++  The plan is simulated lazily (`operation::drill_prior::PriorCell`):
++  only when the raw reading refuses, and at most once per job - verify's
++  #96 acquittal shares the same cell.
++- **Lathe:** a lathe axial drill reads the grid revolved about the axis
++  (the lowest of four compass cells per ring, the highest ring) - the
++  spindle carries any cut all the way round. A turning predecessor is
++  now cut in the prior plan as its nose ball (moves carry the nose
++  centre), not as a flat disc of the insert size, so a facing pass reads
++  the faced end, never below it (a few microns high on the grid).
++  `prior_state` (the Pocket3D rest mask) keeps its old atom - #109 scope.
++- **Cross drills keep the raw stock:** the column grid stands along Z
++  and cannot be read along a radial hole line; their laws say nothing
++  new.
++- **Staleness:** the Drill stamp carries `rest::prior_digest` (as
++  Pocket3D's does) and `stale_reason` names the predecessor, so a drill
++  judged against an earlier pocket goes Stale when that pocket's
++  recorded path moves. Only Drill joins (#109 owns the general case).
++  Cost: a drill behind any cutting op now regenerates after it - the
++  posting suite's stale test regenerates in program order.
++- **Dropped:** reading the prior always (pays a simulation on every
++  clean job); reading the lathe grid unrevolved (a facing pass at Y 0
++  never covers the drill's disk); a tolerance on the prior reading to
++  pass R exactly at a ball-faced end (the reading may never be low).
++- **Found:** the lathe Facing kind faces the work MODEL, not stock
++  above it ("nothing to face" when the part top is the finished end),
++  so a bar's facing allowance in the stock cannot be faced off yet -
++  the lathe test models the allowance on the bar.
+diff --git a/crates/app/src/operation/drill_prior.rs b/crates/app/src/operation/drill_prior.rs
+new file mode 100644
+index 00000000..f35a96f3
+--- /dev/null
++++ b/crates/app/src/operation/drill_prior.rs
+@@ -0,0 +1,91 @@
++//! The program ahead of one operation, cut at most once and only when a
++//! law asks (issue #89, after #96's review): the drilling laws (reach,
++//! R plane, holder) and verify's vertical-rapid law both read the grid
++//! the setup's earlier operations leave standing, and both ask only
++//! when the raw stock would refuse - a clean job never simulates.
++//!
++//! A lathe's axial drill reads the grid revolved ([`revolved_surface`]):
++//! the spindle turns the work under every turning pass, so a column cut
++//! anywhere on a ring about the axis is cut all the way round it.
++//!
++//! Provenance: our own design notes (lazy evaluation of the re-machining
++//! rest grid; a body of revolution's surface as a function of radius);
++//! no vendor material consulted.
++
++use crate::geo2d::Point2;
++use crate::rest::PriorPlan;
++use crate::stock_sim::Dexel;
++
++/// The plan, simulated on first [`PriorCell::get`]. A plan that cannot
++/// be cut (a posed predecessor the column grid refuses) is logged and
++/// read as unknown - the raw stock, never air.
++pub struct PriorCell {
++    plan: Option<PriorPlan>,
++    dex: Option<Dexel>,
++}
++
++impl PriorCell {
++    pub(super) fn new(plan: Option<PriorPlan>) -> Self {
++        Self { plan, dex: None }
++    }
++
++    /// The grid the program ahead leaves standing, or `None` when
++    /// nothing ahead has cut, or what it cut cannot be read.
++    pub(super) fn get(&mut self) -> Option<&Dexel> {
++        if let Some(plan) = self.plan.take() {
++            match plan.simulate() {
++                Ok(d) => self.dex = Some(d),
++                Err(e) => eprintln!("camcraft: the program ahead could not be cut, the raw stock stands: {e}"),
++            }
++        }
++        self.dex.as_ref()
++    }
++}
++
++/// The prior grid as one drill reads it: under the disk on a mill
++/// ([`crate::verify::prior_surface`]), revolved about the axis for a
++/// lathe's axial hole ([`revolved_surface`]).
++#[derive(Clone, Copy)]
++pub(super) struct PriorRead<'a> {
++    pub dex: &'a Dexel,
++    pub revolved: bool,
++}
++
++impl PriorRead<'_> {
++    pub(super) fn surface(&self, q: Point2, r: f64) -> Option<f64> {
++        if self.revolved { revolved_surface(self.dex, q, r) } else { crate::verify::prior_surface(self.dex, q, r) }
++    }
++}
++
++/// The highest material the prior grid holds over the disk (`c`, `r`)
++/// of a work turning about `c` (a lathe's axial hole, on the spindle):
++/// at each radius sampled out to `r`, the LOWEST of four compass cells
++/// on that ring (the spindle carried any cut all the way round; fewer
++/// samples can only read higher), then the highest of those rings.
++/// `None` when no ring is on the grid or a height is unreadable - an
++/// unknown prior is the raw stock.
++fn revolved_surface(dex: &Dexel, c: Point2, r: f64) -> Option<f64> {
++    if !(r.is_finite() && r >= 0.0 && dex.cell > 0.0 && c.x.is_finite() && c.y.is_finite()) {
++        return None;
++    }
++    let step = dex.cell * 0.5;
++    let n = (r / step).ceil().clamp(0.0, 1.0e5) as usize;
++    let mut top: Option<f64> = None;
++    for i in 0..=n {
++        let rho = (i as f64 * step).min(r);
++        let mut ring: Option<f64> = None;
++        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
++            if let Some(k) = dex.col(Point2::new(c.x + dx * rho, c.y + dy * rho)) {
++                let z = dex.top_at(k);
++                if z.is_nan() {
++                    return None;
++                }
++                ring = Some(ring.map_or(z, |t| t.min(z)));
++            }
++        }
++        if let Some(z) = ring {
++            top = Some(top.map_or(z, |t| t.max(z)));
++        }
++    }
++    top
++}
+diff --git a/crates/app/src/operation/drill_reach.rs b/crates/app/src/operation/drill_reach.rs
+index bb7489d1..bec711c6 100644
+--- a/crates/app/src/operation/drill_reach.rs
++++ b/crates/app/src/operation/drill_reach.rs
+@@ -18,6 +18,12 @@
+ //! back-bore cycles run in a hole that is already there: they are held
+ //! not to the flute but to the shank fitting that hole.
+ //!
++//! Issue #89: the axial laws read the stock as the setup's earlier
++//! operations left it (the re-machining prior grid, read under each
++//! disk at its highest covered cell; unknown = raw). The cross holes'
++//! laws keep the raw stock: the column grid stands along Z and cannot
++//! be read along a radial hole line.
++//!
+ //! Provenance: usable flute length versus hole depth, and holder
+ //! clearance over the work, are the machine-tool handbooks' drilling
+ //! practice; the swept-rectangle distance is textbook planar geometry
+@@ -26,6 +32,7 @@
+ 
+ use crate::cl::{Cycle, CycleKind, Toolpath};
+ use crate::drilling::{CrossHole, CycleChoice, Hole, SPOT_DEPTH, THROUGH_CLEAR};
++use crate::geo2d::Point2;
+ use crate::geometry::{Point3, Triangle};
+ use crate::machining2d::GenError;
+ use crate::tools::Tool;
+@@ -113,11 +120,18 @@ fn seg_dist(p: (f64, f64), q: (f64, f64)) -> f64 {
+ /// the material top over the holder's disk. A tap, bore or back-bore
+ /// cycle runs in an existing hole (`holes`, the list the kernel cut):
+ /// past its flute only the shank must fit that hole's diameter.
++///
++/// `prior` (issue #89) is the grid the setup's earlier operations left
++/// standing: over each disk the stock and the hole's mouth stand no
++/// higher than its highest covered cell ([`prior_surface`]); `None`,
++/// or a disk it cannot read, is the raw stock; a lathe's axial hole
++/// reads it revolved about the axis ([`super::drill_prior::PriorRead`]).
+ pub(super) fn axial_reach(
+     t: &Toolpath,
+     holes: &[Hole],
+     part: &[Triangle],
+     stock: Option<&[Triangle]>,
++    prior: Option<super::drill_prior::PriorRead<'_>>,
+     tool: &Tool,
+     name: &str,
+ ) -> Result<(), GenError> {
+@@ -128,8 +142,12 @@ pub(super) fn axial_reach(
+     let body = 0.5 * finite_or_zero(tool.diameter).max(finite_or_zero(tool.shank_d));
+     for c in &t.cycles {
+         let Cycle { xy, r_z, bottom_z, .. } = *c;
+-        r_plane_clear(part, stock, c, body)?;
+-        let top = top_over(part, stock, xy.x, xy.y, body).unwrap_or(c.entry_z).max(c.entry_z.min(r_z));
++        let q = Point2::new(xy.x, xy.y);
++        let prior_at = |r: f64| prior.and_then(|p| p.surface(q, r));
++        let pb = prior_at(body);
++        r_plane_clear(part, stock, c, body, pb)?;
++        let entry = top::cut_by(Some(c.entry_z), pb).unwrap_or(c.entry_z);
++        let top = top_over(part, stock, xy.x, xy.y, body, pb).unwrap_or(entry).max(entry.min(r_z));
+         let depth = top - bottom_z;
+         if matches!(c.kind, CycleKind::Tap | CycleKind::Bore | CycleKind::BackBore) {
+             shank_fits(c, holes, depth, flute, tool, name)?;
+@@ -144,7 +162,7 @@ pub(super) fn axial_reach(
+         }
+         if let Some((reach, hr)) = holder(tool, name)? {
+             let face = bottom_z + reach;
+-            if let Some(ht) = top_over(part, stock, xy.x, xy.y, hr).filter(|&z| face < z - TOL) {
++            if let Some(ht) = top_over(part, stock, xy.x, xy.y, hr, prior_at(hr)).filter(|&z| face < z - TOL) {
+                 return Err(GenError::Invalid(format!(
+                     "tool {name}'s holder (dia. {:.3}, {reach:.3} mm above the tip) sinks to Z {face:.3} at the \
+                      hole at ({:.3}, {:.3}), below the material top {ht:.3} around it - the holder feeds into \
+diff --git a/crates/app/src/operation/drill_top.rs b/crates/app/src/operation/drill_top.rs
+index 2ff5d6aa..0885c2ae 100644
+--- a/crates/app/src/operation/drill_top.rs
++++ b/crates/app/src/operation/drill_top.rs
+@@ -18,16 +18,36 @@ use crate::machining2d::GenError;
+ /// The highest material over the XY disk (`c`, `r`): the part's facets
+ /// and the stock's, as they stand (issue #91: the stock above the R
+ /// plane is no longer clipped away - [`r_plane_clear`] refuses it
+-/// first, so the rapid laws are never asked to vouch for it).
+-pub(super) fn top_over(part: &[Triangle], stock: &[Triangle], cx: f64, cy: f64, r: f64) -> Option<f64> {
++/// first, so the rapid laws are never asked to vouch for it). `prior`
++/// is the surface the setup's earlier operations left over the same
++/// disk (issue #89, read conservatively by the caller): the stock
++/// stands no higher than it. `None` is the raw stock.
++pub(super) fn top_over(
++    part: &[Triangle],
++    stock: &[Triangle],
++    cx: f64,
++    cy: f64,
++    r: f64,
++    prior: Option<f64>,
++) -> Option<f64> {
+     let p = highest(part, cx, cy, r);
+-    let s = highest(stock, cx, cy, r);
++    let s = cut_by(highest(stock, cx, cy, r), prior);
+     match (p, s) {
+         (Some(a), Some(b)) => Some(a.max(b)),
+         (a, b) => a.or(b),
+     }
+ }
+ 
++/// A raw height `z` under the prior surface (issue #89): the lower of
++/// the two when the prior is a number, the raw height otherwise - an
++/// unknown prior is the raw stock, never air.
++pub(super) fn cut_by(z: Option<f64>, prior: Option<f64>) -> Option<f64> {
++    match (z, prior.filter(|p| !p.is_nan())) {
++        (Some(z), Some(p)) => Some(z.min(p)),
++        (z, _) => z,
++    }
++}
++
+ /// The highest point of the facets whose projection meets the disk,
+ /// each read over its part inside the disk ([`facet_top`]) - on a
+ /// drafted top the far vertex does not count (#91 review).
+@@ -81,17 +101,24 @@ pub(super) fn facet_top(t: &Triangle, cx: f64, cy: f64, r: f64) -> f64 {
+ /// the part (its facets and the hole's entry surface) and the stock
+ /// together - the part alone when there is no stock, or the stock is
+ /// the op's own source; the message names whichever stands higher.
+-/// The stock is read raw: removal by an earlier operation (a facing
+-/// pass) is not credited yet (#89), so a faced-first program is refused
+-/// too until then - the message says so rather than promise a fix that
+-/// cannot pass. A non-finite height is
+-/// refused, never waved through.
+-pub(super) fn r_plane_clear(part: &[Triangle], stock: &[Triangle], c: &Cycle, body: f64) -> Result<(), GenError> {
++/// Removal by the setup's earlier operations (`prior`, issue #89: the
++/// surface they left over the disk, `None` when unknown) lowers the
++/// stock and the hole's own mouth - a faced or pocketed top is air; an
++/// unknown prior leaves both at their raw heights. A non-finite height
++/// is refused, never waved through.
++pub(super) fn r_plane_clear(
++    part: &[Triangle],
++    stock: &[Triangle],
++    c: &Cycle,
++    body: f64,
++    prior: Option<f64>,
++) -> Result<(), GenError> {
+     // The part as it stands before this cycle: its facets over the disk,
+     // and the hole's own mouth - the modelled hole is what the cycle
+-    // cuts, so its bore is not yet air.
+-    let p = highest(part, c.xy.x, c.xy.y, body).map_or(c.entry_z, |p| p.max(c.entry_z));
+-    let (top, what) = match highest(stock, c.xy.x, c.xy.y, body) {
++    // cuts, so its bore is not yet air (unless an earlier op cut it).
++    let entry = cut_by(Some(c.entry_z), prior).unwrap_or(c.entry_z);
++    let p = highest(part, c.xy.x, c.xy.y, body).map_or(entry, |p| p.max(entry));
++    let (top, what) = match cut_by(highest(stock, c.xy.x, c.xy.y, body), prior) {
+         Some(s) if s >= p || p.is_nan() => (s, "stock"),
+         _ => (p, "part"),
+     };
+@@ -101,7 +128,7 @@ pub(super) fn r_plane_clear(part: &[Triangle], stock: &[Triangle], c: &Cycle, bo
+     Err(GenError::Invalid(format!(
+         "R plane Z {:.3} is below the {what} top Z {top:.3} over the hole at ({:.3}, {:.3}) - the rapid down to R \
+          would cross uncut stock (a collision); raise Top of Part Z (the R plane) to the {what} top or above \
+-         (stock faced by an earlier operation still counts at its raw height)",
++         (an earlier operation's removal counts only once that operation is generated, upright, in this setup)",
+         c.r_z, c.xy.x, c.xy.y
+     )))
+ }
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index c01b04c6..0665f2d4 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -67,6 +67,8 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+         wcs_origin,
+         spindle_note: _,
+     } = job;
++    // The program ahead, cut only when a law asks (#89, #96 review).
++    let mut verify_prior = super::drill_prior::PriorCell::new(verify_prior);
+     // Tool: the diameter drives the path, the body drives the reach law.
+     let d = tool.diameter;
+ 
+@@ -1834,8 +1836,18 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     holes,
+                 })
+                 .and_then(|t| {
+-                    // Issue #84: flute reach and holder from the stock.
+-                    super::drill_reach::axial_reach(&t, holes, &material.facets, stock_facets.as_deref(), &tool, &tool_name)?;
++                    // Issue #84: flute reach and holder from the stock;
++                    // #89: a raw-stock refusal is re-read against what
++                    // the setup's earlier operations left standing.
++                    let reach = |prior| {
++                        super::drill_reach::axial_reach(&t, holes, &material.facets, stock_facets.as_deref(), prior, &tool, &tool_name)
++                    };
++                    if let Err(raw) = reach(None) {
++                        match verify_prior.get() {
++                            Some(dex) => reach(Some(super::drill_prior::PriorRead { dex, revolved: lathe_axial }))?,
++                            None => return Err(raw),
++                        }
++                    }
+                     Ok(t)
+                 })?
+             };
+@@ -2709,13 +2721,10 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // the setup's earlier operations left standing.
+             // Cut only when a rapid was convicted: the simulation is
+             // the costly half, and a clean path needs no second word.
+-            if let Some(plan) = verify_prior
+-                && warns.iter().any(|w| matches!(w, Warning::RapidInStock { .. }))
++            if warns.iter().any(|w| matches!(w, Warning::RapidInStock { .. }))
++                && let Some(dex) = verify_prior.get()
+             {
+-                match plan.simulate() {
+-                    Ok(dex) => verify::acquit_by_prior(&path, &dex, geom.radius, Z_TOL, &mut warns),
+-                    Err(e) => eprintln!("camcraft: the program ahead could not be cut for the rapid law, raw stock stands: {e}"),
+-                }
++                verify::acquit_by_prior(&path, dex, geom.radius, Z_TOL, &mut warns);
+             }
+             warns.extend(workholding_warnings(&path, &geom, &fixture_boxes, &workholding, rotary_axis, spindle));
+             // The revolved-blade verdict (M5.2 C): the meridian
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index fec4ccd4..bd94a9bc 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -121,6 +121,7 @@ mod cross_entry;
+ mod cross_spindle;
+ mod cross_stock;
+ mod drill_reach;
++mod drill_prior;
+ mod plunge_solid;
+ mod rotary_law;
+ pub(crate) mod spindle_law;
+diff --git a/crates/app/src/operation/stamp.rs b/crates/app/src/operation/stamp.rs
+index 5281ee85..ad3f9350 100644
+--- a/crates/app/src/operation/stamp.rs
++++ b/crates/app/src/operation/stamp.rs
+@@ -258,7 +258,12 @@ pub fn current_stamp(
+     // longer describes the same cut. With nothing ahead of it nothing
+     // is written: first operations' and other kinds' stamps are
+     // bit-for-bit what they were before stage D (the inert-data law).
+-    if params.kind() == OpType::Pocket3D
++    // Issue #89: an axial Drill's reach, R-plane and holder laws read
++    // what the program ahead removed, so its stamp carries the same
++    // digest - a drill judged against an earlier pocket goes Stale
++    // when that pocket's recorded path moves. Only Drill joins here
++    // (#109 owns the general case for every other kind).
++    if matches!(params.kind(), OpType::Pocket3D | OpType::Drill)
+         && let Some(digest) = crate::rest::prior_digest(world, op_name, setup)
+     {
+         h.write_u8(b'R');
+@@ -385,7 +390,7 @@ pub fn stale_reason(
+     // clean while the stamp still mismatches, so a cutting
+     // predecessor's recorded path is what moved - whatever its own
+     // status reads.
+-    if op.params.kind() == OpType::Pocket3D
++    if matches!(op.params.kind(), OpType::Pocket3D | OpType::Drill)
+         && let Some(name) = model::name_of(world, entity)
+         && let Some(why) = crate::rest::prior_stale(world, &name, op.setup.as_deref())
+     {
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 994dbb5f..8d0993ca 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -87,6 +87,11 @@ struct Ahead {
+     /// the rest grid sweeps the same corner the program sim does, so a
+     /// bull predecessor's fillet ring reads as the rest it is.
+     corner: Option<f64>,
++    /// A turning insert's nose radius (issue #89): its moves carry the
++    /// nose CENTRE, so the prior plan cuts it as a ball of that radius
++    /// (tip = centre - nose) - the insert's real cutting edge, never
++    /// the flat disc of its whole size. Only [`PriorPlan`] reads it.
++    nose: Option<f64>,
+     cut: bool,
+     moves: Vec<Move>,
+ }
+@@ -187,6 +192,11 @@ fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>) -> Vec<Ahea
+             corner: tool
+                 .as_ref()
+                 .and_then(|t| stock_sim::bull_corner(t).ok().flatten()),
++            nose: tool
++                .as_ref()
++                .filter(|t| t.kind == crate::tools::ToolKind::Turning)
++                .map(|t| t.nose_radius)
++                .filter(|n| n.is_finite() && *n > 0.0),
+             cut,
+             moves,
+         });
+@@ -313,10 +323,33 @@ impl PriorPlan {
+     /// "prior unknown" - the raw stock, never an acquittal.
+     pub fn simulate(self) -> Result<Dexel, String> {
+         let mut dex = self.grid;
++        // A turning insert cuts with its nose: the centre path lowered
++        // to the tip, swept as a ball (issue #89).
++        let tips: Vec<Vec<Move>> = self
++            .ahead
++            .iter()
++            .map(|a| match a.nose {
++                Some(n) => a
++                    .moves
++                    .iter()
++                    .map(|m| {
++                        let mut m = *m;
++                        m.from.z -= n;
++                        m.to.z -= n;
++                        m
++                    })
++                    .collect(),
++                None => Vec::new(),
++            })
++            .collect();
+         let ops: Vec<SimOp> = self
+             .ahead
+             .iter()
+-            .map(|a| SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner })
++            .zip(&tips)
++            .map(|(a, tip)| match a.nose {
++                Some(n) => SimOp { moves: tip, radius: n, ball: true, cone: None, corner: None },
++                None => SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner },
++            })
+             .collect();
+         stock_sim::simulate(&mut dex, &ops).map_err(|e| e.to_string())?;
+         Ok(dex)
+@@ -332,7 +365,7 @@ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -
+     if ahead.is_empty() {
+         return Ok(None);
+     }
+-    let min_r = ahead.iter().filter(|a| a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
++    let min_r = ahead.iter().map(|a| a.nose.unwrap_or(a.radius)).filter(|r| *r > 0.0).fold(tool_r, f64::min);
+     let grid = stock_sim::stock_grid(world, setup, min_r)?;
+     Ok(Some(PriorPlan { grid, ahead }))
+ }
+diff --git a/crates/app/tests/drill_prior.rs b/crates/app/tests/drill_prior.rs
+new file mode 100644
+index 00000000..a6412548
+--- /dev/null
++++ b/crates/app/tests/drill_prior.rs
+@@ -0,0 +1,357 @@
++//! Issue #89: drilling reads the stock as the setup's earlier operations
++//! left it. A hole on the floor of a pocket an earlier op cleared is
++//! measured from that floor (the #84 reach law), an R plane on a faced
++//! top is not under "uncut stock" (the #91 R-plane law) - mill and lathe
++//! alike - while a drill with nothing ahead, or with an ahead op that
++//! never cut, still reads the raw stock and is refused. A drill judged
++//! against an earlier op's removal goes Stale when that op's path moves.
++//! Provenance: our own fixtures, specced from the Prime Directive and the
++//! shop rule "measure the drill's reach from the surface it enters"; no
++//! vendor material.
++//!
++//! Gate map (#89): covers app::operation (drill_reach, drill_top,
++//! drill_prior, the Drill arm of generate, the Drill stamp), app::rest
++//! (PriorPlan), app::posting (the gate).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, EditOperationParams, GenerateOperation, History, ImportModel, LoadMachine, SetStock,
++};
++use camcraft_app::drilling::{CycleChoice, Hole};
++use camcraft_app::geo2d::Point2;
++use camcraft_app::geometry::{Mesh, Point3, Triangle, cube};
++use camcraft_app::links::Links;
++use camcraft_app::machine::Machine;
++use camcraft_app::machining2d::{FaceHoles, PocketStrategy};
++use camcraft_app::machining3d::Entry3D;
++use camcraft_app::model;
++use camcraft_app::operation::{self, Height, OpParams, OpStatus, SrcRef};
++use camcraft_app::posting;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++const FANUC: &str = include_str!("../../../assets/posts/fanuc.cps");
++const TOP: f64 = 20.0;
++/// The pocket floor; DR-0400's flute is 12 mm.
++const FLOOR: f64 = 12.0;
++/// The hole's floor under the pocket: 10 mm deep from the floor, 18
++/// from the raw top - inside the flute only from the floor.
++const HOLE_FLOOR: f64 = 2.0;
++
++fn flip(t: &Triangle) -> Triangle {
++    Triangle::new(t.a, t.c, t.b)
++}
++
++fn quad(a: Point3, b: Point3, c: Point3, d: Point3, f: &mut Vec<Triangle>) {
++    f.push(Triangle::new(a, b, c));
++    f.push(Triangle::new(a, c, d));
++}
++
++/// The flat ring at `z` between the squares `outer` and `inner` (half
++/// widths), facing up.
++fn ring(outer: f64, inner: f64, z: f64, f: &mut Vec<Triangle>) {
++    let sq = |h: f64| [(-h, -h), (h, -h), (h, h), (-h, h)];
++    let (o, i) = (sq(outer), sq(inner));
++    let p = |(x, y): (f64, f64)| Point3::new(x, y, z);
++    for k in 0..4 {
++        let n = (k + 1) % 4;
++        quad(p(o[k]), p(o[n]), p(i[n]), p(i[k]), f);
++    }
++}
++
++/// A 40 x 40 x [-10, 20] block. `pocket` = Some(half): a square pocket
++/// from the top to [`FLOOR`], a 4.1 mm square hole from its floor down
++/// to [`HOLE_FLOOR`]; None: the 4.1 mm hole from the top down to
++/// [`FLOOR`] alone.
++fn block(pocket: Option<f64>) -> Mesh {
++    let mut f = Vec::new();
++    let outer = cube(Point3::new(-20.0, -20.0, -10.0), Point3::new(20.0, 20.0, TOP));
++    f.extend(outer.facets[4..12].iter().cloned());
++    f.extend(outer.facets[0..2].iter().cloned());
++    let h = 2.05;
++    let walls = |lo: f64, hi: f64, half: f64, f: &mut Vec<Triangle>| {
++        let c = cube(Point3::new(-half, -half, lo), Point3::new(half, half, hi));
++        f.extend(c.facets[4..12].iter().map(flip));
++    };
++    let floor = |z: f64, f: &mut Vec<Triangle>| {
++        let c = cube(Point3::new(-h, -h, z), Point3::new(h, h, z + 1.0));
++        f.extend(c.facets[0..2].iter().map(flip));
++    };
++    match pocket {
++        Some(p) => {
++            ring(20.0, p, TOP, &mut f);
++            walls(FLOOR, TOP, p, &mut f);
++            ring(p, h, FLOOR, &mut f);
++            walls(HOLE_FLOOR, FLOOR, h, &mut f);
++            floor(HOLE_FLOOR, &mut f);
++        }
++        None => {
++            ring(20.0, h, TOP, &mut f);
++            walls(FLOOR, TOP, h, &mut f);
++            floor(FLOOR, &mut f);
++        }
++    }
++    Mesh::from_facets(f)
++}
++
++fn add_tool(world: &World, h: &mut History, name: &str) {
++    let t = catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog");
++    h.execute(world, AddTool::new(world, name, t).expect("tool"));
++}
++
++/// The block under a 40 x 40 box stock, z -10..`stock_top`.
++fn mill_world(pocket: Option<f64>, stock_top: f64) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("block", block(pocket)));
++    let at = Location { pos: Point3::new(0.0, 0.0, -10.0), ..Default::default() };
++    let s = SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 40.0, dz: stock_top + 10.0 }, at);
++    h.execute(&world, s.expect("stock"));
++    for t in ["DR-0400", "EM-0600-4FL", "EM-0800-4FL"] {
++        add_tool(&world, &mut h, t);
++    }
++    (world, h)
++}
++
++fn drill(entry: f64, floor: f64, r: f64) -> OpParams {
++    let hole = Hole { xy: Point2::new(0.0, 0.0), radius: 2.0, entry_z: entry, floor_z: floor, through: false, stepped: false };
++    OpParams::Drill {
++        clearance_z: Height::fixed(TOP + 15.0),
++        retract_z: None,
++        top_z: Height::fixed(r),
++        bottom_z: None,
++        cycle: CycleChoice::Drill,
++        peck: 0.0,
++        dwell: 0.0,
++        feed: 120.0,
++        plunge_feed: 80.0,
++        holes: vec![hole],
++        cross: vec![],
++    }
++}
++
++fn pocket(bottom: f64) -> OpParams {
++    OpParams::Pocket3D {
++        links: Links::ROUGH3D,
++        stepover: 2.5,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(30.0),
++        retract_z: None,
++        top_z: Height::fixed(TOP),
++        bottom_z: Height::fixed(bottom),
++        stepdown: 4.0,
++        feed: 1500.0,
++        plunge_feed: 400.0,
++        climb: true,
++        strategy: PocketStrategy::Zigzag,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        rest_rough: false,
++        optimal_load: camcraft_app::load::load_of_degrees(60.0),
++        feed_opt: false,
++        shell: false,
++    }
++}
++
++fn face(cut: f64) -> OpParams {
++    OpParams::Face {
++        holes: FaceHoles::CutAir,
++        blend_turns: false,
++        tilt: None,
++        stepover: 5.0,
++        clearance_z: Height::fixed(35.0),
++        cut_z: Height::fixed(cut),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    }
++}
++
++fn create(world: &World, h: &mut History, name: &str, tool: &str, src: &str, p: OpParams) {
++    let c = CreateOperation::new(world, name, tool, SrcRef::Entity(src.into()), p);
++    h.execute(world, c.expect("create"));
++}
++
++/// Generate `name`; the generation error's text, if any.
++fn generate(world: &World, h: &mut History, name: &str) -> Result<(), String> {
++    h.execute(world, GenerateOperation::new(world, name).map_err(|e| format!("{e:?}"))?);
++    let e = model::find_by_name(world, name).ok_or("no op")?;
++    match operation::status_of(world, &e) {
++        OpStatus::Ok => Ok(()),
++        _ => {
++            let op = model::operation_of(world, &e).ok_or("no op")?;
++            Err(operation::generate(world, &op, name).err().map_or_else(|| "not Ok".into(), |e| e.to_string()))
++        }
++    }
++}
++
++fn status(world: &World, name: &str) -> OpStatus {
++    model::find_by_name(world, name).map_or(OpStatus::Never, |e| operation::status_of(world, &e))
++}
++
++fn post(world: &World, cps: &str, tag: &str) -> Result<String, String> {
++    let nc = std::env::temp_dir().join(format!("camcraft-drill-prior-{tag}-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&nc);
++    let r = posting::post_script(world, &nc, cps).map(|p| p.program);
++    let _ = std::fs::remove_file(&nc);
++    r
++}
++
++#[test]
++fn a_hole_on_a_pocket_floor_an_earlier_op_cleared_posts() {
++    // R on the raw top (Z 20): the R-plane law is clean either way; the
++    // reach from the raw top is 18 mm past the 12 mm flute - from the
++    // pocket floor P1 left it is the hole's own 10 mm.
++    let (world, mut h) = mill_world(Some(6.0), TOP);
++    create(&world, &mut h, "Op1", "EM-0600-4FL", "block", pocket(FLOOR));
++    generate(&world, &mut h, "Op1").expect("the pocket generates");
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(FLOOR, HOLE_FLOOR, TOP));
++    generate(&world, &mut h, "Op2").unwrap_or_else(|e| panic!("the hole on the pocket floor generates: {e}"));
++    let text = post(&world, FANUC, "pocket").unwrap_or_else(|e| panic!("pocket-then-drill posts: {e}"));
++    assert!(text.contains("G81"), "{text}");
++}
++
++#[test]
++fn the_same_hole_with_nothing_ahead_is_still_refused() {
++    let (world, mut h) = mill_world(Some(6.0), TOP);
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(FLOOR, HOLE_FLOOR, TOP));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("drill-first generated past its flute"));
++    assert!(e.contains("deep from the stock surface") && e.contains("flute"), "the reach refusal: {e}");
++}
++
++#[test]
++fn an_ahead_op_that_never_cut_leaves_the_raw_reading() {
++    // P1 created but never generated: what it would cut is unknown, so
++    // the raw stock stands.
++    let (world, mut h) = mill_world(Some(6.0), TOP);
++    create(&world, &mut h, "Op1", "EM-0600-4FL", "block", pocket(FLOOR));
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(FLOOR, HOLE_FLOOR, TOP));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("an uncut pocket was credited"));
++    assert!(e.contains("deep from the stock surface"), "the reach refusal: {e}");
++}
++
++#[test]
++fn a_shallower_earlier_pocket_makes_the_drill_stale() {
++    let (world, mut h) = mill_world(Some(6.0), TOP);
++    create(&world, &mut h, "Op1", "EM-0600-4FL", "block", pocket(FLOOR));
++    generate(&world, &mut h, "Op1").expect("Op1");
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(FLOOR, HOLE_FLOOR, TOP));
++    generate(&world, &mut h, "Op2").expect("Op2");
++    assert_eq!(status(&world, "Op2"), OpStatus::Ok);
++    h.execute(&world, EditOperationParams::new(&world, "Op1", pocket(FLOOR + 3.0)).expect("edit"));
++    generate(&world, &mut h, "Op1").expect("P1 again");
++    assert_eq!(status(&world, "Op2"), OpStatus::Stale, "the drill was judged against P1's old floor");
++}
++
++#[test]
++fn face_then_drill_with_r_at_the_faced_height_posts() {
++    // Stock 5 mm over the part top; F1 faces it to Z 20; R = 20.
++    let (world, mut h) = mill_world(None, TOP + 5.0);
++    create(&world, &mut h, "Op1", "EM-0800-4FL", "block", face(TOP));
++    generate(&world, &mut h, "Op1").expect("the face generates");
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(TOP, FLOOR, TOP));
++    generate(&world, &mut h, "Op2").unwrap_or_else(|e| panic!("R on the faced top generates: {e}"));
++    let text = post(&world, FANUC, "face").unwrap_or_else(|e| panic!("face-then-drill posts: {e}"));
++    assert!(text.contains("G81") && text.contains("R20"), "{text}");
++}
++
++#[test]
++fn drill_first_with_r_under_the_unfaced_stock_is_still_refused() {
++    let (world, mut h) = mill_world(None, TOP + 5.0);
++    create(&world, &mut h, "Op2", "DR-0400", "block", drill(TOP, FLOOR, TOP));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("R under the raw stock generated"));
++    assert!(e.contains("R plane Z 20.000") && e.contains("below the stock top Z 25.000"), "{e}");
++}
++
++/// The closed-solid revolve the turning suites share.
++fn revolve(meridian: &[(f64, f64)], segs: usize) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = std::f64::consts::TAU * j as f64 / segs as f64;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..segs {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++/// A bar r10 standing at its raw length (z -20..22, the Facing kind
++/// faces the work model, so the allowance is modelled on it), bored
++/// r2.05 to Z 10, in its box stock (z -20..22), on a lathe. The
++/// finished end face is Z 20.
++fn lathe_world() -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -20.0), ..Location::default() };
++    let s = SetStock::new(&world, StockShape::Box { dx: 24.0, dy: 24.0, dz: 42.0 }, at);
++    h.execute(&world, s.expect("stock"));
++    let lathe = Machine {
++        model: "TestBench lathe".into(),
++        vendor: "Camcraft Testbench".into(),
++        kind: Some("lathe".into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12000.0),
++        ..Default::default()
++    };
++    h.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe)).expect("lathe"));
++    for t in ["DR-0400", "TN-1600-0R8"] {
++        add_tool(&world, &mut h, t);
++    }
++    let bar = revolve(&[(0.0, -20.0), (10.0, -20.0), (10.0, 22.0), (2.05, 22.0), (2.05, 10.0), (0.0, 10.0)], 64);
++    h.execute(&world, ImportModel::from_mesh("bar", bar));
++    (world, h)
++}
++
++fn facing() -> OpParams {
++    OpParams::Facing {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(30.0),
++        top_z: Height::fixed(22.0),
++        bottom_z: Height::fixed(20.0),
++        stepdown: 0.5,
++        feed: 150.0,
++        plunge_feed: 80.0,
++    }
++}
++
++/// R 1 mm over the faced end (the everyday R clearance): the nose ball
++/// on the column grid reads the faced end a few microns high, never low.
++#[test]
++fn a_lathe_axial_drill_after_facing_posts() {
++    let (world, mut h) = lathe_world();
++    create(&world, &mut h, "Op1", "TN-1600-0R8", "bar", facing());
++    generate(&world, &mut h, "Op1").expect("the facing generates");
++    create(&world, &mut h, "Op2", "DR-0400", "bar", drill(TOP, 10.0, TOP + 1.0));
++    generate(&world, &mut h, "Op2").unwrap_or_else(|e| panic!("the drill on the faced end generates: {e}"));
++    // The drill's own verdict: Ok. (The whole program's post is not
++    // asserted - the Facing kind faces the work MODEL, so this fixture's
++    // facing pass reads as a gouge of the modelled allowance; a facing
++    // of stock above the part is its own gap, not this law's.)
++    assert_eq!(status(&world, "Op2"), OpStatus::Ok);
++}
++
++#[test]
++fn a_lathe_axial_drill_before_facing_is_refused() {
++    let (world, mut h) = lathe_world();
++    create(&world, &mut h, "Op2", "DR-0400", "bar", drill(TOP, 10.0, TOP + 1.0));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("R under the facing allowance generated"));
++    assert!(e.contains("below the stock top Z 22.000"), "{e}");
++}
+diff --git a/crates/app/tests/posting.rs b/crates/app/tests/posting.rs
+index 6b66af6f..07815be8 100644
+--- a/crates/app/tests/posting.rs
++++ b/crates/app/tests/posting.rs
+@@ -274,11 +274,12 @@ fn a_stale_operation_blocks_the_post_and_leaves_the_file_untouched() {
+         "a refusal rewrites nothing"
+     );
+ 
+-    // Regenerating through the command clears it and the post runs again.
+-    history.execute(
+-        &world,
+-        GenerateOperation::new(&world, "Contour1").expect("regenerate"),
+-    );
++    // Regenerating through the commands, in program order, clears it
++    // and the post runs again (issue #89: Drill1 reads what Contour1
++    // ahead of it removed, so Contour1's new path moves Drill1 too).
++    for op in ["Contour1", "Drill1"] {
++        history.execute(&world, GenerateOperation::new(&world, op).expect("regenerate"));
++    }
+     posting::post_setup(&world, &path).expect("fresh again posts");
+     let _ = std::fs::remove_file(&path);
+ }
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index 8131e17d..f25008f4 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -183,7 +183,7 @@ pub use types::{FixturePart, Mode, VerifyContext, Warning};
+ pub use crossing::{crossed_pairs, crossed_pairs_all};
+ pub use engine::{verify, verify_bodies};
+ pub use air::cuts_no_material;
+-pub use prior::acquit_by_prior;
++pub use prior::{acquit_by_prior, prior_surface};
+ pub use laws::{bands_vs_fixtures, rapids_vs_fixtures, rapids_vs_fixtures_spindle};
+ pub use workholding::{bands_vs_workholding, rapids_vs_workholding, Workholding};
+ pub use probe::Cutter;
+diff --git a/crates/sim/src/verify/prior.rs b/crates/sim/src/verify/prior.rs
+index 74ee7aa1..8b1d8353 100644
+--- a/crates/sim/src/verify/prior.rs
++++ b/crates/sim/src/verify/prior.rs
+@@ -40,7 +40,9 @@ pub fn acquit_by_prior(path: &Toolpath, prior: &Dexel, tool_r: f64, z_tol: f64,
+ 
+ /// The highest material the prior grid holds under the disc (q, r):
+ /// `None` when the disc covers no grid cell or a height is unreadable.
+-fn prior_surface(dex: &Dexel, q: Point2, r: f64) -> Option<f64> {
++/// Issue #89: drilling's reach, R-plane and holder laws read the same
++/// conservative surface the rapid law does.
++pub fn prior_surface(dex: &Dexel, q: Point2, r: f64) -> Option<f64> {
+     if !(r.is_finite() && r >= 0.0 && dex.cell > 0.0 && q.x.is_finite() && q.y.is_finite()) {
+         return None;
+     }
+
+From 40ad390a47423c4f3e79fea7033771a422eab136 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 7 Nov 2026 21:33:20 +0100
+Subject: [PATCH 2/3] fix(app): drill prior credits only lathe facing, cones
+ drill predecessors
+
+PR #123 review fixes:
+- B1/B2: on a lathe the prior plan credits only the Facing kind cut
+  with its nose ball; a boring bar, groove or parting blade ahead (cut
+  as a full disc and revolved, or a column credited under standing
+  material) makes the prior unknown - the raw stock stands.
+- A twist-drill predecessor is cut with its point cone (as Taper),
+  so a pilot's 118 deg point is not read as a flat floor.
+- The turning nose radius joins the rest digest.
+- Every Drill stamps the stock it read, so an axial drill goes Stale
+  on a stock change.
+- cut_by keeps a NaN raw height NaN (the non-finite law).
+- Nits: the prior disk is padded by half a cell diagonal, an over-long
+  ring count is refused instead of clamped, vertical-plane arcs are
+  dropped from the nose-lowered path.
+
+Tests: drill_prior_kinds (boring ahead on a lathe refused, pilot cone
+refuses R 6, axial drill Stale on stock change), drill_prior (parting
+ahead does not credit the end face, R 0.1 under the faced end refused).
+
+Refs #89
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ RECOMMENDED.md                          |  17 +++
+ crates/app/src/operation/drill_prior.rs |  10 +-
+ crates/app/src/operation/drill_top.rs   |   3 +
+ crates/app/src/operation/stamp.rs       |   6 +-
+ crates/app/src/rest.rs                  |  27 +++-
+ crates/app/tests/drill_prior.rs         |  40 +++++-
+ crates/app/tests/drill_prior_kinds.rs   | 184 ++++++++++++++++++++++++
+ 7 files changed, 280 insertions(+), 7 deletions(-)
+ create mode 100644 crates/app/tests/drill_prior_kinds.rs
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index 12582b98..0427c33b 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13165,3 +13165,20 @@ revolved (follow-up material if users hit it with long keyways).
+   above it ("nothing to face" when the part top is the finished end),
+   so a bar's facing allowance in the stock cannot be faced off yet -
+   the lathe test models the allowance on the bar.
++- **Review fixes (PR #123):** (B1/B2) on a lathe the prior plan credits
++  ONLY the Facing kind cut with its nose ball - a boring bar, groove or
++  parting blade was cut as a full-diameter disc on the y = 0 strip and
++  revolved round the bar, and the column grid credits a turning move
++  under standing material (a kerf to the axis) with everything above it
++  (the same reason `LATHE_COLUMN_REFUSAL` refuses the column arm); any
++  other kind ahead makes the prior unknown, so the raw stock stands.
++  Dropped: a meridian (revolved field) prior - the right model, but the
++  drill laws read a height; that is #109-sized. A twist-drill
++  predecessor is now cut with its point cone (`cone` for Drill as for
++  Taper), so a pilot's 118 deg point is not read as a flat floor; the
++  nose radius joins the digest; every Drill (not only cross drills)
++  stamps the stock it read; `cut_by` keeps a NaN raw height NaN; the
++  prior reading pads its disk by half a cell diagonal, refuses (not
++  clamps) a ring count past 1e5, and drops vertical-plane arcs from the
++  nose-lowered path (lowering only the ends would bend them) - dropping a
++  cut credits less, never more.
+diff --git a/crates/app/src/operation/drill_prior.rs b/crates/app/src/operation/drill_prior.rs
+index f35a96f3..3c36f9ab 100644
+--- a/crates/app/src/operation/drill_prior.rs
++++ b/crates/app/src/operation/drill_prior.rs
+@@ -52,7 +52,11 @@ pub(super) struct PriorRead<'a> {
+ }
+ 
+ impl PriorRead<'_> {
++    /// The disk is padded by half a cell's diagonal (review nit): a
++    /// cell whose centre falls just outside `r` can still hold
++    /// material inside it.
+     pub(super) fn surface(&self, q: Point2, r: f64) -> Option<f64> {
++        let r = r + self.dex.cell.abs() * std::f64::consts::FRAC_1_SQRT_2;
+         if self.revolved { revolved_surface(self.dex, q, r) } else { crate::verify::prior_surface(self.dex, q, r) }
+     }
+ }
+@@ -69,7 +73,11 @@ fn revolved_surface(dex: &Dexel, c: Point2, r: f64) -> Option<f64> {
+         return None;
+     }
+     let step = dex.cell * 0.5;
+-    let n = (r / step).ceil().clamp(0.0, 1.0e5) as usize;
++    let n = (r / step).ceil();
++    if !n.is_finite() || n > 1.0e5 {
++        return None; // too many rings to read: unknown, never a clamped short read
++    }
++    let n = n as usize;
+     let mut top: Option<f64> = None;
+     for i in 0..=n {
+         let rho = (i as f64 * step).min(r);
+diff --git a/crates/app/src/operation/drill_top.rs b/crates/app/src/operation/drill_top.rs
+index 0885c2ae..6c4e3274 100644
+--- a/crates/app/src/operation/drill_top.rs
++++ b/crates/app/src/operation/drill_top.rs
+@@ -43,6 +43,9 @@ pub(super) fn top_over(
+ /// unknown prior is the raw stock, never air.
+ pub(super) fn cut_by(z: Option<f64>, prior: Option<f64>) -> Option<f64> {
+     match (z, prior.filter(|p| !p.is_nan())) {
++        // `NaN.min(p)` is `p`: a non-finite raw height stays NaN so the
++        // laws refuse it (#89 review).
++        (Some(z), _) if z.is_nan() => Some(z),
+         (Some(z), Some(p)) => Some(z.min(p)),
+         (z, _) => z,
+     }
+diff --git a/crates/app/src/operation/stamp.rs b/crates/app/src/operation/stamp.rs
+index ad3f9350..82d71c65 100644
+--- a/crates/app/src/operation/stamp.rs
++++ b/crates/app/src/operation/stamp.rs
+@@ -233,9 +233,9 @@ pub fn current_stamp(
+     // Issue #77: a cross drill stands off the setup's RAW stock as well
+     // as its part, so the stock it read is an input - a bar re-sized
+     // after generation must stale the op, never post the old hops.
+-    // Only that kind writes the term: every other stamp keeps its bits.
+-    if let OpParams::Drill { cross, .. } = params
+-        && !cross.is_empty()
++    // #89 review: an axial drill's reach, R-plane and holder laws read
++    // the stock too, so every Drill writes it; other stamps keep their bits.
++    if matches!(params, OpParams::Drill { .. })
+         && !matches!(src, SrcRef::Stock)
+     {
+         h.write_u8(b'X');
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 8d0993ca..259f4f8e 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -75,10 +75,14 @@ pub struct PriorState {
+ /// on it), and the cached moves themselves when it has cut anything.
+ struct Ahead {
+     name: String,
++    /// The operation's kind: on a lathe only the Facing kind is read
++    /// ([`prior_plan`], #89 review).
++    kind: crate::operation::OpType,
+     path: u64,
+     radius: f64,
+     ball: bool,
+-    /// Cot of the half-angle, Some only for a chamfer mill (M2.4 B):
++    /// Cot of the half-angle, Some for a chamfer mill (M2.4 B) and a
++    /// twist drill's point (#89 review: a pilot's cone stands):
+     /// the rest grid must sweep the same cone the program sim does, or
+     /// a predecessor's chamfer would evaporate a full disc of
+     /// material that is really still standing.
+@@ -176,6 +180,7 @@ fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>) -> Vec<Ahea
+         let cut = !moves.is_empty();
+         out.push(Ahead {
+             name: n.clone(),
++            kind: op.params.kind(),
+             path: if cut { path_hash(&moves) } else { 0 },
+             radius: tool.as_ref().map_or(0.0, |t| t.diameter * 0.5),
+             ball: tool
+@@ -183,7 +188,7 @@ fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>) -> Vec<Ahea
+                 .is_some_and(|t| t.kind == crate::tools::ToolKind::BallNose),
+             cone: tool
+                 .as_ref()
+-                .filter(|t| t.kind == crate::tools::ToolKind::Taper)
++                .filter(|t| matches!(t.kind, crate::tools::ToolKind::Taper | crate::tools::ToolKind::Drill))
+                 .map(|t| (t.tip_angle.to_radians() * 0.5).tan())
+                 .filter(|x| x.is_finite() && *x > 0.0)
+                 .map(|x| 1.0 / x),
+@@ -235,6 +240,11 @@ fn digest_of(ahead: &[Ahead]) -> u64 {
+                 h.write_u8(2);
+                 h.write(&c.to_bits().to_le_bytes());
+             }
++            // The insert's nose is atom too (#89 review).
++            if let Some(n) = a.nose {
++                h.write_u8(3);
++                h.write(&n.to_bits().to_le_bytes());
++            }
+         } else {
+             h.write_u8(0);
+         }
+@@ -332,6 +342,9 @@ impl PriorPlan {
+                 Some(n) => a
+                     .moves
+                     .iter()
++                    // A vertical-plane arc's centre moves with its ends:
++                    // lowering only the ends would bend it (review nit).
++                    .filter(|m| m.arc.as_ref().is_none_or(|a| a.plane.is_xy()))
+                     .map(|m| {
+                         let mut m = *m;
+                         m.from.z -= n;
+@@ -365,6 +378,16 @@ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -
+     if ahead.is_empty() {
+         return Ok(None);
+     }
++    // #89 review (B1/B2): on a lathe the column grid credits a turning
++    // move under standing material (a parting kerf, an ID groove behind
++    // a lip) with everything above it, and a bar or blade cut as a full
++    // disc would be revolved round the bar. Only the Facing kind, cut
++    // with its nose, never undercuts: any other kind ahead is unknown.
++    if crate::machine::kind_of(world) == crate::machine::Kind::Lathe
++        && let Some(a) = ahead.iter().find(|a| a.kind != crate::operation::OpType::Facing || a.nose.is_none())
++    {
++        return Err(format!("operation '{}' ahead is not a facing pass - a lathe's prior reads only those", a.name));
++    }
+     let min_r = ahead.iter().map(|a| a.nose.unwrap_or(a.radius)).filter(|r| *r > 0.0).fold(tool_r, f64::min);
+     let grid = stock_sim::stock_grid(world, setup, min_r)?;
+     Ok(Some(PriorPlan { grid, ahead }))
+diff --git a/crates/app/tests/drill_prior.rs b/crates/app/tests/drill_prior.rs
+index a6412548..cc4c85f3 100644
+--- a/crates/app/tests/drill_prior.rs
++++ b/crates/app/tests/drill_prior.rs
+@@ -312,7 +312,7 @@ fn lathe_world() -> (World, History) {
+         ..Default::default()
+     };
+     h.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe)).expect("lathe"));
+-    for t in ["DR-0400", "TN-1600-0R8"] {
++    for t in ["DR-0400", "TN-1600-0R8", "GT-0300"] {
+         add_tool(&world, &mut h, t);
+     }
+     let bar = revolve(&[(0.0, -20.0), (10.0, -20.0), (10.0, 22.0), (2.05, 22.0), (2.05, 10.0), (0.0, 10.0)], 64);
+@@ -355,3 +355,41 @@ fn a_lathe_axial_drill_before_facing_is_refused() {
+     let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("R under the facing allowance generated"));
+     assert!(e.contains("below the stock top Z 22.000"), "{e}");
+ }
++
++/// Review fix 3: R 0.1 under the faced end must refuse - a model that
++/// over-cut the end by a nose radius would wave it through.
++#[test]
++fn a_lathe_axial_drill_with_r_just_under_the_faced_end_is_refused() {
++    let (world, mut h) = lathe_world();
++    create(&world, &mut h, "Op1", "TN-1600-0R8", "bar", facing());
++    generate(&world, &mut h, "Op1").expect("the facing generates");
++    create(&world, &mut h, "Op2", "DR-0400", "bar", drill(TOP, 10.0, TOP - 0.1));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("R under the faced end generated"));
++    assert!(e.contains("R plane Z 19.900"), "{e}");
++}
++
++/// Review fix B1/B2: a parting kerf to the axis does not clear the end
++/// face above it - on a lathe only the Facing kind is credited.
++#[test]
++fn a_parting_op_ahead_does_not_credit_the_lathe_end_face() {
++    let (world, mut h) = lathe_world();
++    let part = OpParams::Part {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(30.0),
++        top_z: Height::fixed(22.0),
++        bottom_z: Height::fixed(0.0),
++        stepdown: 0.5,
++        feed: 150.0,
++        plunge_feed: 60.0,
++        bar_load: false,
++        bar_advance: 0.0,
++        bar_unload: false,
++        bar_transfer: false,
++        inspect_tol: 0.0,
++    };
++    create(&world, &mut h, "Op1", "GT-0300", "bar", part);
++    generate(&world, &mut h, "Op1").expect("the parting generates");
++    create(&world, &mut h, "Op2", "DR-0400", "bar", drill(TOP, 10.0, TOP + 1.0));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("the kerf credited the end face"));
++    assert!(e.contains("below the stock top Z 22.000"), "{e}");
++}
+diff --git a/crates/app/tests/drill_prior_kinds.rs b/crates/app/tests/drill_prior_kinds.rs
+new file mode 100644
+index 00000000..93b98976
+--- /dev/null
++++ b/crates/app/tests/drill_prior_kinds.rs
+@@ -0,0 +1,184 @@
++//! Issue #89 review fixes: which predecessors' removal a drill may
++//! credit. On a lathe only the Facing kind (a nose that never undercuts)
++//! is credited - a boring bar cut as a disc would clear the core it never
++//! touched; a drill predecessor is cut with its point cone, not a flat
++//! disc at the tip; and an axial drill's stamp carries the stock it read.
++//! Provenance: our own fixtures, specced from the Prime Directive
++//! (crediting removal that did not happen is a collision); no vendor
++//! material.
++//!
++//! Gate map (#89): covers app::rest (Ahead, PriorPlan), app::operation
++//! (drill_prior, the Drill stamp).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SetStock};
++use camcraft_app::drilling::{CycleChoice, Hole};
++use camcraft_app::geo2d::Point2;
++use camcraft_app::geometry::{Mesh, Point3, Triangle, cube};
++use camcraft_app::machine::Machine;
++use camcraft_app::model;
++use camcraft_app::operation::{self, Height, OpParams, OpStatus, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::{Tool, catalog};
++use camcraft_app::world::new_world;
++
++fn tool(name: &str) -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog")
++}
++
++fn add(world: &World, h: &mut History, name: &str, t: Tool) {
++    h.execute(world, AddTool::new(world, name, t).expect("tool"));
++}
++
++/// A twist drill of diameter `d` (DR-0600's 118 deg point, long flute).
++fn drill_tool(d: f64) -> Tool {
++    Tool { diameter: d, shank_d: d, flute_len: 30.0, ..tool("DR-0600") }
++}
++
++fn drill(radius: f64, entry: f64, floor: f64, r: f64) -> OpParams {
++    let hole = Hole { xy: Point2::new(0.0, 0.0), radius, entry_z: entry, floor_z: floor, through: false, stepped: false };
++    OpParams::Drill {
++        clearance_z: Height::fixed(40.0),
++        retract_z: None,
++        top_z: Height::fixed(r),
++        bottom_z: None,
++        cycle: CycleChoice::Drill,
++        peck: 0.0,
++        dwell: 0.0,
++        feed: 120.0,
++        plunge_feed: 80.0,
++        holes: vec![hole],
++        cross: vec![],
++    }
++}
++
++fn create(world: &World, h: &mut History, name: &str, tool: &str, src: &str, p: OpParams) {
++    let c = CreateOperation::new(world, name, tool, SrcRef::Entity(src.into()), p);
++    h.execute(world, c.expect("create"));
++}
++
++fn generate(world: &World, h: &mut History, name: &str) -> Result<(), String> {
++    h.execute(world, GenerateOperation::new(world, name).map_err(|e| format!("{e:?}"))?);
++    let e = model::find_by_name(world, name).ok_or("no op")?;
++    match operation::status_of(world, &e) {
++        OpStatus::Ok => Ok(()),
++        _ => {
++            let op = model::operation_of(world, &e).ok_or("no op")?;
++            Err(operation::generate(world, &op, name).err().map_or_else(|| "not Ok".into(), |e| e.to_string()))
++        }
++    }
++}
++
++fn status(world: &World, name: &str) -> OpStatus {
++    model::find_by_name(world, name).map_or(OpStatus::Never, |e| operation::status_of(world, &e))
++}
++
++fn box_stock(world: &World, h: &mut History, top: f64) {
++    let at = Location { pos: Point3::new(0.0, 0.0, -10.0), ..Default::default() };
++    let s = SetStock::new(world, StockShape::Box { dx: 40.0, dy: 40.0, dz: top + 10.0 }, at);
++    h.execute(world, s.expect("stock"));
++}
++
++/// A 40 x 40 plate, z -10..0, under a box stock z -10..`stock_top`.
++fn plate_world(stock_top: f64) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    let plate = cube(Point3::new(-20.0, -20.0, -10.0), Point3::new(20.0, 20.0, 0.0));
++    h.execute(&world, ImportModel::from_mesh("plate", plate));
++    box_stock(&world, &mut h, stock_top);
++    (world, h)
++}
++
++/// Review fix 2: a 10 mm pilot to tip Z 5 leaves its 118 deg point cone
++/// standing - at r 4 it reaches Z 5 + 4 / tan 59 deg (about 7.4), so an
++/// 8 mm drill with R 6 rapids into it.
++#[test]
++fn a_pilot_drills_point_cone_still_stands_over_a_smaller_drills_r_plane() {
++    let (world, mut h) = plate_world(20.0);
++    add(&world, &mut h, "D10", drill_tool(10.0));
++    add(&world, &mut h, "D8", drill_tool(8.0));
++    create(&world, &mut h, "Op1", "D10", "plate", drill(5.0, 20.0, 5.0, 21.0));
++    generate(&world, &mut h, "Op1").expect("the pilot generates");
++    create(&world, &mut h, "Op2", "D8", "plate", drill(4.0, 20.0, 1.0, 6.0));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("R 6 under the pilot's cone generated"));
++    assert!(e.contains("R plane Z 6.000"), "{e}");
++}
++
++/// Review fix 5: an axial drill reads the stock (#84, #91), so a stock
++/// change makes it Stale.
++#[test]
++fn an_axial_drill_goes_stale_when_the_stock_changes() {
++    let (world, mut h) = plate_world(20.0);
++    add(&world, &mut h, "D4", tool("DR-0400"));
++    create(&world, &mut h, "Op1", "D4", "plate", drill(2.0, 20.0, 12.0, 21.0));
++    generate(&world, &mut h, "Op1").expect("the drill generates");
++    assert_eq!(status(&world, "Op1"), OpStatus::Ok);
++    box_stock(&world, &mut h, 20.5);
++    assert_eq!(status(&world, "Op1"), OpStatus::Stale, "the drill was judged against the old stock");
++}
++
++fn revolve(meridian: &[(f64, f64)], segs: usize) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = std::f64::consts::TAU * j as f64 / segs as f64;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..segs {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++/// Review fix B1/B2: a bar r10 (z -20..22) bored r7 to Z 10 in a solid
++/// box stock, on a lathe. The boring bar only rides the bore's wall - cut
++/// as a full-diameter disc on the y = 0 strip and revolved, it would
++/// "clear" the core the bar never touched, and the drill's R plane in the
++/// bore would pass under the uncut stock.
++#[test]
++fn a_turned_boring_op_ahead_of_a_lathe_axial_drill_is_not_credited() {
++    let world = new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -20.0), ..Location::default() };
++    let s = SetStock::new(&world, StockShape::Box { dx: 24.0, dy: 24.0, dz: 42.0 }, at);
++    h.execute(&world, s.expect("stock"));
++    let lathe = Machine {
++        model: "TestBench lathe".into(),
++        vendor: "Camcraft Testbench".into(),
++        kind: Some("lathe".into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12000.0),
++        ..Default::default()
++    };
++    h.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe)).expect("lathe"));
++    add(&world, &mut h, "D4", tool("DR-0400"));
++    add(&world, &mut h, "BAR", Tool { diameter: 13.6, shank_d: 13.6, ..tool("BR-1000") });
++    let bar = revolve(&[(0.0, -20.0), (10.0, -20.0), (10.0, 22.0), (7.0, 22.0), (7.0, 10.0), (0.0, 10.0)], 64);
++    h.execute(&world, ImportModel::from_mesh("bar", bar));
++    let bore = OpParams::BoringTurning {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(30.0),
++        top_z: Height::fixed(22.0),
++        bottom_z: Height::fixed(10.5),
++        feed: 120.0,
++        plunge_feed: 40.0,
++    };
++    create(&world, &mut h, "Op1", "BAR", "bar", bore);
++    generate(&world, &mut h, "Op1").expect("the boring generates");
++    create(&world, &mut h, "Op2", "D4", "bar", drill(2.0, 10.0, 2.0, 12.0));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("the boring bar credited the core"));
++    assert!(e.contains("stock"), "{e}");
++}
+
+From 80965042b32e9d190e118783d28f1de8112b91b8 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 7 Nov 2026 21:36:49 +0100
+Subject: [PATCH 3/3] fix(app): a turning kind ahead on a mill-turn is not
+ credited either - only nose-cut Facing is
+
+The #89 review fix gated the facing-only rule on the Lathe machine kind,
+so a mill-turn still credited a boring/grooving/parting op ahead of an
+axial drill through the column grid. The rule now holds on any machine
+for turning-family kinds (and for every kind on a lathe). Pinned by
+drill_prior_kinds::a_turned_boring_op_ahead_of_a_mill_turn_axial_drill_is_not_credited
+(fails without this change).
+
+Refs #89
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/rest.rs                | 15 ++++++++---
+ crates/app/tests/drill_prior_kinds.rs | 37 +++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 259f4f8e..5bed300d 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -383,10 +383,17 @@ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -
+     // a lip) with everything above it, and a bar or blade cut as a full
+     // disc would be revolved round the bar. Only the Facing kind, cut
+     // with its nose, never undercuts: any other kind ahead is unknown.
+-    if crate::machine::kind_of(world) == crate::machine::Kind::Lathe
+-        && let Some(a) = ahead.iter().find(|a| a.kind != crate::operation::OpType::Facing || a.nose.is_none())
+-    {
+-        return Err(format!("operation '{}' ahead is not a facing pass - a lathe's prior reads only those", a.name));
++    // The same holds for a turning kind on a mill-turn: the column grid
++    // reads its undercuts the same way, so outside a lathe every turning
++    // kind but nose-cut Facing ahead is unknown too.
++    let lathe = crate::machine::kind_of(world) == crate::machine::Kind::Lathe;
++    let facing = |a: &Ahead| a.kind == crate::operation::OpType::Facing && a.nose.is_some();
++    let turning = |a: &Ahead| a.kind.info().family() == crate::operation::Family::Turn;
++    if let Some(a) = ahead.iter().find(|a| !facing(a) && (lathe || turning(a))) {
++        return Err(format!(
++            "operation '{}' ahead is a turning pass other than facing - the column grid cannot read its removal",
++            a.name
++        ));
+     }
+     let min_r = ahead.iter().map(|a| a.nose.unwrap_or(a.radius)).filter(|r| *r > 0.0).fold(tool_r, f64::min);
+     let grid = stock_sim::stock_grid(world, setup, min_r)?;
+diff --git a/crates/app/tests/drill_prior_kinds.rs b/crates/app/tests/drill_prior_kinds.rs
+index 93b98976..51535c07 100644
+--- a/crates/app/tests/drill_prior_kinds.rs
++++ b/crates/app/tests/drill_prior_kinds.rs
+@@ -182,3 +182,40 @@ fn a_turned_boring_op_ahead_of_a_lathe_axial_drill_is_not_credited() {
+     let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("the boring bar credited the core"));
+     assert!(e.contains("stock"), "{e}");
+ }
++
++// #89: a turning kind ahead on a mill-turn is read no more generously than on
++// a lathe - the column grid cannot read its undercuts either.
++#[test]
++fn a_turned_boring_op_ahead_of_a_mill_turn_axial_drill_is_not_credited() {
++    let world = new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -20.0), ..Location::default() };
++    let s = SetStock::new(&world, StockShape::Box { dx: 24.0, dy: 24.0, dz: 42.0 }, at);
++    h.execute(&world, s.expect("stock"));
++    let lathe = Machine {
++        model: "TestBench mill-turn".into(),
++        vendor: "Camcraft Testbench".into(),
++        kind: Some("mill-turn".into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12000.0),
++        ..Default::default()
++    };
++    h.execute(&world, LoadMachine::new(&world, "millturn.mch".into(), Some(lathe)).expect("mill-turn"));
++    add(&world, &mut h, "D4", tool("DR-0400"));
++    add(&world, &mut h, "BAR", Tool { diameter: 13.6, shank_d: 13.6, ..tool("BR-1000") });
++    let bar = revolve(&[(0.0, -20.0), (10.0, -20.0), (10.0, 22.0), (7.0, 22.0), (7.0, 10.0), (0.0, 10.0)], 64);
++    h.execute(&world, ImportModel::from_mesh("bar", bar));
++    let bore = OpParams::BoringTurning {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(30.0),
++        top_z: Height::fixed(22.0),
++        bottom_z: Height::fixed(10.5),
++        feed: 120.0,
++        plunge_feed: 40.0,
++    };
++    create(&world, &mut h, "Op1", "BAR", "bar", bore);
++    generate(&world, &mut h, "Op1").expect("the boring generates");
++    create(&world, &mut h, "Op2", "D4", "bar", drill(2.0, 10.0, 2.0, 12.0));
++    let e = generate(&world, &mut h, "Op2").err().unwrap_or_else(|| panic!("on a mill-turn the boring bar credited the core"));
++    assert!(e.contains("stock"), "{e}");
++}

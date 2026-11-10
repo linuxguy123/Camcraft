@@ -1,0 +1,873 @@
+From 6761845ff5228d617bfb3190b269ce537a1f9838 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 9 Nov 2026 02:49:43 +0100
+Subject: [PATCH] feat(carry): fixtures read the carried stock; lathe carry
+ refused by name; carried body cached
+
+- A carried setup's tagged fixtures are read against the body it is
+  entered with: a fixture standing inside material the earlier setups
+  left refuses the post by name (fixture_carried::FIXTURE_IN_CARRIED);
+  one seated on a face they machined is clear even where the declared
+  block still reaches through it. Live at the post gate.
+- The lathe / mill-turn part flip stays refused, now one named constant
+  (stock_sim::CARRY_MACHINE_REFUSAL), pinned on generation, the rest
+  chain, the sim and the post.
+- The carried body is memoized by content (origin stock, lattice, turns,
+  every cutting atom's exact moves), bounded, cleared with the document;
+  rest::carried_body_computes pins that an unrelated edit is a hit and an
+  upstream one recomputes.
+
+Fixes #321
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/fixture_carried.rs          | 128 +++++++++++++
+ crates/app/src/lib.rs                      |   1 +
+ crates/app/src/posting.rs                  |   3 +
+ crates/app/src/project/wire.rs             |   2 +
+ crates/app/src/rest.rs                     |   4 +-
+ crates/app/src/rest/across.rs              |  52 +++++-
+ crates/app/src/rest/carried_cache.rs       | 164 ++++++++++++++++
+ crates/app/src/stock_sim.rs                |   2 +-
+ crates/app/src/stock_sim_carry.rs          |   9 +-
+ crates/app/src/world.rs                    |   2 +
+ crates/app/tests/carried_fixtures_cache.rs | 207 +++++++++++++++++++++
+ docs/decisions/321-carry-fixtures-cache.md | 104 +++++++++++
+ 12 files changed, 667 insertions(+), 11 deletions(-)
+ create mode 100644 crates/app/src/fixture_carried.rs
+ create mode 100644 crates/app/src/rest/carried_cache.rs
+ create mode 100644 crates/app/tests/carried_fixtures_cache.rs
+ create mode 100644 docs/decisions/321-carry-fixtures-cache.md
+
+diff --git a/crates/app/src/fixture_carried.rs b/crates/app/src/fixture_carried.rs
+new file mode 100644
+index 00000000..67912430
+--- /dev/null
++++ b/crates/app/src/fixture_carried.rs
+@@ -0,0 +1,128 @@
++//! Workholding in a carried setup (#321): a setup entered with the body
++//! the earlier setups machined (#317) holds THAT body, not its declared
++//! block - so its fixtures are read against the carried stock. A fixture
++//! standing inside the material the program really carries in (a vise
++//! jaw modelled into a wall setup 1 left standing, a clamp on a face that
++//! is still there) is workholding that cannot be where it is modelled:
++//! every fixture verdict of that setup judged steel the machine will not
++//! hold there, and the post is refused by name.
++//!
++//! Provenance: our own design per #308's research decision (the carried
++//! body is the incoming stock, read through each setup's transform);
++//! plain re-clamp practice from machine-tool handbooks. No vendor
++//! material consulted.
++//!
++//! ## The laws here
++//!
++//! - **The carried body, not the declared block.** Only the body the
++//!   setup is ENTERED with is read (`rest::entered_body`, the carried-body
++//!   cache's entry): a clamp seated in a pocket setup 1 cut, inside the
++//!   declared block but clear of the real material, is no conflict.
++//! - **Penetration, not contact.** A column counts when its centre lies
++//!   strictly inside the fixture's footprint and its material
++//!   (`floor..top`) overlaps the fixture's Z span by more than
++//!   [`FIXTURE_HIT_TOL`] - jaws gripping a side face and a part seated on
++//!   a plate are contact by design. The column sampling resolves to the
++//!   carried grid's pitch: an overlap narrower than half a cell beside a
++//!   face can pass, and is stated so in the decision record.
++//! - **Live, like every workholding law.** Read at the post gate against
++//!   the steel as it stands now, never baked into a stamp (`fixture`'s
++//!   live-gate law). The machine table is not read: the table is what the
++//!   setup's stock stands on, not steel placed against it.
++//! - **Unreadable is not clear.** A carry the gate cannot read leaves the
++//!   ops of that setup refused by their own generation (#318/#319); this
++//!   clause adds nothing for it, it never reads the declared block instead.
++
++use flecs_ecs::prelude::World;
++
++use crate::fixture::{FIXTURE_HIT_TOL, FixtureBox};
++use crate::model;
++use crate::stock_sim::Body;
++
++/// The phrase every carried-workholding refusal carries.
++pub const FIXTURE_IN_CARRIED: &str = "stands inside the stock carried from";
++
++/// How deep `b` stands in `body`'s material: the largest Z overlap of a
++/// column whose centre lies strictly inside the box's footprint, or
++/// `None` when no column overlaps beyond [`FIXTURE_HIT_TOL`].
++#[must_use]
++pub fn penetration(body: &Body, b: &FixtureBox) -> Option<f64> {
++    let dex = &body.dex;
++    let (bx0, bx1) = (b.min.x.min(b.max.x), b.max.x.max(b.min.x));
++    let (by0, by1) = (b.min.y.min(b.max.y), b.max.y.max(b.min.y));
++    let (bz0, bz1) = (b.min.z.min(b.max.z), b.max.z.max(b.min.z));
++    if !(bx0.is_finite() && bx1.is_finite() && by0.is_finite() && by1.is_finite() && bz0.is_finite() && bz1.is_finite())
++        || !(dex.cell.is_finite() && dex.cell > 0.0)
++    {
++        return None;
++    }
++    // The cell index span the footprint covers, clamped to the grid
++    // (float -> index through a clamp, never an unchecked cast).
++    let span = |lo: f64, hi: f64, o: f64, n: usize| -> (usize, usize) {
++        let top = n as f64;
++        let i0 = ((lo - o) / dex.cell - 1.0).floor().clamp(0.0, top);
++        let i1 = ((hi - o) / dex.cell + 1.0).ceil().clamp(0.0, top);
++        (i0 as usize, i1 as usize)
++    };
++    let (ix0, ix1) = span(bx0, bx1, dex.x0, dex.nx);
++    let (iy0, iy1) = span(by0, by1, dex.y0, dex.ny);
++    let mut worst: Option<f64> = None;
++    for iy in iy0..iy1 {
++        for ix in ix0..ix1 {
++            let c = dex.center(ix, iy);
++            let inside = c.x > bx0 + FIXTURE_HIT_TOL
++                && c.x < bx1 - FIXTURE_HIT_TOL
++                && c.y > by0 + FIXTURE_HIT_TOL
++                && c.y < by1 - FIXTURE_HIT_TOL;
++            let k = ix + iy * dex.nx;
++            if !inside || body.empty_at(k) {
++                continue;
++            }
++            let depth = dex.top_at(k).min(bz1) - body.floor_at(k).max(bz0);
++            if depth.is_finite() && depth > FIXTURE_HIT_TOL {
++                worst = Some(worst.map_or(depth, |w: f64| w.max(depth)));
++            }
++        }
++    }
++    worst
++}
++
++/// The gate's carried-workholding clause: per setup entered with a
++/// carried body, one problem per tagged fixture standing in it. The
++/// setup's first op in program order reads the chain (every op of a
++/// setup is entered with the same body).
++#[must_use]
++pub fn carried_fixture_problems(world: &World) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut seen: Vec<Option<String>> = Vec::new();
++    for (name, e) in crate::setup::operation_order(world) {
++        let Some(op) = model::operation_of(world, &e) else { continue };
++        let setup = crate::setup::effective(world, op.setup.as_deref());
++        if seen.contains(&setup) {
++            continue;
++        }
++        seen.push(setup.clone());
++        let fixtures = crate::fixture::tagged(world, setup.as_deref());
++        if fixtures.is_empty() {
++            continue;
++        }
++        let tool_r = model::find_by_name(world, &op.tool)
++            .and_then(|t| model::tool_of(world, &t))
++            .map_or(0.0, |t| t.diameter * 0.5);
++        // A refused carry is refused by every op's own generation.
++        let Ok(Some((origin, body))) = crate::rest::entered_body(world, &name, setup.as_deref(), tool_r) else {
++            continue;
++        };
++        let to = setup.as_deref().unwrap_or_default();
++        for (fname, fe) in fixtures {
++            let Some(b) = model::entity_world_aabb(world, &fe) else { continue };
++            if let Some(d) = penetration(&body, &FixtureBox { min: b.min, max: b.max }) {
++                out.push(format!(
++                    "setup '{to}': fixture '{fname}' {FIXTURE_IN_CARRIED} setup '{origin}' ({d:.2} mm deep) - \
++                     the part that setup leaves cannot be held as modelled; move the fixture or re-check the hold"
++                ));
++            }
++        }
++    }
++    out
++}
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 96194303..0c83e280 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod commands;
+ pub mod cutting;
+ pub use camcraft_motion::drilling;
+ pub mod fixture;
++pub mod fixture_carried;
+ pub use camcraft_motion::finishing3d;
+ pub use camcraft_geometry::geo2d;
+ pub mod geometry;
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index 27307714..b45661f1 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -558,6 +558,9 @@ pub fn verification_report(world: &World) -> GateReport {
+     // precedent: what the room is made of is verified now, never baked
+     // into a digest).
+     problems.extend(fixture_problems(world));
++    // #321: a carried setup's fixtures against the body it is entered
++    // with - workholding modelled into material the program carries in.
++    problems.extend(crate::fixture_carried::carried_fixture_problems(world));
+ 
+     // The in-process measurement ask (M5.3 D): a Part op's probe
+     // budget is a claim about the FINISHED part, and the finished
+diff --git a/crates/app/src/project/wire.rs b/crates/app/src/project/wire.rs
+index f58fd793..41a2055e 100644
+--- a/crates/app/src/project/wire.rs
++++ b/crates/app/src/project/wire.rs
+@@ -261,6 +261,8 @@ pub fn open(world: &World, text: &str) -> Result<(), ProjectError> {
+ /// Each note is logged as well.
+ pub fn open_noted(world: &World, text: &str) -> Result<Vec<String>, ProjectError> {
+     let file: ProjectFile = serde_json::from_str(text).map_err(|e| corrupt(e.to_string()))?;
++    // #321: the carried-body cache is freed with the document it served.
++    crate::rest::clear_carried_cache();
+     let notes = check_and_apply(world, file)?;
+     for n in &notes {
+         tracing::warn!("project load note: {n}");
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 964c9182..c11d5775 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -56,11 +56,13 @@
+ 
+ mod across;
+ mod ahead;
++mod carried_cache;
+ mod pilots;
+ 
+ pub use pilots::{drills_ahead, turned_ahead, DrillAhead, TurnedAhead};
+ 
+-pub use across::{REST_CARRY_REFUSAL, carried_digest, carried_stock_block, carried_stock_body};
++pub use across::{REST_CARRY_REFUSAL, carried_digest, carried_stock_block, carried_stock_body, entered_body};
++pub use carried_cache::{CAP as CARRIED_CACHE_CAP, clear as clear_carried_cache, computes as carried_body_computes};
+ use across::{carried_grid, chain_of};
+ use ahead::{ahead_of, digest_of, Ahead};
+ use crate::cl::Move;
+diff --git a/crates/app/src/rest/across.rs b/crates/app/src/rest/across.rs
+index dcc76e95..8651a3c7 100644
+--- a/crates/app/src/rest/across.rs
++++ b/crates/app/src/rest/across.rs
+@@ -26,7 +26,8 @@
+ use super::ahead::{all_ahead, Ahead};
+ use crate::stock_sim::carry::{self, Entry};
+ use crate::geometry::Point3;
+-use crate::stock_sim::{Dexel, LatticeTurn, SimOp};
++use crate::stock_sim::{Body, Dexel, LatticeTurn, SimOp};
++use std::sync::Arc;
+ use flecs_ecs::prelude::World;
+ 
+ /// An axis-aligned box, `(min, max)`.
+@@ -122,14 +123,25 @@ pub(super) fn chain_of(world: &World, name: &str, setup: Option<&str>, with_move
+     Ok(Chain { segments })
+ }
+ 
+-/// The column grid the crossing chain leaves standing, in the consumer's
+-/// frame: the origin setup's block, each segment's cut moves swept, the
+-/// body carried at every boundary. The tops are read as the rest grid -
+-/// a column cut through on its far side still reads its standing top
+-/// (more material, never less).
++/// The body the crossing chain leaves standing, in the consumer's frame:
++/// the origin setup's block, each segment's cut moves swept, the body
++/// carried at every boundary. Its tops are read as the rest grid - a
++/// column cut through on its far side still reads its standing top (more
++/// material, never less). Served from the carried-body cache (#321) when
++/// nothing it reads has moved.
+ /// `through_consumer: false` stops at the body the consumer's setup is
+ /// ENTERED with (#319): its own setup's earlier cuts are not swept.
++pub(super) fn carried_body(world: &World, chain: &Chain, min_r: f64, through_consumer: bool) -> Result<Arc<Body>, String> {
++    super::carried_cache::body(world, chain, min_r, through_consumer, || sweep(world, chain, min_r, through_consumer))
++}
++
++/// [`carried_body`]'s tops: the rest grid.
+ pub(super) fn carried_grid(world: &World, chain: &Chain, min_r: f64, through_consumer: bool) -> Result<Dexel, String> {
++    carried_body(world, chain, min_r, through_consumer).map(|b| b.dex.clone())
++}
++
++/// The sweep itself, uncached.
++fn sweep(world: &World, chain: &Chain, min_r: f64, through_consumer: bool) -> Result<Body, String> {
+     let origin = crate::setup::effective(world, chain.origin());
+     let dex = crate::stock_sim::stock_grid(world, origin.as_deref(), min_r)?;
+     let mut body = carry::first_body(world, origin.as_deref(), dex)?;
+@@ -149,7 +161,7 @@ pub(super) fn carried_grid(world: &World, chain: &Chain, min_r: f64, through_con
+             .collect();
+         crate::stock_sim::simulate(&mut body.dex, &ops).map_err(|e| e.to_string())?;
+     }
+-    Ok(body.dex)
++    Ok(body)
+ }
+ 
+ /// The block a later carried setup is entered with, bounded (#319): the
+@@ -192,7 +204,8 @@ pub(super) fn carried_body_bounds(
+     min_r: f64,
+     block: (Point3, Point3),
+ ) -> Result<Option<(Point3, Point3)>, String> {
+-    let dex = carried_grid(world, chain, min_r, false)?;
++    let body = carried_body(world, chain, min_r, false)?;
++    let dex = &body.dex;
+     let h = dex.cell * 0.5;
+     let mut pts = Vec::new();
+     for iy in 0..dex.ny {
+@@ -258,6 +271,29 @@ pub fn carried_stock_body(
+     carried_body_bounds(world, &chain, min_r, block)
+ }
+ 
++/// The body setup `setup` is entered with when the program ahead of
++/// `name` carries it there (#321: the workholding clause reads it), with
++/// the origin setup's name - the carried-body cache's own entry for the
++/// same chain and lattice the op's generation read. `Ok(None)`: no
++/// carried boundary.
++///
++/// # Errors
++/// A refused carry, or a body the grid cannot cut.
++pub fn entered_body(
++    world: &World,
++    name: &str,
++    setup: Option<&str>,
++    tool_r: f64,
++) -> Result<Option<(String, Arc<Body>)>, String> {
++    let chain = chain_of(world, name, setup, true)?;
++    if !chain.crosses() {
++        return Ok(None);
++    }
++    let min_r = chain.ops().filter(|a| a.cut && a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
++    let origin = chain.origin().unwrap_or_default().to_owned();
++    carried_body(world, &chain, min_r, false).map(|b| Some((origin, b)))
++}
++
+ /// The rest digest of an operation whose verdict does not otherwise read
+ /// the program ahead (a posed op, #319): written exactly when its setup
+ /// is entered with a carried body (or the carry refuses), because its
+diff --git a/crates/app/src/rest/carried_cache.rs b/crates/app/src/rest/carried_cache.rs
+new file mode 100644
+index 00000000..83afd293
+--- /dev/null
++++ b/crates/app/src/rest/carried_cache.rs
+@@ -0,0 +1,164 @@
++//! The carried body's cache (#321): the body a later setup is entered
++//! with is the costliest read of a carried setup (every cut ahead swept
++//! through every turn of the chain), and it is read again by each op's
++//! generation, its rest mask and the post gate's workholding clause. It is
++//! computed once per distinct input and served from here until an input
++//! moves.
++//!
++//! Provenance: our own design (content-addressed memo, the M1.5
++//! `features_of_local` precedent); no vendor material consulted.
++//!
++//! ## The laws here
++//!
++//! - **Keyed by everything the sweep reads, never by a name.** The key
++//!   digests the origin setup's stock (placement, mesh signature, shape -
++//!   `write_setup_stock`), the lattice radius, every turn of the chain,
++//!   and every cutting atom's exact moves and tool atom, in order. What
++//!   the sweep does not read (op names, feeds of ops not ahead, the
++//!   consumer setup's own ops when only the entered body is asked for,
++//!   the viewport) never enters it, so an unrelated edit is a hit - and
++//!   anything the sweep does read moves the key, so a stale body is never
++//!   served. An input the key cannot digest (a stock with no geometry
++//!   signature) is never cached: computed fresh every time.
++//! - **Pure fuel.** A hit returns exactly what a miss would compute; no
++//!   verdict reads the cache for truth. [`computes`] counts the misses
++//!   (test-visible: the pin that an unrelated edit does not recompute).
++//! - **Bounded, freed with the document.** Thread-local, most recent
++//!   [`CAP`] bodies; opening a document or making a new world clears it
++//!   ([`clear`]), so nothing of a closed document outlives it.
++
++use std::cell::{Cell, RefCell};
++use std::hash::Hasher;
++use std::sync::Arc;
++
++use super::across::Chain;
++use crate::cl::{Move, MoveKind};
++use crate::stock_sim::Body;
++use flecs_ecs::prelude::World;
++
++/// How many carried bodies are kept (the most recently used).
++pub const CAP: usize = 4;
++
++thread_local! {
++    static CACHE: RefCell<Vec<(u64, Arc<Body>)>> = const { RefCell::new(Vec::new()) };
++    static COMPUTES: Cell<u64> = const { Cell::new(0) };
++}
++
++/// How many carried bodies this thread has computed (cache misses and
++/// uncacheable reads) - the counter the cache's pins read.
++#[must_use]
++pub fn computes() -> u64 {
++    COMPUTES.with(Cell::get)
++}
++
++/// Drop every cached body (a document replaced or a new world made).
++pub fn clear() {
++    CACHE.with(|c| c.borrow_mut().clear());
++}
++
++fn f(h: &mut impl Hasher, v: f64) {
++    h.write_u64(v.to_bits());
++}
++
++fn write_move(h: &mut impl Hasher, m: &Move) {
++    h.write_u8(match m.kind {
++        MoveKind::Rapid => 0,
++        MoveKind::Feed => 1,
++        MoveKind::Plunge => 2,
++    });
++    for v in [m.from.x, m.from.y, m.from.z, m.to.x, m.to.y, m.to.z] {
++        f(h, v);
++    }
++    match &m.arc {
++        // Debug prints every float round-trip exact, and the plane by name.
++        Some(a) => h.write(format!("{a:?}").as_bytes()),
++        None => h.write_u8(0xa0),
++    }
++    match m.axis {
++        Some(a) => a.iter().for_each(|v| f(h, *v)),
++        None => h.write_u8(0xa1),
++    }
++    match m.rotary {
++        Some(c) => f(h, c),
++        None => h.write_u8(0xa2),
++    }
++    match m.feed {
++        Some(v) => f(h, v),
++        None => h.write_u8(0xa3),
++    }
++}
++
++/// The key of the body `chain` leaves: `None` when an input cannot be
++/// digested (then the body is never cached).
++fn key(world: &World, chain: &Chain, min_r: f64, through_consumer: bool) -> Option<u64> {
++    let mut h = std::hash::DefaultHasher::new();
++    h.write(b"camcraft-carried-body-v1");
++    let origin = crate::setup::effective(world, chain.origin());
++    crate::operation::write_setup_stock(world, origin.as_deref(), &mut h)?;
++    f(&mut h, min_r);
++    h.write_u8(u8::from(through_consumer));
++    let last = chain.segments.len().saturating_sub(1);
++    for (i, s) in chain.segments.iter().enumerate() {
++        h.write_u8(0xb0);
++        match &s.turn {
++            Some(t) => h.write(format!("{t:?}").as_bytes()),
++            None => h.write_u8(0),
++        }
++        if i == last && !through_consumer {
++            break;
++        }
++        for a in s.ops.iter().filter(|a| a.cut) {
++            h.write_u8(0xb1);
++            f(&mut h, a.radius);
++            h.write_u8(u8::from(a.ball));
++            for v in [a.cone, a.corner] {
++                match v {
++                    Some(c) => f(&mut h, c),
++                    None => h.write_u8(0),
++                }
++            }
++            h.write_usize(a.moves.len());
++            a.moves.iter().for_each(|m| write_move(&mut h, m));
++        }
++    }
++    Some(h.finish())
++}
++
++/// The body `chain` leaves, from the cache when its key is held, else
++/// computed by `compute` (and kept, when the key could be taken).
++///
++/// # Errors
++/// `compute`'s own; a failed sweep is never cached.
++pub(super) fn body(
++    world: &World,
++    chain: &Chain,
++    min_r: f64,
++    through_consumer: bool,
++    compute: impl FnOnce() -> Result<Body, String>,
++) -> Result<Arc<Body>, String> {
++    let k = key(world, chain, min_r, through_consumer);
++    if let Some(k) = k
++        && let Some(hit) = CACHE.with(|c| {
++            let mut c = c.borrow_mut();
++            let i = c.iter().position(|(kk, _)| *kk == k)?;
++            let entry = c.remove(i);
++            let out = entry.1.clone();
++            c.push(entry); // most recently used last
++            Some(out)
++        })
++    {
++        return Ok(hit);
++    }
++    COMPUTES.with(|n| n.set(n.get().saturating_add(1)));
++    let b = Arc::new(compute()?);
++    if let Some(k) = k {
++        CACHE.with(|c| {
++            let mut c = c.borrow_mut();
++            if c.len() >= CAP {
++                c.remove(0);
++            }
++            c.push((k, b.clone()));
++        });
++    }
++    Ok(b)
++}
+diff --git a/crates/app/src/stock_sim.rs b/crates/app/src/stock_sim.rs
+index 82ca9055..fa9be906 100644
+--- a/crates/app/src/stock_sim.rs
++++ b/crates/app/src/stock_sim.rs
+@@ -27,7 +27,7 @@ pub use lathe::{LathePlan, LATHE_HELIX_REFUSAL, LATHE_THREAD_REFUSAL, LATHE_VERD
+ // next setup's frame through the transform between the two.
+ #[path = "stock_sim_carry.rs"]
+ pub mod carry;
+-pub use carry::incoming_body;
++pub use carry::{CARRY_MACHINE_REFUSAL, incoming_body};
+ 
+ use crate::geometry::Triangle;
+ 
+diff --git a/crates/app/src/stock_sim_carry.rs b/crates/app/src/stock_sim_carry.rs
+index 7094bc97..f83930fb 100644
+--- a/crates/app/src/stock_sim_carry.rs
++++ b/crates/app/src/stock_sim_carry.rs
+@@ -26,6 +26,13 @@
+ 
+ use crate::stock_sim::{Body, Dexel, LatticeTurn, Planned, SimOp, simulate, stock_grid};
+ 
++/// The refusal for a carry on a lathe or mill-turn machine (#321 decided:
++/// the part flip / sub-spindle hand-off is not implemented - the column
++/// lattice carries milled bodies only, and a turned body lives in the
++/// meridian field). Every reader of the carry - the program sim, the rest
++/// and judged stock of generation, and so the post - says this by name.
++pub const CARRY_MACHINE_REFUSAL: &str = "a part flip or sub-spindle hand-off is not supported yet on a lathe or mill-turn machine";
++
+ /// How the program enters a setup from the setup before it.
+ pub(crate) enum Entry {
+     /// Same hold, not linked: the conservative clip to the new block.
+@@ -57,7 +64,7 @@ pub(crate) fn entry(world: &flecs_ecs::prelude::World, from: Option<&str>, to: O
+     }
+     let head = format!("carrying the machined stock from setup '{from}' into setup '{to}'");
+     if crate::machine::kind_of(world) != crate::machine::Kind::Mill {
+-        return Err(format!("{head}: not supported yet on a lathe or mill-turn machine"));
++        return Err(format!("{head}: {CARRY_MACHINE_REFUSAL}"));
+     }
+     let t = setup_relative::transform_between(world, from, to).map_err(|e| format!("{head}: {e}"))?;
+     LatticeTurn::from_matrix(matrix_of(t.rot), [t.pos.x, t.pos.y, t.pos.z])
+diff --git a/crates/app/src/world.rs b/crates/app/src/world.rs
+index b5d829d5..d7643ca2 100644
+--- a/crates/app/src/world.rs
++++ b/crates/app/src/world.rs
+@@ -6,6 +6,8 @@ use flecs_ecs::prelude::World;
+ use crate::schema;
+ 
+ pub fn new_world() -> World {
++    // #321: a new document starts with no carried body cached.
++    crate::rest::clear_carried_cache();
+     let world = World::new();
+     schema::register_schema(&world);
+     world
+diff --git a/crates/app/tests/carried_fixtures_cache.rs b/crates/app/tests/carried_fixtures_cache.rs
+new file mode 100644
+index 00000000..1c6ebcf5
+--- /dev/null
++++ b/crates/app/tests/carried_fixtures_cache.rs
+@@ -0,0 +1,207 @@
++//! #321: carried stock - workholding, the lathe second op, the cache. A
++//! 10x10x5 part sits in a 100 mm block Setup1 faces; Setup2 holds the body
++//! Setup1 left ("Same as") and carries a jaw fixture beside the part. The
++//! jaw is refused at the post where Setup1 left material standing in it,
++//! and clear where Setup1 faced that material away (even though Setup2's
++//! declared block still reaches through it); a carry on a lathe or
++//! mill-turn is refused by name (generation and the rest chain name it,
++//! the sim and the post refuse the path it staled); the carried body is not
++//! recomputed on an unrelated edit, and is on an upstream one.
++//! Provenance: our own fixtures (carried_verify.rs's faced block and
++//! contour) over plain re-clamp practice; no vendor material consulted.
++//!
++//! Gate map (#321): covers app::fixture_carried (carried_fixture_problems,
++//! penetration), app::rest::carried_cache (body, computes, clear),
++//! app::rest::across (carried_body, entered_body), app::stock_sim::carry
++//! (CARRY_MACHINE_REFUSAL), app::posting (the workholding clause).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::cl::MoveKind;
++use camcraft_app::commands::{
++    AddTool, CreateOperation, CreateSetup, EditOperationParams, GenerateOperation, History, ImportModel,
++    LoadMachine, RenameOperation, SetSetupRelative, SetStock, TagFixture,
++};
++use camcraft_app::fixture_carried::{FIXTURE_IN_CARRIED, carried_fixture_problems};
++use camcraft_app::geometry::{Point3, cube};
++use camcraft_app::machining2d::{Lead, Side};
++use camcraft_app::model;
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::posting;
++use camcraft_app::rest::{carried_body_computes, carry_refusal};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_sim::{CARRY_MACHINE_REFUSAL, simulate_document};
++use camcraft_app::tools::catalog;
++use camcraft_app::verify::Warning;
++use camcraft_app::world::new_world;
++
++const TOOL: &str = "EM-0600-4FL";
++
++fn contour(feed: f64) -> OpParams {
++    OpParams::Contour {
++        tilt: None,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(12.0),
++        retract_z: Height::fixed(8.0),
++        top_z: Height::fixed(5.0),
++        bottom_z: Height::fixed(0.0),
++        stepdown: 2.5,
++        feed,
++        plunge_feed: 200.0,
++        climb: true,
++        side: Side::Auto,
++        lead: Lead::None,
++        tolerance: 0.01,
++        tab_count: 0,
++        tab_width: 0.0,
++        tab_height: 0.0,
++        entry: camcraft_app::machining3d::Entry3D::Plunge,
++        helix_radius: 1.0,
++        blend_turns: false,
++        links: camcraft_app::links::Links::PLANAR,
++    }
++}
++
++fn face(cut_z: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 4.0,
++        clearance_z: Height::fixed(30.0),
++        cut_z: Height::fixed(cut_z),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    }
++}
++
++fn block(world: &World, w: f64, z0: f64, dz: f64) -> SetStock {
++    let at = Location { pos: Point3::new(5.0, 5.0, z0), ..Default::default() };
++    SetStock::new(world, StockShape::Box { dx: w, dy: w, dz }, at).expect("stock")
++}
++
++/// The part in Setup1's 100 mm block Z -5..10 faced to `cut1`; Setup2
++/// "Same as" Setup1 declaring a `w2`-wide block Z -5..(-5 + `dz2`), a
++/// jaw (x 20..30, y 0..10, z 5..8) tagged to it, and Contour2.
++fn program(cut1: f64, w2: f64, dz2: f64) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("part", cube(Point3::ZERO, Point3::new(10.0, 10.0, 5.0))));
++    h.execute(&world, block(&world, 100.0, -5.0, 15.0));
++    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("tool");
++    h.execute(&world, AddTool::new(&world, TOOL, tool).expect("add tool"));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("materialize Setup1"));
++    h.execute(&world, CreateOperation::new(&world, "Face1", TOOL, SrcRef::Stock, face(cut1)).expect("create"));
++    h.execute(&world, GenerateOperation::new(&world, "Face1").expect("generate"));
++    h.execute(&world, CreateSetup::new(&world, None, Some("Setup1")).expect("Setup2"));
++    h.execute(&world, SetSetupRelative::link(&world, "Setup2", "Setup1", [0.0; 3]).expect("same as"));
++    h.execute(&world, block(&world, w2, -5.0, dz2));
++    h.execute(&world, ImportModel::from_mesh("Jaw", cube(Point3::new(20.0, 0.0, 5.0), Point3::new(30.0, 10.0, 8.0))));
++    h.execute(&world, TagFixture::new(&world, "Jaw", Some("Setup2")).expect("tag jaw"));
++    let op = CreateOperation::new(&world, "Contour2", TOOL, SrcRef::Entity("part".into()), contour(800.0)).expect("create");
++    h.execute(&world, op);
++    h.execute(&world, GenerateOperation::new(&world, "Contour2").expect("generate"));
++    (world, h)
++}
++
++fn jaw_lines(world: &World) -> Vec<String> {
++    posting::verification_gate(world).into_iter().filter(|p| p.contains(FIXTURE_IN_CARRIED)).collect()
++}
++
++#[test]
++fn a_jaw_modelled_into_material_setup1_left_refuses_the_post() {
++    // Setup1 faces only to 9: material stands to Z 9 under the jaw (Z 5..8),
++    // all of it outside Setup2's small declared block - only the carried
++    // stock says the jaw is modelled into material.
++    let (world, _h) = program(9.0, 12.0, 10.0);
++    let p = carried_fixture_problems(&world);
++    assert_eq!(p.len(), 1, "{p:?}");
++    assert!(
++        p[0].contains("setup 'Setup2'") && p[0].contains("fixture 'Jaw'") && p[0].contains("setup 'Setup1'") && p[0].contains("3.00 mm deep"),
++        "{}",
++        p[0]
++    );
++    assert_eq!(jaw_lines(&world), p, "the post gate reads the same clause");
++    let dir = std::env::temp_dir().join(format!("cc-321-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let posted = posting::post_setup(&world, &dir.join("jaw.nc"));
++    let _ = std::fs::remove_dir_all(&dir);
++    match posted {
++        Ok(_) => panic!("a jaw inside the carried stock posted"),
++        Err(e) => assert!(e.contains(FIXTURE_IN_CARRIED), "{e}"),
++    }
++}
++
++#[test]
++fn a_jaw_where_setup1_faced_the_material_away_is_clear() {
++    // Setup1 faces to 5: the jaw sits ON the face it left (contact, not
++    // penetration). Setup2's declared block (to Z 10) still reaches through
++    // the jaw - the carried body, not the declared block, is read.
++    let (world, _h) = program(5.0, 100.0, 15.0);
++    assert!(carried_fixture_problems(&world).is_empty(), "{:?}", carried_fixture_problems(&world));
++    assert!(jaw_lines(&world).is_empty());
++}
++
++#[test]
++fn the_carried_body_is_not_recomputed_on_an_unrelated_edit() {
++    let (world, mut h) = program(9.0, 100.0, 10.0);
++    let n0 = carried_body_computes();
++    assert!(n0 >= 1, "Contour2's generation read the carried body");
++    // Edits that do not feed the carry: the consumer's own feed, a label
++    // upstream, the post gate reading the same entry - all hits.
++    h.execute(&world, EditOperationParams::new(&world, "Contour2", contour(600.0)).expect("edit"));
++    h.execute(&world, GenerateOperation::new(&world, "Contour2").expect("regenerate"));
++    h.execute(&world, RenameOperation::new(&world, "Face1", "Top face").expect("rename"));
++    h.execute(&world, GenerateOperation::new(&world, "Contour2").expect("regenerate"));
++    let _ = posting::verification_report(&world);
++    assert_eq!(carried_body_computes(), n0, "an unrelated edit recomputed the carried body");
++    // An upstream edit moves the key: recomputed, and never served stale -
++    // Setup1 now faces to 5, so the dive beside the part meets air.
++    h.execute(&world, EditOperationParams::new(&world, "Face1", face(5.0)).expect("edit face"));
++    h.execute(&world, GenerateOperation::new(&world, "Face1").expect("regenerate face"));
++    h.execute(&world, GenerateOperation::new(&world, "Contour2").expect("regenerate"));
++    assert!(carried_body_computes() > n0, "an upstream edit served the cached body");
++    let cached = model::find_by_name(&world, "Contour2").and_then(|e| model::toolpath_of(&world, &e)).expect("cached");
++    assert!(cached.path.moves.iter().any(|m| m.kind == MoveKind::Rapid), "the contour has rapids");
++    assert!(
++        !cached.warnings.iter().any(|w| matches!(w, Warning::RapidInStock { .. })),
++        "the body Setup1 faced to 5 was judged: {:?}",
++        cached.warnings
++    );
++}
++
++#[test]
++fn a_new_document_starts_with_no_carried_body_cached() {
++    let (world, mut h) = program(9.0, 100.0, 10.0);
++    drop(new_world());
++    let n0 = carried_body_computes();
++    h.execute(&world, GenerateOperation::new(&world, "Contour2").expect("regenerate"));
++    assert!(carried_body_computes() > n0, "the cache outlived its document");
++}
++
++#[test]
++fn a_carry_on_a_lathe_or_mill_turn_is_refused_by_name_on_every_path() {
++    for machine in ["Lathe", "Mill-turn"] {
++        let (world, mut h) = program(9.0, 100.0, 10.0);
++        h.execute(&world, LoadMachine::builtin(&world, machine).expect("load machine"));
++        let generated = GenerateOperation::new(&world, "Contour2").map(|_| ()).expect_err("refused").to_string();
++        assert!(
++            generated.contains(CARRY_MACHINE_REFUSAL) && generated.contains("from setup 'Setup1' into setup 'Setup2'"),
++            "{machine}: {generated}"
++        );
++        // The rest chain names it too (the stamp digests that refusal, so
++        // the path cut on the mill goes stale).
++        let rest = carry_refusal(&world, "Contour2", Some("Setup2")).expect("the rest chain refuses");
++        assert!(rest.contains(CARRY_MACHINE_REFUSAL), "{machine}: {rest}");
++        // The sim never judges it: the op cut on the mill is stale by name.
++        let sim = simulate_document(&world).map(|_| ()).expect_err("the program sim never judges it");
++        assert!(sim.contains("Contour2") && sim.contains("regenerate"), "{machine}: {sim}");
++        let gate = posting::verification_report(&world).problems;
++        assert!(gate.iter().any(|p| p.contains("Contour2")), "{machine}: the carried program posted: {gate:?}");
++    }
++}
+diff --git a/docs/decisions/321-carry-fixtures-cache.md b/docs/decisions/321-carry-fixtures-cache.md
+new file mode 100644
+index 00000000..ed3c354d
+--- /dev/null
++++ b/docs/decisions/321-carry-fixtures-cache.md
+@@ -0,0 +1,104 @@
++## #321 - Carried stock: workholding, the lathe second op, the cache
++
++**Decided (1) - workholding reads the carried stock.** A setup entered
++with a carried body (#317) holds that body, so its fixtures are read
++against it: a tagged fixture of that setup standing INSIDE the material
++the program carries in (a jaw modelled into a wall setup 1 left, a clamp
++on a face that is still there) refuses the post by name
++(`fixture_carried::FIXTURE_IN_CARRIED`, naming both setups, the fixture
++and how deep). Only the body the setup is entered with is read - a clamp
++seated on a face or in a pocket setup 1 cut is clear even where the
++declared block still reaches through it. Penetration, not contact:
++column centres strictly inside the footprint, Z overlap beyond the 1 nm
++fixture tolerance - jaws gripping a side and a part seated on a plate are
++contact by design. Live at the post gate, like every workholding law
++(never in a stamp). The machine table is not read (the stock stands on
++it).
++
++The tool and holder against the carried stock were already judged by
++#319 (PR #410): every stock-reading law of a carried setup's generation -
++the rapid, entry, reach (holder) and linking laws - reads the box
++enclosing the declared stock and the carried body, and the post's WARN
++records are those cached warnings. The fixture laws (c2)/(d2) judge the
++same stack against the setup's steel, live. Together that is "tool and
++holder against the carried stock plus that setup's fixtures"; what was
++missing was the fixtures themselves being read against the carried body,
++which is what this adds.
++
++**Why.** Prime Directive: a fixture verdict judged against steel the
++machine cannot hold where it is modelled is a verdict about a different
++setup. A collision check that sees less than reality is crash-class, so
++a modelled hold that contradicts the material is refused, not trusted.
++
++**Considered and dropped.**
++- *Carried material outside the declared stock as fixture boxes* for the
++  (c2)/(d2) laws: the flute's own law would then convict every op that
++  cuts along a declared block smaller than the carried body - the common
++  "declare the finished size" habit #319 chose to note, not refuse. The
++  holder and rapids against that material are #319's union box already.
++- *The spindle housing against the carried stock*: it stands down
++  against stock by the kerf reasoning on every setup, carried or not;
++  changing that is a law change for all setups, not this issue's.
++- *Checking the declared stock too* (single-setup documents): a new
++  refusal on every existing document whose fixture boxes overlap a
++  loosely declared block; out of scope.
++
++**Limits (stated).** The column sampling resolves to the carried grid's
++pitch: an overlap narrower than half a cell beside a face can pass. The
++law is a model-consistency refusal; the tool's own steel and stock laws
++still judge every move.
++
++**Decided (2) - the lathe / mill-turn second op stays refused by name.**
++A part flip or sub-spindle hand-off is not implemented: the column
++lattice carries milled bodies only, and a turned body lives in the
++meridian field (#19), whose flip is a different transform (about the
++spindle normal plus a Z shift) on a different representation. Implementing
++it is a turning-field carry with its own verification, larger than this
++issue's remaining scope. The refusal is now one named constant
++(`stock_sim::CARRY_MACHINE_REFUSAL`) and is pinned on every path:
++generation and the rest chain name it (both read `carry::entry`); a path
++cut before the machine changed goes stale because its stamp digests the
++refused carry, so the program sim and the post refuse that op by name; a
++program sim over fresh paths meets the same `carry::entry` refusal.
++
++**Considered and dropped.** *Treating the lathe flip as the milling carry
++with a flip transform*: the column grid cannot hold a revolved body's
++undercuts, so it would judge less material than stands - refused.
++
++**Decided (3) - the carried body is cached by content.** The body the
++chain leaves (`rest::across::carried_body`) is the costliest read of a
++carried setup and is read by every op's judged stock, its rest mask and
++the post's workholding clause. It is memoized (thread-local, the 4 most
++recently used bodies) under a key digesting everything the sweep reads:
++the origin setup's stock (placement, mesh signature, shape), the lattice
++radius, every turn of the chain, and every cutting op's exact moves and
++tool atom in order (the consumer setup's own ops only when the rest mask
++asks through them). Op names, the consumer's own parameters, the
++viewport and the post gate's reading never enter it, so an unrelated edit
++is a hit; any input of the sweep moves the key, so a stale body is never
++served. A stock without a geometry signature is never cached. Opening a
++document or making a new world clears it, so nothing of a closed document
++outlives it. A test-visible counter (`rest::carried_body_computes`) pins
++both directions.
++
++**Considered and dropped.**
++- *Keying by the stamp digests* (`prior_digest`): they include op names,
++  so a rename would recompute; and they digest path signatures rather
++  than the moves the sweep reads. Hashing the moves themselves is a
++  cheap linear pass beside the sweep and leaves no input out.
++- *A flecs singleton per setup*: a write from the read-only collect phase
++  of generation; the content key makes the per-setup binding unnecessary.
++- *A process-global cache*: would outlive documents; thread-local and
++  cleared on document change instead.
++
++**Not done here (owed).** `stock_sim::incoming_body` (the program walk
++the #320 display reads) is not routed through the cache - it walks the
++whole program, not the rest chain. Heavy-lane measurement on the big
++fixtures was not added; the counter pins the behaviour.
++
++**#320 / PR #408.** Its `carry::Entry::NewBlock` (a fresh blank) breaks the
++chain like the clip; the cache key reads only the chain #318 builds, so
++whichever lands second needs no further rule here.
++
++**Cost to change later.** Local: `fixture_carried`, `rest::carried_cache`
++and `carried_body` in `rest::across`.

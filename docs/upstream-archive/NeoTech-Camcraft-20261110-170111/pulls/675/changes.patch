@@ -1,0 +1,697 @@
+From 64dc177d9be0b3914f65f14937912888efe0ae18 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 9 Nov 2026 22:02:47 -0800
+Subject: [PATCH 1/2] feat(sim): plasma through-cut laws - cut order, kerf
+ crossing, tip-up
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+#672 step 1 (part of #621's plasma research): sim::verify::plasma judges
+a plasma program from a neutral form - the kerf, the cuts in order (each
+the torch-on polyline with its contour id, inner/outer and parent outer)
+and the rapid into each - so it reads the CL's torch records (#670) and
+nothing of the operation's internals:
+- cut order (refusal): an inner contour cut after the outer that frees
+  its part;
+- kerf crossing (warning): a cut within one kerf of an earlier cut's
+  centre line - the THC dive the LinuxCNC Plasma Primer §12 warns of;
+- tip-up (warning): a rapid across a part already cut free (Tormach
+  1300PL manual UM10720 §1.4.2, §4.12.8);
+- malformed (refusal): a non-positive or non-finite kerf, a NaN point, a
+  cut with no path.
+Not yet wired: step 2 reads the plasma op's CL torch records (#670) and
+blocks the post on a refusal.
+
+Pinned by plasma_laws (5): each law tripped by one fixture and passed by
+another.
+
+Refs #672
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/sim/src/verify/mod.rs    |   2 +
+ crates/sim/src/verify/plasma.rs | 181 ++++++++++++++++++++++++++++++++
+ crates/sim/tests/plasma_laws.rs |  84 +++++++++++++++
+ 3 files changed, 267 insertions(+)
+ create mode 100644 crates/sim/src/verify/plasma.rs
+ create mode 100644 crates/sim/tests/plasma_laws.rs
+
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index 1e85fcfd..8e1ae862 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -161,6 +161,8 @@ mod engine;
+ mod finish;
+ mod hidden;
+ mod laws;
++// #672: the plasma through-cut laws (cut order, kerf crossing, tip-up).
++pub mod plasma;
+ mod mesh_posed;
+ mod mesh_steel;
+ mod midpose;
+diff --git a/crates/sim/src/verify/plasma.rs b/crates/sim/src/verify/plasma.rs
+new file mode 100644
+index 00000000..f9c48269
+--- /dev/null
++++ b/crates/sim/src/verify/plasma.rs
+@@ -0,0 +1,181 @@
++//! Plasma through-cut laws (#672, part of #621): what replaces the gouge
++//! and collision checks for a 2D plasma program. A plasma op cuts through,
++//! so the hazards are not depth but ORDER and GAPS:
++//!
++//! - **Cut order (refusal).** A part's inner contour cut after the outer
++//!   contour that frees it: the part has dropped (or tipped) before its
++//!   holes are cut.
++//! - **Kerf crossing (warning).** A cut whose centre line comes within one
++//!   kerf of an earlier cut's: the torch crosses an open kerf, the arc
++//!   voltage jumps and torch height control dives - it "can smash the
++//!   torch into the material" (LinuxCNC Plasma Primer §12).
++//! - **Tip-up (warning).** A rapid that crosses the area of a part already
++//!   cut free: a freed part can tip up into the torch (Tormach 1300PL
++//!   manual UM10720 §1.4.2, §4.12.8).
++//! - **Malformed (refusal).** A non-positive or non-finite kerf, a NaN
++//!   point, a cut with fewer than two points - refused by name.
++//!
++//! Input is a neutral program - the cuts in order, each the torch-on
++//! polyline (arcs chorded by the caller) with its contour id, inner/outer
++//! and parent outer - so the laws read the CL's torch records (#670) and
++//! nothing of the operation's internals.
++//!
++//! Provenance: our own geometry over the cited plasma practice; no vendor
++//! implementation inspected.
++
++use crate::geo2d::Point2;
++
++/// One torch-on span: a contour cut from pierce to torch-off.
++#[derive(Clone, Debug, PartialEq)]
++pub struct PlasmaCut {
++    pub contour: u32,
++    /// A hole (or other inner contour) of a part, rather than its outline.
++    pub inner: bool,
++    /// The outer contour an inner one belongs to.
++    pub parent: Option<u32>,
++    /// The torch path, lead-in to lead-out, in cut order.
++    pub path: Vec<Point2>,
++}
++
++/// A plasma program: the kerf, the cuts in cut order, and the rapid that
++/// reaches each cut's pierce (`rapids[i]` precedes `cuts[i]`; `None` when
++/// the program starts there).
++#[derive(Clone, Debug, Default)]
++pub struct PlasmaProgram {
++    pub kerf: f64,
++    pub cuts: Vec<PlasmaCut>,
++    pub rapids: Vec<Option<(Point2, Point2)>>,
++}
++
++/// What the laws find.
++#[derive(Clone, Debug, PartialEq)]
++pub enum PlasmaFinding {
++    /// Refusal: inner contour `inner` is cut after its outer `parent`.
++    CutOrder { inner: u32, parent: u32 },
++    /// Warning: contour `contour` comes within a kerf of earlier `earlier`.
++    KerfCrossing { contour: u32, earlier: u32, at: Point2 },
++    /// Warning: the rapid before `contour` crosses freed part `freed`.
++    TipUp { contour: u32, freed: u32, at: Point2 },
++    /// Refusal: the program cannot be judged.
++    Malformed(String),
++}
++
++impl PlasmaFinding {
++    /// Does this finding block the post?
++    #[must_use]
++    pub fn refuses(&self) -> bool {
++        matches!(self, PlasmaFinding::CutOrder { .. } | PlasmaFinding::Malformed(_))
++    }
++}
++
++/// Judge a plasma program. Findings come in cut order.
++#[must_use]
++pub fn judge(p: &PlasmaProgram) -> Vec<PlasmaFinding> {
++    if !(p.kerf.is_finite() && p.kerf > 0.0) {
++        return vec![PlasmaFinding::Malformed(format!("plasma kerf {} is not a positive width", p.kerf))];
++    }
++    for c in &p.cuts {
++        if c.path.len() < 2 {
++            return vec![PlasmaFinding::Malformed(format!("contour {} has no cut path", c.contour))];
++        }
++        if c.path.iter().any(|q| !(q.x.is_finite() && q.y.is_finite())) {
++            return vec![PlasmaFinding::Malformed(format!("contour {} has a non-finite point", c.contour))];
++        }
++    }
++    let mut out = Vec::new();
++    for (i, c) in p.cuts.iter().enumerate() {
++        // Cut order: an inner contour after its parent outer.
++        if c.inner
++            && let Some(parent) = c.parent
++            && p.cuts[..i].iter().any(|e| !e.inner && e.contour == parent)
++        {
++            out.push(PlasmaFinding::CutOrder { inner: c.contour, parent });
++        }
++        // Tip-up: the rapid into this cut over a part already cut free.
++        if let Some(Some((a, b))) = p.rapids.get(i) {
++            for e in p.cuts[..i].iter().filter(|e| !e.inner) {
++                if let Some(at) = crosses_area(*a, *b, &e.path) {
++                    out.push(PlasmaFinding::TipUp { contour: c.contour, freed: e.contour, at });
++                }
++            }
++        }
++        // Kerf crossing: within a kerf of an earlier cut's centre line.
++        for e in &p.cuts[..i] {
++            if let Some(at) = near(&c.path, &e.path, p.kerf) {
++                out.push(PlasmaFinding::KerfCrossing { contour: c.contour, earlier: e.contour, at });
++            }
++        }
++    }
++    out
++}
++
++/// The first point of `a` whose segment comes within `gap` of `b`'s path.
++fn near(a: &[Point2], b: &[Point2], gap: f64) -> Option<Point2> {
++    for s in a.windows(2) {
++        for t in b.windows(2) {
++            if seg_dist(s[0], s[1], t[0], t[1]) < gap {
++                return Some(s[0]);
++            }
++        }
++    }
++    None
++}
++
++/// Where segment a-b enters the area closed by `ring` (its endpoints
++/// inside, or it crossing the ring); `None` when it stays outside.
++fn crosses_area(a: Point2, b: Point2, ring: &[Point2]) -> Option<Point2> {
++    if ring.len() < 3 {
++        return None;
++    }
++    if inside(a, ring) {
++        return Some(a);
++    }
++    if inside(b, ring) {
++        return Some(b);
++    }
++    let n = ring.len();
++    for k in 0..n {
++        let (c, d) = (ring[k], ring[(k + 1) % n]);
++        if seg_dist(a, b, c, d) == 0.0 {
++            return Some(c);
++        }
++    }
++    None
++}
++
++/// Even-odd point in polygon.
++fn inside(p: Point2, ring: &[Point2]) -> bool {
++    let mut odd = false;
++    let n = ring.len();
++    for k in 0..n {
++        let (a, b) = (ring[k], ring[(k + 1) % n]);
++        if (a.y > p.y) != (b.y > p.y) {
++            let x = a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y);
++            if p.x < x {
++                odd = !odd;
++            }
++        }
++    }
++    odd
++}
++
++fn cross(o: Point2, a: Point2, b: Point2) -> f64 {
++    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
++}
++
++fn pt_seg(p: Point2, a: Point2, b: Point2) -> f64 {
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let l2 = dx * dx + dy * dy;
++    let t = if l2 > 0.0 { (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
++    let (qx, qy) = (a.x + t * dx, a.y + t * dy);
++    ((p.x - qx).powi(2) + (p.y - qy).powi(2)).sqrt()
++}
++
++/// Distance between segments a-b and c-d (0 when they cross).
++fn seg_dist(a: Point2, b: Point2, c: Point2, d: Point2) -> f64 {
++    let (d1, d2, d3, d4) = (cross(c, d, a), cross(c, d, b), cross(a, b, c), cross(a, b, d));
++    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
++        return 0.0;
++    }
++    pt_seg(a, c, d).min(pt_seg(b, c, d)).min(pt_seg(c, a, b)).min(pt_seg(d, a, b))
++}
+diff --git a/crates/sim/tests/plasma_laws.rs b/crates/sim/tests/plasma_laws.rs
+new file mode 100644
+index 00000000..48b58952
+--- /dev/null
++++ b/crates/sim/tests/plasma_laws.rs
+@@ -0,0 +1,84 @@
++//! #672: the plasma through-cut laws - cut order, kerf crossing, tip-up,
++//! and malformed programs - each tripped by one fixture and passed by
++//! another.
++//!
++//! Gate map (#672): covers sim::verify::plasma.
++//! Provenance: our own fixtures.
++
++use camcraft_sim::geo2d::Point2;
++use camcraft_sim::verify::plasma::{judge, PlasmaCut, PlasmaFinding, PlasmaProgram};
++
++fn p(x: f64, y: f64) -> Point2 {
++    Point2::new(x, y)
++}
++
++/// A closed square, from its lower-left corner, side `s`.
++fn square(x: f64, y: f64, s: f64) -> Vec<Point2> {
++    vec![p(x, y), p(x + s, y), p(x + s, y + s), p(x, y + s), p(x, y)]
++}
++
++fn cut(contour: u32, inner: bool, parent: Option<u32>, path: Vec<Point2>) -> PlasmaCut {
++    PlasmaCut { contour, inner, parent, path }
++}
++
++/// A 100 mm plate part (outer 1) with a 20 mm hole (inner 2) in it.
++fn plate(hole_first: bool) -> PlasmaProgram {
++    let hole = cut(2, true, Some(1), square(40.0, 40.0, 20.0));
++    let outer = cut(1, false, None, square(0.0, 0.0, 100.0));
++    let cuts = if hole_first { vec![hole, outer] } else { vec![outer, hole] };
++    PlasmaProgram { kerf: 1.5, cuts, rapids: vec![None, None] }
++}
++
++#[test]
++fn holes_before_the_outline_pass_clean() {
++    assert_eq!(judge(&plate(true)), vec![]);
++}
++
++#[test]
++fn an_outline_before_its_hole_is_refused_by_name() {
++    let f = judge(&plate(false));
++    assert_eq!(f, vec![PlasmaFinding::CutOrder { inner: 2, parent: 1 }]);
++    assert!(f[0].refuses());
++}
++
++#[test]
++fn a_cut_within_a_kerf_of_an_earlier_one_is_warned() {
++    // Two parts side by side, 1 mm apart with a 1.5 mm kerf: the second
++    // outline runs inside the first one's open kerf.
++    let a = cut(1, false, None, square(0.0, 0.0, 50.0));
++    let b = cut(2, false, None, square(51.0, 0.0, 50.0));
++    let f = judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a.clone(), b], rapids: vec![None, None] });
++    assert!(matches!(f.as_slice(), [PlasmaFinding::KerfCrossing { contour: 2, earlier: 1, .. }]), "{f:?}");
++    assert!(!f[0].refuses(), "a warning, not a refusal");
++    // 5 mm apart: clear.
++    let c = cut(2, false, None, square(55.0, 0.0, 50.0));
++    assert_eq!(judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a, c], rapids: vec![None, None] }), vec![]);
++}
++
++#[test]
++fn a_rapid_over_a_freed_part_is_warned() {
++    // Part 1 (0..50) is cut free, then the rapid to part 3 (at x 120)
++    // starts from the far side of part 1 and crosses it.
++    let a = cut(1, false, None, square(0.0, 0.0, 50.0));
++    let b = cut(3, false, None, square(120.0, 0.0, 30.0));
++    let over = Some((p(-10.0, 25.0), p(120.0, 0.0)));
++    let f = judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a.clone(), b.clone()], rapids: vec![None, over] });
++    assert!(matches!(f.as_slice(), [PlasmaFinding::TipUp { contour: 3, freed: 1, .. }]), "{f:?}");
++    // Around it, below the part: clear.
++    let around = Some((p(0.0, -10.0), p(120.0, -10.0)));
++    assert_eq!(judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a, b], rapids: vec![None, around] }), vec![]);
++}
++
++#[test]
++fn a_malformed_program_is_refused_by_name() {
++    for kerf in [0.0, -1.0, f64::NAN, f64::INFINITY] {
++        let f = judge(&PlasmaProgram { kerf, ..plate(true) });
++        assert!(matches!(f.as_slice(), [PlasmaFinding::Malformed(m)] if m.contains("kerf")), "{kerf}: {f:?}");
++    }
++    let mut bad = plate(true);
++    bad.cuts[0].path[1] = p(f64::NAN, 0.0);
++    assert!(matches!(judge(&bad).as_slice(), [PlasmaFinding::Malformed(m)] if m.contains("non-finite")));
++    let mut empty = plate(true);
++    empty.cuts[1].path.truncate(1);
++    assert!(matches!(judge(&empty).as_slice(), [PlasmaFinding::Malformed(m)] if m.contains("no cut path")));
++}
+
+From e60c2b0b8d1bc0c2af1fab2dc3d8e00fb8439353 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 9 Nov 2026 22:57:19 -0800
+Subject: [PATCH 2/2] fix(sim): plasma laws judge any enclosing contour, roles,
+ and refuse what they can't judge
+
+Review of #675:
+- Cut order is judged against ANY enclosing contour (the parent chain #670
+  writes): an island cut after its hole is refused, as a hole after its
+  outline was. CutOrder { contour, enclosing }.
+- Contours carry a role (Outer / Inner / Open, matching the CL's TORCH ON
+  C<id> OUTER|INNER|OPEN) and a small-hole flag; an open path is never a
+  freed area for tip-up; a centre-pierced small hole may be one point.
+- Refused by name as Malformed: a duplicate contour id, a parent that is
+  the contour itself or no cut carries, an inner contour with no parent,
+  a rapid list that does not match the cuts, a NaN rapid point.
+- The module doc says kerf crossing covers only the torch-height hazard
+  (a warning; shared-kerf common lines are legal) and a true crossing
+  becomes a refusal with the CL reader in step 2. mod order fixed.
+
+Pinned by plasma_laws (8): an_island_after_its_hole_is_refused,
+bad_parents_ids_and_rapids_are_refused_by_name,
+small_holes_and_open_paths, plus the five step-1 laws.
+
+Refs #672
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/sim/src/verify/mod.rs    |   4 +-
+ crates/sim/src/verify/plasma.rs | 118 +++++++++++++++++++++++---------
+ crates/sim/tests/plasma_laws.rs |  80 +++++++++++++++++++---
+ 3 files changed, 156 insertions(+), 46 deletions(-)
+
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index 8e1ae862..f4cc5ab2 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -161,11 +161,11 @@ mod engine;
+ mod finish;
+ mod hidden;
+ mod laws;
+-// #672: the plasma through-cut laws (cut order, kerf crossing, tip-up).
+-pub mod plasma;
+ mod mesh_posed;
+ mod mesh_steel;
+ mod midpose;
++// #672: the plasma through-cut laws (cut order, kerf crossing, tip-up).
++pub mod plasma;
+ mod posed_steel;
+ mod prior;
+ mod probe;
+diff --git a/crates/sim/src/verify/plasma.rs b/crates/sim/src/verify/plasma.rs
+index f9c48269..3d69905f 100644
+--- a/crates/sim/src/verify/plasma.rs
++++ b/crates/sim/src/verify/plasma.rs
+@@ -2,44 +2,65 @@
+ //! and collision checks for a 2D plasma program. A plasma op cuts through,
+ //! so the hazards are not depth but ORDER and GAPS:
+ //!
+-//! - **Cut order (refusal).** A part's inner contour cut after the outer
+-//!   contour that frees it: the part has dropped (or tipped) before its
+-//!   holes are cut.
++//! - **Cut order (refusal).** A contour cut after a contour that encloses
++//!   it (a hole after its outline, an island after its hole): the
++//!   enclosing cut has freed the material it sits in.
+ //! - **Kerf crossing (warning).** A cut whose centre line comes within one
+ //!   kerf of an earlier cut's: the torch crosses an open kerf, the arc
+ //!   voltage jumps and torch height control dives - it "can smash the
+-//!   torch into the material" (LinuxCNC Plasma Primer §12).
++//!   torch into the material" (LinuxCNC Plasma Primer §12). This law
++//!   covers only that torch-height hazard, so it warns (a shared-kerf
++//!   common line is legal); a centre line truly crossing a finished
++//!   contour outside a lead becomes a refusal when the CL reader lands
++//!   (#672 step 2).
+ //! - **Tip-up (warning).** A rapid that crosses the area of a part already
+ //!   cut free: a freed part can tip up into the torch (Tormach 1300PL
+ //!   manual UM10720 §1.4.2, §4.12.8).
+ //! - **Malformed (refusal).** A non-positive or non-finite kerf, a NaN
+-//!   point, a cut with fewer than two points - refused by name.
++//!   point, a cut with fewer than two points (unless a centre-pierced
++//!   small hole), a duplicate contour id, a parent that is the contour
++//!   itself or no cut carries, an inner contour with no parent, a rapid
++//!   list that does not match the cuts, a NaN rapid point - refused by
++//!   name.
+ //!
+ //! Input is a neutral program - the cuts in order, each the torch-on
+-//! polyline (arcs chorded by the caller) with its contour id, inner/outer
+-//! and parent outer - so the laws read the CL's torch records (#670) and
+-//! nothing of the operation's internals.
++//! polyline (arcs chorded by the caller) with its contour id, role and
++//! enclosing contour (the CL's `TORCH ON C<id> OUTER|INNER|OPEN
++//! [PARENT<id>] [SMALL..]`, #670) - and nothing of the operation's
++//! internals.
+ //!
+ //! Provenance: our own geometry over the cited plasma practice; no vendor
+ //! implementation inspected.
+ 
+ use crate::geo2d::Point2;
+ 
++/// What a contour is: a part's outline (or an island in a hole), a hole,
++/// or an open path (a slit, not a closed area).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CutRole {
++    Outer,
++    Inner,
++    Open,
++}
++
+ /// One torch-on span: a contour cut from pierce to torch-off.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct PlasmaCut {
+     pub contour: u32,
+-    /// A hole (or other inner contour) of a part, rather than its outline.
+-    pub inner: bool,
+-    /// The outer contour an inner one belongs to.
++    pub role: CutRole,
++    /// The smallest closed contour enclosing this one (a hole's outline,
++    /// an island's hole); `None` for a top-level contour.
+     pub parent: Option<u32>,
++    /// A centre-pierced small hole: its path may be a single point.
++    pub small: bool,
+     /// The torch path, lead-in to lead-out, in cut order.
+     pub path: Vec<Point2>,
+ }
+ 
+ /// A plasma program: the kerf, the cuts in cut order, and the rapid that
+-/// reaches each cut's pierce (`rapids[i]` precedes `cuts[i]`; `None` when
+-/// the program starts there).
++/// reaches each cut's pierce - `rapids[i]` is (previous torch-off point,
++/// pierce point) before `cuts[i]`, `None` when the program starts there.
++/// `rapids` has one entry per cut.
+ #[derive(Clone, Debug, Default)]
+ pub struct PlasmaProgram {
+     pub kerf: f64,
+@@ -50,8 +71,8 @@ pub struct PlasmaProgram {
+ /// What the laws find.
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum PlasmaFinding {
+-    /// Refusal: inner contour `inner` is cut after its outer `parent`.
+-    CutOrder { inner: u32, parent: u32 },
++    /// Refusal: `contour` is cut after `enclosing`, which encloses it.
++    CutOrder { contour: u32, enclosing: u32 },
+     /// Warning: contour `contour` comes within a kerf of earlier `earlier`.
+     KerfCrossing { contour: u32, earlier: u32, at: Point2 },
+     /// Warning: the rapid before `contour` crosses freed part `freed`.
+@@ -68,32 +89,24 @@ impl PlasmaFinding {
+     }
+ }
+ 
+-/// Judge a plasma program. Findings come in cut order.
++/// Judge a plasma program. Findings come in cut order; a malformed
++/// program is one refusal and nothing else.
+ #[must_use]
+ pub fn judge(p: &PlasmaProgram) -> Vec<PlasmaFinding> {
+-    if !(p.kerf.is_finite() && p.kerf > 0.0) {
+-        return vec![PlasmaFinding::Malformed(format!("plasma kerf {} is not a positive width", p.kerf))];
+-    }
+-    for c in &p.cuts {
+-        if c.path.len() < 2 {
+-            return vec![PlasmaFinding::Malformed(format!("contour {} has no cut path", c.contour))];
+-        }
+-        if c.path.iter().any(|q| !(q.x.is_finite() && q.y.is_finite())) {
+-            return vec![PlasmaFinding::Malformed(format!("contour {} has a non-finite point", c.contour))];
+-        }
++    if let Err(why) = well_formed(p) {
++        return vec![PlasmaFinding::Malformed(why)];
+     }
+     let mut out = Vec::new();
+     for (i, c) in p.cuts.iter().enumerate() {
+-        // Cut order: an inner contour after its parent outer.
+-        if c.inner
+-            && let Some(parent) = c.parent
+-            && p.cuts[..i].iter().any(|e| !e.inner && e.contour == parent)
++        // Cut order: anything enclosing this contour already cut.
++        if let Some(parent) = c.parent
++            && p.cuts[..i].iter().any(|e| e.contour == parent)
+         {
+-            out.push(PlasmaFinding::CutOrder { inner: c.contour, parent });
++            out.push(PlasmaFinding::CutOrder { contour: c.contour, enclosing: parent });
+         }
+-        // Tip-up: the rapid into this cut over a part already cut free.
++        // Tip-up: the rapid into this cut over a closed outline already cut.
+         if let Some(Some((a, b))) = p.rapids.get(i) {
+-            for e in p.cuts[..i].iter().filter(|e| !e.inner) {
++            for e in p.cuts[..i].iter().filter(|e| e.role == CutRole::Outer) {
+                 if let Some(at) = crosses_area(*a, *b, &e.path) {
+                     out.push(PlasmaFinding::TipUp { contour: c.contour, freed: e.contour, at });
+                 }
+@@ -109,6 +122,45 @@ pub fn judge(p: &PlasmaProgram) -> Vec<PlasmaFinding> {
+     out
+ }
+ 
++/// The program's shape, refused by name when it cannot be judged.
++fn well_formed(p: &PlasmaProgram) -> Result<(), String> {
++    if !(p.kerf.is_finite() && p.kerf > 0.0) {
++        return Err(format!("plasma kerf {} is not a positive width", p.kerf));
++    }
++    if p.rapids.len() != p.cuts.len() {
++        return Err(format!("{} rapids for {} cuts - one rapid entry per cut", p.rapids.len(), p.cuts.len()));
++    }
++    let finite = |q: &Point2| q.x.is_finite() && q.y.is_finite();
++    let mut ids = std::collections::HashSet::new();
++    for (c, r) in p.cuts.iter().zip(&p.rapids) {
++        if !ids.insert(c.contour) {
++            return Err(format!("contour {} appears twice", c.contour));
++        }
++        if c.path.is_empty() || (c.path.len() < 2 && !c.small) {
++            return Err(format!("contour {} has no cut path", c.contour));
++        }
++        if !c.path.iter().all(finite) {
++            return Err(format!("contour {} has a non-finite point", c.contour));
++        }
++        if let Some((a, b)) = r
++            && !(finite(a) && finite(b))
++        {
++            return Err(format!("the rapid into contour {} has a non-finite point", c.contour));
++        }
++    }
++    for c in &p.cuts {
++        match c.parent {
++            Some(parent) if parent == c.contour => return Err(format!("contour {} names itself as its parent", c.contour)),
++            Some(parent) if !ids.contains(&parent) => {
++                return Err(format!("contour {} names parent {parent}, which no cut carries", c.contour));
++            }
++            None if c.role == CutRole::Inner => return Err(format!("inner contour {} has no parent", c.contour)),
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
+ /// The first point of `a` whose segment comes within `gap` of `b`'s path.
+ fn near(a: &[Point2], b: &[Point2], gap: f64) -> Option<Point2> {
+     for s in a.windows(2) {
+diff --git a/crates/sim/tests/plasma_laws.rs b/crates/sim/tests/plasma_laws.rs
+index 48b58952..daf12e81 100644
+--- a/crates/sim/tests/plasma_laws.rs
++++ b/crates/sim/tests/plasma_laws.rs
+@@ -6,7 +6,7 @@
+ //! Provenance: our own fixtures.
+ 
+ use camcraft_sim::geo2d::Point2;
+-use camcraft_sim::verify::plasma::{judge, PlasmaCut, PlasmaFinding, PlasmaProgram};
++use camcraft_sim::verify::plasma::{judge, CutRole, PlasmaCut, PlasmaFinding, PlasmaProgram};
+ 
+ fn p(x: f64, y: f64) -> Point2 {
+     Point2::new(x, y)
+@@ -17,14 +17,16 @@ fn square(x: f64, y: f64, s: f64) -> Vec<Point2> {
+     vec![p(x, y), p(x + s, y), p(x + s, y + s), p(x, y + s), p(x, y)]
+ }
+ 
+-fn cut(contour: u32, inner: bool, parent: Option<u32>, path: Vec<Point2>) -> PlasmaCut {
+-    PlasmaCut { contour, inner, parent, path }
++fn cut(contour: u32, role: CutRole, parent: Option<u32>, path: Vec<Point2>) -> PlasmaCut {
++    PlasmaCut { contour, role, parent, small: false, path }
+ }
+ 
++use CutRole::{Inner, Open, Outer};
++
+ /// A 100 mm plate part (outer 1) with a 20 mm hole (inner 2) in it.
+ fn plate(hole_first: bool) -> PlasmaProgram {
+-    let hole = cut(2, true, Some(1), square(40.0, 40.0, 20.0));
+-    let outer = cut(1, false, None, square(0.0, 0.0, 100.0));
++    let hole = cut(2, Inner, Some(1), square(40.0, 40.0, 20.0));
++    let outer = cut(1, Outer, None, square(0.0, 0.0, 100.0));
+     let cuts = if hole_first { vec![hole, outer] } else { vec![outer, hole] };
+     PlasmaProgram { kerf: 1.5, cuts, rapids: vec![None, None] }
+ }
+@@ -37,7 +39,7 @@ fn holes_before_the_outline_pass_clean() {
+ #[test]
+ fn an_outline_before_its_hole_is_refused_by_name() {
+     let f = judge(&plate(false));
+-    assert_eq!(f, vec![PlasmaFinding::CutOrder { inner: 2, parent: 1 }]);
++    assert_eq!(f, vec![PlasmaFinding::CutOrder { contour: 2, enclosing: 1 }]);
+     assert!(f[0].refuses());
+ }
+ 
+@@ -45,13 +47,13 @@ fn an_outline_before_its_hole_is_refused_by_name() {
+ fn a_cut_within_a_kerf_of_an_earlier_one_is_warned() {
+     // Two parts side by side, 1 mm apart with a 1.5 mm kerf: the second
+     // outline runs inside the first one's open kerf.
+-    let a = cut(1, false, None, square(0.0, 0.0, 50.0));
+-    let b = cut(2, false, None, square(51.0, 0.0, 50.0));
++    let a = cut(1, Outer, None, square(0.0, 0.0, 50.0));
++    let b = cut(2, Outer, None, square(51.0, 0.0, 50.0));
+     let f = judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a.clone(), b], rapids: vec![None, None] });
+     assert!(matches!(f.as_slice(), [PlasmaFinding::KerfCrossing { contour: 2, earlier: 1, .. }]), "{f:?}");
+     assert!(!f[0].refuses(), "a warning, not a refusal");
+     // 5 mm apart: clear.
+-    let c = cut(2, false, None, square(55.0, 0.0, 50.0));
++    let c = cut(2, Outer, None, square(55.0, 0.0, 50.0));
+     assert_eq!(judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a, c], rapids: vec![None, None] }), vec![]);
+ }
+ 
+@@ -59,8 +61,8 @@ fn a_cut_within_a_kerf_of_an_earlier_one_is_warned() {
+ fn a_rapid_over_a_freed_part_is_warned() {
+     // Part 1 (0..50) is cut free, then the rapid to part 3 (at x 120)
+     // starts from the far side of part 1 and crosses it.
+-    let a = cut(1, false, None, square(0.0, 0.0, 50.0));
+-    let b = cut(3, false, None, square(120.0, 0.0, 30.0));
++    let a = cut(1, Outer, None, square(0.0, 0.0, 50.0));
++    let b = cut(3, Outer, None, square(120.0, 0.0, 30.0));
+     let over = Some((p(-10.0, 25.0), p(120.0, 0.0)));
+     let f = judge(&PlasmaProgram { kerf: 1.5, cuts: vec![a.clone(), b.clone()], rapids: vec![None, over] });
+     assert!(matches!(f.as_slice(), [PlasmaFinding::TipUp { contour: 3, freed: 1, .. }]), "{f:?}");
+@@ -82,3 +84,59 @@ fn a_malformed_program_is_refused_by_name() {
+     empty.cuts[1].path.truncate(1);
+     assert!(matches!(judge(&empty).as_slice(), [PlasmaFinding::Malformed(m)] if m.contains("no cut path")));
+ }
++
++/// Review of #675: an island (an outer contour inside a hole) cut after
++/// its hole is refused - the hole freed the slug the island sits in.
++#[test]
++fn an_island_after_its_hole_is_refused() {
++    let outline = cut(1, Outer, None, square(0.0, 0.0, 100.0));
++    let hole = cut(2, Inner, Some(1), square(30.0, 30.0, 40.0));
++    let island = cut(3, Outer, Some(2), square(45.0, 45.0, 10.0));
++    let good = PlasmaProgram { kerf: 1.5, cuts: vec![island.clone(), hole.clone(), outline.clone()], rapids: vec![None; 3] };
++    assert_eq!(judge(&good), vec![], "island, hole, outline");
++    let bad = PlasmaProgram { kerf: 1.5, cuts: vec![hole, island, outline], rapids: vec![None; 3] };
++    assert_eq!(judge(&bad), vec![PlasmaFinding::CutOrder { contour: 3, enclosing: 2 }]);
++}
++
++/// Review of #675: parents, ids and rapids that can't be judged are
++/// refused by name, never silently skipped.
++#[test]
++fn bad_parents_ids_and_rapids_are_refused_by_name() {
++    let mal = |p: PlasmaProgram, word: &str| {
++        let f = judge(&p);
++        assert!(matches!(f.as_slice(), [PlasmaFinding::Malformed(m)] if m.contains(word)), "{word}: {f:?}");
++    };
++    let mut p = plate(true);
++    p.cuts[0].parent = Some(9);
++    mal(p, "no cut carries");
++    let mut p = plate(true);
++    p.cuts[0].parent = Some(2);
++    mal(p, "itself");
++    let mut p = plate(true);
++    p.cuts[0].parent = None;
++    mal(p, "no parent");
++    let mut p = plate(true);
++    p.cuts[1].contour = 2;
++    mal(p, "twice");
++    let mut p = plate(true);
++    p.rapids.pop();
++    mal(p, "one rapid entry per cut");
++    let mut p = plate(true);
++    p.rapids[1] = Some((p.cuts[0].path[0], Point2::new(f64::NAN, 0.0)));
++    mal(p, "rapid into contour 1");
++}
++
++/// A centre-pierced small hole may be a single point; an open path is
++/// never a freed area for tip-up.
++#[test]
++fn small_holes_and_open_paths() {
++    let mut dot = cut(2, Inner, Some(1), vec![p(50.0, 50.0)]);
++    dot.small = true;
++    let outline = cut(1, Outer, None, square(0.0, 0.0, 100.0));
++    assert_eq!(judge(&PlasmaProgram { kerf: 1.5, cuts: vec![dot, outline], rapids: vec![None, None] }), vec![]);
++    // A slit (open) cut first, then a rapid across it: not a tip-up.
++    let slit = cut(1, Open, None, vec![p(0.0, 0.0), p(50.0, 0.0), p(50.0, 50.0), p(0.0, 50.0), p(0.0, 0.0)]);
++    let next = cut(3, Outer, None, square(120.0, 0.0, 30.0));
++    let over = Some((p(-10.0, 25.0), p(120.0, 0.0)));
++    assert_eq!(judge(&PlasmaProgram { kerf: 1.5, cuts: vec![slit, next], rapids: vec![None, over] }), vec![]);
++}

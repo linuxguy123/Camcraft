@@ -1,0 +1,1616 @@
+From 92e76e4bb012833b0eaad5c4cbb0be34795e2d94 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 15:19:39 -0800
+Subject: [PATCH] feat(ui): Machines pane - browse and validate machine
+ configurations
+
+First slice of #287: a dockable, read-only Machines pane, opened and
+closed from the ribbon's View door beside the properties pane. It lists
+the shipped machine library plus the document's own mounted .mch file,
+and shows the selected machine's validation (pass, or every refusal by
+name) and its properties in collapsible groups.
+
+App layer: machine::library (catalogue: builtins, scan_dir, enumerate;
+per machine its kind, axes, rotaries, units, serving built-in posts and
+a property sheet in the file's own units) and machine::validate
+(validate_text -> named refusals: travel min < max, feeds/speeds above
+0, M-word codes, live_tool all-or-none, units, required keys per kind;
+malformed JSON is a refusal, never a panic). The pane reads no file
+itself. No create/edit/save/assign yet; decisions and the open owner
+question (user machine folder) in docs/decisions/287-machines-pane.md.
+
+Refs #287
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ assets/machines/AGENTS.md                     |   4 +-
+ crates/app/src/machine/library.rs             | 161 +++++++++
+ crates/app/src/machine/mod.rs                 |   5 +
+ crates/app/src/machine/sheet.rs               | 151 ++++++++
+ crates/app/src/machine/validate.rs            | 341 ++++++++++++++++++
+ crates/app/tests/machine_library.rs           | 251 +++++++++++++
+ crates/ui/src/egui_app/layout/mod.rs          |  18 +-
+ crates/ui/src/egui_app/machines_pane.rs       | 141 ++++++++
+ crates/ui/src/egui_app/mod.rs                 |   2 +
+ crates/ui/src/egui_app/panes.rs               |   2 +-
+ crates/ui/src/egui_app/shell.rs               |   7 +
+ crates/ui/src/egui_app/tests.rs               |   3 +-
+ crates/ui/src/egui_app/tests/machines_pane.rs | 148 ++++++++
+ crates/ui/src/state.rs                        |  12 +-
+ docs/decisions/287-machines-pane.md           |  95 +++++
+ 15 files changed, 1335 insertions(+), 6 deletions(-)
+ create mode 100644 crates/app/src/machine/library.rs
+ create mode 100644 crates/app/src/machine/sheet.rs
+ create mode 100644 crates/app/src/machine/validate.rs
+ create mode 100644 crates/app/tests/machine_library.rs
+ create mode 100644 crates/ui/src/egui_app/machines_pane.rs
+ create mode 100644 crates/ui/src/egui_app/tests/machines_pane.rs
+ create mode 100644 docs/decisions/287-machines-pane.md
+
+diff --git a/assets/machines/AGENTS.md b/assets/machines/AGENTS.md
+index 9a79122d..d0b572ba 100644
+--- a/assets/machines/AGENTS.md
++++ b/assets/machines/AGENTS.md
+@@ -145,7 +145,9 @@ record is refused instead.
+    mirror) and asserts declared kind == inferred kind, so a
+    half-registered or self-contradictory definition fails the suite,
+    not the shop.
+-4. Gate: `cargo test -p camcraft-app --test machine --test posting`,
++4. Gate: `cargo test -p camcraft-app --test machine --test posting
++   --test machine_library` (the last runs the Machines pane's validator,
++   `app::machine::validate`, over every library entry - #287),
+    plus a CLI smoke — `post.exe --machine <name>.mch <post>.cps
+    <file>.cnc out.nc` over a committed golden stream (a 5-axis
+    definition should drive the refusal path in fanuc.cps's `tilt()`
+diff --git a/crates/app/src/machine/library.rs b/crates/app/src/machine/library.rs
+new file mode 100644
+index 00000000..a108cc17
+--- /dev/null
++++ b/crates/app/src/machine/library.rs
+@@ -0,0 +1,161 @@
++//! The machine catalogue (issue #287): every machine definition the
++//! app can name - the shipped library and the user's own `.mch` files -
++//! each with a summary, a read-only property sheet and its validation.
++//!
++//! Provenance: our own design, specced from the issue's workflow (list
++//! shipped and user machines with their kind, axes, units and posts) and
++//! the `.mch` grammar in `assets/machines/AGENTS.md`; no vendor machine
++//! library or its layout was consulted.
++//!
++//! Reading only. Nothing here writes a file or touches the document:
++//! assigning a machine stays the `LoadMachine` command's job, and the
++//! catalogue is rebuilt on demand (the pane caches it), never stored.
++
++use std::path::{Path, PathBuf};
++
++use flecs_ecs::prelude::World;
++use serde_json::Value;
++
++use super::validate::{validate_text, Refusal};
++use super::{kind, parse_mch, Kind};
++use crate::posting;
++
++pub use super::sheet::PropGroup;
++
++/// Where a catalogue entry came from.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum MachineSource {
++    /// A shipped library entry, by its picker name (`posting::MACHINES`).
++    Builtin(&'static str),
++    /// A file on disk.
++    File(PathBuf),
++}
++
++impl MachineSource {
++    /// The words the pane shows for the source.
++    #[must_use]
++    pub fn label(&self) -> String {
++        match self {
++            MachineSource::Builtin(_) => "built-in".to_owned(),
++            MachineSource::File(p) => p.display().to_string(),
++        }
++    }
++}
++
++/// One machine in the catalogue: what it is, where it came from, how
++/// its file reads, and whether it validates.
++#[derive(Clone, Debug)]
++pub struct MachineEntry {
++    /// The list name: the library's picker name, or the file's model
++    /// (its file name when it states none or does not read).
++    pub name: String,
++    pub source: MachineSource,
++    /// Declared or inferred kind; `None` when the file does not read.
++    pub kind: Option<Kind>,
++    /// Linear axis letters, in the file's controller order.
++    pub axes: Vec<String>,
++    /// Rotary axis letters.
++    pub rotaries: Vec<String>,
++    /// `mm` or `inch` (the stated length unit; unstated reads mm).
++    pub units: &'static str,
++    /// The built-in posts that serve this machine's kind
++    /// (`posting::post_serves`); empty when the kind is unknown.
++    pub posts: Vec<&'static str>,
++    /// The read-only property sheet, grouped.
++    pub groups: Vec<PropGroup>,
++    /// Empty = the file validates clean.
++    pub refusals: Vec<Refusal>,
++}
++
++impl MachineEntry {
++    #[must_use]
++    pub fn is_valid(&self) -> bool {
++        self.refusals.is_empty()
++    }
++
++    /// Build an entry from a file's text. Never panics: a file that
++    /// does not read is an entry with its refusals and no facts.
++    #[must_use]
++    pub fn from_text(name: &str, source: MachineSource, text: &str) -> Self {
++        let refusals = validate_text(text);
++        let raw: Option<Value> = serde_json::from_str(text).ok();
++        let parsed = parse_mch(text).ok();
++        let kind = parsed.as_ref().map(|m| kind(Some(m)));
++        let (axes, rotaries) = parsed.as_ref().map_or_else(Default::default, |m| {
++            let pick = |rot: bool| m.axes.iter().filter(|a| a.rotary == rot).map(|a| a.name.clone()).collect();
++            (pick(false), pick(true))
++        });
++        let units = if parsed.as_ref().and_then(|m| m.units.as_deref()) == Some("inch") { "inch" } else { "mm" };
++        let posts: Vec<&'static str> = kind.map_or_else(Vec::new, |k| {
++            posting::BUILTINS.iter().map(|(n, _)| *n).filter(|n| posting::post_serves(n, k)).collect()
++        });
++        let groups = match (&raw, &parsed) {
++            (Some(v), Some(m)) => super::sheet::groups(v, m, kind, &posts),
++            _ => Vec::new(),
++        };
++        Self { name: name.to_owned(), source, kind, axes, rotaries, units, posts, groups, refusals }
++    }
++
++    /// Read an entry from a `.mch` file. An unreadable file is an
++    /// entry naming the read failure, never an error the caller drops.
++    #[must_use]
++    pub fn from_file(path: &Path) -> Self {
++        let file_name = path
++            .file_name()
++            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
++        match std::fs::read_to_string(path) {
++            Ok(text) => {
++                let model = parse_mch(&text)
++                    .ok()
++                    .map(|m| m.model)
++                    .filter(|m| !m.trim().is_empty() && m != "unknown");
++                let name = model.unwrap_or(file_name);
++                Self::from_text(&name, MachineSource::File(path.to_path_buf()), &text)
++            }
++            Err(e) => {
++                let mut entry = Self::from_text(&file_name, MachineSource::File(path.to_path_buf()), "{}");
++                entry.refusals = vec![Refusal { key: "file".to_owned(), rule: format!("cannot be read ({e})") }];
++                entry
++            }
++        }
++    }
++}
++
++/// The shipped library, in `posting::MACHINES` order.
++#[must_use]
++pub fn builtins() -> Vec<MachineEntry> {
++    posting::MACHINES
++        .iter()
++        .map(|(name, text)| MachineEntry::from_text(name, MachineSource::Builtin(name), text))
++        .collect()
++}
++
++/// Every `.mch` file directly inside `dir`, sorted by file name. A
++/// missing or unreadable folder lists nothing (there is nothing to
++/// name); an unreadable FILE is listed with its refusal.
++#[must_use]
++pub fn scan_dir(dir: &Path) -> Vec<MachineEntry> {
++    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
++    let mut paths: Vec<PathBuf> = rd
++        .filter_map(Result::ok)
++        .map(|e| e.path())
++        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mch")))
++        .collect();
++    paths.sort();
++    paths.iter().map(|p| MachineEntry::from_file(p)).collect()
++}
++
++/// The catalogue for this document: the shipped library, then the
++/// user's own machine file - the `.mch` the document has mounted from
++/// disk (Setup pane, "Load other"), read fresh from that path. There is
++/// no user machine folder yet (docs/decisions/287-machines-pane.md);
++/// [`scan_dir`] is the seam a later slice points at one.
++#[must_use]
++pub fn enumerate(world: &World) -> Vec<MachineEntry> {
++    let mut out = builtins();
++    let (path, _) = super::of(world);
++    if !path.is_empty() && !path.starts_with(&posting::builtin_path("")) {
++        out.push(MachineEntry::from_file(Path::new(&path)));
++    }
++    out
++}
+diff --git a/crates/app/src/machine/mod.rs b/crates/app/src/machine/mod.rs
+index 7f3b032f..be1c8e12 100644
+--- a/crates/app/src/machine/mod.rs
++++ b/crates/app/src/machine/mod.rs
+@@ -49,6 +49,11 @@
+ // world - the singleton glue and the program checker.
+ pub use camcraft_post::machine::*;
+ 
++// #287: the Machines pane's catalogue, property sheet and validator.
++pub mod library;
++mod sheet;
++pub mod validate;
++
+ use flecs_ecs::core::WorldGet;
+ use flecs_ecs::prelude::World;
+ 
+diff --git a/crates/app/src/machine/sheet.rs b/crates/app/src/machine/sheet.rs
+new file mode 100644
+index 00000000..397fad8e
+--- /dev/null
++++ b/crates/app/src/machine/sheet.rs
+@@ -0,0 +1,151 @@
++//! The machine property sheet (issue #287): a `.mch` restated as
++//! grouped, read-only rows for the Machines pane.
++//!
++//! Provenance: our own layout, specced from the `.mch` grammar in
++//! `assets/machines/AGENTS.md`; group names and row words are ours.
++//!
++//! Numbers are shown AS THE FILE STATES THEM, in the file's own length
++//! unit - the reader scales an inch file to mm for the checker, but a
++//! person reading their machine wants the numbers they typed. An
++//! unstated value says so; it is never shown as a zero.
++
++use serde_json::Value;
++
++use super::validate::{axis_parts, head_parts};
++use super::{Kind, Machine};
++
++/// One collapsible group of the sheet: a title and its (label, value)
++/// rows.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PropGroup {
++    pub title: String,
++    pub rows: Vec<(String, String)>,
++}
++
++impl PropGroup {
++    fn new(title: &str) -> Self {
++        Self { title: title.to_owned(), rows: Vec::new() }
++    }
++
++    fn row(&mut self, label: impl Into<String>, value: impl Into<String>) {
++        self.rows.push((label.into(), value.into()));
++    }
++}
++
++const UNSTATED: &str = "not stated";
++
++/// A stated value as text: a number plainly, anything else as its JSON
++/// (so a malformed value is visible as itself), absence as "not stated".
++fn val(v: Option<&Value>, unit: &str) -> String {
++    match v {
++        None | Some(Value::Null) => UNSTATED.to_owned(),
++        Some(Value::Number(n)) => match n.as_f64() {
++            Some(x) if unit.is_empty() => format!("{x}"),
++            Some(x) => format!("{x} {unit}"),
++            None => n.to_string(),
++        },
++        Some(Value::String(s)) => s.clone(),
++        Some(other) => other.to_string(),
++    }
++}
++
++/// The sheet's groups: General, Axes, Spindle, Tool station, Coolants,
++/// Posts. `raw` is the file's JSON, `m` the reader's view of it.
++pub(crate) fn groups(raw: &Value, m: &Machine, k: Option<Kind>, posts: &[&str]) -> Vec<PropGroup> {
++    let len = if m.units.as_deref() == Some("inch") { "in" } else { "mm" };
++    let mut out = Vec::new();
++
++    let mut g = PropGroup::new("General");
++    g.row("Model", val(raw.pointer("/general/model"), ""));
++    g.row("Vendor", val(raw.pointer("/general/vendor"), ""));
++    let declared = raw.pointer("/general/kind").and_then(Value::as_str).filter(|w| !w.is_empty());
++    g.row(
++        "Kind",
++        match (declared, k) {
++            (Some(w), _) => w.to_owned(),
++            (None, Some(k)) => format!("{} (inferred from the axes)", k.word()),
++            (None, None) => UNSTATED.to_owned(),
++        },
++    );
++    g.row("Length unit", val(raw.pointer("/kinematics/default/units/length"), ""));
++    g.row("Angle unit", val(raw.pointer("/kinematics/default/units/angle"), ""));
++    g.row("Spindles", m.spindles.map_or_else(|| UNSTATED.to_owned(), |n| n.to_string()));
++    out.push(g);
++
++    let mut g = PropGroup::new("Axes");
++    let ctrl = raw.pointer("/controller/synced_configuration/parts");
++    for (name, part, rotary) in axis_parts(raw) {
++        let (dist, rate) = if rotary { ("deg", "deg/min") } else { (len, if len == "in" { "in/min" } else { "mm/min" }) };
++        let t = part.get("travel");
++        let travel = match (t.and_then(|t| t.get("min")), t.and_then(|t| t.get("max"))) {
++            (None, None) => UNSTATED.to_owned(),
++            (lo, hi) => format!("{} .. {}", val(lo, ""), val(hi, dist)),
++        };
++        let c = ctrl.and_then(|c| c.get(name.as_str()));
++        let mut s = format!(
++            "{}, travel {travel}, feed {}, rapid {}",
++            if rotary { "rotary" } else { "linear" },
++            val(c.and_then(|c| c.get("max_normal_speed")), rate),
++            val(c.and_then(|c| c.get("max_rapid_speed")), rate),
++        );
++        if rotary {
++            s.push_str(&format!(", about {}", val(part.get("axis"), "")));
++        }
++        g.row(name, s);
++    }
++    if g.rows.is_empty() {
++        g.row("Axes", "none stated");
++    }
++    out.push(g);
++
++    let heads = head_parts(raw);
++    let head = heads.iter().find(|h| h.get("spindle").is_some_and(|s| !s.is_null())).or(heads.first());
++    let sp = head.and_then(|h| h.get("spindle"));
++    let mut g = PropGroup::new("Spindle");
++    g.row("Min speed", val(sp.and_then(|s| s.get("min_speed")), "rpm"));
++    g.row("Max speed", val(sp.and_then(|s| s.get("max_speed")), "rpm"));
++    g.row("Power", val(sp.and_then(|s| s.get("power")), "kW"));
++    if let Some(r) = sp.and_then(|s| s.get("ranges")).and_then(Value::as_array) {
++        for (i, r) in r.iter().enumerate() {
++            g.row(
++                format!("Range {}", i + 1),
++                format!("{} .. {}", val(r.get("min_speed"), ""), val(r.get("max_speed"), "rpm")),
++            );
++        }
++    }
++    g.row("Rigid tapping", val(sp.and_then(|s| s.get("rigid_tapping")), ""));
++    g.row("Body diameter", val(sp.and_then(|s| s.get("body_diameter")), len));
++    g.row("Body length", val(sp.and_then(|s| s.get("body_length")), len));
++    out.push(g);
++
++    let ts = head.and_then(|h| h.get("tool_station"));
++    let mut g = PropGroup::new("Tool station");
++    g.row("Max tool length", val(ts.and_then(|t| t.get("max_tool_length")), len));
++    g.row("Max tool diameter", val(ts.and_then(|t| t.get("max_tool_diameter")), len));
++    g.row("Tools", val(raw.pointer("/tooling/number_of_tools"), ""));
++    g.row(
++        "Live tool",
++        match &m.live_tool {
++            Some(l) => format!(
++                "C on {}, C off {}, spindle on {}, spindle off {}",
++                l.c_axis_on, l.c_axis_off, l.spindle_on, l.spindle_off
++            ),
++            None => UNSTATED.to_owned(),
++        },
++    );
++    out.push(g);
++
++    let mut g = PropGroup::new("Coolants");
++    for c in &m.coolants {
++        g.row(c.name.clone(), if c.m_code.is_empty() { "no code".to_owned() } else { c.m_code.clone() });
++    }
++    if g.rows.is_empty() {
++        g.row("Coolants", "none stated");
++    }
++    out.push(g);
++
++    let mut g = PropGroup::new("Posts");
++    g.row("Built-in posts", if posts.is_empty() { "none".to_owned() } else { posts.join(", ") });
++    out.push(g);
++    out
++}
+diff --git a/crates/app/src/machine/validate.rs b/crates/app/src/machine/validate.rs
+new file mode 100644
+index 00000000..00b082f8
+--- /dev/null
++++ b/crates/app/src/machine/validate.rs
+@@ -0,0 +1,341 @@
++//! Machine-file validation (issue #287): the named refusals a `.mch`
++//! must clear before the Machines pane calls it good - and, in a later
++//! slice, before the editor may save it.
++//!
++//! Provenance: our own rules, specced from the `.mch` grammar in
++//! `assets/machines/AGENTS.md` and general machine-tool practice (a
++//! stroke runs from a lower to a higher bound, a feed or a spindle speed
++//! is a positive rate, a coolant word is an RS-274 `M` number); no
++//! vendor validator or file was consulted.
++//!
++//! The reader (`parse_mch`) is deliberately forgiving: an unreadable
++//! travel is DROPPED, a zero rate reads "not stated". That is right for
++//! a checker - and wrong for a file a person is about to trust, where a
++//! stroke typed backwards should be named, not silently ignored. So the
++//! validator reads the raw JSON, and every refusal names the key it is
++//! about and the rule it breaks. Absent stays legal (the unstated-limit
++//! law): only what a file STATES is judged, plus the few keys every
++//! machine of its kind must carry.
++
++use std::fmt;
++
++use serde_json::Value;
++
++use super::{kind, parse_mch, Kind};
++
++/// One named refusal: the key it is about and the rule it breaks.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Refusal {
++    /// The key, in words a reader can find in the file (`X travel`,
++    /// `general.kind`, `coolant Flood`).
++    pub key: String,
++    /// The rule, with the offending value where there is one.
++    pub rule: String,
++}
++
++impl Refusal {
++    fn new(key: impl Into<String>, rule: impl Into<String>) -> Self {
++        Self { key: key.into(), rule: rule.into() }
++    }
++}
++
++impl fmt::Display for Refusal {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}: {}", self.key, self.rule)
++    }
++}
++
++/// An axis part of the kinematics tree, as the file states it: its
++/// letter, its JSON, and whether it is a rotary. Depth-first, the walk
++/// `parse_mch` makes - the pane's property sheet reads the same list.
++pub(crate) fn axis_parts(v: &Value) -> Vec<(String, &Value, bool)> {
++    fn walk<'a>(parts: Option<&'a Value>, out: &mut Vec<(String, &'a Value, bool)>) {
++        let Some(arr) = parts.and_then(Value::as_array) else { return };
++        for p in arr {
++            let ty = p.get("type").and_then(Value::as_str);
++            let rotary = ty == Some("rotary");
++            let name = p
++                .get("name")
++                .and_then(Value::as_str)
++                .or_else(|| p.get("id").and_then(Value::as_str))
++                .unwrap_or("");
++            if (ty == Some("linear") || rotary) && !name.is_empty() {
++                out.push((name.to_owned(), p, rotary));
++            }
++            walk(p.get("parts"), out);
++        }
++    }
++    let mut out = Vec::new();
++    walk(v.pointer("/kinematics/default/parts"), &mut out);
++    out
++}
++
++/// Every `type: "head"` part, depth-first.
++pub(crate) fn head_parts(v: &Value) -> Vec<&Value> {
++    fn walk<'a>(parts: Option<&'a Value>, out: &mut Vec<&'a Value>) {
++        let Some(arr) = parts.and_then(Value::as_array) else { return };
++        for p in arr {
++            if p.get("type").and_then(Value::as_str) == Some("head") {
++                out.push(p);
++            }
++            walk(p.get("parts"), out);
++        }
++    }
++    let mut out = Vec::new();
++    walk(v.pointer("/kinematics/default/parts"), &mut out);
++    out
++}
++
++/// Validate a machine file's text. Empty = the file is good. Never
++/// panics: malformed JSON is itself a refusal by name.
++#[must_use]
++pub fn validate_text(text: &str) -> Vec<Refusal> {
++    let v: Value = match serde_json::from_str(text) {
++        Ok(v) => v,
++        Err(e) => return vec![Refusal::new("file", format!("not readable JSON ({e})"))],
++    };
++    if !v.is_object() {
++        return vec![Refusal::new("file", "must be one machine object { ... }")];
++    }
++    let mut out = Vec::new();
++    general(&v, &mut out);
++    units(&v, &mut out);
++    let axes = axis_parts(&v);
++    axis_rules(&axes, &mut out);
++    for head in head_parts(&v) {
++        spindle(head.get("spindle"), &mut out);
++        station(head.get("tool_station"), &mut out);
++    }
++    coolants(v.pointer("/tooling/coolants"), &mut out);
++    controller(&v, &mut out);
++    if let Some(n) = v.pointer("/tooling/number_of_tools")
++        && !n.is_null()
++        && n.as_u64().is_none_or(|n| n == 0)
++    {
++        out.push(Refusal::new("tooling.number_of_tools", format!("{n} must be a whole number above 0")));
++    }
++    required_by_kind(&v, text, &axes, &mut out);
++    // Anything the reader still refuses that no rule above named (it
++    // should be none - the reader's refusals are covered by name).
++    if out.is_empty()
++        && let Err(e) = parse_mch(text)
++    {
++        out.push(Refusal::new("file", e.trim_start_matches("machine file: ").to_owned()));
++    }
++    out
++}
++
++fn general(v: &Value, out: &mut Vec<Refusal>) {
++    let g = v.get("general");
++    let model = g.and_then(|g| g.get("model")).and_then(Value::as_str);
++    if model.is_none_or(|m| m.trim().is_empty()) {
++        out.push(Refusal::new("general.model", "required - the machine's name"));
++    }
++    match g.and_then(|g| g.get("kind")) {
++        None | Some(Value::Null) => {}
++        Some(Value::String(w)) if w.is_empty() || Kind::from_word(w).is_some() => {}
++        Some(other) => out.push(Refusal::new("general.kind", format!("{other} is not mill, lathe or mill-turn"))),
++    }
++}
++
++fn units(v: &Value, out: &mut Vec<Refusal>) {
++    let u = v.pointer("/kinematics/default/units");
++    match u.and_then(|u| u.get("length")) {
++        None | Some(Value::Null) => {}
++        Some(Value::String(s)) if matches!(s.as_str(), "mm" | "inch" | "inches") => {}
++        Some(other) => out.push(Refusal::new("units.length", format!("{other} is not mm or inch"))),
++    }
++    match u.and_then(|u| u.get("angle")) {
++        None | Some(Value::Null) => {}
++        Some(Value::String(s)) if matches!(s.as_str(), "degrees" | "degree" | "deg") => {}
++        Some(other) => out.push(Refusal::new("units.angle", format!("{other} is not degrees"))),
++    }
++}
++
++fn axis_rules(axes: &[(String, &Value, bool)], out: &mut Vec<Refusal>) {
++    let mut seen: Vec<String> = Vec::new();
++    for (name, part, rotary) in axes {
++        let up = name.to_ascii_uppercase();
++        if seen.contains(&up) {
++            out.push(Refusal::new(name.clone(), "is stated twice in the axis tree"));
++        }
++        seen.push(up);
++        if let Some(t) = part.get("travel").filter(|t| !t.is_null()) {
++            travel(&format!("{name} travel"), t, out);
++        }
++        if let Some(r) = part.get("resolution") {
++            positive(&format!("{name} resolution"), r, out);
++        }
++        if let Some(a) = part.get("axis") {
++            let d: Option<Vec<f64>> = a
++                .as_array()
++                .filter(|v| v.len() == 3)
++                .and_then(|v| v.iter().map(Value::as_f64).collect());
++            match d {
++                Some(d) if d.iter().all(|x| x.is_finite()) => {
++                    if *rotary && d.iter().all(|x| *x == 0.0) {
++                        out.push(Refusal::new(format!("{name} axis"), "states the zero direction"));
++                    }
++                }
++                _ => out.push(Refusal::new(format!("{name} axis"), format!("{a} must be three finite numbers"))),
++            }
++        }
++    }
++}
++
++fn travel(key: &str, t: &Value, out: &mut Vec<Refusal>) {
++    let lo = t.get("min").and_then(Value::as_f64).filter(|x| x.is_finite());
++    let hi = t.get("max").and_then(Value::as_f64).filter(|x| x.is_finite());
++    match (lo, hi) {
++        (Some(lo), Some(hi)) if lo < hi => {}
++        (Some(lo), Some(hi)) => out.push(Refusal::new(key, format!("min {lo} must be below max {hi}"))),
++        _ => out.push(Refusal::new(key, "min and max must both be numbers")),
++    }
++}
++
++/// A stated rate must be a number above zero. A null reads unstated
++/// (legal); a zero is refused here even though the reader would read it
++/// as unstated - a file someone validates should say what it means.
++fn positive(key: &str, x: &Value, out: &mut Vec<Refusal>) {
++    if x.is_null() {
++        return;
++    }
++    if !x.as_f64().is_some_and(|x| x.is_finite() && x > 0.0) {
++        out.push(Refusal::new(key, format!("{x} must be a number above 0 (leave the key out when unstated)")));
++    }
++}
++
++fn spindle(sp: Option<&Value>, out: &mut Vec<Refusal>) {
++    let Some(sp) = sp.filter(|s| !s.is_null()) else { return };
++    for k in ["min_speed", "max_speed", "power"] {
++        if let Some(x) = sp.get(k) {
++            positive(&format!("spindle {k}"), x, out);
++        }
++    }
++    let lo = sp.get("min_speed").and_then(Value::as_f64);
++    let hi = sp.get("max_speed").and_then(Value::as_f64);
++    if let (Some(lo), Some(hi)) = (lo, hi)
++        && lo > hi
++    {
++        out.push(Refusal::new("spindle", format!("min_speed {lo} must not exceed max_speed {hi}")));
++    }
++    if let Some(ranges) = sp.get("ranges").filter(|r| !r.is_null()) {
++        let Some(arr) = ranges.as_array() else {
++            out.push(Refusal::new("spindle ranges", "must be a list of { min_speed, max_speed }"));
++            return;
++        };
++        for (i, r) in arr.iter().enumerate() {
++            let key = format!("spindle range {}", i + 1);
++            let lo = r.get("min_speed").and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
++            let hi = r.get("max_speed").and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
++            match (lo, hi) {
++                (Some(lo), Some(hi)) if lo < hi => {}
++                (Some(lo), Some(hi)) => out.push(Refusal::new(key, format!("min_speed {lo} must be below max_speed {hi}"))),
++                _ => out.push(Refusal::new(key, "min_speed and max_speed must both be numbers above 0")),
++            }
++        }
++    }
++}
++
++fn station(ts: Option<&Value>, out: &mut Vec<Refusal>) {
++    let Some(ts) = ts.filter(|t| !t.is_null()) else { return };
++    coolants(ts.get("coolants"), out);
++    if let Some(lt) = ts.get("live_tool").filter(|l| !l.is_null()) {
++        let words = ["c_axis_on", "c_axis_off", "spindle_on", "spindle_off"];
++        let stated = words
++            .iter()
++            .filter(|k| lt.get(**k).and_then(Value::as_str).is_some_and(|w| !w.trim().is_empty()))
++            .count();
++        if stated != words.len() {
++            out.push(Refusal::new(
++                "live_tool",
++                format!("states {stated} of the 4 words (c_axis_on, c_axis_off, spindle_on, spindle_off) - all four or none"),
++            ));
++        }
++    }
++}
++
++/// An M-code word: `M` and one to four digits (`M8`, `M88`), the
++/// shape the reader normalizes a bare number to.
++fn is_m_word(s: &str) -> bool {
++    let mut c = s.chars();
++    matches!(c.next(), Some('M' | 'm'))
++        && (1..=4).contains(&c.clone().count())
++        && c.all(|d| d.is_ascii_digit())
++}
++
++fn coolants(list: Option<&Value>, out: &mut Vec<Refusal>) {
++    let Some(list) = list.filter(|l| !l.is_null()) else { return };
++    let Some(arr) = list.as_array() else {
++        out.push(Refusal::new("coolants", "must be a list"));
++        return;
++    };
++    for (i, e) in arr.iter().enumerate() {
++        if let Some(name) = e.as_str() {
++            if name.trim().is_empty() {
++                out.push(Refusal::new(format!("coolant {}", i + 1), "has an empty name"));
++            }
++            continue;
++        }
++        let name = e.get("name").and_then(Value::as_str).unwrap_or("");
++        if name.trim().is_empty() {
++            out.push(Refusal::new(format!("coolant {}", i + 1), "needs a name"));
++            continue;
++        }
++        let key = format!("coolant {name}");
++        match e.get("mCode").or_else(|| e.get("mcode")) {
++            None | Some(Value::Null) => {}
++            Some(Value::String(s)) if is_m_word(s.trim()) => {}
++            Some(Value::Number(n)) if n.as_u64().is_some_and(|n| n < 10_000) => {}
++            Some(other) => out.push(Refusal::new(key, format!("code {other} is not an M word like M8"))),
++        }
++    }
++}
++
++fn controller(v: &Value, out: &mut Vec<Refusal>) {
++    let Some(parts) = v.pointer("/controller/synced_configuration/parts").filter(|p| !p.is_null()) else {
++        return;
++    };
++    let Some(map) = parts.as_object() else {
++        out.push(Refusal::new("controller parts", "must be keyed by axis letter"));
++        return;
++    };
++    for (letter, c) in map {
++        for (k, word) in [("max_normal_speed", "feed"), ("max_rapid_speed", "rapid")] {
++            if let Some(x) = c.get(k) {
++                positive(&format!("{letter} {word} ({k})"), x, out);
++            }
++        }
++    }
++}
++
++/// The keys every machine of its kind must carry: the kinematics tree,
++/// and the linear axes the kind moves - X/Y/Z for a mill, X/Z for a
++/// lathe, X/Y/Z and a rotary for a mill-turn. The kind is the declared
++/// word, else the reader's axis-inventory inference.
++fn required_by_kind(v: &Value, text: &str, axes: &[(String, &Value, bool)], out: &mut Vec<Refusal>) {
++    if !v.pointer("/kinematics/default/parts").is_some_and(Value::is_array) {
++        out.push(Refusal::new("kinematics.default.parts", "required - the machine's axis tree"));
++        return;
++    }
++    let declared = v
++        .pointer("/general/kind")
++        .and_then(Value::as_str)
++        .and_then(Kind::from_word);
++    let Some(k) = declared.or_else(|| parse_mch(text).ok().map(|m| kind(Some(&m)))) else {
++        return;
++    };
++    let has_linear = |l: &str| axes.iter().any(|(n, _, r)| !r && n.eq_ignore_ascii_case(l));
++    let need: &[&str] = match k {
++        Kind::Lathe => &["X", "Z"],
++        Kind::Mill | Kind::MillTurn => &["X", "Y", "Z"],
++    };
++    for l in need {
++        if !has_linear(l) {
++            out.push(Refusal::new(format!("{l} axis"), format!("required for a {} machine", k.word())));
++        }
++    }
++    if k == Kind::MillTurn && !axes.iter().any(|(_, _, r)| *r) {
++        out.push(Refusal::new("rotary axis", "required for a mill-turn machine (the turning spindle, C)"));
++    }
++}
+diff --git a/crates/app/tests/machine_library.rs b/crates/app/tests/machine_library.rs
+new file mode 100644
+index 00000000..9c3c5272
+--- /dev/null
++++ b/crates/app/tests/machine_library.rs
+@@ -0,0 +1,251 @@
++//! The machine catalogue and validator (issue #287): every shipped
++//! machine lists with its kind, axes, units and posts and validates
++//! clean; each validation rule refuses a crafted bad file BY NAME; a
++//! malformed file is a named refusal, never a panic.
++//!
++//! Fixture law (clean-room): the crafted files are our own values in
++//! the `.mch` layout of `assets/machines/AGENTS.md`.
++//! Provenance: our own tests, specced from the issue's validation list.
++//!
++//! Gate map (M4.4): covers app::machine, app::machine::library, app::machine::validate, app::machine::sheet, app::posting.
++
++use std::path::PathBuf;
++
++use camcraft_app::machine::library::{self, MachineEntry, MachineSource};
++use camcraft_app::machine::validate::validate_text;
++use camcraft_app::machine::Kind;
++use camcraft_app::posting;
++
++/// A good 3-axis mill; `patch` edits its JSON before it is written out.
++fn mill(patch: impl FnOnce(&mut serde_json::Value)) -> String {
++    let mut v = serde_json::json!({
++      "general": { "model": "TEST MILL", "vendor": "Testbench", "kind": "mill" },
++      "kinematics": { "default": {
++        "units": { "length": "mm", "angle": "degrees" },
++        "parts": [
++          { "id": "base", "name": "table", "type": "table", "parts": [
++            { "id": "z", "name": "Z", "type": "linear", "travel": { "min": -200.0, "max": 0.0 }, "parts": [
++              { "id": "y", "name": "Y", "type": "linear", "travel": { "min": -100.0, "max": 100.0 }, "parts": [
++                { "id": "x", "name": "X", "type": "linear", "travel": { "min": -150.0, "max": 150.0 } }
++              ] }
++            ] },
++            { "id": "head", "name": "head", "type": "head",
++              "spindle": { "min_speed": 100.0, "max_speed": 8000.0, "power": 3.0 },
++              "tool_station": { "max_tool_length": 120.0,
++                "coolants": [ { "name": "Flood", "mCode": "M8" }, "Mist" ] } }
++          ] }
++        ] } },
++      "controller": { "synced_configuration": { "parts": {
++        "X": { "coordinate": 0, "max_normal_speed": 2000.0, "max_rapid_speed": 4000.0 },
++        "Y": { "coordinate": 1, "max_normal_speed": 2000.0, "max_rapid_speed": 4000.0 },
++        "Z": { "coordinate": 2, "max_normal_speed": 1500.0, "max_rapid_speed": 3000.0 }
++      } } },
++      "tooling": { "number_of_tools": 8 }
++    });
++    patch(&mut v);
++    v.to_string()
++}
++
++fn at<'a>(v: &'a mut serde_json::Value, ptr: &str) -> &'a mut serde_json::Value {
++    v.pointer_mut(ptr).unwrap_or_else(|| panic!("fixture has {ptr}"))
++}
++
++/// The refusals' keys, for asserting a rule refused by name.
++fn keys(text: &str) -> Vec<String> {
++    validate_text(text).into_iter().map(|r| r.key).collect()
++}
++
++fn one_refusal(text: &str, key: &str, rule_has: &str) {
++    let r = validate_text(text);
++    assert!(
++        r.iter().any(|r| r.key == key && r.rule.contains(rule_has)),
++        "expected a refusal `{key}: ..{rule_has}..`, got {r:?}"
++    );
++}
++
++const X_TRAVEL: &str = "/kinematics/default/parts/0/parts/0/parts/0/parts/0/travel";
++const SPINDLE: &str = "/kinematics/default/parts/0/parts/1/spindle";
++const COOLANTS: &str = "/kinematics/default/parts/0/parts/1/tool_station/coolants";
++
++#[test]
++fn a_good_crafted_mill_validates_clean() {
++    assert_eq!(validate_text(&mill(|_| {})), vec![]);
++}
++
++#[test]
++fn every_shipped_machine_lists_and_validates_clean() {
++    let list = library::builtins();
++    assert_eq!(list.len(), posting::MACHINES.len());
++    for e in &list {
++        assert!(e.is_valid(), "{} refuses: {:?}", e.name, e.refusals);
++        assert!(matches!(e.source, MachineSource::Builtin(_)));
++        assert!(e.kind.is_some(), "{} has a kind", e.name);
++        assert!(!e.posts.is_empty(), "{} has a post", e.name);
++        assert!(!e.groups.is_empty(), "{} has a property sheet", e.name);
++    }
++    let lathe = list.iter().find(|e| e.name == "Lathe").expect("the library has a lathe");
++    assert_eq!(lathe.kind, Some(Kind::Lathe));
++    assert_eq!(lathe.axes, vec!["X", "Z"]);
++    assert!(lathe.posts.contains(&"Fanuc Lathe") && !lathe.posts.contains(&"Fanuc"));
++    let mt = list.iter().find(|e| e.name == "Mill-turn").expect("the library has a mill-turn");
++    assert_eq!(mt.kind, Some(Kind::MillTurn));
++    assert_eq!(mt.rotaries, vec!["C"]);
++    let tm = list.iter().find(|e| e.name == "Tormach 770MX").expect("the library has the 770MX");
++    assert_eq!(tm.units, "inch");
++    // The sheet quotes the file's own numbers, not the mm restatement.
++    let axes = tm.groups.iter().find(|g| g.title == "Axes").expect("an Axes group");
++    let x = axes.rows.iter().find(|(l, _)| l == "X").expect("an X row");
++    assert!(x.1.contains("-14 .. 14 in"), "{x:?}");
++}
++
++/// Every `.mch` in `assets/machines` is a library entry, except the
++/// post-grammar default (`3axis-vmc.mch` is the static mirror form the
++/// post reads, not a checker-grammar machine file).
++#[test]
++fn every_machine_file_in_assets_is_in_the_library() {
++    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/machines");
++    let files = library::scan_dir(&dir);
++    let named: Vec<String> = posting::MACHINES.iter().map(|(_, t)| t.to_string()).collect();
++    for e in files {
++        let MachineSource::File(p) = &e.source else { panic!("scan lists files") };
++        if p.file_name().is_some_and(|n| n == "3axis-vmc.mch") {
++            continue;
++        }
++        let text = std::fs::read_to_string(p).expect("read the asset");
++        assert!(named.contains(&text), "{} is not registered in posting::MACHINES", p.display());
++        assert!(e.is_valid(), "{} refuses: {:?}", p.display(), e.refusals);
++    }
++}
++
++#[test]
++fn backwards_travel_refuses_naming_the_axis() {
++    let t = mill(|v| *at(v, X_TRAVEL) = serde_json::json!({ "min": 10.0, "max": 5.0 }));
++    one_refusal(&t, "X travel", "min 10 must be below max 5");
++    let t = mill(|v| *at(v, X_TRAVEL) = serde_json::json!({ "min": "a", "max": 5.0 }));
++    one_refusal(&t, "X travel", "must both be numbers");
++}
++
++#[test]
++fn non_positive_feeds_and_speeds_refuse_by_name() {
++    let t = mill(|v| *at(v, "/controller/synced_configuration/parts/Y/max_normal_speed") = 0.0.into());
++    one_refusal(&t, "Y feed (max_normal_speed)", "above 0");
++    let t = mill(|v| *at(v, "/controller/synced_configuration/parts/Z/max_rapid_speed") = (-5.0).into());
++    one_refusal(&t, "Z rapid (max_rapid_speed)", "above 0");
++    let t = mill(|v| *at(v, &format!("{SPINDLE}/max_speed")) = "fast".into());
++    one_refusal(&t, "spindle max_speed", "above 0");
++    let t = mill(|v| *at(v, &format!("{SPINDLE}/min_speed")) = 9000.0.into());
++    one_refusal(&t, "spindle", "must not exceed max_speed");
++    let t = mill(|v| at(v, SPINDLE)["ranges"] = serde_json::json!([{ "min_speed": 500.0, "max_speed": 100.0 }]));
++    one_refusal(&t, "spindle range 1", "below max_speed");
++}
++
++#[test]
++fn malformed_codes_refuse_by_name() {
++    let t = mill(|v| *at(v, COOLANTS) = serde_json::json!([{ "name": "Flood", "mCode": "G8" }]));
++    one_refusal(&t, "coolant Flood", "not an M word");
++    let t = mill(|v| *at(v, COOLANTS) = serde_json::json!([{ "mCode": "M8" }]));
++    one_refusal(&t, "coolant 1", "needs a name");
++    // A bare number code is the reader's other legal spelling.
++    let t = mill(|v| *at(v, COOLANTS) = serde_json::json!([{ "name": "Flood", "mCode": 8 }]));
++    assert_eq!(validate_text(&t), vec![]);
++    let t = mill(|v| {
++        at(v, "/kinematics/default/parts/0/parts/1/tool_station")["live_tool"] =
++            serde_json::json!({ "c_axis_on": "M19", "spindle_on": "M3" });
++    });
++    one_refusal(&t, "live_tool", "states 2 of the 4 words");
++}
++
++#[test]
++fn required_keys_per_kind_refuse_by_name() {
++    // A mill with no Y.
++    let t = mill(|v| {
++        let z = at(v, "/kinematics/default/parts/0/parts/0");
++        z["parts"] = serde_json::json!([{ "id": "x", "name": "X", "type": "linear" }]);
++    });
++    one_refusal(&t, "Y axis", "required for a mill machine");
++    // A declared mill-turn with no rotary.
++    let t = mill(|v| *at(v, "/general/kind") = "mill-turn".into());
++    one_refusal(&t, "rotary axis", "required for a mill-turn");
++    // A declared lathe needs X and Z only - the mill fixture still has them.
++    let t = mill(|v| *at(v, "/general/kind") = "lathe".into());
++    assert!(!keys(&t).iter().any(|k| k.ends_with("axis")), "{:?}", validate_text(&t));
++    let t = mill(|v| *at(v, "/general/model") = "".into());
++    one_refusal(&t, "general.model", "required");
++    let t = mill(|v| v["kinematics"] = serde_json::json!({}));
++    one_refusal(&t, "kinematics.default.parts", "required");
++}
++
++#[test]
++fn other_stated_values_refuse_by_name() {
++    let t = mill(|v| *at(v, "/general/kind") = "drill press".into());
++    one_refusal(&t, "general.kind", "not mill, lathe or mill-turn");
++    let t = mill(|v| *at(v, "/kinematics/default/units/length") = "cm".into());
++    one_refusal(&t, "units.length", "not mm or inch");
++    let t = mill(|v| *at(v, "/tooling/number_of_tools") = 0.into());
++    one_refusal(&t, "tooling.number_of_tools", "above 0");
++    let t = mill(|v| {
++        at(v, "/kinematics/default/parts/0/parts/0/parts/0/parts/0")["name"] = "Y".into();
++    });
++    one_refusal(&t, "Y", "stated twice");
++}
++
++#[test]
++fn malformed_files_refuse_by_name_and_never_panic() {
++    for (text, key) in [
++        ("", "file"),
++        ("{ not json", "file"),
++        ("[1, 2, 3]", "file"),
++        ("\"a machine\"", "file"),
++    ] {
++        let r = validate_text(text);
++        assert_eq!(r.len(), 1, "{text:?}: {r:?}");
++        assert_eq!(r[0].key, key);
++        let e = MachineEntry::from_text("bad", MachineSource::Builtin("bad"), text);
++        assert!(!e.is_valid() && e.kind.is_none() && e.groups.is_empty());
++    }
++    // A rotary with a garbled direction - the reader refuses it; so
++    // does the validator, naming the axis.
++    let t = mill(|v| {
++        at(v, "/kinematics/default/parts/0/parts")
++            .as_array_mut()
++            .expect("parts list")
++            .push(serde_json::json!({ "id": "c", "name": "C", "type": "rotary", "axis": [0, "z", 1] }));
++    });
++    one_refusal(&t, "C axis", "three finite numbers");
++}
++
++#[test]
++fn a_user_file_lists_by_its_model_and_an_unreadable_one_by_name() {
++    let dir = std::env::temp_dir().join(format!("camcraft_machine_library_{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    std::fs::write(dir.join("shop.mch"), mill(|_| {})).expect("write");
++    std::fs::write(dir.join("broken.mch"), "{").expect("write");
++    std::fs::write(dir.join("notes.txt"), "not a machine").expect("write");
++    let list = library::scan_dir(&dir);
++    assert_eq!(list.len(), 2, "only .mch files list");
++    let broken = &list[0];
++    assert_eq!(broken.name, "broken.mch");
++    assert_eq!(broken.refusals[0].key, "file");
++    let shop = &list[1];
++    assert_eq!(shop.name, "TEST MILL");
++    assert!(shop.is_valid(), "{:?}", shop.refusals);
++    assert_eq!(shop.source, MachineSource::File(dir.join("shop.mch")));
++    let gone = MachineEntry::from_file(&dir.join("gone.mch"));
++    assert!(gone.refusals[0].rule.contains("cannot be read"));
++    assert!(library::scan_dir(&dir.join("no-such-folder")).is_empty());
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn the_catalogue_adds_the_documents_machine_file() {
++    let world = camcraft_app::world::new_world();
++    assert_eq!(library::enumerate(&world).len(), posting::MACHINES.len(), "a built-in mount adds nothing");
++    let p = std::env::temp_dir().join(format!("camcraft_machine_library_doc_{}.mch", std::process::id()));
++    std::fs::write(&p, mill(|_| {})).expect("write");
++    let m = camcraft_app::machine::parse_mch(&mill(|_| {})).expect("parse");
++    camcraft_app::machine::set(&world, &p.display().to_string(), Some(&m));
++    let list = library::enumerate(&world);
++    assert_eq!(list.len(), posting::MACHINES.len() + 1);
++    assert_eq!(list.last().map(|e| e.source.clone()), Some(MachineSource::File(p.clone())));
++    let _ = std::fs::remove_file(&p);
++}
+diff --git a/crates/ui/src/egui_app/layout/mod.rs b/crates/ui/src/egui_app/layout/mod.rs
+index 112572af..d1aab6c2 100644
+--- a/crates/ui/src/egui_app/layout/mod.rs
++++ b/crates/ui/src/egui_app/layout/mod.rs
+@@ -61,6 +61,7 @@ pub(crate) fn tab_of(p: Panel) -> Tab {
+     match p {
+         Panel::Browser => Tab::Browser,
+         Panel::Properties => Tab::Properties,
++        Panel::Machines => Tab::Machines,
+     }
+ }
+ 
+@@ -74,6 +75,7 @@ pub(crate) fn panels_open(dock: &DockState<Tab>) -> PanelsOpen {
+     PanelsOpen {
+         browser: is_open(dock, &Tab::Browser),
+         properties: is_open(dock, &Tab::Properties),
++        machines: is_open(dock, &Tab::Machines),
+     }
+ }
+ 
+@@ -93,9 +95,19 @@ fn reopen(dock: &mut DockState<Tab>, p: Panel) {
+         dock.push_to_first_leaf(tab);
+         return;
+     }
++    // #287: the Machines pane opens as a tab beside the properties pane
++    // when that is open (same side, same width - one more context pane),
++    // else alone at the right like the properties pane would.
++    if p == Panel::Machines
++        && let Some(props) = dock.find_tab(&Tab::Properties)
++        && let Ok(leaf) = dock.leaf_mut(props.node_path())
++    {
++        leaf.append_tab(tab);
++        return;
++    }
+     let (side, frac) = match p {
+         Panel::Browser => (Split::Left, BROWSER_FRAC),
+-        Panel::Properties => (Split::Right, REOPEN_PROPS_FRAC),
++        Panel::Properties | Panel::Machines => (Split::Right, REOPEN_PROPS_FRAC),
+     };
+     dock.split(NodePath::MAIN_ROOT, side, frac, Node::leaf(tab));
+ }
+@@ -137,10 +149,11 @@ pub(crate) enum ViewRow {
+     Reset,
+ }
+ 
+-const ROWS: [ViewRow; 4] = [
++const ROWS: [ViewRow; 5] = [
+     ViewRow::Viewport,
+     ViewRow::Panel(Panel::Browser),
+     ViewRow::Panel(Panel::Properties),
++    ViewRow::Panel(Panel::Machines),
+     ViewRow::Reset,
+ ];
+ 
+@@ -149,6 +162,7 @@ fn row_label(r: ViewRow) -> &'static str {
+         ViewRow::Viewport => "Viewport",
+         ViewRow::Panel(Panel::Browser) => "Browser",
+         ViewRow::Panel(Panel::Properties) => "Properties",
++        ViewRow::Panel(Panel::Machines) => "Machines",
+         ViewRow::Reset => "Reset layout",
+     }
+ }
+diff --git a/crates/ui/src/egui_app/machines_pane.rs b/crates/ui/src/egui_app/machines_pane.rs
+new file mode 100644
+index 00000000..9baee987
+--- /dev/null
++++ b/crates/ui/src/egui_app/machines_pane.rs
+@@ -0,0 +1,141 @@
++//! The Machines pane (issue #287, first slice): a dockable, read-only
++//! browser of every machine definition the app can name - the shipped
++//! library and the document's own `.mch` file - with each machine's
++//! grouped properties and its validation, refusal by refusal.
++//!
++//! Provenance: the workflow is specced from the issue (list, inspect,
++//! validate machine configurations); every word and widget here is
++//! ours. The catalogue, the sheet and the rules live in the app layer
++//! (`camcraft_app::machine::library` / `validate`): this pane only draws
++//! what they answer - it reads no file itself.
++//!
++//! View state only: which row is selected and the cached catalogue are
++//! ephemeral like the dock (never a command, never saved). The pane
++//! edits nothing and assigns nothing in this slice.
++
++use egui::{Label, RichText, ScrollArea, Ui};
++
++use camcraft_app::machine::library::{self, MachineEntry};
++
++use super::colorvision::text_inks;
++use super::layout::{group_open, prop_grid};
++use super::theme::Tokens;
++use crate::state::State;
++
++/// The pane's view state.
++#[derive(Default)]
++pub struct MachinesPane {
++    /// The catalogue as last read; `None` = read it on the next draw.
++    pub list: Option<Vec<MachineEntry>>,
++    /// The document's machine path the catalogue was read for - a new
++    /// mount re-reads it (the document's file is one of the entries).
++    pub listed_for: String,
++    /// The selected row, an index into `list`.
++    pub selected: Option<usize>,
++}
++
++/// A list row's words: name, then kind, axes and units - unique per
++/// entry in practice, and what a test finds the row by.
++pub(crate) fn row_label(e: &MachineEntry) -> String {
++    let kind = e.kind.map_or("?", |k| k.word());
++    let mut axes: String = e.axes.concat();
++    axes.push_str(&e.rotaries.concat());
++    if axes.is_empty() {
++        axes.push('?');
++    }
++    let mark = if e.is_valid() { "" } else { "  [refused]" };
++    format!("{}  ({kind}, {axes}, {}){mark}", e.name, e.units)
++}
++
++/// The validation heading for an entry.
++pub(crate) fn verdict(e: &MachineEntry) -> String {
++    match e.refusals.len() {
++        0 => "Validation: passes".to_owned(),
++        1 => "Validation: 1 refusal".to_owned(),
++        n => format!("Validation: {n} refusals"),
++    }
++}
++
++/// Make sure the catalogue is current: read once, and again when the
++/// document mounts a different machine.
++fn refresh(state: &mut State) {
++    let (path, _) = camcraft_app::machine::of(&state.world);
++    let p = &mut state.machines_pane;
++    if p.list.is_none() || p.listed_for != path {
++        let list = library::enumerate(&state.world);
++        if p.selected.is_some_and(|i| i >= list.len()) {
++            p.selected = None;
++        }
++        p.list = Some(list);
++        p.listed_for = path;
++    }
++}
++
++pub(crate) fn draw(ui: &mut Ui, state: &mut State, pal: &Tokens) {
++    refresh(state);
++    let inks = text_inks(ui, &state.world);
++    let p = &mut state.machines_pane;
++    let Some(list) = p.list.as_ref() else { return };
++    let mut reread = false;
++    ui.horizontal(|ui| {
++        ui.label(RichText::new(format!("{} machines", list.len())).color(pal.text_dim));
++        if ui
++            .button("Refresh")
++            .on_hover_text("Read the machine files again")
++            .clicked()
++        {
++            reread = true;
++        }
++    });
++    ui.separator();
++    let mut chose = None;
++    ScrollArea::vertical()
++        .id_salt("machines-list")
++        .max_height((ui.available_height() * 0.4).max(80.0))
++        .auto_shrink([false, true])
++        .show(ui, |ui| {
++            for (i, e) in list.iter().enumerate() {
++                let r = ui
++                    .selectable_label(p.selected == Some(i), row_label(e))
++                    .on_hover_text(e.source.label());
++                if r.clicked() {
++                    chose = Some(i);
++                }
++            }
++        });
++    if let Some(i) = chose {
++        p.selected = Some(i);
++    }
++    ui.separator();
++    let Some(e) = p.selected.and_then(|i| list.get(i)) else {
++        ui.label(RichText::new("Select a machine to see its properties.").color(pal.text_dim));
++        if reread {
++            p.list = None;
++        }
++        return;
++    };
++    ScrollArea::vertical().id_salt("machines-detail").show(ui, |ui| {
++        ui.add(Label::new(RichText::new(&e.name).strong()).wrap());
++        ui.add(Label::new(RichText::new(e.source.label()).small().color(pal.text_dim)).wrap());
++        let ink = if e.is_valid() { pal.accent } else { inks.error };
++        ui.label(RichText::new(verdict(e)).color(ink).strong());
++        for r in &e.refusals {
++            ui.add(Label::new(RichText::new(r.to_string()).color(inks.error)).wrap());
++        }
++        ui.add_space(4.0);
++        for g in &e.groups {
++            group_open(ui, &g.title, None, true, |ui| {
++                prop_grid(ui, &format!("machine-{}", g.title), |ui| {
++                    for (label, value) in &g.rows {
++                        ui.label(label);
++                        ui.add(Label::new(value).wrap());
++                        ui.end_row();
++                    }
++                });
++            });
++        }
++    });
++    if reread {
++        p.list = None;
++    }
++}
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index 107533a4..19157fc6 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -47,6 +47,8 @@ mod load_field;
+ // pub(crate) past egui_app: `State::machine_editor` names its draft
+ // type (M3.3 stage C), so state.rs has to see through the door.
+ pub(crate) mod machine_editor;
++// pub(crate) for the same reason: `State::machines_pane` (#287).
++pub(crate) mod machines_pane;
+ mod feeds_page;
+ mod spindle_row;
+ mod approach_page;
+diff --git a/crates/ui/src/egui_app/panes.rs b/crates/ui/src/egui_app/panes.rs
+index 05f4ae06..18df0dc6 100644
+--- a/crates/ui/src/egui_app/panes.rs
++++ b/crates/ui/src/egui_app/panes.rs
+@@ -415,7 +415,7 @@ pub(super) fn tip_of(c: Cmd, state: &State) -> String {
+         Cmd::Deviate => {
+             "Judge the program's stock against the model (deviation map)".into()
+         }
+-        Cmd::View => "Show or hide the browser and properties panes, or reset the layout".into(),
++        Cmd::View => "Show or hide the browser, properties and machines panes, or reset the layout".into(),
+     }
+ }
+ 
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index ae01696e..2963fa9a 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -36,6 +36,7 @@ use crate::viewport::View3D;
+ use super::icons;
+ use super::layout;
+ use super::machine_editor;
++use super::machines_pane;
+ use super::unsaved_prompt;
+ use super::frame_watch::FrameWatch;
+ use super::gpu;
+@@ -144,6 +145,7 @@ pub(crate) enum Tab {
+     Viewport,
+     Browser,
+     Properties,
++    Machines,
+ }
+ 
+ impl Tab {
+@@ -152,6 +154,7 @@ impl Tab {
+             Tab::Viewport => "viewport",
+             Tab::Browser => "browser",
+             Tab::Properties => "properties",
++            Tab::Machines => "machines",
+         }
+     }
+ }
+@@ -923,6 +926,10 @@ impl TabViewer for ShellTabs<'_> {
+                 let pal = theme::current();
+                 pages::properties(ui, self.state, &pal);
+             }
++            Tab::Machines => {
++                let pal = theme::current();
++                machines_pane::draw(ui, self.state, &pal);
++            }
+         }
+     }
+ }
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index b393cffc..f5207b66 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -80,6 +80,7 @@ mod spindle_row;
+ mod stock_size;
+ mod stock_fit_sides;
+ mod layout;
++mod machines_pane;
+ mod unsaved;
+ mod first_setup;
+ 
+@@ -2569,7 +2570,7 @@ fn tips_match_the_imgui_table() {
+         (Cmd::Deviate, "Judge the program's stock against the model (deviation map)"),
+         (
+             Cmd::View,
+-            "Show or hide the browser and properties panes, or reset the layout",
++            "Show or hide the browser, properties and machines panes, or reset the layout",
+         ),
+     ];
+     for (c, want) in rows {
+diff --git a/crates/ui/src/egui_app/tests/machines_pane.rs b/crates/ui/src/egui_app/tests/machines_pane.rs
+new file mode 100644
+index 00000000..c72c93ce
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/machines_pane.rs
+@@ -0,0 +1,148 @@
++//! The Machines pane's frame tests (issue #287): the View door opens it
++//! beside the properties pane, it lists the shipped library, selecting a
++//! machine shows its properties and its validation - a clean pass, or
++//! each refusal by name - and none of it touches the command queue (the
++//! pane is view state; it edits and assigns nothing).
++//! Provenance: our own tests, specced from the issue and the egui_dock /
++//! egui_kittest vendored sources; no HSMWorks material involved.
++//!
++//! Gate map (M4.4): covers ui::egui_app::machines_pane, ui::egui_app::layout, ui::state, app::machine::library, app::machine::validate.
++
++use super::super::layout::{self, ViewRow};
++use super::super::machines_pane::{row_label, verdict};
++use super::*;
++use crate::state::Panel;
++
++fn blank_harness() -> Harness<'static, ShellUi> {
++    Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, ShellUi::blank())
++}
++
++fn click(h: &mut Harness<'static, ShellUi>, at: egui::Pos2) {
++    set_pos(h, at);
++    button_at(h, egui::PointerButton::Primary, at, true);
++    button_at(h, egui::PointerButton::Primary, at, false);
++    h.run_steps(2);
++}
++
++/// Open the Machines pane the way a user does: the ribbon's View door,
++/// then its "Machines" row.
++fn open_machines(h: &mut Harness<'static, ShellUi>) {
++    let strip =
++        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, super::super::shell::RIBBON_H));
++    let (cells, _) = mill_plan_at(1280.0);
++    let button = cells
++        .iter()
++        .find(|c| c.cmd == Cmd::View)
++        .expect("the View door stands on the bar")
++        .rect;
++    let rows = panes::view_rows_of(button, strip, &theme::current());
++    let at = rows
++        .iter()
++        .find(|(r, _)| *r == ViewRow::Panel(Panel::Machines))
++        .expect("the View door lists Machines")
++        .1
++        .center();
++    click(h, button.center());
++    click(h, at);
++}
++
++fn assert_no_commands(h: &Harness<'static, ShellUi>) {
++    let st = &h.state().state;
++    assert!(st.pending.is_empty(), "the pane queued a command: {:?}", st.pending);
++    assert!(st.history.is_empty(), "the pane landed in the history");
++}
++
++#[test]
++fn the_view_door_opens_the_machines_pane_beside_properties() {
++    let mut h = blank_harness();
++    h.run();
++    assert!(!layout::is_open(&h.state().dock, &Tab::Machines), "closed by default");
++    open_machines(&mut h);
++    let dock = &h.state().dock;
++    let m = dock.find_tab(&Tab::Machines).expect("the pane opened");
++    let p = dock.find_tab(&Tab::Properties).expect("properties still open");
++    assert_eq!(m.node_path(), p.node_path(), "a tab in the properties pane's leaf");
++    assert!(h.state().state.panels_open.machines);
++    // The pane read the catalogue: the whole shipped library, in order.
++    let names: Vec<String> = h
++        .state()
++        .state
++        .machines_pane
++        .list
++        .as_ref()
++        .expect("the catalogue was read")
++        .iter()
++        .map(|e| e.name.clone())
++        .collect();
++    let want: Vec<String> = camcraft_app::posting::MACHINES.iter().map(|(n, _)| (*n).to_owned()).collect();
++    assert_eq!(names, want);
++    // The same door closes it.
++    open_machines(&mut h);
++    assert!(!layout::is_open(&h.state().dock, &Tab::Machines));
++    assert_no_commands(&h);
++}
++
++#[test]
++fn selecting_a_shipped_machine_shows_its_sheet_and_a_clean_validation() {
++    let mut h = blank_harness();
++    h.run();
++    open_machines(&mut h);
++    let lathe = h
++        .state()
++        .state
++        .machines_pane
++        .list
++        .as_ref()
++        .and_then(|l| l.iter().find(|e| e.name == "Lathe").cloned())
++        .expect("the library lists the lathe");
++    h.get_by_label(&row_label(&lathe)).click();
++    h.run_steps(2);
++    let sel = h.state().state.machines_pane.selected;
++    let picked = h.state().state.machines_pane.list.as_ref().and_then(|l| sel.and_then(|i| l.get(i)));
++    assert_eq!(picked.map(|e| e.name.as_str()), Some("Lathe"));
++    h.get_by_label("Validation: passes");
++    h.get_by_label("Axes");
++    h.get_by_label("Spindle");
++    assert_no_commands(&h);
++}
++
++#[test]
++fn a_refused_machine_file_shows_each_refusal_by_name() {
++    let text = r#"{
++      "general": { "model": "BACKWARDS MILL", "kind": "mill" },
++      "kinematics": { "default": { "units": { "length": "mm" }, "parts": [
++        { "name": "X", "type": "linear", "travel": { "min": 10.0, "max": 5.0 } },
++        { "name": "Y", "type": "linear" }, { "name": "Z", "type": "linear" }
++      ] } }
++    }"#;
++    let path = std::env::temp_dir().join(format!("camcraft_ui_machines_pane_{}.mch", std::process::id()));
++    std::fs::write(&path, text).expect("write the fixture file");
++    let mut h = blank_harness();
++    let m = camcraft_app::machine::parse_mch(text).expect("the reader takes it (it drops the travel)");
++    camcraft_app::machine::set(&h.state().state.world, &path.display().to_string(), Some(&m));
++    h.run();
++    open_machines(&mut h);
++    let bad = h
++        .state()
++        .state
++        .machines_pane
++        .list
++        .as_ref()
++        .and_then(|l| l.last().cloned())
++        .expect("the document's file is listed last");
++    assert_eq!(bad.name, "BACKWARDS MILL");
++    let label = row_label(&bad);
++    // The document's row is last, below the list's fold: scroll it in,
++    // let the scroll settle, then press it with the real pointer.
++    h.get_by_label(&label).scroll_to_me();
++    h.run_steps(10);
++    let at = h.get_by_label(&label).rect().center();
++    click(&mut h, at);
++    assert_eq!(verdict(&bad), "Validation: 1 refusal");
++    h.get_by_label("Validation: 1 refusal");
++    h.get_by_label("X travel: min 10 must be below max 5");
++    assert_no_commands(&h);
++    let _ = std::fs::remove_file(&path);
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index dd227606..520eb3fb 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1001,6 +1001,9 @@ pub struct PostView {
+ pub enum Panel {
+     Browser,
+     Properties,
++    /// The Machines pane (#287): closed by default, opened from the View
++    /// door beside the properties pane.
++    Machines,
+ }
+ 
+ /// A dock-layout ask from the View door, applied by the shell on the
+@@ -1022,6 +1025,7 @@ pub enum LayoutRequest {
+ pub struct PanelsOpen {
+     pub browser: bool,
+     pub properties: bool,
++    pub machines: bool,
+ }
+ 
+ impl PanelsOpen {
+@@ -1030,6 +1034,7 @@ impl PanelsOpen {
+         match p {
+             Panel::Browser => self.browser,
+             Panel::Properties => self.properties,
++            Panel::Machines => self.machines,
+         }
+     }
+ }
+@@ -1260,6 +1265,10 @@ pub struct State {
+     /// edit are a copy of the machine until Apply pushes `LoadMachine`,
+     /// which is the command, which is the undo.
+     pub machine_editor: Option<crate::egui_app::machine_editor::MachineEditor>,
++    /// The Machines pane's view state (#287): the cached catalogue and
++    /// the selected row. Ephemeral like the dock itself - browsing a
++    /// machine is not a command; assigning one will be.
++    pub machines_pane: crate::egui_app::machines_pane::MachinesPane,
+     /// M6.1 C's resolution furniture (never a command, never saved -
+     /// the camera's law): the parse cache for `File` themes, the
+     /// discovered theme files behind the switcher's rows, and the last
+@@ -1412,7 +1421,7 @@ impl State {
+             ribbon_more: None,
+             ribbon_mode_open: false,
+             ribbon_view_open: false,
+-            panels_open: PanelsOpen { browser: true, properties: true },
++            panels_open: PanelsOpen { browser: true, properties: true, machines: false },
+             layout_request: None,
+             tree_menu: None,
+             retype_confirm: None,
+@@ -1451,6 +1460,7 @@ impl State {
+             },
+             tool_editor: None,
+             machine_editor: None,
++            machines_pane: Default::default(),
+             theme_cache: theme_files::Cache::new(),
+             // One walk per window, at construction: the switcher's file
+             // rows are furniture, not live filesystem polling (the
+diff --git a/docs/decisions/287-machines-pane.md b/docs/decisions/287-machines-pane.md
+new file mode 100644
+index 00000000..1750fa37
+--- /dev/null
++++ b/docs/decisions/287-machines-pane.md
+@@ -0,0 +1,95 @@
++## #287 - Machines pane, first slice: browse and validate
++
++**What was decided:** Ship the read-only half of the Machines pane first
++(Refs #287, not Fixes). The app layer gains `machine::library` (the
++catalogue: `builtins()`, `scan_dir(dir)`, `enumerate(world)`, one
++`MachineEntry` per machine with name, source, kind, linear axes, rotaries,
++units, serving built-in posts, a grouped property sheet and its
++refusals) and `machine::validate` (`validate_text(text) -> Vec<Refusal>`,
++each refusal a key and a rule, e.g. `X travel: min 10 must be below max
++5`). The ui gains a dockable "Machines" tab, opened and closed from the
++ribbon's View door like Browser and Properties, which lists the
++catalogue, shows the selected machine's validation (pass, or every
++refusal by name) and its properties in collapsible groups. No create,
++edit, save, assign or file write in this slice.
++
++**Why, choice by choice:**
++
++- *Where user machines are found.* The app has no user machine folder or
++  search path today; the only user files it reads are the one the
++  document mounts through the Setup pane's "Load other" (`machine::of`'s
++  path). So the catalogue is the shipped library plus that file, read
++  fresh from disk. `scan_dir` (every `.mch` in a folder, unreadable files
++  listed with their refusal) is built and tested as the seam a later
++  slice points at a real user folder. Considered and dropped: inventing a
++  per-user folder now (`~/.camcraft/machines`, the project's folder) - a
++  new storage convention is a product decision with platform-path
++  questions, and nothing could write to it yet. **Owner decision wanted
++  (recommended option first):** a user machine folder resolved like
++  theme files are (`crates/ui/src/theme_dir.rs`): a `CAMCRAFT_MACHINES`
++  override, else a writable per-user folder under the platform's
++  app-data directory (`<data dir>/camcraft/machines`) - scanned by the
++  pane and written by the editor's Save As. Theme files resolve only
++  read-only install folders (beside the exe, the app bundle), which an
++  editor cannot write to, so the per-user folder is new. Alternative: a
++  folder setting stored in the project file.
++- *`3axis-vmc.mch` is not listed.* It is `DEFAULT_MCH`, the post's
++  static-grammar mirror form (`kinematics.static`), not a checker-grammar
++  machine file, and it is not in `posting::MACHINES`. The pane lists the
++  library the Setup pane's picker lists. A test asserts every other
++  `.mch` in `assets/machines` is registered and validates clean.
++- *Compatible posts* are derived, not stored: the built-in posts for
++  which `posting::post_serves(name, kind)` holds - the same listing law
++  the Setup pane's post picker uses. Cheap and already authoritative.
++- *Validation reads the raw JSON, not the parsed `Machine`.* The reader
++  is forgiving by design (a backwards travel is dropped, a zero rate
++  reads "not stated") - right for the checker, wrong for a file a person
++  is about to trust. The rules: travel min < max with both numbers;
++  feeds/rapids (`max_normal_speed`, `max_rapid_speed`), spindle
++  `min_speed`/`max_speed`/`power`, spindle ranges and axis `resolution`
++  must be numbers above 0 when stated (a stated 0 refuses - "leave the
++  key out when unstated"; null and absent stay legal, the unstated-limit
++  law); spindle min <= max; coolant entries named, codes an `M` word
++  (`M8`) or a bare whole number (the reader's two spellings); `live_tool`
++  all four words or none; `tooling.number_of_tools` a whole number above
++  0; `units.length` mm/inch/inches, `units.angle` degrees; a rotary's
++  direction three finite numbers, not zero; no letter stated twice;
++  `general.kind` a known word. Required keys: `general.model`,
++  `kinematics.default.parts`, and per kind the linear axes it moves
++  (mill X/Y/Z, lathe X/Z, mill-turn X/Y/Z plus a rotary). Malformed JSON
++  or a non-object is one refusal keyed `file`. Considered and dropped:
++  refusing zero tool-station dimensions (`body_diameter: 0.0` is how
++  shipped lathe files say "no envelope"), requiring a spindle or a tool
++  count (unstated is legal; the posts' guards keep their silence), and
++  refusing a declared kind that disagrees with the inferred one (a lathe
++  with an extra axis is not wrong; the library test already pins
++  declared == inferred for shipped files).
++- *The sheet shows the file's own numbers in the file's own unit* (an
++  inch machine reads `-14 .. 14 in`), from the raw JSON, not the reader's
++  mm restatement - what a person typed is what they recognise and what
++  the editor will write back.
++- *Pane placement and state.* Opening follows the existing panel
++  convention exactly: a `Panel::Machines` row in the View door, a
++  `LayoutRequest::Toggle`, a `Tab::Machines` in the dock - view state,
++  never a command, never saved. It opens as a tab in the Properties
++  pane's leaf (or alone at the right if Properties is closed); it is
++  not in the default dock, so Reset layout closes it. Selection and the
++  cached catalogue live in `State::machines_pane`, ephemeral like the
++  dock; the catalogue is re-read when the document mounts a different
++  machine and on the pane's Refresh button. No icon: the View door rows
++  and dock tab titles carry none.
++- *Tests are structural*, no golden PNG: the app suite
++  `crates/app/tests/machine_library.rs` and the ui frame tests
++  `crates/ui/src/egui_app/tests/machines_pane.rs`.
++
++**Left for follow-up slices:** create (from a library template or
++blank), edit as a property grid with save that preserves unknown keys,
++validation blocking save, the user machine folder (owner decision
++above), "Use for this setup" through an undoable command (the existing
++`LoadMachine` is the natural carrier), and deciding whether the
++existing machine editor window (Setup pane) folds into the pane.
++
++**Cost to change later:** low. The catalogue and validator are pure
++functions over text; a user folder is one `scan_dir` call in
++`enumerate`. Rules are additive; a rule that proves too strict for
++real files is one match arm.

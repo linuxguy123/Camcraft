@@ -1,0 +1,1045 @@
+From 65b27eb9128e1e4ea597cafa429dc3ce44567af8 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 13:02:01 -0800
+Subject: [PATCH] feat(probe): seed the Probe op from a picked face, edge,
+ vertex or round wall
+
+A pick on a Probe op now seeds its touch in the same undoable
+SetOperationGeometry command: a planar face gives a Face touch against
+its outward normal, a straight level top edge an Edge touch on the wall
+under it, a vertex an outside Corner from its X and Y walls, and a
+closed round rim or welded round wall a Bore or Boss centre from
+Circular's circle fit (Bore when the wall's outward normals face the
+axis). Picks the probe cannot touch (a downward or tilted face, a bent
+or sloped edge, an inside corner, a cone) are refused by name and leave
+the op unchanged. The Geometry tab's selection account names the seed
+under the pick chip; no project-format change.
+
+New: operation::probe_pick / probe_pick_round (probe_seed,
+probe_from_picks, seeded_params, probe_account); tests in
+crates/app/tests/probe_pick.rs; decision in
+docs/decisions/171-probe-from-pick.md.
+
+Fixes #171
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/commands/operation/geometry.rs |  17 +-
+ crates/app/src/operation/mod.rs               |   4 +
+ crates/app/src/operation/picks.rs             |   4 +
+ crates/app/src/operation/probe_pick.rs        | 387 ++++++++++++++++++
+ crates/app/src/operation/probe_pick_round.rs  | 112 +++++
+ crates/app/tests/probe_pick.rs                | 371 +++++++++++++++++
+ docs/decisions/171-probe-from-pick.md         |  50 +++
+ 7 files changed, 944 insertions(+), 1 deletion(-)
+ create mode 100644 crates/app/src/operation/probe_pick.rs
+ create mode 100644 crates/app/src/operation/probe_pick_round.rs
+ create mode 100644 crates/app/tests/probe_pick.rs
+ create mode 100644 docs/decisions/171-probe-from-pick.md
+
+diff --git a/crates/app/src/commands/operation/geometry.rs b/crates/app/src/commands/operation/geometry.rs
+index 63788314..aa236921 100644
+--- a/crates/app/src/commands/operation/geometry.rs
++++ b/crates/app/src/commands/operation/geometry.rs
+@@ -59,11 +59,26 @@ impl SetOperationGeometry {
+         // A pocket-family pick that bounds no area from above is refused
+         // here, at the pick, with the fix - Generate stays the backstop.
+         super::gates::area_gate(world, prev.setup.as_deref(), &src, &prev.params)?;
+-        let next = Operation { src, ..prev.clone() };
++        // A probe's pick seeds its touch (#171) in this same command, so
++        // one undo takes back the pick and the seed together; a pick the
++        // probe cannot touch is refused here, by name.
++        let params = match crate::operation::probe_from_picks(world, &prev.params, src_items(&src)) {
++            Some(seeded) => seeded.map_err(CommandError::Invalid)?,
++            None => prev.params.clone(),
++        };
++        let next = Operation { src, params, ..prev.clone() };
+         Ok(SetOperationGeometry { name: name.to_string(), prev, next })
+     }
+ }
+ 
++/// The pick list of a selection source.
++fn src_items(src: &SrcRef) -> &[GeoSel] {
++    match src {
++        SrcRef::Selection(items) => items,
++        _ => &[],
++    }
++}
++
+ /// One pick, checked against the model as it stands: the entity exists,
+ /// is solid, has geometry to select from, and the feature id resolves
+ /// right now (interactive adds never queue a stale pick; ids that
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 9158bcb3..554bc570 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -90,6 +90,10 @@ pub use footprint::machined_footprint;
+ mod probe;
+ // #108: the Probe operation's generation and protected-move law.
+ pub mod probe_op;
++// #171: the Probe op seeded from one picked face, edge, vertex or round wall.
++mod probe_pick;
++mod probe_pick_round;
++pub use probe_pick::{PROBE_AXIS_TOL_DEG, ProbeSeed, probe_account, probe_from_picks, probe_seed, seeded_params};
+ pub(crate) use probe::*;
+ mod selection;
+ pub use selection::*;
+diff --git a/crates/app/src/operation/picks.rs b/crates/app/src/operation/picks.rs
+index ad31979b..3f421337 100644
+--- a/crates/app/src/operation/picks.rs
++++ b/crates/app/src/operation/picks.rs
+@@ -67,6 +67,10 @@ pub fn selection_account(
+     items: &[GeoSel],
+     params: &OpParams,
+ ) -> (Vec<String>, Option<String>) {
++    // A probe's pick seeds a touch, it bounds no region (#171).
++    if let Some(account) = super::probe_account(world, items, params) {
++        return account;
++    }
+     let mut notes = Vec::new();
+     match selection_geometry_impl(world, setup, items, params, Some(&mut notes)) {
+         Ok(_) => (notes, None),
+diff --git a/crates/app/src/operation/probe_pick.rs b/crates/app/src/operation/probe_pick.rs
+new file mode 100644
+index 00000000..db97580d
+--- /dev/null
++++ b/crates/app/src/operation/probe_pick.rs
+@@ -0,0 +1,387 @@
++//! The Probe operation seeded from one picked feature (#171): a planar
++//! face seeds a Face touch against its outward normal, a straight edge
++//! an Edge touch on the side face under it, a vertex an outside Corner
++//! (one X and one Y touch, off the two walls meeting there), and a
++//! round wall or rim a Bore or Boss centre (see `probe_pick_round`).
++//! Anything the probe cannot touch honestly is refused by name - never
++//! guessed. The seed is written into the op's params by the pick
++//! command itself (`SetOperationGeometry`), so one undo takes it back.
++//!
++//! Provenance: touch-probe practice from machine-tool handbooks (a
++//! touch travels against the surface normal; an outside corner takes
++//! one touch per wall); outward normals from facet winding (standard
++//! mesh geometry). Our own law and code; no vendor material consulted.
++
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use crate::geometry::feature::{self, FaceKind, Features};
++use crate::geometry::{Point3, Triangle, quat_rotate_point, transform_point};
++use crate::model;
++use crate::probing::{ProbeDir, ProbeMode};
++use crate::schema::Location;
++
++use super::{FeatureSel, GeoSel, OpParams};
++
++/// How far (degrees) a face normal may stand off an axis and still be
++/// touched along it: a probe travels along X, Y or down Z only, and
++/// an exact CAD face is exact - this is tessellation slack, not a lean.
++pub const PROBE_AXIS_TOL_DEG: f64 = 1.0;
++
++/// Positional slack (mm) for "straight", "level" and "below": the facet
++/// lattice's own, like the circle fit's tolerance.
++pub(super) const PICK_TOL: f64 = 0.01;
++
++/// What one pick seeds into a Probe op: the mode, the touch directions,
++/// the expected contact, and - for a round pick - the nominal radius.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct ProbeSeed {
++    pub mode: ProbeMode,
++    pub dir: ProbeDir,
++    pub dir_y: ProbeDir,
++    pub target: [f64; 3],
++    pub radius: Option<f64>,
++}
++
++fn dir_word(d: ProbeDir) -> &'static str {
++    match d {
++        ProbeDir::XPos => "+X",
++        ProbeDir::XNeg => "-X",
++        ProbeDir::YPos => "+Y",
++        ProbeDir::YNeg => "-Y",
++        ProbeDir::ZNeg => "-Z",
++    }
++}
++
++impl ProbeSeed {
++    /// One line for the op page: what the pick made of the probe.
++    #[must_use]
++    pub fn describe(&self) -> String {
++        let [x, y, z] = self.target;
++        let at = format!("({x:.3}, {y:.3}, {z:.3})");
++        match self.mode {
++            ProbeMode::Face => format!("Face touch toward {} at {at}", dir_word(self.dir)),
++            ProbeMode::Edge => format!("Edge touch toward {} under {at}", dir_word(self.dir)),
++            ProbeMode::Corner => format!(
++                "Outside corner, touches toward {} and {} at {at}",
++                dir_word(self.dir),
++                dir_word(self.dir_y)
++            ),
++            ProbeMode::Bore | ProbeMode::Boss => format!(
++                "{} centre, radius {:.3} mm, rim centre {at}",
++                if self.mode == ProbeMode::Bore { "Bore" } else { "Boss" },
++                self.radius.unwrap_or(0.0)
++            ),
++        }
++    }
++}
++
++/// The picked entity's topology, facets and placement: every query
++/// below answers in WORLD coordinates, the frame the probe's target and
++/// its stylus law (`probe_op`, over world facets) both live in.
++pub(super) struct PickCtx {
++    pub features: Arc<Features>,
++    pub tris: Arc<[Triangle]>,
++    pub loc: Location,
++}
++
++impl PickCtx {
++    pub(super) fn of(world: &World, entity: &str) -> Result<PickCtx, String> {
++        let e = model::find_by_name(world, entity)
++            .ok_or_else(|| format!("'{entity}' is gone - re-pick the feature"))?;
++        let none = || format!("'{entity}' carries no geometry to probe");
++        let features = model::features_of(world, &e).ok_or_else(none)?;
++        let tris = model::facets_of(world, &e).ok_or_else(none)?;
++        let loc = model::transform_of(world, &e).unwrap_or_default();
++        Ok(PickCtx { features, tris, loc })
++    }
++
++    pub(super) fn point(&self, v: u32) -> Option<Point3> {
++        let p = self.features.verts.get(v as usize)?;
++        let w = transform_point(Point3::new(p[0], p[1], p[2]), self.loc.pos, self.loc.rot);
++        w.is_finite().then_some(w)
++    }
++
++    pub(super) fn world(&self, p: [f64; 3]) -> Point3 {
++        transform_point(Point3::new(p[0], p[1], p[2]), self.loc.pos, self.loc.rot)
++    }
++
++    /// The face's outward unit normal in world, from its facets' winding
++    /// (the stored plane normal is winding-blind); `None` when the
++    /// facets cancel or carry no area.
++    pub(super) fn outward(&self, face: usize) -> Option<Point3> {
++        let f = self.features.faces.get(face)?;
++        let mut n = Point3::new(0.0, 0.0, 0.0);
++        for &i in &f.facets {
++            let Some(t) = self.tris.get(i as usize) else { continue };
++            let c = (t.b - t.a).cross(t.c - t.a);
++            if c.is_finite() {
++                n = Point3::new(n.x + c.x, n.y + c.y, n.z + c.z);
++            }
++        }
++        let w = quat_rotate_point(self.loc.rot, n);
++        let len = w.dot(w).sqrt();
++        (len.is_finite() && len > 1e-12).then(|| Point3::new(w.x / len, w.y / len, w.z / len))
++    }
++
++    /// The face's area centroid in world.
++    pub(super) fn centroid(&self, face: usize) -> Option<Point3> {
++        let f = self.features.faces.get(face)?;
++        let c = crate::pick::facets_centroid(&self.tris, f.facets.iter().map(|&i| i as usize))?;
++        Some(self.world(c))
++    }
++
++    /// The distinct faces (indices into `features.faces`) bounding the
++    /// given feature edges.
++    pub(super) fn faces_of_edges(&self, edges: impl IntoIterator<Item = u32>) -> Vec<usize> {
++        let mut out: Vec<usize> = Vec::new();
++        for ei in edges {
++            let Some(e) = self.features.edges.get(ei as usize) else { continue };
++            for &t in e.facets.iter().take(e.n_facets.min(3) as usize) {
++                if let Some(&fi) = self.features.facet_face.get(t as usize)
++                    && !out.contains(&(fi as usize))
++                {
++                    out.push(fi as usize);
++                }
++            }
++        }
++        out
++    }
++}
++
++/// Which axis a unit normal stands along, within the tolerance: 0, 1
++/// or 2 for X, Y, Z, and its sign.
++pub(super) fn axis_of(n: Point3) -> Option<(usize, f64)> {
++    let cos = PROBE_AXIS_TOL_DEG.to_radians().cos();
++    [n.x, n.y, n.z]
++        .into_iter()
++        .enumerate()
++        .find(|(_, c)| c.abs() >= cos)
++        .map(|(k, c)| (k, c.signum()))
++}
++
++/// The touch that travels AGAINST an outward normal: `None` for a face
++/// looking down (the stylus only descends) or off every axis.
++fn against(n: Point3) -> Option<ProbeDir> {
++    match axis_of(n)? {
++        (0, s) => Some(if s > 0.0 { ProbeDir::XNeg } else { ProbeDir::XPos }),
++        (1, s) => Some(if s > 0.0 { ProbeDir::YNeg } else { ProbeDir::YPos }),
++        (2, s) if s > 0.0 => Some(ProbeDir::ZNeg),
++        _ => None,
++    }
++}
++
++fn off_axis(n: Point3) -> String {
++    let worst = n.x.abs().max(n.y.abs()).max(n.z.abs()).clamp(-1.0, 1.0);
++    format!("{:.1} deg", worst.acos().to_degrees())
++}
++
++/// The seed one pick makes, or the named reason it cannot make one.
++pub fn probe_seed(world: &World, sel: &GeoSel) -> Result<ProbeSeed, String> {
++    let cx = PickCtx::of(world, &sel.entity)?;
++    match sel.feature {
++        FeatureSel::Face(id) => face_seed(&cx, id),
++        FeatureSel::Chain(id) => {
++            let chain = feature::resolve_chain(&cx.features, id)
++                .ok_or("the picked edge is no longer in the model - re-pick it")?;
++            if chain.closed {
++                super::probe_pick_round::rim_seed(&cx, &chain)
++            } else {
++                edge_seed(&cx, &chain)
++            }
++        }
++        FeatureSel::Patch(id) => super::probe_pick_round::wall_seed(&cx, id),
++        FeatureSel::Vertex(id) => corner_seed(&cx, id),
++    }
++}
++
++fn face_seed(cx: &PickCtx, id: u64) -> Result<ProbeSeed, String> {
++    let gone = "the picked face is no longer in the model - re-pick it";
++    let fi = cx.features.faces.iter().position(|f| f.id == id).ok_or(gone)?;
++    let f = cx.features.faces.get(fi).ok_or(gone)?;
++    if f.kind != FaceKind::Planar {
++        return Err("the picked face is not planar - a face touch needs a flat face".into());
++    }
++    let n = cx.outward(fi).ok_or("the picked face has no area to touch")?;
++    let dir = match against(n) {
++        Some(d) => d,
++        None if axis_of(n) == Some((2, -1.0)) => {
++            return Err("the picked face looks down - the stylus only descends in Z; probe it from a side".into());
++        }
++        None => {
++            return Err(format!(
++                "the picked face stands {} off X, Y and Z - a probe touches along an axis",
++                off_axis(n)
++            ));
++        }
++    };
++    let target = on_face(cx, fi).ok_or("the picked face has no area to touch")?;
++    Ok(ProbeSeed { mode: ProbeMode::Face, dir, dir_y: ProbeDir::YPos, target: [target.x, target.y, target.z], radius: None })
++}
++
++/// A point ON the face to touch: its area centroid when that lands on
++/// one of its facets, else the nearest facet's own centroid (a face
++/// round a hole has its centroid in the hole - air, not the face). The
++/// pick names a feature, not a click point, so this stands for it.
++fn on_face(cx: &PickCtx, fi: usize) -> Option<Point3> {
++    let f = cx.features.faces.get(fi)?;
++    let c = cx.centroid(fi)?;
++    let mut best: Option<(f64, Point3)> = None;
++    for &i in &f.facets {
++        let Some(t) = cx.tris.get(i as usize) else { continue };
++        let (a, b, d) = (cx.world([t.a.x, t.a.y, t.a.z]), cx.world([t.b.x, t.b.y, t.b.z]), cx.world([t.c.x, t.c.y, t.c.z]));
++        if inside(c, a, b, d) {
++            return Some(c);
++        }
++        let m = Point3::new((a.x + b.x + d.x) / 3.0, (a.y + b.y + d.y) / 3.0, (a.z + b.z + d.z) / 3.0);
++        let dist = (m - c).dot(m - c);
++        if m.is_finite() && best.is_none_or(|(bd, _)| dist < bd) {
++            best = Some((dist, m));
++        }
++    }
++    best.map(|(_, m)| m)
++}
++
++/// Is `p` (in the triangle's plane) inside triangle `abc`?
++fn inside(p: Point3, a: Point3, b: Point3, c: Point3) -> bool {
++    let n = (b - a).cross(c - a);
++    let s = |u: Point3, v: Point3| (v - u).cross(p - u).dot(n);
++    let (x, y, z) = (s(a, b), s(b, c), s(c, a));
++    n.dot(n) > 0.0 && ((x >= 0.0 && y >= 0.0 && z >= 0.0) || (x <= 0.0 && y <= 0.0 && z <= 0.0))
++}
++
++/// The one vertical, axis-facing face among `faces` that hangs below
++/// height `z`: the wall an edge or corner touch lands on.
++fn walls_below(cx: &PickCtx, faces: &[usize], z: f64) -> Vec<(usize, ProbeDir, Point3)> {
++    faces
++        .iter()
++        .filter_map(|&fi| {
++            let n = cx.outward(fi)?;
++            let dir = against(n).filter(|d| d.is_x() || d.is_y())?;
++            let c = cx.centroid(fi)?;
++            (c.z < z - PICK_TOL).then_some((fi, dir, c))
++        })
++        .collect()
++}
++
++fn edge_seed(cx: &PickCtx, chain: &feature::Chain) -> Result<ProbeSeed, String> {
++    let pts: Vec<Point3> = feature::chain_points(&cx.features, chain).iter().map(|p| cx.world(*p)).collect();
++    let (Some(&a), Some(&b)) = (pts.first(), pts.last()) else {
++        return Err("the picked edge has no length".into());
++    };
++    let d = b - a;
++    let len = d.dot(d).sqrt();
++    if !(len.is_finite() && len > PICK_TOL) {
++        return Err("the picked edge has no length".into());
++    }
++    let u = Point3::new(d.x / len, d.y / len, d.z / len);
++    let bend = pts.iter().map(|p| (*p - a).cross(u)).map(|v| v.dot(v).sqrt()).fold(0.0, f64::max);
++    if bend.is_nan() || bend > PICK_TOL {
++        return Err(format!(
++            "the picked edge is not straight (it bends {bend:.3} mm off its chord) - an edge touch needs a straight edge; pick a vertex or a round rim instead"
++        ));
++    }
++    if (b.z - a.z).abs() > PICK_TOL {
++        return Err("the picked edge is not level - an edge touch runs under a horizontal top edge".into());
++    }
++    let walls = walls_below(cx, &cx.faces_of_edges(chain.edges.iter().copied()), a.z);
++    let [(_, dir, _)] = walls.as_slice() else {
++        return Err(format!(
++            "the picked edge has {} vertical side faces facing X or Y under it - an edge touch needs exactly one",
++            walls.len()
++        ));
++    };
++    let m = Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
++    Ok(ProbeSeed { mode: ProbeMode::Edge, dir: *dir, dir_y: ProbeDir::YPos, target: [m.x, m.y, m.z], radius: None })
++}
++
++fn corner_seed(cx: &PickCtx, id: u64) -> Result<ProbeSeed, String> {
++    let vi = feature::resolve_vertex(&cx.features, id)
++        .ok_or("the picked vertex is no longer in the model - re-pick it")?;
++    let v = cx.point(vi).ok_or("the picked vertex is not finite")?;
++    let edges = cx.features.edges.iter().enumerate().filter(|(_, e)| e.a == vi || e.b == vi);
++    let faces = cx.faces_of_edges(edges.map(|(i, _)| i as u32));
++    // Every face meeting the corner is a wall facing X or Y, or level
++    // (the top): a chamfer or a draft there is no outside corner.
++    for &fi in &faces {
++        let n = cx.outward(fi).ok_or("a face at the picked vertex has no area")?;
++        if axis_of(n).is_none() {
++            return Err(format!(
++                "a face at the picked vertex stands {} off the axes - an outside corner takes two vertical walls facing X and Y",
++                off_axis(n)
++            ));
++        }
++    }
++    let walls = walls_below(cx, &faces, v.z);
++    let xs: Vec<_> = walls.iter().filter(|w| w.1.is_x()).collect();
++    let ys: Vec<_> = walls.iter().filter(|w| w.1.is_y()).collect();
++    let ([(_, dx, cxw)], [(_, dy, cyw)]) = (xs.as_slice(), ys.as_slice()) else {
++        return Err(format!(
++            "the picked vertex tops {} wall(s) facing X and {} facing Y - an outside corner takes exactly one of each below it",
++            xs.len(),
++            ys.len()
++        ));
++    };
++    // Outside, not inside: each wall runs away from the vertex the way
++    // the OTHER touch travels (`probing::contacts` insets each touch
++    // along that wall) - an inside corner's walls run the other way.
++    let along_y = (cxw.y - v.y) * dy.unit().y;
++    let along_x = (cyw.x - v.x) * dx.unit().x;
++    if !(along_y > PICK_TOL && along_x > PICK_TOL) {
++        return Err("the picked vertex is an inside corner - the corner probe finds an outside one".into());
++    }
++    Ok(ProbeSeed { mode: ProbeMode::Corner, dir: *dx, dir_y: *dy, target: [v.x, v.y, v.z], radius: None })
++}
++
++/// Write a seed into a Probe op's params; `None` for any other kind.
++/// The numbers the pick does not speak to (feeds, distances, result)
++/// stay the author's.
++#[must_use]
++pub fn seeded_params(params: &OpParams, seed: &ProbeSeed) -> Option<OpParams> {
++    let mut out = params.clone();
++    let OpParams::Probe { mode, dir, dir_y, target, radius, .. } = &mut out else {
++        return None;
++    };
++    *mode = seed.mode;
++    *dir = seed.dir;
++    *dir_y = seed.dir_y;
++    *target = seed.target;
++    if let Some(r) = seed.radius {
++        *radius = r;
++    }
++    Some(out)
++}
++
++/// A Probe op's params re-seeded from its pick list - what the pick
++/// command writes. `None` when `params` is not a probe (every other
++/// kind's picks bound a region instead). One pick only.
++#[must_use]
++pub fn probe_from_picks(world: &World, params: &OpParams, items: &[GeoSel]) -> Option<Result<OpParams, String>> {
++    if !matches!(params, OpParams::Probe { .. }) {
++        return None;
++    }
++    let [sel] = items else {
++        return Some(Err(format!(
++            "a probe is seeded from one pick, not {} - pick one face, edge, vertex or round wall",
++            items.len()
++        )));
++    };
++    Some(probe_seed(world, sel).and_then(|s| seeded_params(params, &s).ok_or_else(|| "not a probe".to_owned())))
++}
++
++/// The op page's account of a probe's pick: the seed it made, or why
++/// it makes none. `None` for other kinds.
++#[must_use]
++pub fn probe_account(world: &World, items: &[GeoSel], params: &OpParams) -> Option<(Vec<String>, Option<String>)> {
++    if !matches!(params, OpParams::Probe { .. }) || items.is_empty() {
++        return None;
++    }
++    Some(match items {
++        [sel] => match probe_seed(world, sel) {
++            Ok(s) => (vec![format!("Probe from the pick: {}", s.describe())], None),
++            Err(e) => (Vec::new(), Some(e)),
++        },
++        _ => (Vec::new(), Some("a probe is seeded from one pick - remove the others".into())),
++    })
++}
+diff --git a/crates/app/src/operation/probe_pick_round.rs b/crates/app/src/operation/probe_pick_round.rs
+new file mode 100644
+index 00000000..3bcf85f4
+--- /dev/null
++++ b/crates/app/src/operation/probe_pick_round.rs
+@@ -0,0 +1,112 @@
++//! The round half of the Probe pick seed (#171): a picked cylindrical
++//! wall (a welded patch) or a closed round rim seeds a Bore or Boss
++//! centre - centre and radius from the circle fit Circular's pick reads
++//! ([`super::circle_of_region`]), at the rim's height. Bore or Boss is
++//! the wall's own winding: an outward normal that points AT the axis is
++//! a hole's wall (the material is outside it), one pointing away is a
++//! boss's. Provenance: touch-probe practice (a bore is touched outward
++//! from its centre, a boss inward from outside); facet-winding normals
++//! from standard mesh geometry. Our own law; no vendor material consulted.
++
++use crate::geo2d::{Loop, Point2, Region};
++use crate::geometry::Point3;
++use crate::geometry::feature::{self, Chain};
++use crate::probing::{ProbeDir, ProbeMode};
++
++use super::probe_pick::{PICK_TOL, PickCtx, ProbeSeed};
++
++/// A wall counts as vertical when its outward normal's Z is within the
++/// probe's axis tolerance of level.
++fn vertical(n: Point3) -> bool {
++    n.z.abs() <= super::probe_pick::PROBE_AXIS_TOL_DEG.to_radians().sin()
++}
++
++/// The circle a level ring of world points stands on: centre, radius
++/// and the ring's height. Refused by name when the ring tilts or the
++/// fit finds no circle.
++fn ring_circle(pts: &[Point3], what: &str) -> Result<(Point2, f64, f64), String> {
++    let (lo, hi) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), p| (l.min(p.z), h.max(p.z)));
++    if !(hi.is_finite() && lo.is_finite()) || hi - lo > PICK_TOL {
++        return Err(format!("the picked {what} is not level - a bore or boss centre is found on a vertical round wall"));
++    }
++    let not_round = || format!("the picked {what} is not a circle - a bore or boss centre needs a round wall");
++    let ring = Loop::new(pts.iter().map(|p| Point2::new(p.x, p.y)).collect()).map_err(|_| not_round())?;
++    let region = Region::new(vec![ring]).map_err(|_| not_round())?;
++    let (c, r) = super::circle_of_region(&region).map_err(|_| not_round())?;
++    Ok((c, r, hi))
++}
++
++/// Bore or Boss from the area-weighted side the walls' outward normals
++/// face, about the centre. Mixed or level-only walls refuse.
++fn side_of(cx: &PickCtx, faces: &[usize], c: Point2, what: &str) -> Result<ProbeMode, String> {
++    let mut lean = 0.0f64;
++    let mut walls = 0usize;
++    for &fi in faces {
++        let (Some(n), Some(m), Some(f)) = (cx.outward(fi), cx.centroid(fi), cx.features.faces.get(fi)) else {
++            continue;
++        };
++        if !vertical(n) {
++            continue;
++        }
++        walls += 1;
++        lean += f.area * (n.x * (m.x - c.x) + n.y * (m.y - c.y)).signum();
++    }
++    if walls == 0 {
++        return Err(format!("the picked {what} has no vertical wall - a bore or boss centre is touched on one"));
++    }
++    if lean < 0.0 {
++        Ok(ProbeMode::Bore)
++    } else if lean > 0.0 {
++        Ok(ProbeMode::Boss)
++    } else {
++        Err(format!("the picked {what} faces neither into a hole nor out of a boss"))
++    }
++}
++
++fn seed(mode: ProbeMode, c: Point2, r: f64, z: f64) -> ProbeSeed {
++    ProbeSeed { mode, dir: ProbeDir::ZNeg, dir_y: ProbeDir::YPos, target: [c.x, c.y, z], radius: Some(r) }
++}
++
++/// A closed rim chain: its circle, and the wall under it decides the side.
++pub(super) fn rim_seed(cx: &PickCtx, chain: &Chain) -> Result<ProbeSeed, String> {
++    let pts: Vec<Point3> = feature::chain_points(&cx.features, chain).iter().map(|p| cx.world(*p)).collect();
++    let (c, r, z) = ring_circle(&pts, "rim")?;
++    let below: Vec<usize> = cx
++        .faces_of_edges(chain.edges.iter().copied())
++        .into_iter()
++        .filter(|&fi| cx.centroid(fi).is_some_and(|m| m.z < z - PICK_TOL))
++        .collect();
++    Ok(seed(side_of(cx, &below, c, "rim")?, c, r, z))
++}
++
++/// A welded round wall: every strip vertical, the top closed ring's
++/// circle at the rim, the strips' winding deciding the side.
++pub(super) fn wall_seed(cx: &PickCtx, id: u64) -> Result<ProbeSeed, String> {
++    let gone = "the picked wall is no longer in the model - re-pick it";
++    let patch = feature::patches(&cx.features).into_iter().find(|p| p.id == id).ok_or(gone)?;
++    let rings = feature::patch_rings(&cx.features, id).ok_or(gone)?;
++    let faces: Vec<usize> = cx
++        .features
++        .faces
++        .iter()
++        .enumerate()
++        .filter(|(_, f)| patch.faces.contains(&f.id))
++        .map(|(i, _)| i)
++        .collect();
++    if faces.iter().any(|&fi| cx.outward(fi).is_none_or(|n| !vertical(n))) {
++        return Err("the picked wall is not vertical (a cone, fillet or tilted wall) - a bore or boss centre is found on a vertical round wall".into());
++    }
++    let mut top: Option<(Point2, f64, f64)> = None;
++    for ring in rings.iter().filter(|r| r.closed) {
++        let pts: Vec<Point3> = ring.verts.iter().filter_map(|&v| cx.point(v)).collect();
++        if pts.len() != ring.verts.len() {
++            return Err("the picked wall's rim is not finite".into());
++        }
++        let fit = ring_circle(&pts, "wall's rim")?;
++        if top.is_none_or(|t| fit.2 > t.2) {
++            top = Some(fit);
++        }
++    }
++    let (c, r, z) = top.ok_or("the picked wall has no closed rim - a bore or boss centre needs a full round wall")?;
++    Ok(seed(side_of(cx, &faces, c, "wall")?, c, r, z))
++}
+diff --git a/crates/app/tests/probe_pick.rs b/crates/app/tests/probe_pick.rs
+new file mode 100644
+index 00000000..5459688d
+--- /dev/null
++++ b/crates/app/tests/probe_pick.rs
+@@ -0,0 +1,371 @@
++//! #171 acceptance: a Probe op seeded from one pick - a planar face
++//! seeds a Face touch against its outward normal, a straight top edge
++//! an Edge touch on the wall under it, a vertex an outside Corner, a
++//! round wall or rim a Bore or Boss centre from the circle fit. The
++//! seed rides the pick command (one undo), and a pick the probe cannot
++//! touch is refused by name with the op untouched.
++//!
++//! Provenance: touch-probe practice from machine-tool handbooks; our
++//! own fixtures (a box, a sloped block, a bored plate, a round boss).
++//!
++//! Gate map (M4.4): covers app::operation (probe_pick, probe_pick_round,
++//! picks::selection_account), app::commands (SetOperationGeometry's
++//! probe seed, CreateOperation from a pick, undo / redo).
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetOperationGeometry, SetStock,
++};
++use camcraft_app::geometry::feature;
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::model;
++use camcraft_app::operation::{
++    self, FeatureSel, GeoSel, Height, HeightReference, OpParams, OpType, ProbeSeed, SrcRef,
++};
++use camcraft_app::probing::{ProbeDir, ProbeMode};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::probe_tool;
++use camcraft_app::world::new_world;
++
++const N: usize = 96;
++
++/// Eight corners, bottom ring then top ring (CCW from above), as an
++/// outward-wound hexahedron.
++fn hexa(c: [Point3; 8]) -> Vec<Triangle> {
++    let quads = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
++    let mut f = Vec::new();
++    for q in quads {
++        f.push(Triangle::new(c[q[0]], c[q[1]], c[q[2]]));
++        f.push(Triangle::new(c[q[0]], c[q[2]], c[q[3]]));
++    }
++    f
++}
++
++/// The 40 x 30 x 10 box at the origin; `drop` lowers its +X top edge.
++fn box_mesh(drop: f64) -> Mesh {
++    let p = Point3::new;
++    Mesh::from_facets(hexa([
++        p(0.0, 0.0, 0.0),
++        p(40.0, 0.0, 0.0),
++        p(40.0, 30.0, 0.0),
++        p(0.0, 30.0, 0.0),
++        p(0.0, 0.0, 10.0),
++        p(40.0, 0.0, 10.0 - drop),
++        p(40.0, 30.0, 10.0 - drop),
++        p(0.0, 30.0, 10.0),
++    ]))
++}
++
++/// A 40 x 40 x 8 plate centred on (0, 0) with a through bore of radius 10.
++fn bored_plate() -> Mesh {
++    let tau = std::f64::consts::TAU;
++    let ang = |i: usize| tau * (i % N) as f64 / N as f64;
++    let bp = |i: usize, z: f64| Point3::new(10.0 * ang(i).cos(), 10.0 * ang(i).sin(), z);
++    let op = |i: usize, z: f64| {
++        let (x, y) = (ang(i).cos(), ang(i).sin());
++        let s = x.abs().max(y.abs());
++        Point3::new(x * 20.0 / s, y * 20.0 / s, z)
++    };
++    let mut f = Vec::new();
++    let mut quad = |a: Point3, b: Point3, c: Point3, d: Point3| {
++        f.push(Triangle::new(a, b, c));
++        f.push(Triangle::new(a, c, d));
++    };
++    for i in 0..N {
++        let j = i + 1;
++        quad(bp(j, 8.0), bp(i, 8.0), op(i, 8.0), op(j, 8.0));
++        quad(bp(i, 8.0), bp(j, 8.0), bp(j, 0.0), bp(i, 0.0));
++        quad(op(j, 8.0), op(i, 8.0), op(i, 0.0), op(j, 0.0));
++        quad(bp(i, 0.0), bp(j, 0.0), op(j, 0.0), op(i, 0.0));
++    }
++    Mesh::from_facets(f)
++}
++
++/// A round boss of radius 8 about (100, 0), Z 0..12, outward-wound.
++fn boss() -> Mesh {
++    let tau = std::f64::consts::TAU;
++    let p = |i: usize, z: f64| {
++        let a = tau * (i % N) as f64 / N as f64;
++        Point3::new(100.0 + 8.0 * a.cos(), 8.0 * a.sin(), z)
++    };
++    let (top, bot) = (Point3::new(100.0, 0.0, 12.0), Point3::new(100.0, 0.0, 0.0));
++    let mut f = Vec::new();
++    for i in 0..N {
++        let j = i + 1;
++        f.push(Triangle::new(top, p(i, 12.0), p(j, 12.0)));
++        f.push(Triangle::new(bot, p(j, 0.0), p(i, 0.0)));
++        f.push(Triangle::new(p(i, 0.0), p(j, 0.0), p(j, 12.0)));
++        f.push(Triangle::new(p(i, 0.0), p(j, 12.0), p(i, 12.0)));
++    }
++    Mesh::from_facets(f)
++}
++
++fn world_with(name: &str, mesh: Mesh) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh(name, mesh));
++    h.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 30.0, dz: 10.0 }, Location::default()).expect("stock"),
++    );
++    h.execute(&world, AddTool::new(&world, "PROBE-4", probe_tool(4.0, 30.0)).expect("tool"));
++    (world, h)
++}
++
++fn probe_params() -> OpParams {
++    OpParams::Probe {
++        clearance_z: Height::of(HeightReference::TopOfStock, 15.0),
++        mode: ProbeMode::Face,
++        dir: ProbeDir::ZNeg,
++        dir_y: ProbeDir::YPos,
++        target: [0.0; 3],
++        radius: 10.0,
++        approach: 5.0,
++        overtravel: 5.0,
++        backoff: 1.0,
++        fast_feed: 300.0,
++        slow_feed: 30.0,
++        depth: 3.0,
++        inset: 5.0,
++        set_wcs: Some(0),
++        tolerance: 0.5,
++    }
++}
++
++fn verts_of(world: &World, entity: &str, facets: &[u32]) -> Vec<[f64; 3]> {
++    let e = model::find_by_name(world, entity).expect("entity");
++    let t = model::facets_of(world, &e).expect("facets");
++    facets
++        .iter()
++        .flat_map(|&i| {
++            let t = t[i as usize];
++            [[t.a.x, t.a.y, t.a.z], [t.b.x, t.b.y, t.b.z], [t.c.x, t.c.y, t.c.z]]
++        })
++        .collect()
++}
++
++/// The face every vertex of which passes `on`.
++fn face(world: &World, entity: &str, on: impl Fn([f64; 3]) -> bool) -> GeoSel {
++    let e = model::find_by_name(world, entity).expect("entity");
++    let f = model::features_of(world, &e).expect("features");
++    let id = f
++        .faces
++        .iter()
++        .find(|fa| verts_of(world, entity, &fa.facets).into_iter().all(&on))
++        .map(|fa| fa.id)
++        .expect("the face");
++    GeoSel { entity: entity.into(), feature: FeatureSel::Face(id) }
++}
++
++/// The chain every point of which passes `on`.
++fn chain(world: &World, entity: &str, on: impl Fn([f64; 3]) -> bool) -> GeoSel {
++    let e = model::find_by_name(world, entity).expect("entity");
++    let f = model::features_of(world, &e).expect("features");
++    let id = feature::chains(&f)
++        .into_iter()
++        .find(|c| feature::chain_points(&f, c).into_iter().all(&on))
++        .map(|c| c.id)
++        .expect("the chain");
++    GeoSel { entity: entity.into(), feature: FeatureSel::Chain(id) }
++}
++
++fn vertex(world: &World, entity: &str, at: [f64; 3]) -> GeoSel {
++    let e = model::find_by_name(world, entity).expect("entity");
++    let f = model::features_of(world, &e).expect("features");
++    let vi = feature::corner_verts(&f).into_iter().find(|&v| f.verts[v as usize] == at).expect("the vertex");
++    GeoSel { entity: entity.into(), feature: FeatureSel::Vertex(feature::vertex_id(&f, vi).expect("id")) }
++}
++
++fn patch(world: &World, entity: &str) -> GeoSel {
++    let e = model::find_by_name(world, entity).expect("entity");
++    let f = model::features_of(world, &e).expect("features");
++    let ps = feature::patches(&f);
++    assert_eq!(ps.len(), 1, "one round wall");
++    GeoSel { entity: entity.into(), feature: FeatureSel::Patch(ps[0].id) }
++}
++
++fn seed(world: &World, sel: &GeoSel) -> ProbeSeed {
++    operation::probe_seed(world, sel).expect("a seed")
++}
++
++fn near(a: [f64; 3], b: [f64; 3], tol: f64) -> bool {
++    a.iter().zip(b).all(|(x, y)| (x - y).abs() < tol)
++}
++
++#[test]
++fn a_planar_face_seeds_a_face_touch_against_its_normal() {
++    let (world, _) = world_with("part", box_mesh(0.0));
++    let top = seed(&world, &face(&world, "part", |v| v[2] == 10.0));
++    assert_eq!((top.mode, top.dir), (ProbeMode::Face, ProbeDir::ZNeg));
++    assert!(near(top.target, [20.0, 15.0, 10.0], 1e-9), "{top:?}");
++    let side = seed(&world, &face(&world, "part", |v| v[0] == 40.0));
++    assert_eq!((side.mode, side.dir), (ProbeMode::Face, ProbeDir::XNeg), "a +X face is touched travelling -X");
++    assert!(near(side.target, [40.0, 15.0, 5.0], 1e-9), "{side:?}");
++    let front = seed(&world, &face(&world, "part", |v| v[1] == 0.0));
++    assert_eq!(front.dir, ProbeDir::YPos, "a -Y face is touched travelling +Y");
++}
++
++#[test]
++fn a_straight_top_edge_seeds_an_edge_touch_on_the_wall_under_it() {
++    let (world, _) = world_with("part", box_mesh(0.0));
++    let s = seed(&world, &chain(&world, "part", |v| v[1] == 0.0 && v[2] == 10.0));
++    assert_eq!((s.mode, s.dir), (ProbeMode::Edge, ProbeDir::YPos));
++    assert!(near(s.target, [20.0, 0.0, 10.0], 1e-9), "the edge's midpoint: {s:?}");
++    let s = seed(&world, &chain(&world, "part", |v| v[0] == 40.0 && v[2] == 10.0));
++    assert_eq!((s.mode, s.dir), (ProbeMode::Edge, ProbeDir::XNeg));
++}
++
++#[test]
++fn a_vertex_seeds_an_outside_corner_from_its_two_walls() {
++    let (world, _) = world_with("part", box_mesh(0.0));
++    let s = seed(&world, &vertex(&world, "part", [0.0, 0.0, 10.0]));
++    assert_eq!((s.mode, s.dir, s.dir_y), (ProbeMode::Corner, ProbeDir::XPos, ProbeDir::YPos));
++    assert_eq!(s.target, [0.0, 0.0, 10.0]);
++    let s = seed(&world, &vertex(&world, "part", [40.0, 30.0, 10.0]));
++    assert_eq!((s.dir, s.dir_y), (ProbeDir::XNeg, ProbeDir::YNeg));
++}
++
++#[test]
++fn a_round_wall_or_rim_seeds_a_bore_or_boss_centre() {
++    let (world, mut h) = world_with("plate", bored_plate());
++    h.execute(&world, ImportModel::from_mesh("boss", boss()));
++    let rim = |v: [f64; 3]| (v[0].hypot(v[1]) - 10.0).abs() < 1e-6 && v[2] == 8.0;
++    for sel in [patch(&world, "plate"), chain(&world, "plate", rim)] {
++        let s = seed(&world, &sel);
++        assert_eq!(s.mode, ProbeMode::Bore, "{sel:?}: the wall faces its axis");
++        assert!(near(s.target, [0.0, 0.0, 8.0], 1e-6), "{s:?}");
++        assert!((s.radius.expect("a radius") - 10.0).abs() < 0.01, "{s:?}");
++    }
++    let top = |v: [f64; 3]| ((v[0] - 100.0).hypot(v[1]) - 8.0).abs() < 1e-6 && v[2] == 12.0;
++    for sel in [patch(&world, "boss"), chain(&world, "boss", top)] {
++        let s = seed(&world, &sel);
++        assert_eq!(s.mode, ProbeMode::Boss, "{sel:?}: the wall faces away from its axis");
++        assert!(near(s.target, [100.0, 0.0, 12.0], 1e-6), "{s:?}");
++        assert!((s.radius.expect("a radius") - 8.0).abs() < 0.01, "{s:?}");
++    }
++}
++
++#[test]
++fn picks_the_probe_cannot_touch_are_refused_by_name() {
++    let (world, _) = world_with("part", box_mesh(0.0));
++    let why = |sel: GeoSel| operation::probe_seed(&world, &sel).expect_err("refused");
++    let w = why(face(&world, "part", |v| v[2] == 0.0));
++    assert!(w.contains("looks down"), "{w}");
++    let w = why(chain(&world, "part", |v| v[0] == 0.0 && v[1] == 0.0));
++    assert!(w.contains("not level"), "a vertical edge: {w}");
++    let w = why(vertex(&world, "part", [0.0, 0.0, 0.0]));
++    assert!(w.contains("0 wall(s) facing X"), "a bottom vertex tops no wall: {w}");
++
++    let (world, _) = world_with("ramp", box_mesh(5.0));
++    let slope = face(&world, "ramp", |v| (v[2] - (10.0 - v[0] / 8.0)).abs() < 1e-9);
++    let w = operation::probe_seed(&world, &slope).expect_err("a sloped face");
++    assert!(w.contains("off X, Y and Z"), "{w}");
++    let w = operation::probe_seed(&world, &vertex(&world, "ramp", [0.0, 0.0, 10.0])).expect_err("a sloped corner");
++    assert!(w.contains("off the axes"), "{w}");
++    let w = operation::probe_seed(&world, &chain(&world, "ramp", |v| v[1] == 0.0 && v[2] > 0.0)).expect_err("a sloped edge");
++    assert!(w.contains("not level"), "{w}");
++}
++
++fn probe_op(world: &World) -> camcraft_app::schema::Operation {
++    let e = model::find_by_name(world, "Probe1").expect("op");
++    model::operation_of(world, &e).expect("operation")
++}
++
++#[test]
++fn the_pick_command_seeds_the_probe_and_one_undo_takes_both_back() {
++    let (world, mut h) = world_with("part", box_mesh(0.0));
++    h.execute(&world, CreateOperation::new(&world, "Probe1", "PROBE-4", SrcRef::Stock, probe_params()).expect("create"));
++    let before = probe_op(&world);
++    let edge = chain(&world, "part", |v| v[1] == 0.0 && v[2] == 10.0);
++    h.execute(&world, SetOperationGeometry::new(&world, "Probe1", vec![edge.clone()]).expect("pick"));
++    let after = probe_op(&world);
++    assert_eq!(after.src, SrcRef::Selection(vec![edge.clone()]));
++    let OpParams::Probe { mode, dir, target, approach, .. } = after.params else { panic!("a probe") };
++    assert_eq!((mode, dir, target), (ProbeMode::Edge, ProbeDir::YPos, [20.0, 0.0, 10.0]));
++    assert!(matches!(before.params, OpParams::Probe { approach: a, .. } if a == approach), "the pick seeds, the numbers stay");
++    // The page's account names the seed.
++    let (notes, refusal) = operation::selection_account(&world, None, &[edge], &after.params);
++    assert_eq!(refusal, None);
++    assert!(notes.iter().any(|n| n.contains("Edge touch toward +Y")), "{notes:?}");
++
++    assert!(h.undo(&world));
++    assert_eq!(probe_op(&world).src, before.src);
++    assert_eq!(probe_op(&world).params, before.params, "one undo restores the typed params too");
++    assert!(h.redo(&world));
++    assert_eq!(probe_op(&world).params, after.params);
++
++    // A pick the probe cannot touch, or two picks, change nothing.
++    let down = face(&world, "part", |v| v[2] == 0.0);
++    let err = SetOperationGeometry::new(&world, "Probe1", vec![down.clone()]).err().expect("refused");
++    assert!(err.to_string().contains("looks down"), "{err}");
++    let top = face(&world, "part", |v| v[2] == 10.0);
++    let err = SetOperationGeometry::new(&world, "Probe1", vec![top.clone(), down.clone()]).err().expect("refused");
++    assert!(err.to_string().contains("one pick"), "{err}");
++    let (_, refusal) = operation::selection_account(&world, None, &[down], &after.params);
++    assert!(refusal.is_some_and(|r| r.contains("looks down")));
++}
++
++#[test]
++fn a_probe_created_from_a_pick_generates_clean() {
++    for (name, mesh, sel_of) in [
++        ("part", box_mesh(0.0), Box::new(|w: &World| face(w, "part", |v| v[2] == 10.0)) as Box<dyn Fn(&World) -> GeoSel>),
++        ("part", box_mesh(0.0), Box::new(|w: &World| vertex(w, "part", [0.0, 0.0, 10.0]))),
++        ("plate", bored_plate(), Box::new(|w: &World| patch(w, "plate"))),
++    ] {
++        let (world, mut h) = world_with(name, mesh);
++        let sel = sel_of(&world);
++        let params = operation::probe_from_picks(&world, &probe_params(), std::slice::from_ref(&sel))
++            .expect("a probe")
++            .expect("seeded");
++        let src = SrcRef::Selection(vec![sel]);
++        h.execute(&world, CreateOperation::new(&world, "Probe1", "PROBE-4", src, params).expect("create"));
++        h.execute(&world, GenerateOperation::new(&world, "Probe1").expect("generate"));
++        let e = model::find_by_name(&world, "Probe1").expect("op");
++        let cache = model::toolpath_of(&world, &e).expect("cached");
++        assert!(!cache.path.moves.is_empty());
++        assert!(cache.warnings.is_empty(), "{name}: a seeded touch is clean: {:?}", cache.warnings);
++        assert!(h.undo(&world) && h.undo(&world), "generate and create undo");
++        assert!(model::find_by_name(&world, "Probe1").is_none());
++    }
++}
++
++#[test]
++fn other_kinds_are_not_seeded() {
++    let (world, _) = world_with("part", box_mesh(0.0));
++    let face_params = operation::retype_params(&probe_params(), OpType::Face as usize);
++    let top = face(&world, "part", |v| v[2] == 10.0);
++    assert!(operation::probe_from_picks(&world, &face_params, std::slice::from_ref(&top)).is_none());
++    assert!(operation::probe_account(&world, &[top], &face_params).is_none());
++}
++
++/// An L-shaped block, Z 0..10: the notch's corner at (10, 10) is inside.
++fn l_block() -> Mesh {
++    let ring = [(0.0, 0.0), (10.0, 0.0), (40.0, 0.0), (40.0, 10.0), (10.0, 10.0), (10.0, 30.0), (0.0, 30.0), (0.0, 10.0)];
++    let p = |(x, y): (f64, f64), z: f64| Point3::new(x, y, z);
++    let mut f = Vec::new();
++    // Caps: three squares sharing every corner (no T-junctions).
++    for [a, b, c, d] in [[0, 1, 4, 7], [1, 2, 3, 4], [7, 4, 5, 6]] {
++        let (a, b, c, d) = (ring[a], ring[b], ring[c], ring[d]);
++        f.push(Triangle::new(p(a, 10.0), p(b, 10.0), p(c, 10.0)));
++        f.push(Triangle::new(p(a, 10.0), p(c, 10.0), p(d, 10.0)));
++        f.push(Triangle::new(p(a, 0.0), p(c, 0.0), p(b, 0.0)));
++        f.push(Triangle::new(p(a, 0.0), p(d, 0.0), p(c, 0.0)));
++    }
++    for i in 0..ring.len() {
++        let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
++        f.push(Triangle::new(p(a, 0.0), p(b, 0.0), p(b, 10.0)));
++        f.push(Triangle::new(p(a, 0.0), p(b, 10.0), p(a, 10.0)));
++    }
++    Mesh::from_facets(f)
++}
++
++#[test]
++fn an_inside_corner_is_refused_and_an_outside_one_on_the_l_seeds() {
++    let (world, _) = world_with("l", l_block());
++    let w = operation::probe_seed(&world, &vertex(&world, "l", [10.0, 10.0, 10.0])).expect_err("inside");
++    assert!(w.contains("inside corner"), "{w}");
++    let s = seed(&world, &vertex(&world, "l", [40.0, 0.0, 10.0]));
++    assert_eq!((s.mode, s.dir, s.dir_y), (ProbeMode::Corner, ProbeDir::XNeg, ProbeDir::YPos));
++}
+diff --git a/docs/decisions/171-probe-from-pick.md b/docs/decisions/171-probe-from-pick.md
+new file mode 100644
+index 00000000..ec1b2449
+--- /dev/null
++++ b/docs/decisions/171-probe-from-pick.md
+@@ -0,0 +1,50 @@
++## #171 - Probe op created from a picked face, edge, vertex or round wall (2026-11-08)
++
++- **Chosen:** the seed rides the existing pick command. On a Probe op,
++  `SetOperationGeometry` reads its one pick through
++  `operation::probe_from_picks` and writes the seeded mode, directions,
++  target (and radius for a round pick) into the op's params in the SAME
++  command - one undo restores both the source and the typed values. A
++  pick the probe cannot touch refuses the command by name; the op stays
++  as it was. Creating straight from a pick is `probe_from_picks` +
++  `CreateOperation` with `SrcRef::Selection([pick])`. The seed is written
++  once, at the command (AGENTS.md: values at command creation); generation
++  still reads only the typed fields, so a hand-tuned target after the pick
++  is kept until the next pick.
++- **Rules:** planar face -> Face, travel against the outward normal
++  (normal from facet winding, since the stored plane normal is
++  winding-blind), within 1 deg of +-X, +-Y or +Z; a downward face refuses
++  (the stylus only descends). Target: the face's area centroid when it
++  lies on a facet, else the nearest facet's centroid (a face round a hole
++  has its centroid in air). Straight level open edge -> Edge on the one
++  vertical X- or Y-facing face hanging below it, target its midpoint.
++  Vertex -> outside Corner: every face there axis-facing, exactly one X
++  wall and one Y wall below the vertex, and each wall must run away from
++  the vertex the way the other touch travels (an inside corner refuses).
++  Closed rim chain or welded round wall (patch) -> Bore or Boss: circle
++  from `circle_of_region` (Circular's fit) on the top level ring, target
++  its centre at rim height. **Bore vs Boss rule:** the area-weighted sign
++  of the vertical walls' outward normals against the radial direction -
++  pointing at the axis is a hole's wall (Bore), pointing away is a boss
++  (Boss); a tilted (cone/fillet) wall refuses.
++- **"The op page shows the picked source":** no new persisted field and
++  no project-format rung. The pick is already the op's persisted
++  `SrcRef::Selection` and the Geometry tab already draws it as a chip; the
++  probe branch of `selection_account` (which the tab prints under the
++  chips) adds "Probe from the pick: <seed>" or the refusal. No UI code
++  changed.
++- **Considered and dropped:** re-reading the pick live at generation like
++  Circular does (the typed fields would then be dead while a pick stood,
++  and the op page would show numbers that are not what runs); a
++  `probe_source` label persisted on the params (a v53 rung for text the
++  selection already carries); a separate "Seed from pick" button (two
++  steps where the pick itself is the intent); a clicked-point target
++  (`GeoSel` names a feature by hash, not a hit point - adding one is a
++  format change).
++- **Not pinned:** an open *curved* edge refuses as "not straight" by the
++  same chord test, but no fixture builds one; wall height vs `depth` is
++  not checked at the pick (a wall shorter than the touch depth is judged
++  by the stylus law at generation).
++- **Cost to change later:** low - the seed is one app module
++  (`operation/probe_pick.rs`, `probe_pick_round.rs`) and a five-line hook
++  in `SetOperationGeometry`.

@@ -1,0 +1,1273 @@
+From b058edcf1f246726770fc6e8cc275328b4fa4eab Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 16:40:05 -0600
+Subject: [PATCH 1/6] fix(ui): stop idle redraw CPU spin
+
+Schedule frames for input, egui animation, imports, and active playback while letting an idle or hidden window wait. Keep one follow-up frame for viewport state changes and stop polling a paused stock worker after its target is shown.
+
+Refs #164
+---
+ RECOMMENDED.md                      |  15 +++
+ crates/app/src/stock_play_worker.rs |  11 +++
+ crates/app/tests/stock_play.rs      |   4 +
+ crates/ui/src/egui_app/shell.rs     | 143 ++++++++++++++++++++++++++--
+ crates/ui/src/state.rs              |   5 +
+ 5 files changed, 168 insertions(+), 10 deletions(-)
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index e5524204..e44a0958 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13273,3 +13273,18 @@ revolved (follow-up material if users hit it with long keyways).
+   them. Dropped: an exact disc-versus-polygon minimum of the lifted
+   surface (needs a lifted-tool / stock-edge distance per wall segment;
+   the ring bound d / 8 plus the chord bulge is stated instead).
++
++## #164: Idle window redraw and high CPU
++
++- The reported project loads and processes through the CLI in under a second.
++  The windowed shell currently uses `ControlFlow::Poll` and requests another
++  redraw unconditionally after each frame, so an open project keeps rebuilding
++  its scene and browser even when the user is idle.
++- Choose event-driven redraw: request a frame for input and queued commands;
++  honor egui's repaint delay for timed UI work; keep a bounded timer while
++  simulation or import progress needs frames. An idle document then waits for
++  an event. This targets the repeated work while preserving live playback.
++- Review added one follow-up frame after input because the shell collects the
++  scene before the UI can change browser eyes or toolpath visibility. Suspend
++  frame timers while the window is occluded, then redraw when it becomes
++  visible again; hidden surfaces have no useful picture to update.
+diff --git a/crates/app/src/stock_play_worker.rs b/crates/app/src/stock_play_worker.rs
+index 6b5177b9..828c8552 100644
+--- a/crates/app/src/stock_play_worker.rs
++++ b/crates/app/src/stock_play_worker.rs
+@@ -174,6 +174,17 @@ impl PlayWorker {
+         Some(self.shown.load(Ordering::Relaxed)).filter(|&a| a != usize::MAX)
+     }
+ 
++    /// Whether the UI should keep polling for a requested or published frame.
++    /// A paused playhead at its displayed target needs no redraw timer.
++    #[must_use]
++    pub fn needs_poll(&self) -> bool {
++        let target = lock(&self.shared.req).map(|g| g.target.min(self.index.total()));
++        if target.is_none() || self.shown_at() != target {
++            return true;
++        }
++        lock(&self.shared.out).is_none_or(|g| g.latest.is_some())
++    }
++
+     /// Publications so far.
+     #[must_use]
+     pub fn published(&self) -> u64 {
+diff --git a/crates/app/tests/stock_play.rs b/crates/app/tests/stock_play.rs
+index 4c34258f..c9507b06 100644
+--- a/crates/app/tests/stock_play.rs
++++ b/crates/app/tests/stock_play.rs
+@@ -158,10 +158,12 @@ fn frames_until(w: &PlayWorker, k: usize) -> Vec<PlayFrame> {
+ fn the_worker_publishes_a_model_that_follows_the_cutter() {
+     let world = faced_doc();
+     let w = PlayWorker::spawn(PlaySeed::gather(&world, false, COARSE).expect("seed")).expect("worker");
++    assert!(w.needs_poll(), "the first picture is still pending");
+     let total = w.index().total();
+     assert!(total > 4, "rows to play: {total}");
+     let first = frames_until(&w, 0);
+     assert_eq!(first.last().map(|f| f.at), Some(0), "the uncut stock is published first");
++    assert!(!w.needs_poll(), "a paused playhead at its displayed target is idle");
+     let uncut = frame(&first[0].view.stock);
+     // The playhead advances in steps; each published picture is cut by
+     // no fewer moves than the one before, and the end is the end.
+@@ -170,8 +172,10 @@ fn the_worker_publishes_a_model_that_follows_the_cutter() {
+     let mut changed = 0;
+     for k in [total / 4, total / 2, 3 * total / 4, total] {
+         w.request(k);
++        assert!(w.needs_poll(), "a new playhead target needs frames");
+         let fr = frames_until(&w, k);
+         assert_eq!(fr.last().map(|f| f.at), Some(k), "the worker reaches the playhead");
++        assert!(!w.needs_poll(), "the landed frame needs no further polling");
+         for f in &fr {
+             assert!(f.at >= *ats.last().unwrap_or(&0), "published views advance monotonically: {ats:?} then {}", f.at);
+             ats.push(f.at);
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index 5445539e..ef71ef26 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -66,7 +66,7 @@ pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>) -> i32 {
+             return 1;
+         }
+     };
+-    event_loop.set_control_flow(ControlFlow::Poll);
++    event_loop.set_control_flow(ControlFlow::Wait);
+     let mut shell = Shell::new(pick, want);
+     let code = match event_loop.run_app(&mut shell) {
+         Ok(()) => shell.exit_code,
+@@ -125,6 +125,12 @@ struct Shell {
+     gpu_want: Option<String>,
+     /// #74: per-frame phase timing; a frame over budget is logged by phase.
+     frame_watch: FrameWatch,
++    /// Next redraw requested by egui or an active background task.
++    next_repaint: Option<std::time::Instant>,
++    /// One extra frame lets input-driven viewport changes reach the scene.
++    followup_redraw: bool,
++    /// A hidden surface has no useful frame timer.
++    occluded: bool,
+     state: State,
+ }
+ 
+@@ -183,6 +189,9 @@ impl Shell {
+             gpu_pick: pick,
+             gpu_want: want,
+             frame_watch: FrameWatch::new(std::time::Instant::now()),
++            next_repaint: None,
++            followup_redraw: false,
++            occluded: false,
+             state,
+         }
+     }
+@@ -285,10 +294,11 @@ impl Shell {
+     }
+ 
+     fn draw(&mut self) {
+-        if self.failed {
++        if self.failed || self.occluded {
+             return;
+         }
+         let now = std::time::Instant::now;
++        let followup_redraw = std::mem::take(&mut self.followup_redraw);
+         self.frame_watch.begin(now());
+         // Commands the panels queued last frame land before the scene is
+         // collected, so this frame draws what the user's click did.
+@@ -321,6 +331,7 @@ impl Shell {
+             scene_digest,
+             exit_requested,
+             frame_watch,
++            next_repaint,
+             state,
+             ..
+         } = self;
+@@ -398,6 +409,18 @@ impl Shell {
+                 left_press,
+             );
+         });
++        let egui_delay = full_output
++            .viewport_output
++            .get(&egui::ViewportId::ROOT)
++            .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
++        let delay = redraw_delay(
++            egui_delay,
++            followup_redraw || !state.pending.is_empty() || state.layout_request.is_some(),
++            state.import_in_progress(),
++            state.sim.is_some_and(|sim| sim.playing),
++            state.field_play.as_ref().is_some_and(|play| play.needs_poll()),
++        );
++        *next_repaint = delay.and_then(|d| now().checked_add(d));
+         drain_textures(renderer, device, queue, &mut full_output);
+         winit_state.handle_platform_output(window, full_output.platform_output);
+ 
+@@ -412,10 +435,19 @@ impl Shell {
+             wgpu::CurrentSurfaceTexture::Success(st)
+             | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
+             wgpu::CurrentSurfaceTexture::Timeout
+-            | wgpu::CurrentSurfaceTexture::Occluded
+-            | wgpu::CurrentSurfaceTexture::Validation => return,
++            | wgpu::CurrentSurfaceTexture::Validation => {
++                *next_repaint = now().checked_add(std::time::Duration::from_millis(16));
++                return;
++            }
++            wgpu::CurrentSurfaceTexture::Occluded => {
++                // Some platforms report this through wgpu without sending
++                // WindowEvent::Occluded. Wait for the next window event.
++                *next_repaint = None;
++                return;
++            }
+             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                 surface.configure(device, conf);
++                *next_repaint = now().checked_add(std::time::Duration::from_millis(16));
+                 return;
+             }
+         };
+@@ -636,20 +668,44 @@ impl winit::application::ApplicationHandler for Shell {
+     fn resumed(&mut self, el: &ActiveEventLoop) {
+         if self.window.is_none() && !self.failed {
+             self.init_gpu(el);
++            if let Some(window) = &self.window {
++                window.request_redraw();
++            }
+         }
+     }
+ 
+     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
++        if let WindowEvent::Occluded(occluded) = &event {
++            self.occluded = *occluded;
++        }
+         // Feed egui first (pointer/keyboard/text/scale), like the imgui
+         // shell's platform.prepare_frame; the EventResponse (child-viewport
+         // control flow) is inert for our single root viewport.
+-        if let (Some(winit_state), Some(window)) = (self.winit_state.as_mut(), self.window.as_ref())
++        let repaint = match (self.winit_state.as_mut(), self.window.as_ref()) {
++            (Some(winit_state), Some(window)) => winit_state.on_window_event(window, &event).repaint,
++            _ => false,
++        };
++        if repaint && !self.occluded && !matches!(event, WindowEvent::RedrawRequested)
++            && let Some(window) = &self.window
+         {
+-            let _response = winit_state.on_window_event(window, &event);
++            self.followup_redraw = true;
++            window.request_redraw();
+         }
+         match &event {
+             WindowEvent::CloseRequested => el.exit(),
+-            WindowEvent::Resized(size) => self.on_resize(*size),
++            WindowEvent::Resized(size) => {
++                self.on_resize(*size);
++                if let Some(window) = &self.window && !self.occluded {
++                    self.followup_redraw = true;
++                    window.request_redraw();
++                }
++            }
++            WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
++                if let Some(window) = &self.window && !self.occluded {
++                    self.followup_redraw = true;
++                    window.request_redraw();
++                }
++            }
+             WindowEvent::RedrawRequested => {
+                 self.draw();
+                 if self.exit_requested {
+@@ -660,13 +716,80 @@ impl winit::application::ApplicationHandler for Shell {
+         }
+     }
+ 
+-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+-        if let Some(window) = self.window.as_ref() {
+-            window.request_redraw();
++    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
++        if self.occluded {
++            el.set_control_flow(ControlFlow::Wait);
++            return;
++        }
++        match (self.next_repaint, self.window.as_ref()) {
++            (Some(deadline), Some(window)) if deadline <= std::time::Instant::now() => {
++                self.next_repaint = None;
++                window.request_redraw();
++                el.set_control_flow(ControlFlow::Wait);
++            }
++            (Some(deadline), Some(_)) => el.set_control_flow(ControlFlow::WaitUntil(deadline)),
++            _ => el.set_control_flow(ControlFlow::Wait),
+         }
+     }
+ }
+ 
++/// Idle documents need no redraw. Active egui animation, queued commands,
++/// imports and simulation each name the next useful frame.
++fn redraw_delay(
++    egui_delay: std::time::Duration,
++    pending: bool,
++    importing: bool,
++    sim_playing: bool,
++    field_play_pending: bool,
++) -> Option<std::time::Duration> {
++    use std::time::Duration;
++    let mut delay = egui_delay;
++    if pending {
++        delay = Duration::ZERO;
++    }
++    if importing || field_play_pending {
++        delay = delay.min(Duration::from_millis(50));
++    }
++    if sim_playing {
++        delay = delay.min(Duration::from_millis(16));
++    }
++    (delay != Duration::MAX).then_some(delay)
++}
++
++#[cfg(test)]
++mod redraw_tests {
++    use super::redraw_delay;
++    use std::time::Duration;
++
++    #[test]
++    fn idle_document_needs_no_frame_timer() {
++        assert_eq!(
++            redraw_delay(Duration::MAX, false, false, false, false),
++            None
++        );
++    }
++
++    #[test]
++    fn queued_and_live_work_keep_the_window_moving() {
++        assert_eq!(
++            redraw_delay(Duration::MAX, true, false, false, false),
++            Some(Duration::ZERO)
++        );
++        assert_eq!(
++            redraw_delay(Duration::MAX, false, true, false, false),
++            Some(Duration::from_millis(50))
++        );
++        assert_eq!(
++            redraw_delay(Duration::MAX, false, false, true, false),
++            Some(Duration::from_millis(16))
++        );
++        assert_eq!(
++            redraw_delay(Duration::from_millis(10), false, true, false, false),
++            Some(Duration::from_millis(10))
++        );
++    }
++}
++
+ impl Shell {
+     fn shutdown(&mut self) {
+         // Surface/renderer first, window last (see the field-order note);
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index a65c4c24..efdc25c7 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -3102,6 +3102,11 @@ impl State {
+         }
+     }
+ 
++    /// The shell polls a running import on a timer while otherwise idle.
++    pub(crate) fn import_in_progress(&self) -> bool {
++        self.import_rx.is_some() || !self.import_queue.is_empty()
++    }
++
+     /// Drop any live/queued imports because the document is being replaced.
+     /// A worker still running finishes in the background and discards itself.
+     fn abandon_imports(&mut self) {
+
+From 2e52fec56fb973dc20835204dba76b96cf625895 Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 18:08:48 -0600
+Subject: [PATCH 2/6] fix(ui): keep window resizing responsive
+
+---
+ crates/ui/src/egui_app/shell.rs | 61 ++++++++++++++++++++++++++++-----
+ 1 file changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index ef71ef26..c24ad3df 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -131,6 +131,10 @@ struct Shell {
+     followup_redraw: bool,
+     /// A hidden surface has no useful frame timer.
+     occluded: bool,
++    /// Resize events can arrive faster than a GPU frame. Configure only for
++    /// the newest size when the next resize frame is due.
++    pending_resize: Option<PhysicalSize<u32>>,
++    last_resize_frame: Option<std::time::Instant>,
+     state: State,
+ }
+ 
+@@ -192,6 +196,8 @@ impl Shell {
+             next_repaint: None,
+             followup_redraw: false,
+             occluded: false,
++            pending_resize: None,
++            last_resize_frame: None,
+             state,
+         }
+     }
+@@ -290,7 +296,12 @@ impl Shell {
+         }
+         config.width = w;
+         config.height = h;
++        let started = std::time::Instant::now();
+         surface.configure(device, config);
++        let elapsed = started.elapsed();
++        if elapsed > super::frame_watch::BUDGET {
++            eprintln!("gpu: slow resize configure {} ms", elapsed.as_millis());
++        }
+     }
+ 
+     fn draw(&mut self) {
+@@ -310,6 +321,7 @@ impl Shell {
+             }
+             self.window_title = title;
+         }
++        self.frame_watch.mark("commands", now());
+         let scene = world::collect(&self.state);
+ 
+         let Self {
+@@ -335,7 +347,7 @@ impl Shell {
+             state,
+             ..
+         } = self;
+-        frame_watch.mark("commands+scene", now());
++        frame_watch.mark("scene", now());
+         let (
+             Some(window),
+             Some(device),
+@@ -685,7 +697,8 @@ impl winit::application::ApplicationHandler for Shell {
+             (Some(winit_state), Some(window)) => winit_state.on_window_event(window, &event).repaint,
+             _ => false,
+         };
+-        if repaint && !self.occluded && !matches!(event, WindowEvent::RedrawRequested)
++        if repaint && !self.occluded
++            && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_))
+             && let Some(window) = &self.window
+         {
+             self.followup_redraw = true;
+@@ -694,11 +707,7 @@ impl winit::application::ApplicationHandler for Shell {
+         match &event {
+             WindowEvent::CloseRequested => el.exit(),
+             WindowEvent::Resized(size) => {
+-                self.on_resize(*size);
+-                if let Some(window) = &self.window && !self.occluded {
+-                    self.followup_redraw = true;
+-                    window.request_redraw();
+-                }
++                self.pending_resize = Some(*size);
+             }
+             WindowEvent::Occluded(false) | WindowEvent::Focused(true) => {
+                 if let Some(window) = &self.window && !self.occluded {
+@@ -707,7 +716,32 @@ impl winit::application::ApplicationHandler for Shell {
+                 }
+             }
+             WindowEvent::RedrawRequested => {
++                let resized = if let Some(size) = self.pending_resize {
++                    let deadline = resize_frame_deadline(self.last_resize_frame);
++                    if std::time::Instant::now() < deadline {
++                        return;
++                    }
++                    self.pending_resize = None;
++                    self.on_resize(size);
++                    self.followup_redraw = true;
++                    true
++                } else {
++                    false
++                };
+                 self.draw();
++                if resized {
++                    let done = std::time::Instant::now();
++                    self.last_resize_frame = Some(done);
++                    // The layout's View3D size lands on a follow-up frame.
++                    // Keep that frame from immediately blocking the next
++                    // batch of pointer and resize events.
++                    if let (Some(next), Some(earliest)) = (
++                        self.next_repaint.as_mut(),
++                        done.checked_add(std::time::Duration::from_millis(16)),
++                    ) {
++                        *next = (*next).max(earliest);
++                    }
++                }
+                 if self.exit_requested {
+                     el.exit();
+                 }
+@@ -721,7 +755,11 @@ impl winit::application::ApplicationHandler for Shell {
+             el.set_control_flow(ControlFlow::Wait);
+             return;
+         }
+-        match (self.next_repaint, self.window.as_ref()) {
++        let resize_due = self.pending_resize.map(|_| resize_frame_deadline(self.last_resize_frame));
++        // A pending resize carries the repaint too. Its frame deadline
++        // supersedes older egui timers, including an immediate follow-up.
++        let next = resize_due.or(self.next_repaint);
++        match (next, self.window.as_ref()) {
+             (Some(deadline), Some(window)) if deadline <= std::time::Instant::now() => {
+                 self.next_repaint = None;
+                 window.request_redraw();
+@@ -733,6 +771,13 @@ impl winit::application::ApplicationHandler for Shell {
+     }
+ }
+ 
++/// A resize frame is enough to update the window promptly without making
++/// GPU reconfiguration and rendering block every pointer event in the drag.
++fn resize_frame_deadline(last: Option<std::time::Instant>) -> std::time::Instant {
++    last.and_then(|t| t.checked_add(std::time::Duration::from_millis(16)))
++        .unwrap_or_else(std::time::Instant::now)
++}
++
+ /// Idle documents need no redraw. Active egui animation, queued commands,
+ /// imports and simulation each name the next useful frame.
+ fn redraw_delay(
+
+From ff0e2aee81e1aabb4a2b77fc822adbd2a2c45130 Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 18:20:53 -0600
+Subject: [PATCH 3/6] fix(app): keep stock aligned with moved parts
+
+---
+ RECOMMENDED.md                        | 13 ++++++
+ crates/app/src/commands/move_model.rs | 52 ++++++++++++++++++---
+ crates/app/tests/commands_undo.rs     | 65 +++++++++++++++++++++++++++
+ 3 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index e44a0958..d64cae16 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13288,3 +13288,16 @@ revolved (follow-up material if users hit it with long keyways).
+   scene before the UI can change browser eyes or toolpath visibility. Suspend
+   frame timers while the window is occluded, then redraw when it becomes
+   visible again; hidden surfaces have no useful picture to update.
++
++## Model placement and existing stock
++
++- Carry existing stock by the same rigid transform when its source is the
++  moved model, or when the document has only one non-fixture part. This
++  preserves the stock's position and orientation relative to the part, and
++  keeps the model and stock placement change in one undo step.
++- In a document with several parts, leave box and cylinder stock in place:
++  a fitted stock can cover more than one part and has no stored source link.
++  A from-model stock has that link and follows its named source.
++- Dropped: refitting stock to the new world-axis bounding box on every model
++  move. A refit would discard the stock orientation and placement the user
++  already chose.
+diff --git a/crates/app/src/commands/move_model.rs b/crates/app/src/commands/move_model.rs
+index 5d6400e0..4a6e0cc2 100644
+--- a/crates/app/src/commands/move_model.rs
++++ b/crates/app/src/commands/move_model.rs
+@@ -16,12 +16,10 @@
+ //!   chokepoint as every pose write (`check_location`, shared from the
+ //!   fixture module so there is one law): a finite position and a
+ //!   quaternion that normalizes, or the command never enters history.
+-//! - **The model's own `Location` is the single truth.** Everything
+-//!   downstream - facet transforms, the stock solid, the staleness
+-//!   digest that hashes this entity's `SrcRef::Entity` - already reads
+-//!   or hashes it, so moving a part marks its operations Stale with no
+-//!   cascade write here. The command writes one component, like
+-//!   `MoveFixture`.
++//! - **The model's `Location` is the single truth for its geometry.**
++//!   The same rigid placement change carries stock made from that model,
++//!   or the stock of a document with one part. Existing operation stamps
++//!   read the changed placements and become stale.
+ //! - **Pages own their verbs.** A fixture is placed on the Fixtures
+ //!   page (`MoveFixture`), a work offset on the Work Offsets page
+ //!   (`SetWcsOrigin`), and the machine table is derived prose - all
+@@ -35,8 +33,10 @@ use flecs_ecs::prelude::World;
+ use crate::commands::fixture::check_location;
+ use crate::commands::{Command, CommandError};
+ use crate::fixture::MACHINE_TABLE;
++use crate::geometry::{quat_conjugate, quat_mul, transform_inverse_point, transform_point};
+ use crate::model;
+ use crate::schema::Location;
++use crate::stock::StockShape;
+ 
+ /// Place a model: the same rigid transform any page sets, applied to
+ /// the named part. Construction snapshots the previous `Location` for
+@@ -45,6 +45,7 @@ pub struct MoveModel {
+     name: String,
+     prev: Location,
+     next: Location,
++    stock: Vec<(String, Location, Location)>,
+ }
+ 
+ impl MoveModel {
+@@ -68,10 +69,39 @@ impl MoveModel {
+         }
+         let next = check_location(location, &format!("'{name}'"))?;
+         let prev = model::transform_of(world, &entity).unwrap_or_default();
++        let single_part = model::model_entities(world)
++            .iter()
++            .filter(|(_, entity)| !model::is_fixture(world, entity))
++            .count()
++            == 1;
++        let stock = model::named_entities(world)
++            .into_iter()
++            .filter_map(|(stock_name, entity)| {
++                let shape = model::stock_def_of(world, &entity)?;
++                let follows = match shape {
++                    StockShape::FromModel { source } => source == name,
++                    _ => single_part,
++                };
++                follows.then(|| {
++                    let before = model::transform_of(world, &entity).unwrap_or_default();
++                    let local = transform_inverse_point(before.pos, prev.pos, prev.rot);
++                    let after = Location {
++                        pos: transform_point(local, next.pos, next.rot),
++                        rot: quat_mul(quat_mul(next.rot, quat_conjugate(prev.rot)), before.rot),
++                    };
++                    (stock_name, before, after)
++                })
++            })
++            .map(|(stock_name, before, after)| {
++                check_location(after, &format!("stock '{stock_name}'"))
++                    .map(|after| (stock_name, before, after))
++            })
++            .collect::<Result<Vec<_>, _>>()?;
+         Ok(MoveModel {
+             name: name.to_string(),
+             prev,
+             next,
++            stock,
+         })
+     }
+ }
+@@ -81,11 +111,21 @@ impl Command for MoveModel {
+         if let Some(entity) = model::find_by_name(world, &self.name) {
+             model::set_transform(world, &entity, self.next);
+         }
++        for (name, _, next) in &self.stock {
++            if let Some(entity) = model::find_by_name(world, name) {
++                model::set_transform(world, &entity, *next);
++            }
++        }
+     }
+ 
+     fn invert(&self, world: &World) {
+         if let Some(entity) = model::find_by_name(world, &self.name) {
+             model::set_transform(world, &entity, self.prev);
+         }
++        for (name, prev, _) in &self.stock {
++            if let Some(entity) = model::find_by_name(world, name) {
++                model::set_transform(world, &entity, *prev);
++            }
++        }
+     }
+ }
+diff --git a/crates/app/tests/commands_undo.rs b/crates/app/tests/commands_undo.rs
+index f8ff1c61..c7a746ab 100644
+--- a/crates/app/tests/commands_undo.rs
++++ b/crates/app/tests/commands_undo.rs
+@@ -786,6 +786,71 @@ fn move_model_rotation_roundtrips_exact_and_the_stamp_follows() {
+     assert_eq!([again.pos.x, again.rot[0]], [20.0, at.rot[0]], "redo replays bytes");
+ }
+ 
++#[test]
++fn moving_one_part_carries_existing_stock_and_undo_restores_both() {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(&world, ImportModel::from_mesh("part", cube_mesh()));
++    let stock_before = Location {
++        pos: Point3::new(2.0, 0.0, 0.0),
++        ..Location::default()
++    };
++    history.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 4.0, dy: 4.0, dz: 2.0 }, stock_before)
++            .expect("stock"),
++    );
++    let part_after = Location {
++        pos: Point3::new(10.0, 0.0, 0.0),
++        rot: quat_from_euler(0.0, 0.0, FRAC_PI_2),
++    };
++    history.execute(&world, MoveModel::new(&world, "part", part_after).expect("move"));
++    let stock = model::find_by_name(&world, STOCK_NAME).expect("stock remains");
++    let moved = model::transform_of(&world, &stock).expect("placement");
++    assert!((moved.pos.x - 10.0).abs() < 1e-12);
++    assert!((moved.pos.y - 2.0).abs() < 1e-12);
++    for (actual, expected) in moved.rot.iter().zip(part_after.rot) {
++        assert!((*actual - expected).abs() < 1e-12);
++    }
++
++    assert!(history.undo(&world));
++    assert_eq!(model::transform_of(&world, &stock), Some(stock_before));
++    assert!(history.redo(&world));
++    assert_eq!(model::transform_of(&world, &stock), Some(moved));
++}
++
++#[test]
++fn moving_one_of_two_parts_only_carries_stock_copied_from_it() {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(&world, ImportModel::from_mesh("part", cube_mesh()));
++    history.execute(&world, ImportModel::from_mesh("other", cube_mesh()));
++    history.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 4.0, dy: 4.0, dz: 2.0 }, Location::default())
++            .expect("stock"),
++    );
++    let moved = Location { pos: Point3::new(3.0, 0.0, 0.0), ..Location::default() };
++    history.execute(&world, MoveModel::new(&world, "part", moved).expect("move"));
++    let stock = model::find_by_name(&world, STOCK_NAME).expect("stock");
++    assert_eq!(model::transform_of(&world, &stock), Some(Location::default()));
++
++    history.execute(
++        &world,
++        SetStock::new(
++            &world,
++            StockShape::FromModel { source: "part".into() },
++            Location::default(),
++        )
++        .expect("stock copied from part"),
++    );
++    history.execute(
++        &world,
++        MoveModel::new(&world, "part", Location::default()).expect("move back"),
++    );
++    assert_eq!(model::transform_of(&world, &stock), Some(Location::default()));
++}
++
+ #[test]
+ fn a_moved_part_marks_generated_ops_stale_and_undo_clears_it() {
+     let (world, mut history, _top) = selection_fixture();
+
+From 2e77da656b3476c25d3838b6f36bf23eab0b3301 Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 18:49:31 -0600
+Subject: [PATCH 4/6] fix(app): keep rotated geometry picks responsive
+
+---
+ RECOMMENDED.md                        | 22 +++++++
+ crates/app/src/operation/picks.rs     | 19 ++++---
+ crates/app/src/operation/selection.rs | 26 ++++++---
+ crates/app/src/operation/stitch.rs    | 82 +++++++++++++++++++++++----
+ crates/app/tests/pick_doors.rs        | 45 ++++++++++++++-
+ crates/geometry/src/geo2d.rs          |  2 +-
+ crates/geometry/src/geometry/slice.rs | 69 +++++++++++++++++++++-
+ crates/geometry/tests/slice.rs        | 17 ++++++
+ 8 files changed, 249 insertions(+), 33 deletions(-)
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index d64cae16..ed3aeb67 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13301,3 +13301,25 @@ revolved (follow-up material if users hit it with long keyways).
+ - Dropped: refitting stock to the new world-axis bounding box on every model
+   move. A refit would discard the stock orientation and placement the user
+   already chose.
++
++## Facing pick on a rotated part
++
++- A picked face already gives the facing boundary. Only open chains and
++  chain-only selections need whole-model and stock silhouettes, so skip
++  their sixteen-section projections for face-only picks. A steep face is
++  refused at the pick with the existing horizontal-face guidance.
++- Canonicalize face boundary rings in linear time with minimum-rotation
++  scans in both directions. The previous comparison rebuilt every rotated
++  copy of the ring, quadratic work repeated by the Geometry panel.
++- Dropped: a UI-only cache of the selection account. It would hide the
++  repeated work but leave the same expensive path in command validation
++  and generation.
++- Follow-up from the edge-pick hand test: a Face operation can use an open
++  chain, so its panel and viewport legitimately need the model and stock
++  silhouettes. Cache the exact input/output of the shared sixteen-section
++  projection for meshes up to 50,000 facets. Exact facet comparison avoids
++  a digest collision becoming a wrong machining preview; a four-entry
++  bound keeps the memory cost finite. Larger meshes use the original path.
++- `CAMCRAFT_PROFILE_PROJECTION=1` reports projection cache misses with
++  elapsed time and occasional hit counts. It is opt-in so a normal window
++  does not spend time printing diagnostics on every read.
+diff --git a/crates/app/src/operation/picks.rs b/crates/app/src/operation/picks.rs
+index 044471fd..ad31979b 100644
+--- a/crates/app/src/operation/picks.rs
++++ b/crates/app/src/operation/picks.rs
+@@ -76,13 +76,11 @@ pub fn selection_account(
+     }
+ }
+ 
+-/// The pocket family's flat-area refusal, decided at the doors (pick,
+-/// links edit, creation) instead of only at Generate: a pocket, adaptive
+-/// or offset clearing whose picks include a vertical wall's rim or a
+-/// non-horizontal face bounds no area seen from above - that is a wrong
+-/// pick, and the user should hear it when they make it. `None` for any
+-/// other source, kind, or refusal (those stay generation's; an open run
+-/// mid-pick is the normal state of building a chain edge by edge).
++/// The early flat-area refusal, decided at the pick/link/create doors.
++/// Pocket-family selections that project to a line and a Face selection
++/// whose picked face is too steep are refused before a costly generation.
++/// Other errors stay with generation (an open run mid-pick is normal while
++/// building a chain edge by edge).
+ #[must_use]
+ pub fn selection_refusal(
+     world: &World,
+@@ -93,7 +91,9 @@ pub fn selection_refusal(
+     let SrcRef::Selection(items) = src else {
+         return None;
+     };
+-    if !pocket_family(params) || items.is_empty() {
++    let facing_face = matches!(params, OpParams::Face { .. })
++        && items.iter().any(|g| matches!(g.feature, FeatureSel::Face(_)));
++    if !(pocket_family(params) || facing_face) || items.is_empty() {
+         return None;
+     }
+     selection_geometry_impl(world, setup, items, params, None)
+@@ -111,6 +111,9 @@ fn pocket_family(params: &OpParams) -> bool {
+ fn door_refusal(params: &OpParams, err: GenError) -> Option<String> {
+     match err {
+         GenError::Invalid(msg) if pocket_family(params) && msg.contains(LINE_FROM_ABOVE) => Some(msg),
++        GenError::Invalid(msg)
++            if matches!(params, OpParams::Face { .. })
++                && msg.contains("is not horizontal - a facing pass needs a floor") => Some(msg),
+         _ => None,
+     }
+ }
+diff --git a/crates/app/src/operation/selection.rs b/crates/app/src/operation/selection.rs
+index 111125e1..6a76c67e 100644
+--- a/crates/app/src/operation/selection.rs
++++ b/crates/app/src/operation/selection.rs
+@@ -230,16 +230,24 @@ pub(super) fn selection_geometry_in(
+     let mut envelope = None;
+     let mut chain_only = false;
+     if facing {
+-        let material = material_of(world, setup, &SrcRef::Selection(items.to_vec()))?;
+         chain_only = items.iter().all(|g| !matches!(g.feature, FeatureSel::Face(_)));
+-        let sil = silhouette(&material.facets);
+-        let stock_name = crate::setup::stock_entity_name(world, setup);
+-        envelope = model::find_by_name(world, &stock_name)
+-            .and_then(|e| model::world_facets(world, &e))
+-            .and_then(|f| slice::project(&f, FOOTPRINT_SAMPLES).ok())
+-            .filter(|r| !r.is_empty())
+-            .or_else(|| sil.clone());
+-        material_sil = sil;
++        // A picked face supplies its own closed boundary. The material and
++        // stock silhouettes are only needed to extend an open chain or to
++        // decide which side of a chain-only selection is metal. Projecting
++        // both entire solids here made a face click on a rotated part spend
++        // its time in 16 full-mesh sections before it could even check the
++        // face's orientation.
++        if chain_only || items.iter().any(|g| matches!(g.feature, FeatureSel::Chain(_))) {
++            let material = material_of(world, setup, &SrcRef::Selection(items.to_vec()))?;
++            let sil = silhouette(&material.facets);
++            let stock_name = crate::setup::stock_entity_name(world, setup);
++            envelope = model::find_by_name(world, &stock_name)
++                .and_then(|e| model::world_facets(world, &e))
++                .and_then(|f| slice::project(&f, FOOTPRINT_SAMPLES).ok())
++                .filter(|r| !r.is_empty())
++                .or_else(|| sil.clone());
++            material_sil = sil;
++        }
+     }
+     let mut loops: Vec<Loop> = Vec::new();
+     let mut chains: Vec<Vec<Point2>> = Vec::new();
+diff --git a/crates/app/src/operation/stitch.rs b/crates/app/src/operation/stitch.rs
+index 3265648a..a9d9c425 100644
+--- a/crates/app/src/operation/stitch.rs
++++ b/crates/app/src/operation/stitch.rs
+@@ -309,21 +309,79 @@ pub(super) fn canon_ring(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
+     if n == 0 {
+         return Vec::new();
+     }
+-    let mut best: Option<Vec<(i64, i64)>> = None;
+-    // The two directions: forward (step 1) and mirrored (step n - 1,
+-    // i.e. backward). M11.4 A: the old second step was 2, which is no
+-    // mirror at all - a face loop and its edge chain walked the other
+-    // way never deduped (harmless for `Region::new`'s union, but two
+-    // copies of one boundary for every consumer counting loops).
+-    for start in 0..n {
+-        for step in [1usize, n - 1] {
+-            let walk: Vec<(i64, i64)> = (0..n).map(|k| ring[(start + k * step) % n]).collect();
+-            if best.as_ref().is_none_or(|b| walk < *b) {
+-                best = Some(walk);
++    // Booth's minimum-rotation scan is linear. The old walk allocated 2n
++    // whole rings and compared them, quadratic work on every face pick and
++    // every Geometry-panel redraw for a finely tessellated boundary.
++    let forward = minimum_rotation(ring);
++    let reversed: Vec<_> = ring.iter().rev().copied().collect();
++    let backward = minimum_rotation(&reversed);
++    let a: Vec<_> = (0..n).map(|k| ring[(forward + k) % n]).collect();
++    let b: Vec<_> = (0..n).map(|k| reversed[(backward + k) % n]).collect();
++    a.min(b)
++}
++
++fn minimum_rotation(ring: &[(i64, i64)]) -> usize {
++    let n = ring.len();
++    let (mut i, mut j, mut k) = (0, 1, 0);
++    while i < n && j < n && k < n {
++        match ring[(i + k) % n].cmp(&ring[(j + k) % n]) {
++            std::cmp::Ordering::Equal => k += 1,
++            std::cmp::Ordering::Greater => {
++                i += k + 1;
++                if i <= j {
++                    i = j + 1;
++                }
++                k = 0;
++            }
++            std::cmp::Ordering::Less => {
++                j += k + 1;
++                if j <= i {
++                    j = i + 1;
++                }
++                k = 0;
++            }
++        }
++    }
++    i.min(j) % n
++}
++
++#[cfg(test)]
++mod canonical_ring_tests {
++    use super::canon_ring;
++
++    fn reference(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
++        let n = ring.len();
++        if n == 0 {
++            return Vec::new();
++        }
++        let mut best = None;
++        for start in 0..n {
++            for step in [1, n - 1] {
++                let walk: Vec<_> = (0..n).map(|k| ring[(start + k * step) % n]).collect();
++                if best.as_ref().is_none_or(|old| walk < *old) {
++                    best = Some(walk);
++                }
++            }
++        }
++        best.unwrap_or_default()
++    }
++
++    #[test]
++    fn linear_canonical_ring_matches_all_short_rotations_and_mirrors() {
++        assert_eq!(canon_ring(&[]), Vec::new());
++        for len in 1..=7u32 {
++            for mut code in 0..3usize.pow(len) {
++                let ring: Vec<_> = (0..len)
++                    .map(|_| {
++                        let digit = code % 3;
++                        code /= 3;
++                        (digit as i64, 0)
++                    })
++                    .collect();
++                assert_eq!(canon_ring(&ring), reference(&ring), "{ring:?}");
+             }
+         }
+     }
+-    best.unwrap_or_default()
+ }
+ 
+ /// Run one generated path after another. Both start and end on the
+diff --git a/crates/app/tests/pick_doors.rs b/crates/app/tests/pick_doors.rs
+index 492ff611..6f454a8e 100644
+--- a/crates/app/tests/pick_doors.rs
++++ b/crates/app/tests/pick_doors.rs
+@@ -12,10 +12,10 @@ use flecs_ecs::prelude::World;
+ 
+ use camcraft_app::commands::{
+     AddTool, ChangeOperationKind, ClearToolpath, CommandError, CreateOperation, DeleteOperation,
+-    EditOperationLinks, GenerateOperation, History, ImportModel, SetOperationGeometry, SetStock,
++    EditOperationLinks, GenerateOperation, History, ImportModel, MoveModel, SetOperationGeometry, SetStock,
+ };
+ use camcraft_app::geometry::feature::FaceKind;
+-use camcraft_app::geometry::{Point3, cube};
++use camcraft_app::geometry::{Point3, cube, quat_from_euler};
+ use camcraft_app::model;
+ use camcraft_app::operation::{self, FeatureSel, GeoSel, Height, OpParams, OpStatus, SrcRef};
+ use camcraft_app::schema::{Location, Toolpath};
+@@ -87,6 +87,22 @@ fn pocket() -> OpParams {
+     }
+ }
+ 
++fn facing() -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover: 3.0,
++        clearance_z: Height::fixed(15.0),
++        cut_z: Height::fixed(5.0),
++        top_z: None,
++        stepdown: None,
++        feed: 800.0,
++        plunge_feed: 200.0,
++        climb: true,
++        blend_turns: false,
++    }
++}
++
+ fn cache(world: &World, name: &str) -> Option<Toolpath> {
+     model::find_by_name(world, name).and_then(|e| model::toolpath_of(world, &e))
+ }
+@@ -174,6 +190,31 @@ fn a_wall_pick_for_a_pocket_is_refused_at_every_door() {
+     assert_eq!(status(&world, "P1"), OpStatus::Ok);
+ }
+ 
++#[test]
++fn a_rotated_face_pick_for_facing_is_refused_before_generation() {
++    let (world, mut history) = world_with_part();
++    let top = pick(face_id(&world, false));
++    history.execute(
++        &world,
++        CreateOperation::new(&world, "F1", TOOL, SrcRef::Stock, facing()).expect("facing op"),
++    );
++    history.execute(
++        &world,
++        MoveModel::new(
++            &world,
++            "part",
++            Location { rot: quat_from_euler(std::f64::consts::FRAC_PI_2, 0.0, 0.0), ..Location::default() },
++        )
++        .expect("turn part"),
++    );
++    let err = SetOperationGeometry::new(&world, "F1", vec![top.clone()])
++        .err()
++        .expect("vertical face is refused at the pick");
++    assert!(err.to_string().contains("not horizontal"), "{err}");
++    let (_, refusal) = operation::selection_account(&world, None, &[top], &facing());
++    assert!(refusal.is_some_and(|msg| msg.contains("not horizontal")));
++}
++
+ #[test]
+ fn the_door_is_the_pocket_familys_and_the_horizontal_pick_passes() {
+     let (world, _history) = world_with_part();
+diff --git a/crates/geometry/src/geo2d.rs b/crates/geometry/src/geo2d.rs
+index 957c0b5e..803f092d 100644
+--- a/crates/geometry/src/geo2d.rs
++++ b/crates/geometry/src/geo2d.rs
+@@ -40,7 +40,7 @@ pub(crate) const ARC_TOL_UNITS: f64 = 5e3;
+ /// running a spike out to infinity.
+ pub(crate) const MITER_LIMIT: f64 = 2.0;
+ 
+-#[derive(Error, Debug, PartialEq)]
++#[derive(Clone, Error, Debug, PartialEq)]
+ pub enum GeoError {
+     #[error("invalid geometry: {0}")]
+     Invalid(String),
+diff --git a/crates/geometry/src/geometry/slice.rs b/crates/geometry/src/geometry/slice.rs
+index 9133c16f..bf327e83 100644
+--- a/crates/geometry/src/geometry/slice.rs
++++ b/crates/geometry/src/geometry/slice.rs
+@@ -36,7 +36,40 @@ const WELD: f64 = 1e6;
+ /// Cap on `project`'s Z samples - a silhouette converges on far fewer.
+ pub const MAX_SAMPLES: usize = 64;
+ 
+-#[derive(Error, Debug, PartialEq)]
++// The editor reads the same source and stock silhouette several times per
++// frame (selection notes, outline, fill). Keep a few exact-input results so
++// an unchanged edge pick does not repeat the full multi-slice union.
++const PROJECT_CACHE_ENTRIES: usize = 4;
++const PROJECT_CACHE_FACET_LIMIT: usize = 50_000;
++type ProjectEntry = (usize, Vec<Triangle>, Result<Region, SliceError>);
++thread_local! {
++    static PROJECT_CACHE: std::cell::RefCell<Vec<ProjectEntry>> =
++        const { std::cell::RefCell::new(Vec::new()) };
++    static PROJECT_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++fn profile_projection() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("CAMCRAFT_PROFILE_PROJECTION").is_some())
++}
++
++fn project_timed(facets: &[Triangle], samples: usize, cacheable: bool) -> Result<Region, SliceError> {
++    let started = std::time::Instant::now();
++    let result = project_uncached(facets, samples);
++    if profile_projection() {
++        eprintln!(
++            "profile: projection {} facets={} samples={} elapsed={} ms result={}",
++            if cacheable { "cache miss" } else { "uncached large mesh" },
++            facets.len(),
++            samples,
++            started.elapsed().as_millis(),
++            if result.is_ok() { "ok" } else { "error" },
++        );
++    }
++    result
++}
++
++#[derive(Clone, Error, Debug, PartialEq)]
+ pub enum SliceError {
+     #[error("invalid slice input: {0}")]
+     Invalid(String),
+@@ -178,6 +211,40 @@ pub fn slice(facets: &[Triangle], z: f64) -> Result<Region, SliceError> {
+ /// to [`MAX_SAMPLES`]; a slice that fails on a tangential coincidence is
+ /// retried once at a nudge - if it fails again the error is real.
+ pub fn project(facets: &[Triangle], samples: usize) -> Result<Region, SliceError> {
++    if facets.len() > PROJECT_CACHE_FACET_LIMIT {
++        return project_timed(facets, samples, false);
++    }
++    if let Some(hit) = PROJECT_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        let i = cache.iter().position(|(n, old, _)| *n == samples && old.as_slice() == facets)?;
++        let entry = cache.remove(i);
++        let result = entry.2.clone();
++        cache.push(entry);
++        Some(result)
++    }) {
++        if profile_projection() {
++            PROJECT_CACHE_HITS.with(|hits| {
++                let count = hits.get().saturating_add(1);
++                hits.set(count);
++                if count == 1 || count % 100 == 0 {
++                    eprintln!("profile: projection cache hits={count}");
++                }
++            });
++        }
++        return hit;
++    }
++    let result = project_timed(facets, samples, true);
++    PROJECT_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.len() == PROJECT_CACHE_ENTRIES {
++            cache.remove(0);
++        }
++        cache.push((samples, facets.to_vec(), result.clone()));
++    });
++    result
++}
++
++fn project_uncached(facets: &[Triangle], samples: usize) -> Result<Region, SliceError> {
+     if facets.is_empty() {
+         return Ok(Region::empty());
+     }
+diff --git a/crates/geometry/tests/slice.rs b/crates/geometry/tests/slice.rs
+index faa26ca4..800a2d3f 100644
+--- a/crates/geometry/tests/slice.rs
++++ b/crates/geometry/tests/slice.rs
+@@ -103,6 +103,23 @@ fn l_prism_footprint_unions_its_slices() {
+     assert!(!r.contains(Point2::new(7.0, 7.0)), "cutout corner");
+ }
+ 
++#[test]
++fn repeated_projection_tracks_changed_placement_and_flat_errors() {
++    let a = cube(Point3::ZERO, Point3::new(10.0, 10.0, 5.0));
++    let moved = cube(Point3::new(20.0, 0.0, 0.0), Point3::new(30.0, 10.0, 5.0));
++    let first = slice::project(&a.facets, 16).expect("first footprint");
++    assert_eq!(slice::project(&a.facets, 16).expect("repeat"), first);
++    let second = slice::project(&moved.facets, 16).expect("moved footprint");
++    assert!(!second.contains(Point2::new(5.0, 5.0)));
++    assert!(second.contains(Point2::new(25.0, 5.0)));
++    let flat = [Triangle::new(
++        Point3::new(0.0, 0.0, 2.0),
++        Point3::new(1.0, 0.0, 2.0),
++        Point3::new(0.0, 1.0, 2.0),
++    )];
++    assert_eq!(slice::project(&flat, 16), slice::project(&flat, 16));
++}
++
+ #[test]
+ fn figure_eight_section_decomposes_into_lobes() {
+     // Two lobes touching along a vertical line: a real (non-manifold
+
+From 589f9ef6e122d4415969abb15e507e05f49d5d03 Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 21:27:21 -0600
+Subject: [PATCH 5/6] test(ui): tolerate Linux snapshot antialiasing
+
+---
+ .gitignore                      |  1 +
+ RECOMMENDED.md                  | 13 +++++++++++++
+ crates/ui/src/egui_app/tests.rs | 20 +++++++++++++++-----
+ 3 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 6f53d40e..acd0e2cd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,6 +13,7 @@
+ *.log
+ # UI snapshot test outputs (the blessed goldens live in crates/ui/tests/snapshots)
+ *.new.png
++*.diff.png
+ /tests/
+ 
+ # --- editor / agent / personal local config -----------------------------
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index dad43d0e..41f40bdc 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -13878,3 +13878,16 @@ inside, and they wrap as before.
+   refusal under Adaptive and Offset rings.
+ - Not done (follow-up worth an issue): rotate the development's branch to an azimuth
+   where the work is turned, so a D-flat bar wraps whatever its placement.
++
++### PR #239 gate: Linux snapshot tolerance after Windows golden refresh
++
++**Chosen:** use the snapshot library's per-OS threshold of 1.0 on Linux for
++`egui_app_light` and 1.5 for `egui_tool_editor`; retain the default 0.6 on
++other platforms. The Linux rerender differs from the Windows goldens at only
++one and four pixels above 0.6 respectively; the light image clears at 1.0
++and the tool editor at 1.5. Ignore generated `*.diff.png` files alongside
++the already ignored `*.new.png`.
++
++**Dropped:** re-rendering the goldens on Linux, which would reverse the
++Windows fix and make its gate fail again; a global tolerance change, which
++would weaken unrelated snapshots.
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index cd8a91c8..251f46af 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -1671,9 +1671,8 @@ fn headless_run_succeeds() {
+ /// The churn gate for the migration: one rendered frame of the whole shell,
+ /// compared to `tests/snapshots/egui_app.png` (relative to this crate).
+ /// Regenerate deliberately with `UPDATE_SNAPSHOTS=1`; a failure writes
+-/// `.new.png`/`.diff.png` beside it for eyes. kittest.toml could loosen the
+-/// threshold per OS - not added; if cross-backend drift ever shows, that is
+-/// the knob, in this crate's root.
++/// `.new.png`/`.diff.png` beside it for eyes. Two Windows-refreshed goldens
++/// below use a Linux-only threshold for isolated antialiasing differences.
+ #[test]
+ fn egui_shell_snapshot() {
+     let _g = snapshot_guard();
+@@ -1712,7 +1711,14 @@ fn egui_shell_snapshot_light() {
+     // a theme that cannot be read is a visible refusal, not a style
+     // preference - and the light column is not a refusal.
+     assert_eq!(contrast::readable(&theme::current()), None, "the light golden's own table reads");
+-    harness.snapshot("egui_app_light");
++    // The golden was refreshed on Windows (#66). On Linux its antialiasing
++    // differs at isolated pixels (none exceed 1.0); keep the other OSes'
++    // 0.6 threshold and leave the image itself as the shared reference.
++    harness.snapshot_options(
++        "egui_app_light",
++        &egui_kittest::SnapshotOptions::new()
++            .threshold(egui_kittest::OsThreshold::<f32>::default().linux(1.0)),
++    );
+     theme_set(&harness.state_mut().state.world, &ThemeRef::Dark);
+     harness.run_steps(1); // leave LIVE dark for whatever frame follows.
+ }
+@@ -1806,7 +1812,11 @@ fn tool_editor_snapshot() {
+     harness.run();
+     harness.get_by_label("Edit").click();
+     harness.run_steps(3);
+-    harness.snapshot("egui_tool_editor");
++    harness.snapshot_options(
++        "egui_tool_editor",
++        &egui_kittest::SnapshotOptions::new()
++            .threshold(egui_kittest::OsThreshold::<f32>::default().linux(1.5)),
++    );
+ }
+ 
+ // The S0 one-wgpu proof retired with the imgui renderer at M-g: with
+
+From b1c331cf158676d311fb53d41bb6309e38e317a6 Mon Sep 17 00:00:00 2001
+From: linuxguy123 <linuxguy123@gmail.com>
+Date: Sat, 7 Nov 2026 21:32:44 -0600
+Subject: [PATCH 6/6] fix: satisfy geometry and operation lint checks
+
+---
+ crates/app/src/operation/stitch.rs    | 26 +++++++++++++-------------
+ crates/geometry/src/geometry/slice.rs |  2 +-
+ 2 files changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/crates/app/src/operation/stitch.rs b/crates/app/src/operation/stitch.rs
+index a9d9c425..8066547f 100644
+--- a/crates/app/src/operation/stitch.rs
++++ b/crates/app/src/operation/stitch.rs
+@@ -345,6 +345,19 @@ fn minimum_rotation(ring: &[(i64, i64)]) -> usize {
+     i.min(j) % n
+ }
+ 
++/// Run one generated path after another. Both start and end on the
++/// clearance plane, so the joint is a clearance rapid: append and re-anchor
++/// the added path's opening `from` to the previous move's `to` - a stale
++/// `(0, 0)` there would read as a teleport to the origin.
++pub(super) fn stitch(mut a: Toolpath, mut b: Toolpath) -> Toolpath {
++    if let (Some(to), Some(first)) = (a.moves.last().map(|m| m.to), b.moves.first_mut()) {
++        first.from = to;
++    }
++    a.moves.append(&mut b.moves);
++    a.cycles.append(&mut b.cycles);
++    a
++}
++
+ #[cfg(test)]
+ mod canonical_ring_tests {
+     use super::canon_ring;
+@@ -383,16 +396,3 @@ mod canonical_ring_tests {
+         }
+     }
+ }
+-
+-/// Run one generated path after another. Both start and end on the
+-/// clearance plane, so the joint is a clearance rapid: append and re-anchor
+-/// the added path's opening `from` to the previous move's `to` - a stale
+-/// `(0, 0)` there would read as a teleport to the origin.
+-pub(super) fn stitch(mut a: Toolpath, mut b: Toolpath) -> Toolpath {
+-    if let (Some(to), Some(first)) = (a.moves.last().map(|m| m.to), b.moves.first_mut()) {
+-        first.from = to;
+-    }
+-    a.moves.append(&mut b.moves);
+-    a.cycles.append(&mut b.cycles);
+-    a
+-}
+diff --git a/crates/geometry/src/geometry/slice.rs b/crates/geometry/src/geometry/slice.rs
+index bf327e83..ca11ebf1 100644
+--- a/crates/geometry/src/geometry/slice.rs
++++ b/crates/geometry/src/geometry/slice.rs
+@@ -237,7 +237,7 @@ pub fn project(facets: &[Triangle], samples: usize) -> Result<Region, SliceError
+     PROJECT_CACHE.with(|cache| {
+         let mut cache = cache.borrow_mut();
+         if cache.len() == PROJECT_CACHE_ENTRIES {
+-            cache.remove(0);
++            drop(cache.remove(0));
+         }
+         cache.push((samples, facets.to_vec(), result.clone()));
+     });

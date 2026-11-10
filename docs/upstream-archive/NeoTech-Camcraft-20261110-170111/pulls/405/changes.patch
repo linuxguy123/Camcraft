@@ -1,0 +1,1025 @@
+From 709a836cb47072e1bf238452b3ca024704ae20cc Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 9 Nov 2026 02:02:18 +0100
+Subject: [PATCH 1/2] wip(rest): rest across carried setups
+
+---
+ crates/app/src/operation/job.rs          |   9 +
+ crates/app/src/operation/mod.rs          |   1 +
+ crates/app/src/operation/stamp_stock.rs  |   2 +-
+ crates/app/src/rest.rs                   | 154 ++++++++++++---
+ crates/app/src/rest/across.rs            | 143 ++++++++++++++
+ crates/app/src/rest/ahead.rs             |  25 ++-
+ crates/app/src/stock_sim_carry.rs        |   2 +-
+ crates/app/tests/rest_across_setups.rs   | 240 +++++++++++++++++++++++
+ docs/decisions/318-rest-across-setups.md |  65 ++++++
+ 9 files changed, 606 insertions(+), 35 deletions(-)
+ create mode 100644 crates/app/src/rest/across.rs
+ create mode 100644 crates/app/tests/rest_across_setups.rs
+ create mode 100644 docs/decisions/318-rest-across-setups.md
+
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index d7d8faba..2040289b 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -208,6 +208,15 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+         OpParams::MultiAxisContour { .. } => Some(drive_chains_of(world, op)),
+         _ => None,
+     };
++    // #318: an op that reads the program ahead in a setup whose incoming
++    // stock must be carried across a boundary the carry refuses has no
++    // known stock to judge against - refused by name, never read as the
++    // setup's own fresh block.
++    if super::drill_prior::reads_prior(&op.params)
++        && let Some(why) = crate::rest::carry_refusal(world, op_name, setup)
++    {
++        return Err(GenError::Invalid(format!("{op_name}: {why}")));
++    }
+     let prior = match &op.params {
+         OpParams::Pocket3D { .. } | OpParams::MultiAxisRough { .. } => {
+             // The mask the rest laws stand on, resolved NOW on the
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 9158bcb3..02179e56 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -79,6 +79,7 @@ mod stamp;
+ pub use stamp::*;
+ mod stamp_stock;
+ pub use stamp_stock::reads_setup_stock;
++pub(crate) use stamp_stock::write_setup_stock;
+ mod material;
+ pub use material::*;
+ mod material_region;
+diff --git a/crates/app/src/operation/stamp_stock.rs b/crates/app/src/operation/stamp_stock.rs
+index f4509537..c63610c6 100644
+--- a/crates/app/src/operation/stamp_stock.rs
++++ b/crates/app/src/operation/stamp_stock.rs
+@@ -87,7 +87,7 @@ pub(super) fn write_stock_source(world: &World, entity: &Entity, h: &mut impl Ha
+ /// term names the stock's definition, not only its tessellation.
+ /// `None` when a present stock has no geometry left to digest - an
+ /// unresolvable stamp, which reads Stale.
+-pub(super) fn write_setup_stock(world: &World, setup: Option<&str>, h: &mut impl Hasher) -> Option<()> {
++pub(crate) fn write_setup_stock(world: &World, setup: Option<&str>, h: &mut impl Hasher) -> Option<()> {
+     h.write_u8(b'X');
+     match model::find_by_name(world, &crate::setup::stock_entity_name(world, setup)) {
+         None => h.write_u8(0),
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 0a65a74f..5b4b350e 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -15,12 +15,13 @@
+ //!   known wart (an operation named `Operation10` sorts before
+ //!   `Operation2` inside one setup) is shared so re-machining and the
+ //!   machine can never disagree.
+-//! - **Rest is same-setup.** A predecessor machines in the CONSUMER's
+-//!   setup or it cut a differently-placed block: cross-setup masks
+-//!   would need the flip transform (M3.3's orientation law), so an
+-//!   operation from another setup is simply not ahead here. Within one
+-//!   setup this is physically exact; across setups a later setup
+-//!   re-cuts conservatively - air, never a gouge (the mask law).
++//! - **Rest crosses setups where the body is carried (#318).** A
++//!   predecessor in an earlier setup is ahead exactly when the program
++//!   sim carries the machined body from its setup into the consumer's
++//!   (#317, `across`): the rest grid is then the origin block cut and
++//!   carried through every boundary. A setup entered by the clip (same
++//!   hold, not linked) starts from its own block - the side that never
++//!   assumes material gone; a refused carry refuses the rest by name.
+ //! - **The mask only removes cuts, never adds them.** The rest state is
+ //!   the stock grid with every earlier operation's CACHED moves
+ //!   subtracted; a consumer's level targets are intersected with it, so
+@@ -53,8 +54,11 @@
+ //!   moves and it goes Stale - the same one-way ratchet the whole
+ //!   associativity chain runs on.
+ 
++mod across;
+ mod ahead;
+ 
++pub use across::REST_CARRY_REFUSAL;
++use across::{carried_grid, chain_of};
+ use ahead::{ahead_of, digest_of, Ahead};
+ use crate::cl::Move;
+ use crate::machining2d::GenError;
+@@ -78,8 +82,35 @@ pub struct PriorState {
+ /// `status_of` can ask every frame (M3.1 C's live-questions law).
+ #[must_use]
+ pub fn prior_digest(world: &World, name: &str, setup: Option<&str>) -> Option<u64> {
+-    let ahead = ahead_of(world, name, setup, false);
+-    (!ahead.is_empty()).then(|| digest_of(&ahead))
++    use std::hash::Hasher;
++    let chain = match chain_of(world, name, setup, false) {
++        Ok(c) => c,
++        // A refused carry digests its reason: generation refuses it by
++        // name, and the stamp moves the moment the refusal does.
++        Err(e) => {
++            let mut h = std::hash::DefaultHasher::new();
++            h.write(b"camcraft-rest-refused");
++            h.write(e.as_bytes());
++            return Some(h.finish());
++        }
++    };
++    if !chain.crosses() {
++        let ahead = chain.into_ops();
++        return (!ahead.is_empty()).then(|| digest_of(&ahead));
++    }
++    let mut h = std::hash::DefaultHasher::new();
++    chain.term(world, &mut h);
++    let ahead: Vec<Ahead> = chain.into_ops();
++    h.write_u64(digest_of(&ahead));
++    Some(h.finish())
++}
++
++/// The refusal a rest reading of `name` meets (#318): `Some` when the
++/// stock its setup starts from has to be carried across a boundary the
++/// carry refuses. Generation refuses every op that reads the prior.
++#[must_use]
++pub fn carry_refusal(world: &World, name: &str, setup: Option<&str>) -> Option<String> {
++    chain_of(world, name, setup, false).err()
+ }
+ 
+ /// The suppressed operations (#110) ahead of `name` in its setup that
+@@ -91,7 +122,11 @@ pub fn prior_digest(world: &World, name: &str, setup: Option<&str>) -> Option<u6
+ /// material `name` could have assumed gone.
+ #[must_use]
+ pub fn suppressed_cuts_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<String> {
+-    ahead_of(world, name, setup, false)
++    // Across every carried setup boundary too (#318); a refused carry
++    // refuses generation, so the same-setup walk is what stands then.
++    chain_of(world, name, setup, false)
++        .map(across::Chain::into_ops)
++        .unwrap_or_else(|_| ahead_of(world, name, setup, false))
+         .into_iter()
+         .filter(|a| a.cut)
+         .filter(|a| {
+@@ -115,7 +150,17 @@ pub fn prior_state(
+     setup: Option<&str>,
+     tool_r: f64,
+ ) -> Result<PriorState, GenError> {
+-    let ahead = ahead_of(world, name, setup, true);
++    let chain = chain_of(world, name, setup, true).map_err(GenError::Invalid)?;
++    if chain.crosses() {
++        // The stock this setup starts from is what the earlier setups
++        // left, carried (#318) - a mask even when nothing ahead cut.
++        let digest = prior_digest(world, name, setup);
++        let min_r = chain.ops().filter(|a| a.cut && a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
++        let grid = carried_grid(world, &chain, min_r)
++            .map_err(|e| GenError::Invalid(format!("rest from previous setups: {e}")))?;
++        return Ok(PriorState { grid: Some(grid), digest });
++    }
++    let ahead = chain.into_ops();
+     if ahead.is_empty() {
+         return Ok(PriorState {
+             grid: None,
+@@ -166,6 +211,13 @@ pub fn prior_state(
+ pub struct PriorPlan {
+     grid: Dexel,
+     ahead: Vec<Ahead>,
++    /// #318: the setups the body is carried through after `ahead` is
++    /// cut - each turn and the cut operations of that setup. Empty for a
++    /// same-setup plan, whose `grid` is then a plain column grid; a
++    /// crossing plan's `grid` is the origin body's tops and `floor` its
++    /// floor.
++    carried: Vec<(crate::stock_sim::LatticeTurn, Vec<Ahead>)>,
++    floor: Option<crate::stock_sim::Body>,
+ }
+ 
+ impl PriorPlan {
+@@ -173,11 +225,26 @@ impl PriorPlan {
+     /// posed predecessor the column grid cannot cut) is the caller's
+     /// "prior unknown" - the raw stock, never an acquittal.
+     pub fn simulate(self) -> Result<Dexel, String> {
+-        let mut dex = self.grid;
++        let Some(mut body) = self.floor else {
++            let mut dex = self.grid;
++            sweep(&mut dex, &self.ahead)?;
++            return Ok(dex);
++        };
++        sweep(&mut body.dex, &self.ahead)?;
++        for (turn, ops) in &self.carried {
++            body = body.carry(turn)?;
++            sweep(&mut body.dex, ops)?;
++        }
++        Ok(body.dex)
++    }
++}
++
++/// Cut `ahead` into `dex`, each through its own atom.
++fn sweep(dex: &mut Dexel, ahead: &[Ahead]) -> Result<(), String> {
++    {
+         // A turning insert cuts with its nose: the centre path lowered
+         // to the tip, swept as a ball (issue #89).
+-        let tips: Vec<Vec<Move>> = self
+-            .ahead
++        let tips: Vec<Vec<Move>> = ahead
+             .iter()
+             .map(|a| match a.nose {
+                 Some(n) => a
+@@ -196,8 +263,7 @@ impl PriorPlan {
+                 None => Vec::new(),
+             })
+             .collect();
+-        let ops: Vec<SimOp> = self
+-            .ahead
++        let ops: Vec<SimOp> = ahead
+             .iter()
+             .zip(&tips)
+             .map(|(a, tip)| match a.nose {
+@@ -205,8 +271,8 @@ impl PriorPlan {
+                 None => SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner },
+             })
+             .collect();
+-        stock_sim::simulate(&mut dex, &ops).map_err(|e| e.to_string())?;
+-        Ok(dex)
++        stock_sim::simulate(dex, &ops).map_err(|e| e.to_string())?;
++        Ok(())
+     }
+ }
+ 
+@@ -215,10 +281,21 @@ impl PriorPlan {
+ /// IS the prior), an error when the stock grid cannot be built (the
+ /// caller treats that as an unknown prior - raw stock).
+ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -> Result<Option<PriorPlan>, String> {
+-    let ahead: Vec<Ahead> = ahead_of(world, name, setup, true).into_iter().filter(|a| a.cut).collect();
+-    if ahead.is_empty() {
++    let chain = chain_of(world, name, setup, true)?;
++    let crosses = chain.crosses();
++    let origin = crate::setup::effective(world, chain.origin());
++    let mut segs = chain.segments.into_iter();
++    let first: Vec<Ahead> = segs.next().map(|s| s.ops).unwrap_or_default().into_iter().filter(|a| a.cut).collect();
++    let carried: Vec<(crate::stock_sim::LatticeTurn, Vec<Ahead>)> = segs
++        .filter_map(|s| s.turn.map(|t| (t, s.ops.into_iter().filter(|a| a.cut).collect())))
++        .collect();
++    let every = || first.iter().chain(carried.iter().flat_map(|(_, o)| o.iter()));
++    // A crossing plan is read even when nothing cut: the carried block
++    // is not the consumer's own (#318).
++    if !crosses && first.is_empty() {
+         return Ok(None);
+     }
++    let ahead: Vec<&Ahead> = every().collect();
+     // #89 review (B1/B2): on a lathe the column grid credits a turning
+     // move under standing material (a parting kerf, an ID groove behind
+     // a lip) with everything above it, and a bar or blade cut as a full
+@@ -237,8 +314,13 @@ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -
+         ));
+     }
+     let min_r = ahead.iter().map(|a| a.nose.unwrap_or(a.radius)).filter(|r| *r > 0.0).fold(tool_r, f64::min);
+-    let grid = stock_sim::stock_grid(world, setup, min_r)?;
+-    Ok(Some(PriorPlan { grid, ahead }))
++    if !crosses {
++        let grid = stock_sim::stock_grid(world, setup, min_r)?;
++        return Ok(Some(PriorPlan { grid, ahead: first, carried, floor: None }));
++    }
++    let grid = stock_sim::stock_grid(world, origin.as_deref(), min_r)?;
++    let body = stock_sim::carry::first_body(world, origin.as_deref(), grid.clone())?;
++    Ok(Some(PriorPlan { grid, ahead: first, carried, floor: Some(body) }))
+ }
+ 
+ /// The staleness story re-machining adds to `stale_reason`'s list of
+@@ -253,15 +335,27 @@ pub fn prior_plan(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -
+ /// not run). The order law above is what makes "ahead" mean what the
+ /// machine means.
+ pub fn prior_stale(world: &World, name: &str, setup: Option<&str>) -> Option<String> {
+-    ahead_of(world, name, setup, false)
+-        .into_iter()
+-        .find(|a| a.cut)
+-        .map(|a| {
+-            format!(
+-                "operation '{}' ahead of it in the program changed - regenerate the program in order",
+-                a.name
+-            )
+-        })
++    let chain = match chain_of(world, name, setup, false) {
++        Ok(c) => c,
++        Err(e) => return Some(e),
++    };
++    let crosses = chain.crosses();
++    let origin = chain.origin().map(str::to_owned);
++    match chain.into_ops().into_iter().find(|a| a.cut) {
++        Some(a) if crosses => Some(format!(
++            "operation '{}' ahead of it in the program, or a setup the stock is carried through, changed - regenerate the program in order",
++            a.name
++        )),
++        Some(a) => Some(format!(
++            "operation '{}' ahead of it in the program changed - regenerate the program in order",
++            a.name
++        )),
++        None if crosses => Some(format!(
++            "the stock carried from setup '{}' changed - regenerate the program in order",
++            origin.unwrap_or_default()
++        )),
++        None => None,
++    }
+ }
+ 
+ /// A twist drill ahead in the setup, as the turned family's rapid law
+diff --git a/crates/app/src/rest/across.rs b/crates/app/src/rest/across.rs
+new file mode 100644
+index 00000000..58aad250
+--- /dev/null
++++ b/crates/app/src/rest/across.rs
+@@ -0,0 +1,143 @@
++//! Rest across setups (#318): the program ahead of an operation, cut
++//! into per-setup segments, reaching back through every setup boundary
++//! the machined body is CARRIED across (#317's `stock_sim::carry`).
++//!
++//! Provenance: our own design per #308's research decision ("stock from
++//! the preceding setup" read through the setup transform); general
++//! machining knowledge, no vendor material consulted.
++//!
++//! ## The laws here
++//!
++//! - **One law with the program sim.** A boundary counts exactly when the
++//!   program sim carries the body across it (`carry::entry` decides, by
++//!   call). A setup entered by the M3.2 A clip (same hold, not linked)
++//!   breaks the chain: its rest starts from its own block as before -
++//!   whether a fresh block or the same part is loaded there is not stated
++//!   until #320, and the fresh block is the side that never assumes
++//!   material gone.
++//! - **A refused carry refuses the rest.** If the body cannot be carried
++//!   into the consumer's setup (a turn the lattice cannot hold, a lathe),
++//!   the stock that setup starts from is unknown: the rest reading is
++//!   refused by name ([`REST_CARRY_REFUSAL`]), never read as a fresh block.
++//! - **A single setup reads exactly as before.** With no carried boundary
++//!   the chain is the same-setup walk and no extra term is written, so
++//!   single-setup stamps and paths are bit-for-bit unchanged.
++
++use super::ahead::{all_ahead, Ahead};
++use crate::stock_sim::carry::{self, Entry};
++use crate::stock_sim::{Dexel, LatticeTurn, SimOp};
++use flecs_ecs::prelude::World;
++
++/// The refusal for a rest reading whose incoming stock cannot be carried.
++pub const REST_CARRY_REFUSAL: &str = "this operation reads the stock earlier setups left, and that stock cannot be carried into its setup";
++
++/// The operations of one setup in the chain, and the turn the body takes
++/// entering it (`None` for the setup the chain starts on).
++pub(super) struct Segment {
++    pub(super) setup: Option<String>,
++    pub(super) turn: Option<LatticeTurn>,
++    pub(super) ops: Vec<Ahead>,
++}
++
++/// The program ahead of one operation as its rest reads it.
++pub(super) struct Chain {
++    pub(super) segments: Vec<Segment>,
++}
++
++impl Chain {
++    /// Does the chain reach back across a carried boundary?
++    pub(super) fn crosses(&self) -> bool {
++        self.segments.len() > 1
++    }
++
++    /// The setup whose block the chain starts on.
++    pub(super) fn origin(&self) -> Option<&str> {
++        self.segments.first().and_then(|s| s.setup.as_deref())
++    }
++
++    pub(super) fn ops(&self) -> impl Iterator<Item = &Ahead> {
++        self.segments.iter().flat_map(|s| s.ops.iter())
++    }
++
++    pub(super) fn into_ops(self) -> Vec<Ahead> {
++        self.segments.into_iter().flat_map(|s| s.ops).collect()
++    }
++
++    /// The chain's own digest term, beside the predecessors' paths: the
++    /// setups crossed, each turn, and the origin setup's stock (the block
++    /// the carried body was cut from). Only written when the chain crosses.
++    pub(super) fn term(&self, world: &World, h: &mut impl std::hash::Hasher) {
++        h.write(b"camcraft-rest-across-v1");
++        for s in &self.segments {
++            h.write(s.setup.as_deref().unwrap_or("").as_bytes());
++            h.write_u8(0);
++            match &s.turn {
++                // Debug prints every float round-trip exact.
++                Some(t) => h.write(format!("{t:?}").as_bytes()),
++                None => h.write_u8(0),
++            }
++        }
++        if crate::operation::write_setup_stock(world, self.origin(), h).is_none() {
++            h.write_u8(0xfe);
++        }
++    }
++}
++
++/// The chain ahead of `name` (consumer setup `setup`).
++///
++/// # Errors
++/// [`REST_CARRY_REFUSAL`] with the carry's own reason (naming both
++/// setups) when a boundary the chain must cross refuses.
++pub(super) fn chain_of(world: &World, name: &str, setup: Option<&str>, with_moves: bool) -> Result<Chain, String> {
++    let consumer = crate::setup::effective(world, setup);
++    let mut segments: Vec<Segment> = Vec::new();
++    for a in all_ahead(world, name, with_moves) {
++        match segments.last_mut() {
++            Some(s) if s.setup == a.setup => s.ops.push(a),
++            _ => segments.push(Segment { setup: a.setup.clone(), turn: None, ops: vec![a] }),
++        }
++    }
++    if segments.last().is_none_or(|s| s.setup != consumer) {
++        segments.push(Segment { setup: consumer, turn: None, ops: Vec::new() });
++    }
++    // Back from the consumer: every carried boundary extends the chain,
++    // the first clip ends it.
++    let mut start = segments.len() - 1;
++    while start > 0 {
++        let (from, to) = (segments[start - 1].setup.as_deref(), segments[start].setup.as_deref());
++        match carry::entry(world, from, to) {
++            Ok(Entry::Clip) => break,
++            Ok(Entry::Carry(t)) => {
++                segments[start].turn = Some(t);
++                start -= 1;
++            }
++            Err(e) => return Err(format!("{REST_CARRY_REFUSAL}: {e}")),
++        }
++    }
++    let segments = segments.split_off(start);
++    Ok(Chain { segments })
++}
++
++/// The column grid the crossing chain leaves standing, in the consumer's
++/// frame: the origin setup's block, each segment's cut moves swept, the
++/// body carried at every boundary. The tops are read as the rest grid -
++/// a column cut through on its far side still reads its standing top
++/// (more material, never less).
++pub(super) fn carried_grid(world: &World, chain: &Chain, min_r: f64) -> Result<Dexel, String> {
++    let origin = crate::setup::effective(world, chain.origin());
++    let dex = crate::stock_sim::stock_grid(world, origin.as_deref(), min_r)?;
++    let mut body = carry::first_body(world, origin.as_deref(), dex)?;
++    for s in &chain.segments {
++        if let Some(t) = &s.turn {
++            body = body.carry(t)?;
++        }
++        let ops: Vec<SimOp> = s
++            .ops
++            .iter()
++            .filter(|a| a.cut)
++            .map(|a| SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner })
++            .collect();
++        crate::stock_sim::simulate(&mut body.dex, &ops).map_err(|e| e.to_string())?;
++    }
++    Ok(body.dex)
++}
+diff --git a/crates/app/src/rest/ahead.rs b/crates/app/src/rest/ahead.rs
+index 46d7734f..cc90bd9e 100644
+--- a/crates/app/src/rest/ahead.rs
++++ b/crates/app/src/rest/ahead.rs
+@@ -39,6 +39,9 @@ pub(super) struct Ahead {
+     pub(super) nose: Option<f64>,
+     pub(super) cut: bool,
+     pub(super) moves: Vec<Move>,
++    /// The operation's effective setup (#318: the chain across setups
++    /// groups the program by it).
++    pub(super) setup: Option<String>,
+ }
+ 
+ /// The operations in program order ahead of `name` in the consumer's
+@@ -52,8 +55,22 @@ pub(super) struct Ahead {
+ /// the stale story pass `false` and read only the path signature stored
+ /// with the cache (#109 review B1: `status_of` asks every frame).
+ pub(super) fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>, with_moves: bool) -> Vec<Ahead> {
+-    let ops = crate::setup::operation_order(world);
+     let consumer = crate::setup::effective(world, consumer_setup);
++    // another setup's cut is not this block's rest
++    collect(world, name, with_moves, |s| *s == consumer)
++}
++
++/// Every operation ahead of `name` in program order, whatever its setup
++/// (#318): the chain across setups (`super::across`) cuts it into
++/// per-setup segments.
++pub(super) fn all_ahead(world: &World, name: &str, with_moves: bool) -> Vec<Ahead> {
++    collect(world, name, with_moves, |_| true)
++}
++
++/// The walk both readings share: the program in order up to `name`,
++/// keeping the operations whose effective setup `keep` accepts.
++fn collect(world: &World, name: &str, with_moves: bool, keep: impl Fn(&Option<String>) -> bool) -> Vec<Ahead> {
++    let ops = crate::setup::operation_order(world);
+     let Some(self_ix) = ops
+         .iter()
+         .position(|(n, _)| n == name)
+@@ -65,8 +82,9 @@ pub(super) fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>,
+         let Some(op) = model::operation_of(world, e) else {
+             continue; // in the operation list; lost a beat later
+         };
+-        if crate::setup::effective(world, op.setup.as_deref()) != consumer {
+-            continue; // another setup's cut is not this block's rest
++        let setup = crate::setup::effective(world, op.setup.as_deref());
++        if !keep(&setup) {
++            continue;
+         }
+         let tool = model::find_by_name(world, &op.tool)
+             .and_then(|t| model::tool_of(world, &t));
+@@ -116,6 +134,7 @@ pub(super) fn ahead_of(world: &World, name: &str, consumer_setup: Option<&str>,
+                 .filter(|n| n.is_finite() && *n > 0.0),
+             cut,
+             moves,
++            setup,
+         });
+     }
+     out
+diff --git a/crates/app/src/stock_sim_carry.rs b/crates/app/src/stock_sim_carry.rs
+index bc7f957e..7094bc97 100644
+--- a/crates/app/src/stock_sim_carry.rs
++++ b/crates/app/src/stock_sim_carry.rs
+@@ -93,7 +93,7 @@ pub(crate) struct Walked {
+ /// bottom (the box and cylinder from their placement, a from-model
+ /// stock from its mesh read from below). Upright cuts never move the
+ /// floor, so it is read when the first carry needs it.
+-fn first_body(world: &flecs_ecs::prelude::World, setup: Option<&str>, dex: Dexel) -> Result<Body, String> {
++pub(crate) fn first_body(world: &flecs_ecs::prelude::World, setup: Option<&str>, dex: Dexel) -> Result<Body, String> {
+     use crate::{model, stock::StockShape};
+     let name = crate::setup::stock_entity_name(world, setup);
+     let e = model::find_by_name(world, &name).ok_or_else(|| format!("no stock '{name}' to carry"))?;
+diff --git a/crates/app/tests/rest_across_setups.rs b/crates/app/tests/rest_across_setups.rs
+new file mode 100644
+index 00000000..224333e2
+--- /dev/null
++++ b/crates/app/tests/rest_across_setups.rs
+@@ -0,0 +1,240 @@
++//! #318: rest machining across setups. A rest pass in a later setup the
++//! machined body is carried into (#317) reads what the earlier setups cut:
++//! it skips the material Setup1 removed, its stamp moves when anything
++//! ahead in Setup1 (or the carry itself) changes, a suppressed Setup1 cut
++//! refuses it by name at the post, and a carry the lattice refuses refuses
++//! the rest reading by name instead of falling back to a fresh block.
++//! Provenance: our own fixtures (remachining.rs's plate with a pocket)
++//! over plain re-clamp practice; no vendor material consulted.
++//!
++//! Gate map (#318): covers app::rest (prior_state, prior_digest,
++//! prior_stale, suppressed_cuts_ahead, carry_refusal, rest::across),
++//! app::operation (job, stamp), app::posting_suppressed,
++//! app::commands (SetSetupRelative, AlignPartToSetup, EditOperationParams).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::cl::MoveKind;
++use camcraft_app::commands::{
++    AddTool, AlignPartToSetup, CreateOperation, CreateSetup, EditOperationParams, GenerateOperation, History,
++    ImportModel, SetSetupRelative, SetStock,
++};
++use camcraft_app::geometry::{Mesh, Point3, Triangle, cube};
++use camcraft_app::machining2d::PocketStrategy;
++use camcraft_app::machining3d::Entry3D;
++use camcraft_app::model;
++use camcraft_app::operation::{self, Height, OpParams, OpStatus, SrcRef};
++use camcraft_app::posting;
++use camcraft_app::rest::REST_CARRY_REFUSAL;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++/// A 40x40x20 plate with a 20x20 pocket sunk to z=10.
++fn plate_with_pocket() -> Mesh {
++    let mut facets = Vec::new();
++    let outer = cube(Point3::new(-20.0, -20.0, 0.0), Point3::new(20.0, 20.0, 20.0));
++    facets.extend(outer.facets[0..2].iter().cloned());
++    facets.extend(outer.facets[4..12].iter().cloned());
++    let inner = cube(Point3::new(-10.0, -10.0, 10.0), Point3::new(10.0, 10.0, 20.0));
++    facets.extend(inner.facets[0..2].iter().cloned());
++    facets.extend(inner.facets[4..12].iter().cloned());
++    let o = [(-20.0, -20.0), (20.0, -20.0), (20.0, 20.0), (-20.0, 20.0)].map(|(x, y)| Point3::new(x, y, 20.0));
++    let i = [(-10.0, -10.0), (10.0, -10.0), (10.0, 10.0), (-10.0, 10.0)].map(|(x, y)| Point3::new(x, y, 20.0));
++    for k in 0..4 {
++        let (a, b, c, d) = (o[k], o[(k + 1) % 4], i[(k + 1) % 4], i[k]);
++        facets.push(Triangle::new(a, b, c));
++        facets.push(Triangle::new(a, c, d));
++    }
++    Mesh::from_facets(facets)
++}
++
++fn pocket(bottom_z: f64, stepover: f64, rest_rough: bool) -> OpParams {
++    OpParams::Pocket3D {
++        links: camcraft_app::links::Links::ROUGH3D,
++        stepover,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(30.0),
++        retract_z: None,
++        top_z: Height::fixed(20.0),
++        bottom_z: Height::fixed(bottom_z),
++        stepdown: 5.0,
++        feed: 1500.0,
++        plunge_feed: 400.0,
++        climb: true,
++        strategy: PocketStrategy::Zigzag,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        rest_rough,
++        optimal_load: camcraft_app::load::load_of_degrees(60.0),
++        feed_opt: false,
++        shell: false,
++    }
++}
++
++fn add(world: &World, h: &mut History, name: &str, tool: &str, params: OpParams) {
++    let cmd = CreateOperation::new(world, name, tool, SrcRef::Entity("plate".into()), params);
++    h.execute(world, cmd.expect("create"));
++    h.execute(world, GenerateOperation::new(world, name).expect("generate"));
++}
++
++/// How Setup2 is entered from Setup1.
++#[derive(Clone, Copy, PartialEq)]
++enum Second {
++    /// No Setup2: both ops in Setup1 (the single-setup reference).
++    None,
++    /// Setup2 from Setup1's datum, not linked: the M3.2 A clip.
++    Clip,
++    /// Setup2 placed "Same as" Setup1: the body is carried.
++    SameAs,
++}
++
++/// The plate in the stock, Setup1 roughing with the 8 mm tool, then the
++/// 4 mm rest pass - in Setup1 or in Setup2 as `second` says.
++fn program(second: Second) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    for t in ["EM-0800-4FL", "EM-0400-2FL"] {
++        let tool = catalog().into_iter().find(|(n, _)| *n == t).map(|(_, t)| t).expect("catalog entry");
++        h.execute(&world, AddTool::new(&world, t, tool).expect("catalog tool"));
++    }
++    let stock = SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 40.0, dz: 20.0 }, Location::default());
++    h.execute(&world, stock.expect("box stock"));
++    h.execute(&world, ImportModel::from_mesh("plate", plate_with_pocket()));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("materialize Setup1"));
++    add(&world, &mut h, "Rough1", "EM-0800-4FL", pocket(12.0, 4.0, false));
++    if second != Second::None {
++        h.execute(&world, CreateSetup::new(&world, None, Some("Setup1")).expect("Setup2"));
++    }
++    if second == Second::SameAs {
++        h.execute(&world, SetSetupRelative::link(&world, "Setup2", "Setup1", [0.0; 3]).expect("same as"));
++    }
++    add(&world, &mut h, "Rest2", "EM-0400-2FL", pocket(10.0, 2.0, true));
++    (world, h)
++}
++
++fn path(world: &World, name: &str) -> Vec<camcraft_app::cl::Move> {
++    model::find_by_name(world, name).and_then(|e| model::toolpath_of(world, &e)).expect("cached").path.moves
++}
++
++fn setup_of(world: &World, name: &str) -> Option<String> {
++    model::find_by_name(world, name).and_then(|e| model::operation_of(world, &e)).and_then(|o| o.setup)
++}
++
++/// The cutting length below the stock top (Z < 20): what the pass spends
++/// in material it believes stands.
++fn cut_length(world: &World, name: &str) -> f64 {
++    path(world, name)
++        .iter()
++        .filter(|m| m.kind != MoveKind::Rapid && m.from.z.max(m.to.z) < 20.0 - 1e-6)
++        .map(|m| ((m.to.x - m.from.x).powi(2) + (m.to.y - m.from.y).powi(2) + (m.to.z - m.from.z).powi(2)).sqrt())
++        .sum()
++}
++
++fn status(world: &World, name: &str) -> OpStatus {
++    operation::status_of(world, &model::find_by_name(world, name).expect("op"))
++}
++
++#[test]
++fn a_second_setup_rest_pass_skips_what_the_first_setup_cleared() {
++    let (carried, _h) = program(Second::SameAs);
++    assert_eq!(setup_of(&carried, "Rest2").as_deref(), Some("Setup2"));
++    assert_eq!(setup_of(&carried, "Rough1").as_deref(), Some("Setup1"));
++    let (one, _h1) = program(Second::None);
++    let (clip, _h2) = program(Second::Clip);
++    // Carried "Same as" Setup1: Setup2's rest pass is the very pass the
++    // same op would get in Setup1 - it reads Rough1's cut.
++    assert_eq!(path(&carried, "Rest2"), path(&one, "Rest2"), "the carried rest equals the same-setup rest");
++    // Entered by the clip (not linked) it starts from its own block, as
++    // before #318, and re-cuts the pocket Rough1 cleared.
++    let (c, f) = (cut_length(&carried, "Rest2"), cut_length(&clip, "Rest2"));
++    assert!(c + 1.0 < f, "the carried rest cuts less: {c} vs fresh-block {f}");
++    assert!(posting::verification_report(&carried).problems.is_empty(), "{:?}", posting::verification_report(&carried).problems);
++}
++
++#[test]
++fn a_change_ahead_in_the_first_setup_stales_the_second_setups_rest_and_undo_restores_it() {
++    let (world, mut h) = program(Second::SameAs);
++    assert_eq!(status(&world, "Rest2"), OpStatus::Ok);
++
++    // Re-rough Setup1 to another depth: Rest2's rest digest moves.
++    let edit = EditOperationParams::new(&world, "Rough1", pocket(14.0, 4.0, false)).expect("edit");
++    h.execute(&world, edit);
++    h.execute(&world, GenerateOperation::new(&world, "Rough1").expect("regenerate"));
++    assert_eq!(status(&world, "Rough1"), OpStatus::Ok);
++    assert_eq!(status(&world, "Rest2"), OpStatus::Stale, "Setup1's new path stales Setup2's rest");
++    let why = operation::stale_reason(&world, &model::find_by_name(&world, "Rest2").expect("Rest2"));
++    assert!(why.as_ref().is_some_and(|w| w.contains("'Rough1'") && w.contains("setup")), "{why:?}");
++    assert!(h.undo(&world) && h.undo(&world));
++    assert_eq!(status(&world, "Rest2"), OpStatus::Ok, "undo restores the path Rest2 was generated against");
++
++    // Unlinking Setup2 ends the carry: Rest2 now reads its own block.
++    h.execute(&world, SetSetupRelative::unlink(&world, "Setup2").expect("unlink"));
++    assert_eq!(status(&world, "Rest2"), OpStatus::Stale, "the carry itself is an input");
++    assert!(h.undo(&world));
++    assert_eq!(status(&world, "Rest2"), OpStatus::Ok);
++}
++
++#[test]
++fn a_suppressed_first_setup_cut_refuses_the_second_setups_rest_by_name() {
++    let (world, mut h) = program(Second::SameAs);
++    assert!(posting::verification_report(&world).problems.is_empty());
++    h.execute(&world, EditOperationParams::with_suppressed(&world, "Rough1", true).expect("suppress"));
++    let want = "operation Rest2 was generated against the cut of suppressed Rough1; unsuppress Rough1 or suppress Rest2 too";
++    let problems = posting::verification_report(&world).problems;
++    assert!(problems.iter().any(|p| p == want), "{problems:?}");
++}
++
++#[test]
++fn a_clip_entered_setup_does_not_read_the_first_setups_cuts() {
++    // Not carried: suppressing Rough1 leaves Setup2's rest posting, and
++    // the rest stamp does not read Setup1 (the pre-#318 law, unchanged).
++    let (world, mut h) = program(Second::Clip);
++    h.execute(&world, EditOperationParams::with_suppressed(&world, "Rough1", true).expect("suppress"));
++    let problems = posting::verification_report(&world).problems;
++    assert!(!problems.iter().any(|p| p.contains("generated against")), "{problems:?}");
++    assert_eq!(status(&world, "Rest2"), OpStatus::Ok);
++}
++
++#[test]
++fn a_carry_the_lattice_refuses_refuses_the_rest_reading_by_name() {
++    // Face Setup1, then turn Setup2 30 degrees about Z: the body cannot be
++    // carried exactly, so a Setup2 op that reads the program ahead is
++    // refused by name - never generated against a fresh block.
++    let world = new_world();
++    let mut h = History::default();
++    let tool = catalog().into_iter().find(|(n, _)| *n == "EM-0400-2FL").map(|(_, t)| t).expect("tool");
++    h.execute(&world, AddTool::new(&world, "EM-0400-2FL", tool).expect("add tool"));
++    h.execute(&world, ImportModel::from_mesh("plate", cube(Point3::new(-30.0, -30.0, 0.0), Point3::new(30.0, 30.0, 16.0))));
++    let at = Location { pos: Point3::new(0.0, 0.0, -2.0), ..Default::default() };
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, at).expect("stock"));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("Setup1"));
++    let face = |name: &str| {
++        let p = OpParams::Face {
++            holes: Default::default(),
++            tilt: None,
++            blend_turns: false,
++            stepover: 3.0,
++            clearance_z: Height::fixed(30.0),
++            cut_z: Height::fixed(16.0),
++            top_z: None,
++            stepdown: None,
++            feed: 1200.0,
++            plunge_feed: 300.0,
++            climb: true,
++        };
++        CreateOperation::new(&world, name, "EM-0400-2FL", SrcRef::Entity("plate".into()), p).expect("create")
++    };
++    h.execute(&world, face("Face1"));
++    h.execute(&world, GenerateOperation::new(&world, "Face1").expect("generate"));
++    h.execute(&world, CreateSetup::new(&world, None, Some("Setup1")).expect("Setup2"));
++    h.execute(&world, AlignPartToSetup::angles(&world, "Setup2", [0.0, 0.0, 30.0]).expect("30 degrees"));
++    h.execute(&world, face("Face2"));
++    let why = camcraft_app::rest::carry_refusal(&world, "Face2", Some("Setup2")).expect("refused");
++    assert!(why.starts_with(REST_CARRY_REFUSAL) && why.contains("from setup 'Setup1' into setup 'Setup2'"), "{why}");
++    let err = GenerateOperation::new(&world, "Face2").err().expect("generation refused").to_string();
++    assert!(err.contains("Face2") && err.contains("from setup 'Setup1' into setup 'Setup2'"), "{err}");
++    assert!(err.contains(REST_CARRY_REFUSAL), "{err}");
++}
+diff --git a/docs/decisions/318-rest-across-setups.md b/docs/decisions/318-rest-across-setups.md
+new file mode 100644
+index 00000000..8563a600
+--- /dev/null
++++ b/docs/decisions/318-rest-across-setups.md
+@@ -0,0 +1,65 @@
++## #318 - Rest machining across setups, and staleness that crosses them
++
++**Decided: rest crosses a setup boundary exactly where the program sim
++carries the body (#317), by call.** `rest::across::chain_of` walks back
++from the consumer's setup through the program; at every boundary it asks
++`stock_sim::carry::entry` - the function the sim's own walk uses - and
++extends the chain on `Carry`, ends it on `Clip`. The rest grid for a
++crossing chain is the origin setup's block, each segment's cut moves
++swept, the body carried at each boundary (`rest::across::carried_grid`);
++the verify prior (`PriorPlan`) does the same on the job thread, with the
++origin body built on the caller's thread. Considered and dropped: calling
++`stock_sim::incoming_body` directly - it walks `posting::program_ops`,
++which refuses the whole program over any Stale or never-generated op
++(including the consumer being regenerated), so it cannot serve
++generation; the shared seam is `carry::entry` + `Body::carry` instead.
++
++**Decided: a clip-entered setup keeps its own fresh block (the pre-#318
++law).** Two setups that hold the part alike and are not linked are
++entered by the M3.2 A clip. Whether the same part or a new block is
++loaded there is not stated until #320's per-setup stock-source choice;
++the fresh block is the side that never assumes material gone (re-cuts air
++at worst). Considered and dropped: reading the clip's "earlier cuts stand
++below the new top" for rest - if the user loaded a new blank, that
++assumes material gone that is there (full-width engagement, rapid into
++stock: gouge-class).
++
++**Decided: a refused carry refuses the rest reading by name.** If the
++consumer's chain must cross a boundary `carry::entry` refuses (a turn the
++lattice cannot carry exactly, a lathe or mill-turn), every op that reads
++the program ahead (`operation::reads_prior` - Pocket3D, Drill and every
++unposed op) is refused at `collect_job` with `rest::REST_CARRY_REFUSAL`
++plus the carry's own reason naming both setups. Never generated against
++the setup's own block. Considered and dropped: refusing only when
++something ahead actually cut - the incoming stock of a carried setup is
++the earlier setup's block even uncut, which may stand outside the later
++setup's declared stock.
++
++**Decided: the rest grid reads the carried body's tops.** A column cut
++through on its far side still reads its standing top (more material,
++never less); masks only subtract, so the worst case is air cutting.
++Considered and dropped: `Body::display()` (cut-through columns as air) -
++exact, but it would hand the mask a less-conservative reading for no
++pinned gain.
++
++**Decided: the stamp.** A crossing chain's digest (`rest::prior_digest`)
++is the predecessors' path digest (unchanged law: cached paths, not
++intentions) plus the chain's own term: the setups crossed, each lattice
++turn (round-trip exact), and the origin setup's stock definition. So
++regenerating a Setup1 op, changing the re-clamp (alignment, link,
++unlink), changing Setup1's stock, deleting/reordering ahead all stale the
++later setup's rest op; undo restores the old digest. A refused chain
++digests its refusal text. A chain that does not cross writes exactly the
++old digest - single-setup stamps and goldens are bit-for-bit unchanged.
++Suppression does not move the digest (the mask is what was planned, as
++in #161); `rest::suppressed_cuts_ahead` now walks the chain, so the post
++refuses a Setup2 op generated against a suppressed Setup1 cut by name.
++
++**Left to #319:** the raw-stock laws in a later setup (rapid-in-stock
++convictions read the setup's own declared stock before the prior can
++acquit; Face's top-stock credit, area/region builds) still read the
++setup's own block. The carried prior only acquits where the carried body
++truly is cut, which is safe; convicting against carried material that
++stands OUTSIDE the declared block is #319's verification work.
++Same-setup only, unchanged: `drills_ahead` / `turned_ahead` (the turned
++family runs on a lathe, where the carry is refused anyway).
+
+From 394ed0f33a3ca4f7e752d98144a59f1d85da3953 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 9 Nov 2026 02:07:50 +0100
+Subject: [PATCH 2/2] feat(rest): rest machining reads the stock carried from
+ earlier setups
+
+A rest-reading op in a setup the machined body is carried into (#317)
+now reads what the earlier setups cut: the rest mask and the verify
+prior are the origin block, cut and carried through every boundary
+carry::entry carries. Clip-entered setups keep their own block. The
+rest digest folds the setups crossed, each lattice turn and the origin
+stock, so a change ahead in an earlier setup stales the later op; the
+suppressed-ahead refusal walks the same chain; a refused carry refuses
+every reads_prior op by name (REST_CARRY_REFUSAL). Single-setup stamps
+and goldens are unchanged. rest.rs split (pilots.rs) for the 400-line law.
+
+Fixes #318
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/rest.rs          | 50 ++---------------------------
+ crates/app/src/rest/pilots.rs   | 57 +++++++++++++++++++++++++++++++++
+ crates/app/tests/setup_carry.rs | 10 +++---
+ 3 files changed, 66 insertions(+), 51 deletions(-)
+ create mode 100644 crates/app/src/rest/pilots.rs
+
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index 5b4b350e..962ca3c5 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -56,6 +56,9 @@
+ 
+ mod across;
+ mod ahead;
++mod pilots;
++
++pub use pilots::{drills_ahead, turned_ahead, DrillAhead, TurnedAhead};
+ 
+ pub use across::REST_CARRY_REFUSAL;
+ use across::{carried_grid, chain_of};
+@@ -357,50 +360,3 @@ pub fn prior_stale(world: &World, name: &str, setup: Option<&str>) -> Option<Str
+         None => None,
+     }
+ }
+-
+-/// A twist drill ahead in the setup, as the turned family's rapid law
+-/// credits it (#103): its cut moves, the drill's radius and the cot of
+-/// its point's half-angle. A drill that states no point (tip angle 0 or
+-/// 180) is read as the standard 118-degree point: a flat point would
+-/// credit the full radius down to the tip - MORE removed (review S3).
+-pub struct DrillAhead {
+-    pub radius: f64,
+-    pub cone: Option<f64>,
+-    pub moves: Vec<Move>,
+-}
+-
+-/// A turning op ahead in the setup, as the turned family's rapid law
+-/// credits it (#159): its moves (nose centres) and its insert's nose
+-/// radius - a blade or gauge states none and credits its centre line
+-/// alone (less removed, never more).
+-pub struct TurnedAhead {
+-    pub nose: f64,
+-    pub moves: Vec<Move>,
+-}
+-
+-/// Every turning-family op ahead of `name` in its setup that has cut.
+-/// Read in the meridian, so a kerf to the axis credits exactly its
+-/// swept nose - the column grid's undercut objection (#89 review) does
+-/// not arise.
+-pub fn turned_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<TurnedAhead> {
+-    ahead_of(world, name, setup, true)
+-        .into_iter()
+-        .filter(|a| a.cut && a.kind.info().family() == crate::operation::Family::Turn)
+-        .map(|a| TurnedAhead { nose: a.nose.unwrap_or(0.0), moves: a.moves })
+-        .collect()
+-}
+-
+-/// cot(59 deg): the 118-degree twist drill point (machine-tool handbooks).
+-const STANDARD_POINT_COT: f64 = 0.600_860_619_027_560_4;
+-
+-/// Every Drill operation ahead of `name` in its setup that has cut. Read
+-/// on a lathe too - the axial hole is a cylinder about the spindle, so
+-/// the meridian law reads it without the column grid (the prior plan's
+-/// facing-only rule is unchanged).
+-pub fn drills_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<DrillAhead> {
+-    ahead_of(world, name, setup, true)
+-        .into_iter()
+-        .filter(|a| a.cut && a.kind == crate::operation::OpType::Drill && a.radius > 0.0)
+-        .map(|a| DrillAhead { radius: a.radius, cone: a.cone.or(Some(STANDARD_POINT_COT)), moves: a.moves })
+-        .collect()
+-}
+diff --git a/crates/app/src/rest/pilots.rs b/crates/app/src/rest/pilots.rs
+new file mode 100644
+index 00000000..3481a4f7
+--- /dev/null
++++ b/crates/app/src/rest/pilots.rs
+@@ -0,0 +1,57 @@
++//! The pilots and turned passes ahead of a turned-family op (#103, #159),
++//! read in the meridian rather than through the column grid.
++//!
++//! Provenance: our own design, split out of `rest.rs` for AGENTS.md's
++//! 400-line limit (#318); twist drill point geometry from machine-tool
++//! handbooks. No vendor implementation inspected.
++
++use super::ahead::ahead_of;
++use crate::cl::Move;
++use flecs_ecs::prelude::World;
++
++/// A twist drill ahead in the setup, as the turned family's rapid law
++/// credits it (#103): its cut moves, the drill's radius and the cot of
++/// its point's half-angle. A drill that states no point (tip angle 0 or
++/// 180) is read as the standard 118-degree point: a flat point would
++/// credit the full radius down to the tip - MORE removed (review S3).
++pub struct DrillAhead {
++    pub radius: f64,
++    pub cone: Option<f64>,
++    pub moves: Vec<Move>,
++}
++
++/// A turning op ahead in the setup, as the turned family's rapid law
++/// credits it (#159): its moves (nose centres) and its insert's nose
++/// radius - a blade or gauge states none and credits its centre line
++/// alone (less removed, never more).
++pub struct TurnedAhead {
++    pub nose: f64,
++    pub moves: Vec<Move>,
++}
++
++/// Every turning-family op ahead of `name` in its setup that has cut.
++/// Read in the meridian, so a kerf to the axis credits exactly its
++/// swept nose - the column grid's undercut objection (#89 review) does
++/// not arise.
++pub fn turned_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<TurnedAhead> {
++    ahead_of(world, name, setup, true)
++        .into_iter()
++        .filter(|a| a.cut && a.kind.info().family() == crate::operation::Family::Turn)
++        .map(|a| TurnedAhead { nose: a.nose.unwrap_or(0.0), moves: a.moves })
++        .collect()
++}
++
++/// cot(59 deg): the 118-degree twist drill point (machine-tool handbooks).
++const STANDARD_POINT_COT: f64 = 0.600_860_619_027_560_4;
++
++/// Every Drill operation ahead of `name` in its setup that has cut. Read
++/// on a lathe too - the axial hole is a cylinder about the spindle, so
++/// the meridian law reads it without the column grid (the prior plan's
++/// facing-only rule is unchanged).
++pub fn drills_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<DrillAhead> {
++    ahead_of(world, name, setup, true)
++        .into_iter()
++        .filter(|a| a.cut && a.kind == crate::operation::OpType::Drill && a.radius > 0.0)
++        .map(|a| DrillAhead { radius: a.radius, cone: a.cone.or(Some(STANDARD_POINT_COT)), moves: a.moves })
++        .collect()
++}
+diff --git a/crates/app/tests/setup_carry.rs b/crates/app/tests/setup_carry.rs
+index 5f8df5b2..7bf30b05 100644
+--- a/crates/app/tests/setup_carry.rs
++++ b/crates/app/tests/setup_carry.rs
+@@ -169,9 +169,11 @@ fn a_turn_the_lattice_cannot_carry_is_refused_by_name() {
+     h.execute(&world, skew);
+     let op = CreateOperation::new(&world, "Face2", TOOL, SrcRef::Entity("part".into()), face(16.0)).expect("create");
+     h.execute(&world, op);
+-    h.execute(&world, GenerateOperation::new(&world, "Face2").expect("generate"));
+-    let err = simulate_document(&world).map(|_| ()).expect_err("refused");
++    // #318: Face2 reads the program ahead, whose stock cannot be carried
++    // in - its generation is refused by name, never cut on a guess.
++    let err = GenerateOperation::new(&world, "Face2").err().expect("generation refused").to_string();
+     assert!(err.contains("from setup 'Setup1' into setup 'Setup2'") && err.contains(CARRY_TURN_REFUSAL), "{err}");
+-    let err = incoming_body(&world, "Setup2").map(|_| ()).expect_err("the same refusal");
+-    assert!(err.contains(CARRY_TURN_REFUSAL), "{err}");
++    // The program cannot be judged either: Face2 never generated, so the
++    // walk refuses before it reaches the carry.
++    assert!(incoming_body(&world, "Setup2").is_err());
+ }

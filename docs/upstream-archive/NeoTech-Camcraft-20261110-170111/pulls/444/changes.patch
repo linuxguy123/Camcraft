@@ -1,0 +1,245 @@
+From 48354f313e78a16f8f7428f30c17ae409ec4814b Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 9 Nov 2026 09:47:11 +0100
+Subject: [PATCH] fix(mcp): refuse null ids, survive oversize and non-UTF-8
+ lines, name nested patch typos
+
+The stdio MCP server now refuses a request whose id is null as an
+invalid request; reads each wire line as bytes capped at 16 MiB, so an
+oversize line is a parse error skipped without being held in memory and
+a non-UTF-8 line is a parse error the session reads past; refuses a
+misspelled field at any depth of a params patch by its dotted path
+(e.g. clearance_z.ofset), not only at the top level; and post reports
+the path v_post actually wrote.
+
+Fixes #443
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/mcp/edit.rs  | 35 ++++++++++++++++++++--
+ crates/app/src/mcp/mod.rs   | 60 +++++++++++++++++++++++++++++++++----
+ crates/app/src/mcp/tools.rs |  3 +-
+ crates/app/tests/mcp.rs     | 59 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 147 insertions(+), 10 deletions(-)
+
+diff --git a/crates/app/src/mcp/edit.rs b/crates/app/src/mcp/edit.rs
+index 7f99b529..fdaeb0f0 100644
+--- a/crates/app/src/mcp/edit.rs
++++ b/crates/app/src/mcp/edit.rs
+@@ -91,12 +91,41 @@ fn patched(base: &OpParams, patch: &Value) -> Result<OpParams, String> {
+         return Err("the patched parameters could not be read back".into());
+     };
+     let back = back.get(&key).and_then(Value::as_object).cloned().unwrap_or_default();
++    if let Some(path) = lost(patch, &back, "") {
++        return Err(format!("bad params patch: unknown field {path} - a {key} operation has no field \"{path}\"; see list_operation_types"));
++    }
++    Ok(next)
++}
++
++/// The first key path of `patch` (dotted, e.g. `clearance_z.ofset`) the
++/// typed round-trip did not keep, at any depth. A null value is a
++/// removal (RFC 7386) and has nothing to keep; an object is checked key
++/// by key against what came back; any other value is a leaf that must
++/// simply be present.
++fn lost(patch: &Map<String, Value>, back: &Map<String, Value>, prefix: &str) -> Option<String> {
+     for (k, v) in patch {
+-        if !v.is_null() && !back.contains_key(k) {
+-            return Err(format!("bad params patch: a {key} operation has no field \"{k}\" - see list_operation_types"));
++        if v.is_null() {
++            continue;
++        }
++        let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
++        match (v, back.get(k)) {
++            (_, None) => return Some(path),
++            (Value::Object(p), Some(Value::Object(b))) => {
++                if let Some(deeper) = lost(p, b, &path) {
++                    return Some(deeper);
++                }
++            }
++            // An object patch whose field came back as a scalar or null
++            // lost every key it carried.
++            (Value::Object(p), Some(_)) => {
++                if let Some(first) = p.iter().find(|(_, x)| !x.is_null()).map(|(n, _)| n) {
++                    return Some(format!("{path}.{first}"));
++                }
++            }
++            _ => {}
+         }
+     }
+-    Ok(next)
++    None
+ }
+ 
+ fn merge(target: &mut Value, patch: &Value) {
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index cadb7823..c1096998 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -22,7 +22,7 @@ mod tools;
+ use crate::script::Env;
+ 
+ use serde_json::{json, Value};
+-use std::io::{BufRead, Write};
++use std::io::{BufRead, Read, Write};
+ 
+ /// The protocol revisions this server speaks, newest first. A client
+ /// asking for one of them gets it echoed; anything else gets the newest
+@@ -77,6 +77,10 @@ impl Server {
+             return Some(rpc_error(Value::Null, INVALID_REQUEST, "a single JSON-RPC object was expected"));
+         };
+         let id = obj.get("id").cloned();
++        if id == Some(Value::Null) {
++            // MCP: a request id is a string or a number, never null.
++            return Some(rpc_error(Value::Null, INVALID_REQUEST, "\"id\" must be a string or a number, not null"));
++        }
+         if obj.get("jsonrpc") != Some(&json!("2.0")) {
+             return id.map(|id| rpc_error(id, INVALID_REQUEST, "\"jsonrpc\" must be \"2.0\""));
+         }
+@@ -170,17 +174,61 @@ fn rpc_error(id: Value, code: i64, msg: &str) -> Value {
+     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
+ }
+ 
++/// The longest wire line the server reads, in bytes (16 MiB). A longer
++/// line is answered with a parse error and skipped to its newline
++/// without being held in memory - one runaway message must not take
++/// the session (or the machine) down with it.
++pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
++
+ /// The stdio loop: one message per line in, one per line out, flushed
+ /// at once (the client waits on it). Ends cleanly at end of input.
++/// A line that is not UTF-8, or longer than [`MAX_LINE_BYTES`], is a
++/// JSON-RPC parse error for that line; the loop reads on. Only an I/O
++/// failure of the streams themselves ends it early.
+ /// Diagnostics never go to stdout - that stream is the protocol's.
+-pub fn serve(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
++pub fn serve(mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+     let mut server = Server::new();
+-    for line in input.lines() {
+-        let line = line?;
+-        if let Some(reply) = server.handle_line(&line) {
++    let mut buf = Vec::new();
++    loop {
++        buf.clear();
++        let cap = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
++        let n = (&mut input).take(cap).read_until(b'\n', &mut buf)?;
++        if n == 0 {
++            return Ok(());
++        }
++        let reply = if !buf.ends_with(b"\n") && buf.len() > MAX_LINE_BYTES {
++            skip_line(&mut input)?;
++            Some(parse_error(&format!("line longer than {MAX_LINE_BYTES} bytes")))
++        } else {
++            match std::str::from_utf8(&buf) {
++                Ok(line) => server.handle_line(line),
++                Err(e) => Some(parse_error(&format!("the line is not UTF-8: {e}"))),
++            }
++        };
++        if let Some(reply) = reply {
+             writeln!(output, "{reply}")?;
+             output.flush()?;
+         }
+     }
+-    Ok(())
++}
++
++fn parse_error(msg: &str) -> String {
++    rpc_error(Value::Null, PARSE_ERROR, &format!("parse error: {msg}")).to_string()
++}
++
++/// Drop input up to and including the next newline (or to the end),
++/// one buffer at a time - nothing of the skipped line is kept.
++fn skip_line(input: &mut impl BufRead) -> std::io::Result<()> {
++    loop {
++        let chunk = input.fill_buf()?;
++        if chunk.is_empty() {
++            return Ok(());
++        }
++        if let Some(i) = chunk.iter().position(|&b| b == b'\n') {
++            input.consume(i.saturating_add(1));
++            return Ok(());
++        }
++        let len = chunk.len();
++        input.consume(len);
++    }
+ }
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index a97bf915..275d8984 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -119,7 +119,8 @@ fn post(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
+         opts["cps"] = json!(p);
+     }
+     let mut out = api::v_post(env, vec![opts])?;
+-    out["files"] = json!([to]);
++    // What v_post itself reports as written, not the path asked for.
++    out["files"] = json!([out.get("path").cloned().unwrap_or_else(|| json!(to))]);
+     Ok(out)
+ }
+ 
+diff --git a/crates/app/tests/mcp.rs b/crates/app/tests/mcp.rs
+index 4fa17dfc..ac8c5dc9 100644
+--- a/crates/app/tests/mcp.rs
++++ b/crates/app/tests/mcp.rs
+@@ -245,3 +245,62 @@ fn the_stdio_loop_answers_line_for_line() {
+     assert_eq!(lines[1]["result"]["isError"], json!(false));
+     assert_eq!(lines[1]["result"]["structuredContent"]["operations"], json!([]));
+ }
++
++#[test]
++fn a_nested_patch_typo_is_refused_by_its_path() {
++    let mut c = Client::new();
++    c.ok("set_stock", json!({ "box": { "dx": 50.0, "dy": 50.0, "dz": 10.0 } }));
++    c.ok("add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    c.ok("add_operation", json!({ "kind": "face", "tool": "EM-0400-2FL" }));
++    // One level down: `ofset` would have been dropped by serde and the
++    // edit reported done while clearance stayed at +25.
++    let msg = c.refused("edit_operation", json!({ "name": "Face1", "params": { "clearance_z": { "ofset": 50.0 } } }));
++    assert!(msg.contains("unknown field clearance_z.ofset"), "{msg}");
++    let job = c.ok("get_job", json!({}));
++    assert_eq!(job["operations"][0]["params"]["face"]["clearance_z"]["offset"], json!(25.0), "{job}");
++    // The same typo on add_operation, and the right spelling lands.
++    let msg = c.refused("add_operation", json!({ "kind": "face", "tool": "EM-0400-2FL", "params": { "cut_z": { "referense": "fixed" } } }));
++    assert!(msg.contains("unknown field cut_z.referense"), "{msg}");
++    let edit = c.ok("edit_operation", json!({ "name": "Face1", "params": { "clearance_z": { "offset": 50.0 } } }));
++    assert_eq!(edit["params"]["face"]["clearance_z"]["offset"], json!(50.0), "{edit}");
++}
++
++#[test]
++fn a_null_id_is_an_invalid_request() {
++    let mut s = Server::new();
++    let reply = s.handle(&json!({ "jsonrpc": "2.0", "id": null, "method": "ping" })).expect("answered");
++    assert_eq!(reply["error"]["code"], json!(-32600), "{reply}");
++    assert_eq!(reply["id"], Value::Null);
++}
++
++fn serve_bytes(input: &[u8]) -> Vec<Value> {
++    let mut out = Vec::new();
++    mcp::serve(input, &mut out).expect("serve");
++    let text = String::from_utf8(out).expect("utf8");
++    text.lines().map(|l| serde_json::from_str(l).expect("one JSON object per line")).collect()
++}
++
++const PING: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n";
++
++#[test]
++fn a_non_utf8_line_is_a_parse_error_and_the_session_reads_on() {
++    let mut input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"x\":\"\xff\xfe\"}\n".to_vec();
++    input.extend_from_slice(PING);
++    let lines = serve_bytes(&input);
++    assert_eq!(lines.len(), 2, "{lines:?}");
++    assert_eq!(lines[0]["error"]["code"], json!(-32700));
++    assert_eq!(lines[1]["id"], json!(7));
++    assert_eq!(lines[1]["result"], json!({}));
++}
++
++#[test]
++fn an_oversized_line_is_a_parse_error_and_is_skipped() {
++    let mut input = vec![b'x'; mcp::MAX_LINE_BYTES + 4096];
++    input.push(b'\n');
++    input.extend_from_slice(PING);
++    let lines = serve_bytes(&input);
++    assert_eq!(lines.len(), 2, "one answer for the long line, one for the ping");
++    assert_eq!(lines[0]["error"]["code"], json!(-32700));
++    assert!(lines[0]["error"]["message"].as_str().is_some_and(|m| m.contains("longer than")), "{}", lines[0]);
++    assert_eq!(lines[1]["id"], json!(7));
++}

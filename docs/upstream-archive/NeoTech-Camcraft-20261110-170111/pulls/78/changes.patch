@@ -1,0 +1,837 @@
+From 0610e2b1c65459569069d681eb4d9d56c5c5dad9 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 7 Nov 2026 13:36:36 +0100
+Subject: [PATCH 1/2] fix(app): measure the cross drill about the work offset's
+ spindle
+
+The radial kernel measured every standoff (bar radius, station side,
+hop/clearance radii, the station-change chord law) about world Z through
+world (0, 0), while the posts program about world Z through the work
+offset's origin. A bar moved off the world origin with G54 moved onto
+it drilled a different chain from G54 than the same bar on the origin
+(hop 26.444/32.444/46.444 mm vs 21.213, final clearance 35.770 vs 15).
+
+- operation/cross_spindle.rs: shift the holes into the spindle frame by
+  the wcs_context origin (collected once as GenJob::wcs_origin), measure
+  stock_r about that line, run the kernel, shift the chain back. An
+  origin on world Z runs the kernel untouched (on-origin bits unchanged).
+- spindle_law::turns also covers a mill-turn's cross drill, so a revolved
+  bar off its work offset is refused by name there too.
+- A plain lathe's cross drill refuses by name a part the axis fit cannot
+  read as turned (the mill-turn keeps drilling prismatic bars).
+
+Fixes #67
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ RECOMMENDED.md                             |  29 +++
+ crates/app/src/operation/cross_spindle.rs  |  99 +++++++++
+ crates/app/src/operation/generate.rs       |  28 +--
+ crates/app/src/operation/job.rs            |  12 +-
+ crates/app/src/operation/mod.rs            |   1 +
+ crates/app/src/operation/spindle_law.rs    |  22 +-
+ crates/app/tests/drilling_cross_spindle.rs | 223 +++++++++++++++++++++
+ 7 files changed, 394 insertions(+), 20 deletions(-)
+ create mode 100644 crates/app/src/operation/cross_spindle.rs
+ create mode 100644 crates/app/tests/drilling_cross_spindle.rs
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index 15a49c92..a06a97ec 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -12422,3 +12422,32 @@ usual. Why: the change is a test file - the zip ships no tests, so its
+ contents cannot differ, and the full release gate (~50 min) already passed on
+ every shipped file. Dropped: re-running the whole release gate for six test
+ lines. The rule stands for any mid-cut change that touches shipped code.
++
++## #67: the cross drill measures about the work offset's spindle (2026-11-07)
++
++`drilling::cross_drill` measures every standoff (bar radius, a station's
++side, the hop/clearance radii, the station-change chord law) about world Z
++through world (0, 0); the posts program about world Z through the work
++offset's origin. Chosen: carry the job into the spindle's frame in a new
++`operation/cross_spindle.rs` - the holes shifted by the `wcs_context` origin
++(now collected once into `GenJob::wcs_origin`, the very origin the spindle
++law judges), `stock_r` measured about that line, the kernel run unchanged,
++the chain shifted back. An origin on world Z skips the shift, so every
++on-origin chain keeps its bits. Considered and dropped: teaching the motion
++kernel a spindle centre (a kernel API change for a frame shift the app seam
++already owns), and re-latticing the shifted chain (it moved the kernel's
++unsnapped chord points off the on-origin chain).
++
++- *Spindle law for the mill-turn.* `spindle_law::turns` now also covers a
++  Drill with cross holes on a mill-turn (the lathe's Drill was already in),
++  so a revolved bar off its work offset is refused by name there too, at
++  generation and at the post, and moving G54 stales the op.
++- *Unreadable parts.* A plain lathe's cross drill refuses by name a part the
++  axis fit cannot read as turned, as its axial drill already does. The
++  mill-turn's does NOT: a hex or square bar is ordinary cross-drill stock on
++  a C-axis machine, and with the standoffs measured about the posted spindle
++  its envelope is honest whatever the part's shape (the drilling_cross suite
++  drills exactly such a rectangular bar). Dropped: refusing it everywhere.
++- Left open: the standoff radius reads the part's facets, not the setup's
++  stock - a cross drill run before the bar is turned to size would hop
++  inside the raw stock. Worth its own issue.
+diff --git a/crates/app/src/operation/cross_spindle.rs b/crates/app/src/operation/cross_spindle.rs
+new file mode 100644
+index 00000000..3fdd3e6c
+--- /dev/null
++++ b/crates/app/src/operation/cross_spindle.rs
+@@ -0,0 +1,99 @@
++//! The cross drill about the posted spindle (issue #67): the radial
++//! kernel (`drilling::cross_drill`) measures every standoff - the bar's
++//! radius, the station's side, the hop and clearance radii, the chord
++//! law between stations - about world Z through world (0, 0). The post
++//! programs about world Z through the WORK OFFSET's origin, so a bar
++//! moved off the world origin with its offset moved onto it would be
++//! drilled about a line it is not on: standoffs measured from the wrong
++//! centre, and a program that differs from the on-origin one. Here the
++//! job is carried into the spindle's frame (an XY shift by the origin
++//! `posting::wcs_context` hands the post, the one the spindle law
++//! judges against), run there, and carried back - so the kernel's own
++//! laws hold about the spindle the machine turns.
++//!
++//! Provenance: a lathe's or mill-turn's live-tool radial position is
++//! measured from the spindle centreline (RS-274 / ISO 6983 lathe
++//! convention, any turning handbook); the frame shift is plain
++//! translation. Our own design notes; no vendor material consulted.
++
++use crate::cl::Toolpath;
++use crate::drilling::{self, CrossHole, CrossParams};
++use crate::geometry::{Point3, Triangle};
++use crate::machining2d::GenError;
++
++/// The plain lathe's cross drill stands on the same reading its axial
++/// drill does: a part the axis fit cannot read as revolved has no
++/// spindle the law could put it on, and is refused by name - never
++/// drilled about a guessed centre. (A mill-turn's cross drill takes a
++/// prismatic bar; it is measured about the work offset as it stands.)
++pub(super) fn lathe_reads(facets: &[Triangle], origin: [f64; 3]) -> Result<(), GenError> {
++    if super::spindle_law::spindle_reading(facets, origin).is_some() {
++        return Ok(());
++    }
++    let why = crate::multiaxis::axis::fit(facets)
++        .err()
++        .map_or_else(|| "its axis lies near the table".to_string(), |e| e.to_string());
++    Err(GenError::Invalid(format!(
++        "a lathe's cross drill plunges toward the spindle, and this part cannot be read as \
++         turned about one ({why}) - model the part as the turned bar it is, or drill it on a \
++         mill-turn"
++    )))
++}
++
++/// Run the radial kernel about world Z through `origin`: `p` carries the
++/// heights, the cycle, the tool and the world-frame hole list; its
++/// `stock_r` and `stock_z_max` are recomputed here from `facets` about
++/// that line. An origin on the world Z axis runs the kernel untouched,
++/// so every on-origin path keeps its bits.
++pub(super) fn cross_drill(
++    p: CrossParams<'_>,
++    facets: &[Triangle],
++    origin: [f64; 3],
++) -> Result<Toolpath, GenError> {
++    let (ox, oy) = (origin[0], origin[1]);
++    if !(ox.is_finite() && oy.is_finite()) {
++        return Err(GenError::Invalid("the work offset's origin is not usable".into()));
++    }
++    let verts = || facets.iter().flat_map(|t| [t.a, t.b, t.c]);
++    let stock_r = verts()
++        .map(|v| ((v.x - ox).powi(2) + (v.y - oy).powi(2)).sqrt())
++        .fold(0.0_f64, f64::max);
++    // The bar's Z top: known, the kernel may route an opposite-station
++    // travel over the end face (M5.2 G); a solid with no vertices says
++    // so honestly. Z is the spindle's own coordinate - no shift.
++    let stock_z_max = verts().map(|v| v.z).reduce(f64::max);
++    if ox == 0.0 && oy == 0.0 {
++        return drilling::cross_drill(&CrossParams { stock_r: stock_r.max(1.0), stock_z_max, ..p });
++    }
++    let local: Vec<CrossHole> = p
++        .holes
++        .iter()
++        .map(|h| CrossHole { origin: Point3::new(h.origin.x - ox, h.origin.y - oy, h.origin.z), ..*h })
++        .collect();
++    let mut t = drilling::cross_drill(&CrossParams {
++        stock_r: stock_r.max(1.0),
++        stock_z_max,
++        holes: &local,
++        ..p
++    })?;
++    // The kernel's chain is straight, cycle-free and computer-
++    // compensated; anything else would need its own carry back, so it
++    // refuses by name rather than post half-shifted.
++    if !t.cycles.is_empty() || !t.comps.is_empty() || t.has_arcs() {
++        return Err(GenError::Invalid(
++            "internal: the cross-drill chain grew records the spindle shift does not carry".into(),
++        ));
++    }
++    // A plain carry: the kernel snapped what it snaps (the mouths) in
++    // its own frame, and re-snapping here would move its unsnapped
++    // chord points off the on-origin chain's.
++    let back = |q: Point3| Point3::new(q.x + ox, q.y + oy, q.z);
++    for m in &mut t.moves {
++        m.from = back(m.from);
++        m.to = back(m.to);
++    }
++    if !t.is_chained() || !t.all_finite() {
++        return Err(GenError::Invalid("cross-drill chain self-check failed after the spindle shift".into()));
++    }
++    Ok(t)
++}
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 485fe20d..2e8beed2 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -48,6 +48,7 @@ pub fn run_job(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+         rotary_axis,
+         part_solid,
+         area,
++        wcs_origin,
+     } = job;
+     // Tool: the diameter drives the path, the body drives the reach law.
+     let d = tool.diameter;
+@@ -1760,20 +1761,19 @@ pub fn run_job(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     ));
+                 }
+                 let top = req_z(hl.top, "Top of Part Z")?;
+-                let verts = || material.facets.iter().flat_map(|t| [t.a, t.b, t.c]);
+-                let stock_r = verts()
+-                    .map(|p| (p.x * p.x + p.y * p.y).sqrt())
+-                    .fold(0.0_f64, f64::max);
+-                // The bar's Z top: known, the kernel may route an
+-                // opposite-station travel over the end face (M5.2
+-                // G); a solid with no vertices says so honestly.
+-                let stock_z_max = verts().map(|p| p.z).reduce(f64::max);
+-                drilling::cross_drill(&drilling::CrossParams {
++                // Issue #67: the lathe reads its bar as turned or
++                // refuses it by name, and every standoff is measured
++                // about the spindle the post programs - world Z
++                // through the work offset - not the world origin.
++                if machine_kind == crate::machine::Kind::Lathe {
++                    super::cross_spindle::lathe_reads(&material.facets, wcs_origin)?;
++                }
++                let radial = drilling::CrossParams {
+                     // The clearance/retract planes projected onto the
+                     // plunge axis: their Z height above R is exactly
+                     // the standoff the radial law wants (a curved
+                     // face has no one plane - the kernel owns the
+-                    // stock_r part).
++                    // stock_r part, measured about the spindle).
+                     clearance_d: (hl.clearance - top).max(1.0),
+                     r_d: (hl.clearance - top).max(1.0),
+                     hop_d: hl.retract.map(|r| (r - top).max(0.0)),
+@@ -1783,11 +1783,13 @@ pub fn run_job(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     dwell: *dwell,
+                     feed: *feed,
+                     plunge_feed: *plunge_feed,
+-                    stock_r: stock_r.max(1.0),
+-                    stock_z_max,
++                    // Both measured about the spindle by the call below.
++                    stock_r: 1.0,
++                    stock_z_max: None,
+                     tool: &tool,
+                     holes: cross,
+-                })?
++                };
++                super::cross_spindle::cross_drill(radial, &material.facets, wcs_origin)?
+             } else {
+                 // M13.5 A: on a plain lathe the Drill kind is the
+                 // turret's axial hole - the doors refuse by name a
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index 5c93f20c..f317122a 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -71,6 +71,11 @@ pub struct GenJob {
+     /// The area controls resolved against the world (M11.5); `None` for
+     /// the identity - an untouched operation carries nothing new.
+     pub(super) area: Option<Result<AreaCtx, GenError>>,
++    /// The work offset's world origin (`posting::wcs_context`), the
++    /// spindle a lathe or mill-turn post programs about: world Z
++    /// through it. The cross drill measures its standoffs from this
++    /// line (issue #67), not from the world origin.
++    pub(super) wcs_origin: [f64; 3],
+ }
+ 
+ /// The tripwire phrase for a stored precompute whose arm never collected
+@@ -189,9 +194,11 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     // through the work offset's origin, the very origin `wcs_context`
+     // hands the post), or it is refused here, before a move exists.
+     // (The post reads it again, against the origin it is handed then.)
++    // The mill-turn's cross drill joins it (issue #67): its standoffs
++    // are measured about that same line.
++    let (slot, wcs_origin) = crate::posting::wcs_context(world, setup, &op.params);
+     if super::spindle_law::turns(world, &op.params) {
+-        let (slot, origin) = crate::posting::wcs_context(world, setup, &op.params);
+-        super::spindle_law::check(&material.facets, origin, slot)?;
++        super::spindle_law::check(&material.facets, wcs_origin, slot)?;
+     }
+     let is_mill = machine_kind == crate::machine::Kind::Mill;
+     let fixtures = crate::fixture::boxes_for(world, setup);
+@@ -231,6 +238,7 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+         rotary_axis,
+         part_solid,
+         area,
++        wcs_origin,
+     })
+ }
+ 
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 4788bcc6..c0c16bb5 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -117,6 +117,7 @@ use boundary_ctx::*;
+ mod job;
+ pub use job::*;
+ mod generate;
++mod cross_spindle;
+ mod plunge_solid;
+ mod rotary_law;
+ pub(crate) mod spindle_law;
+diff --git a/crates/app/src/operation/spindle_law.rs b/crates/app/src/operation/spindle_law.rs
+index bc8deba7..e15677e0 100644
+--- a/crates/app/src/operation/spindle_law.rs
++++ b/crates/app/src/operation/spindle_law.rs
+@@ -75,7 +75,10 @@ impl SpindleReading {
+ /// Read the part about its fitted axis and about the spindle through
+ /// `origin`. `None` when the fit cannot read the model as revolved or
+ /// the axis lies near the table: the turning generators refuse those by
+-/// their own names, in their own order.
++/// their own names, in their own order (the lathe's axial drill at its
++/// `axial_doors`, its cross drill at `cross_spindle::lathe_reads` -
++/// issue #67; a mill-turn's cross drill takes a prismatic bar, measured
++/// about the spindle as it stands).
+ #[must_use]
+ pub fn spindle_reading(facets: &[Triangle], origin: [f64; 3]) -> Option<SpindleReading> {
+     let ax = crate::multiaxis::axis::fit(facets).ok()?;
+@@ -153,12 +156,21 @@ pub(super) fn check(facets: &[Triangle], origin: [f64; 3], slot: &str) -> Result
+     )))
+ }
+ 
+-/// Whether `params` turns about the fitted axis on the document's
+-/// machine: the turning family, and the lathe's axial Drill.
++/// Whether `params` works about the spindle on the document's machine:
++/// the turning family, the lathe's Drill (axial or cross), and the
++/// mill-turn's cross drill (issue #67) - whose standoffs are measured
++/// about this same spindle, so a revolved part off it is refused here
++/// by name rather than drilled about a line it is not on.
+ pub(crate) fn turns(world: &World, params: &super::OpParams) -> bool {
++    let kind = crate::machine::kind_of(world);
+     params.kind().info().family() == super::Family::Turn
+-        || (matches!(params, super::OpParams::Drill { .. })
+-            && crate::machine::kind_of(world) == crate::machine::Kind::Lathe)
++        || match params {
++            super::OpParams::Drill { cross, .. } => {
++                kind == crate::machine::Kind::Lathe
++                    || (kind == crate::machine::Kind::MillTurn && !cross.is_empty())
++            }
++            _ => false,
++        }
+ }
+ 
+ /// The law again at the post, for operation entity `e` named `name`:
+diff --git a/crates/app/tests/drilling_cross_spindle.rs b/crates/app/tests/drilling_cross_spindle.rs
+new file mode 100644
+index 00000000..6c710390
+--- /dev/null
++++ b/crates/app/tests/drilling_cross_spindle.rs
+@@ -0,0 +1,223 @@
++//! The cross drill about the posted spindle (issue #67): the radial
++//! kernel's standoffs - the bar's radius, each station's side, the hop
++//! and clearance radii, the chord law between stations - are measured
++//! about the spindle the post programs (world Z through the work
++//! offset's origin), not about the world origin. A turned bar moved
++//! off the world origin with G54 moved onto its axis drills exactly
++//! the on-origin chain, shifted; the same bar under an unmoved G54 is
++//! refused by name (the spindle law, on the lathe and the mill-turn);
++//! and a plain lathe refuses by name a part the axis fit cannot read as
++//! turned. The on-origin chain is pinned by the drilling_cross suite.
++//!
++//! Gate map (M4.4): covers app::operation (cross_spindle, the cross arm
++//! of generate, collect_job's spindle_law door and its wcs_origin).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::cl::Toolpath;
++use camcraft_app::commands::{AddTool, History, ImportModel, LoadMachine, SetStock, SetWcsOrigin};
++use camcraft_app::drilling::{CrossHole, CycleChoice};
++use camcraft_app::geometry::{IDENTITY_Q, Mesh, Point3, Triangle};
++use camcraft_app::machine::Machine;
++use camcraft_app::operation::{self, Height, OpParams, SrcRef};
++use camcraft_app::schema::{Location, Operation};
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++const TAU: f64 = std::f64::consts::TAU;
++/// Where the moved bar's axis stands: off the world origin in X and Y.
++const AT: (f64, f64) = (10.0, 4.0);
++
++/// A closed r10 bar, z in [-20, 20], revolved about world Z and moved
++/// by (`dx`, `dy`).
++fn bar(dx: f64, dy: f64) -> Mesh {
++    let meridian = [(0.0, -20.0), (10.0, -20.0), (10.0, 20.0), (0.0, 20.0)];
++    let segs = 64;
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / segs as f64;
++        Point3::new(r * th.cos() + dx, r * th.sin() + dy, z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..segs {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++/// A right-trapezoid prism: its sides' perpendicular bisectors meet at
++/// no one point, so no axis of revolution reads off it.
++fn prism() -> Mesh {
++    let q = [(-10.0, -8.0), (12.0, -8.0), (12.0, 4.0), (-10.0, 10.0)];
++    let p = |i: usize, z: f64| Point3::new(q[i % 4].0, q[i % 4].1, z);
++    let mut f = Vec::new();
++    for i in 0..4 {
++        let (a, b, c, d) = (p(i, -20.0), p(i + 1, -20.0), p(i + 1, 20.0), p(i, 20.0));
++        f.push(Triangle::new(a, b, c));
++        f.push(Triangle::new(a, c, d));
++    }
++    for z in [-20.0, 20.0] {
++        f.push(Triangle::new(p(0, z), p(1, z), p(2, z)));
++        f.push(Triangle::new(p(0, z), p(2, z), p(3, z)));
++    }
++    Mesh::from_facets(f)
++}
++
++/// Three stations about a bar whose axis stands at (`dx`, `dy`): +X,
++/// +Y, then -X (the opposite pair takes the end-face detour).
++fn holes(dx: f64, dy: f64) -> Vec<CrossHole> {
++    let h = |x: f64, y: f64, z: f64, dir: Point3| CrossHole {
++        origin: Point3::new(x + dx, y + dy, z),
++        dir,
++        radius: 2.0,
++        entry_d: 0.0,
++        floor_d: -6.0,
++        through: false,
++    };
++    vec![
++        h(10.0, 0.0, 10.0, Point3::new(-1.0, 0.0, 0.0)),
++        h(0.0, 10.0, 0.0, Point3::new(0.0, -1.0, 0.0)),
++        h(-10.0, 0.0, -10.0, Point3::new(1.0, 0.0, 0.0)),
++    ]
++}
++
++fn params(cross: Vec<CrossHole>) -> OpParams {
++    OpParams::Drill {
++        clearance_z: Height::fixed(25.0),
++        retract_z: None,
++        top_z: Height::fixed(20.0),
++        bottom_z: None,
++        cycle: CycleChoice::Auto,
++        peck: 0.0,
++        dwell: 0.0,
++        feed: 120.0,
++        plunge_feed: 80.0,
++        holes: vec![],
++        cross,
++    }
++}
++
++fn op(cross: Vec<CrossHole>) -> Operation {
++    Operation {
++        tool: "DR-0400".into(),
++        src: SrcRef::Entity("bar".into()),
++        params: params(cross),
++        stamp: None,
++        setup: None,
++        area: Default::default(),
++    }
++}
++
++fn world_with(word: &str, part: Mesh) -> (World, History) {
++    let world = new_world();
++    let mut history = History::default();
++    let stock = SetStock::new(
++        &world,
++        camcraft_app::stock::StockShape::Box { dx: 60.0, dy: 60.0, dz: 44.0 },
++        Location::default(),
++    );
++    history.execute(&world, stock.expect("box stock"));
++    let m = Machine { model: format!("TestBench {word}"), kind: Some(word.into()), ..Default::default() };
++    history.execute(&world, LoadMachine::new(&world, "bench.mch".into(), Some(m)).expect("machine"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "DR-0400").map(|(_, t)| t).expect("catalog entry");
++    history.execute(&world, AddTool::new(&world, "DR-0400", tool).expect("catalog tool"));
++    history.execute(&world, ImportModel::from_mesh("bar", part));
++    (world, history)
++}
++
++fn place_g54(world: &World, history: &mut History, x: f64, y: f64) {
++    let at = Location { pos: Point3::new(x, y, 0.0), rot: IDENTITY_Q };
++    history.execute(world, SetWcsOrigin::new(world, "G54", at).expect("set G54"));
++}
++
++/// The chain's moves read from G54: every point minus the offset.
++fn about(t: &Toolpath, ox: f64, oy: f64) -> Vec<(Point3, Point3, Option<[f64; 3]>)> {
++    let rel = |p: Point3| Point3::new(p.x - ox, p.y - oy, p.z);
++    t.moves.iter().map(|m| (rel(m.from), rel(m.to), m.axis)).collect()
++}
++
++#[test]
++fn a_cross_drill_off_the_world_origin_under_a_moved_g54_drills_the_on_origin_chain() {
++    for word in ["lathe", "mill-turn"] {
++        let (world, _h) = world_with(word, bar(0.0, 0.0));
++        let (plain, _) = operation::generate(&world, &op(holes(0.0, 0.0)), "")
++            .unwrap_or_else(|e| panic!("{word}: the on-origin bar drills: {e}"));
++
++        let (world, mut history) = world_with(word, bar(AT.0, AT.1));
++        place_g54(&world, &mut history, AT.0, AT.1);
++        let (moved, _) = operation::generate(&world, &op(holes(AT.0, AT.1)), "")
++            .unwrap_or_else(|e| panic!("{word}: the bar on its work offset drills: {e}"));
++
++        let (a, b) = (about(&plain, 0.0, 0.0), about(&moved, AT.0, AT.1));
++        assert_eq!(a.len(), b.len(), "{word}: the same chain, move for move");
++        for (i, (p, q)) in a.iter().zip(&b).enumerate() {
++            let near = |u: Point3, v: Point3| (u - v).dot(u - v).sqrt() <= 1e-9;
++            assert!(
++                near(p.0, q.0) && near(p.1, q.1) && p.2 == q.2,
++                "{word}: move {i} from G54 reads {q:?}, the on-origin chain {p:?}"
++            );
++        }
++        // And every rapid off a hole's own kerf stands outside the bar
++        // as measured about ITS axis - the standoff law, about the spindle.
++        let r_about = |p: Point3| ((p.x - AT.0).powi(2) + (p.y - AT.1).powi(2)).sqrt();
++        let first = moved.moves.first().map(|m| r_about(m.from)).unwrap_or(0.0);
++        assert!((first - 15.0).abs() < 1e-9, "{word}: the clearance stands r10 + 5 off the axis, read {first}");
++    }
++}
++
++#[test]
++fn a_cross_drill_on_a_bar_off_an_unmoved_work_offset_is_refused_by_name() {
++    for word in ["lathe", "mill-turn"] {
++        let (world, _h) = world_with(word, bar(AT.0, AT.1));
++        match operation::generate(&world, &op(holes(AT.0, AT.1)), "") {
++            Ok((t, _)) => panic!("{word}: a bar 10.770 mm off G54 drilled {} moves", t.moves.len()),
++            Err(e) => {
++                let e = e.to_string();
++                for s in ["spindle", "10.770 mm", "G54"] {
++                    assert!(e.contains(s), "{word}: the refusal names '{s}': {e}");
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn a_lathe_cross_drill_on_a_part_that_reads_as_no_revolve_is_refused_by_name() {
++    let part = prism();
++    assert!(
++        operation::spindle_reading(&part.facets, [0.0; 3]).is_none(),
++        "the fixture's premise: the axis fit cannot read the prism"
++    );
++    let hole = vec![CrossHole {
++        origin: Point3::new(12.0, 0.0, 10.0),
++        dir: Point3::new(-1.0, 0.0, 0.0),
++        radius: 2.0,
++        entry_d: 0.0,
++        floor_d: -6.0,
++        through: false,
++    }];
++    let (world, _h) = world_with("lathe", part);
++    match operation::generate(&world, &op(hole.clone()), "") {
++        Ok((t, _)) => panic!("an unreadable part drilled {} moves on a lathe", t.moves.len()),
++        Err(e) => {
++            let e = e.to_string();
++            for s in ["cross drill", "cannot be read as turned", "mill-turn"] {
++                assert!(e.contains(s), "the refusal names '{s}': {e}");
++            }
++        }
++    }
++    // The mill-turn holds a prismatic bar: it drills, about G54.
++    let (world, _h) = world_with("mill-turn", prism());
++    operation::generate(&world, &op(hole), "").expect("a mill-turn drills a prismatic bar");
++}
+
+From 44ad216bbef3e5fda60426e12eb3ea7fdff20c76 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 7 Nov 2026 14:48:28 +0100
+Subject: [PATCH 2/2] fix(app): refuse a cross hole plunging away from the
+ spindle
+
+Review fixes on PR #78:
+
+- A cross hole whose plunge points away from the spindle line (the
+  mouth's radial offset from world Z through the work offset, dotted
+  with the plunge, is positive) is refused by name in world
+  coordinates. The station law stood the tool on the mouth's side at
+  the hop radius - beyond the far face of a mill-turn block sitting off
+  G54 - and the rapid in to the mouth crossed the material.
+- On the shifted path a kernel refusal names the hole's world mouth,
+  not its spindle-frame point.
+- A lathe part whose axis fit returns a degenerate direction says so,
+  instead of "its axis lies near the table".
+- Tests: the away-plunge refusal (and the toward-plunge hole on the same
+  block still drilling), the world-coordinate kernel refusal, and
+  moving G54 under a generated mill-turn cross drill staling it with the
+  post refusing.
+
+Refs #67
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ RECOMMENDED.md                             |  15 +++
+ crates/app/src/operation/cross_spindle.rs  |  72 +++++++++++++-
+ crates/app/tests/drilling_cross_spindle.rs | 106 +++++++++++++++++++++
+ 3 files changed, 188 insertions(+), 5 deletions(-)
+
+diff --git a/RECOMMENDED.md b/RECOMMENDED.md
+index a06a97ec..f4928855 100644
+--- a/RECOMMENDED.md
++++ b/RECOMMENDED.md
+@@ -12451,3 +12451,18 @@ unsnapped chord points off the on-origin chain).
+ - Left open: the standoff radius reads the part's facets, not the setup's
+   stock - a cross drill run before the bar is turned to size would hop
+   inside the raw stock. Worth its own issue.
++- *Review fixes (PR #78).* (1) Every cross hole must plunge TOWARD the
++  spindle line: in the spindle frame, the mouth's radial offset dotted with
++  the plunge must not be positive, or `cross_spindle` refuses the hole by
++  name in world coordinates. The station law stands a tool on the mouth's
++  side at the hop radius, so on a mill-turn block sitting off G54 a hole on
++  the face nearer the axis, plunging away from it, parked the tool beyond
++  the far face and rapided through the block. Chosen: the per-hole rule (it
++  refuses exactly the holes that would collide). Dropped: refusing a
++  prismatic part whose box does not straddle the G54 line (coarser - it
++  would refuse the block's safe far-face holes too). (2) On the shifted
++  path a kernel refusal is carried back to world coordinates (the hole's
++  mouth point rewritten), so the user reads the point in their own model.
++  (3) A lathe part whose fit returns a degenerate axis says so, rather
++  than "its axis lies near the table". (4) A test pins that moving G54
++  under a generated mill-turn cross drill stales it and the post refuses.
+diff --git a/crates/app/src/operation/cross_spindle.rs b/crates/app/src/operation/cross_spindle.rs
+index 3fdd3e6c..16490d1d 100644
+--- a/crates/app/src/operation/cross_spindle.rs
++++ b/crates/app/src/operation/cross_spindle.rs
+@@ -16,7 +16,7 @@
+ //! convention, any turning handbook); the frame shift is plain
+ //! translation. Our own design notes; no vendor material consulted.
+ 
+-use crate::cl::Toolpath;
++use crate::cl::{lattice, Toolpath};
+ use crate::drilling::{self, CrossHole, CrossParams};
+ use crate::geometry::{Point3, Triangle};
+ use crate::machining2d::GenError;
+@@ -30,9 +30,19 @@ pub(super) fn lathe_reads(facets: &[Triangle], origin: [f64; 3]) -> Result<(), G
+     if super::spindle_law::spindle_reading(facets, origin).is_some() {
+         return Ok(());
+     }
+-    let why = crate::multiaxis::axis::fit(facets)
+-        .err()
+-        .map_or_else(|| "its axis lies near the table".to_string(), |e| e.to_string());
++    // `spindle_reading` reads nothing for exactly three reasons; name
++    // the one that holds.
++    let why = match crate::multiaxis::axis::fit(facets) {
++        Err(e) => e.to_string(),
++        Ok(ax) => {
++            let n = ax.dir.dot(ax.dir).sqrt();
++            if n.is_finite() && n > 0.0 {
++                "its axis lies near the table".to_string()
++            } else {
++                "the fitted axis has no usable direction".to_string()
++            }
++        }
++    };
+     Err(GenError::Invalid(format!(
+         "a lathe's cross drill plunges toward the spindle, and this part cannot be read as \
+          turned about one ({why}) - model the part as the turned bar it is, or drill it on a \
+@@ -54,6 +64,7 @@ pub(super) fn cross_drill(
+     if !(ox.is_finite() && oy.is_finite()) {
+         return Err(GenError::Invalid("the work offset's origin is not usable".into()));
+     }
++    plunges_inward(p.holes, ox, oy)?;
+     let verts = || facets.iter().flat_map(|t| [t.a, t.b, t.c]);
+     let stock_r = verts()
+         .map(|v| ((v.x - ox).powi(2) + (v.y - oy).powi(2)).sqrt())
+@@ -75,7 +86,8 @@ pub(super) fn cross_drill(
+         stock_z_max,
+         holes: &local,
+         ..p
+-    })?;
++    })
++    .map_err(|e| in_world(e, &local, p.holes))?;
+     // The kernel's chain is straight, cycle-free and computer-
+     // compensated; anything else would need its own carry back, so it
+     // refuses by name rather than post half-shifted.
+@@ -97,3 +109,53 @@ pub(super) fn cross_drill(
+     }
+     Ok(t)
+ }
++
++/// Every hole must plunge TOWARD the spindle line: the kernel stands a
++/// station on the mouth's own side at the hop radius, which for a
++/// plunge pointing away from the axis is a point beyond the part's far
++/// side - and the rapid in to the mouth would run through the material.
++/// (A mill-turn block off its work offset has such faces: the ones
++/// nearer the spindle line.) Read in the spindle frame - the mouth's
++/// radial offset from world Z through (`ox`, `oy`) dotted with the
++/// plunge - and refused by name in world coordinates. A non-finite
++/// hole falls through to the kernel's own malformed-list refusal.
++fn plunges_inward(holes: &[CrossHole], ox: f64, oy: f64) -> Result<(), GenError> {
++    for h in holes {
++        let out = (h.origin.x - ox) * h.dir.x + (h.origin.y - oy) * h.dir.y;
++        if out > 1e-9 {
++            return Err(GenError::Invalid(format!(
++                "cross hole at ({}, {}, {}) plunges along ({}, {}, {}), away from the spindle (world Z                  through ({ox}, {oy})): its station would stand beyond the part's far side and the                  rapid in would cross the material - drill it from the face toward the spindle, or                  move the work offset",
++                h.origin.x, h.origin.y, h.origin.z, h.dir.x, h.dir.y, h.dir.z
++            )));
++        }
++    }
++    Ok(())
++}
++
++/// Carry a kernel refusal from the spindle frame back to the world: the
++/// kernel names a hole by its (raw or lattice-snapped) mouth, as an XYZ
++/// or an XY point; the first hole whose point the message carries has
++/// it rewritten to the world mouth the user modelled.
++fn in_world(e: GenError, local: &[CrossHole], world: &[CrossHole]) -> GenError {
++    let fix = |s: String| -> String {
++        for (l, w) in local.iter().zip(world) {
++            let wo = w.origin;
++            let (w3, w2) = (format!("({}, {}, {})", wo.x, wo.y, wo.z), format!("({}, {})", wo.x, wo.y));
++            let snap = Point3::new(lattice(l.origin.x), lattice(l.origin.y), lattice(l.origin.z));
++            let mut out = s.clone();
++            for lo in [l.origin, snap] {
++                out = out.replace(&format!("({}, {}, {})", lo.x, lo.y, lo.z), &w3);
++                out = out.replace(&format!("({}, {})", lo.x, lo.y), &w2);
++            }
++            if out != s {
++                return out;
++            }
++        }
++        s
++    };
++    match e {
++        GenError::Invalid(s) => GenError::Invalid(fix(s)),
++        GenError::Empty(s) => GenError::Empty(fix(s)),
++        other => other,
++    }
++}
+diff --git a/crates/app/tests/drilling_cross_spindle.rs b/crates/app/tests/drilling_cross_spindle.rs
+index 6c710390..15a83a81 100644
+--- a/crates/app/tests/drilling_cross_spindle.rs
++++ b/crates/app/tests/drilling_cross_spindle.rs
+@@ -221,3 +221,109 @@ fn a_lathe_cross_drill_on_a_part_that_reads_as_no_revolve_is_refused_by_name() {
+     let (world, _h) = world_with("mill-turn", prism());
+     operation::generate(&world, &op(hole), "").expect("a mill-turn drills a prismatic bar");
+ }
++
++/// A cross hole on `prism()` moved +30 mm in X (faces at x = 20, the
++/// one nearer the spindle line, and x = 42), mouth on the face at x.
++fn block_hole(x: f64, dir_x: f64) -> Vec<CrossHole> {
++    vec![CrossHole {
++        origin: Point3::new(x, 0.0, 10.0),
++        dir: Point3::new(dir_x, 0.0, 0.0),
++        radius: 2.0,
++        entry_d: 0.0,
++        floor_d: -6.0,
++        through: false,
++    }]
++}
++
++fn moved_prism(dx: f64) -> Mesh {
++    let f = prism()
++        .facets
++        .iter()
++        .map(|t| {
++            let m = |p: Point3| Point3::new(p.x + dx, p.y, p.z);
++            Triangle::new(m(t.a), m(t.b), m(t.c))
++        })
++        .collect();
++    Mesh::from_facets(f)
++}
++
++#[test]
++fn a_mill_turn_cross_hole_plunging_away_from_the_spindle_is_refused_by_name() {
++    // The block sits 20..42 mm off an unmoved G54 in X. A hole on its
++    // near face (x = 20) plunging +X, away from the spindle line: the
++    // station law stands the tool at radius s on the mouth's side -
++    // x ~ 48, beyond the FAR face - and the rapid in to the mouth runs
++    // through the whole block at rapid feed.
++    let (world, _h) = world_with("mill-turn", moved_prism(30.0));
++    match operation::generate(&world, &op(block_hole(20.0, 1.0)), "") {
++        Ok((t, _)) => {
++            let through = t.moves.iter().any(|m| {
++                m.kind == camcraft_app::cl::MoveKind::Rapid
++                    && m.from.x.max(m.to.x) > 42.0
++                    && m.from.x.min(m.to.x) < 20.0
++                    && (m.from.z - 10.0).abs() < 1e-9
++            });
++            panic!("a hole plunging away from the spindle drilled {} moves (a rapid through the block: {through})", t.moves.len());
++        }
++        Err(e) => {
++            let e = e.to_string();
++            for s in ["away from the spindle", "(20, 0, 10)"] {
++                assert!(e.contains(s), "the refusal names '{s}': {e}");
++            }
++        }
++    }
++    // The far face's hole plunges -X, toward the spindle: it drills.
++    operation::generate(&world, &op(block_hole(42.0, -1.0)), "")
++        .expect("a hole plunging toward the spindle drills on the same block");
++}
++
++#[test]
++fn a_kernel_refusal_on_the_shifted_path_names_the_hole_in_world_coordinates() {
++    // A Z plunge is the mill-side drill's word; the kernel refuses it
++    // in the spindle frame (10, 0, 10) - the user's model has the
++    // mouth at world (20, 4, 10).
++    let (world, mut history) = world_with("mill-turn", bar(AT.0, AT.1));
++    place_g54(&world, &mut history, AT.0, AT.1);
++    let hole = vec![CrossHole {
++        origin: Point3::new(AT.0 + 10.0, AT.1, 10.0),
++        dir: Point3::new(0.0, 0.0, -1.0),
++        radius: 2.0,
++        entry_d: 0.0,
++        floor_d: -6.0,
++        through: false,
++    }];
++    match operation::generate(&world, &op(hole), "") {
++        Ok((t, _)) => panic!("a Z plunge drilled {} moves radially", t.moves.len()),
++        Err(e) => {
++            let e = e.to_string();
++            assert!(e.contains("(20, 4, 10)"), "the refusal names the world mouth: {e}");
++            assert!(!e.contains("(10, 0, 10)"), "no spindle-frame point leaks: {e}");
++        }
++    }
++}
++
++#[test]
++fn a_work_offset_moved_after_a_mill_turn_cross_drill_stales_it_and_the_post_refuses() {
++    use camcraft_app::commands::{CreateOperation, GenerateOperation};
++    use camcraft_app::operation::OpStatus;
++    let (world, mut history) = world_with("mill-turn", bar(0.0, 0.0));
++    let create = CreateOperation::new(&world, "X1", "DR-0400", SrcRef::Entity("bar".into()), params(holes(0.0, 0.0)))
++        .expect("create");
++    history.execute(&world, create);
++    history.execute(&world, GenerateOperation::new(&world, "X1").expect("the bar on G54 drills"));
++    let e = camcraft_app::model::find_by_name(&world, "X1").expect("X1");
++    assert_eq!(operation::status_of(&world, &e), OpStatus::Ok);
++
++    // G54 moved 1 mm in Y under the generated op: every standoff was
++    // measured about a line the spindle no longer turns on.
++    place_g54(&world, &mut history, 0.0, 1.0);
++    assert_eq!(operation::status_of(&world, &e), OpStatus::Stale, "the work offset is an input of the cross drill");
++    let err = camcraft_app::posting::stream_records(&world).expect_err("a moved spindle never posts");
++    for s in ["X1", "spindle", "G54"] {
++        assert!(err.contains(s), "the post's refusal names '{s}': {err}");
++    }
++
++    // Moved back, the cached path is fresh again.
++    place_g54(&world, &mut history, 0.0, 0.0);
++    assert_eq!(operation::status_of(&world, &e), OpStatus::Ok);
++}
