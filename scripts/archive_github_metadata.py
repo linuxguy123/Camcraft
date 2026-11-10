@@ -12,14 +12,15 @@ import csv
 import json
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def call(args: list[str]) -> str:
+def call(args: list[str], *, cwd: Path | None = None) -> str:
     for attempt in range(3):
-        result = subprocess.run(args, text=True, capture_output=True, check=False)
+        result = subprocess.run(args, text=True, capture_output=True, check=False, cwd=cwd)
         if result.returncode == 0:
             return result.stdout
         if attempt == 2:
@@ -40,6 +41,39 @@ def api_list(endpoint: str) -> list[dict]:
 def save_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def git_patch(pull: dict, folder: Path) -> None:
+    """Recover a PR patch when GitHub's diff endpoint hits its 300-file limit."""
+    base_sha = pull["base"]["sha"]
+    head_sha = pull["head"]["sha"]
+    base_url = pull["base"]["repo"]["clone_url"]
+    head_repo = pull["head"].get("repo")
+    head_url = head_repo["clone_url"] if head_repo else base_url
+    with tempfile.TemporaryDirectory(prefix="camcraft-pr-patch-") as temp:
+        directory = Path(temp)
+        call(["git", "init", "--quiet"], cwd=directory)
+        call(["git", "fetch", "--no-tags", base_url, base_sha], cwd=directory)
+        try:
+            call(["git", "fetch", "--no-tags", head_url, head_sha], cwd=directory)
+        except RuntimeError:
+            call(["git", "fetch", "--no-tags", base_url,
+                  f"refs/pull/{pull['number']}/head"], cwd=directory)
+            head_sha = call(["git", "rev-parse", "FETCH_HEAD"], cwd=directory).strip()
+        comparison = f"{base_sha}...{head_sha}"
+        patch = call(["git", "diff", "--binary", comparison], cwd=directory)
+        if not patch:
+            raise RuntimeError("Git returned an empty PR patch")
+        (folder / "changes.patch").write_text(patch)
+        (folder / "files_all.tsv").write_text(
+            call(["git", "diff", "--name-status", comparison], cwd=directory)
+        )
+        save_json(folder / "patch_source.json", {
+            "method": "git diff --binary",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "head_source": head_url,
+        })
 
 
 def csv_index(path: Path, records: list[dict]) -> None:
@@ -83,6 +117,7 @@ def main() -> int:
         baselines.extend(
             path for path in sorted(args.baseline_root.iterdir())
             if path.is_dir() and (path / "manifest.json").is_file()
+            and not json.loads((path / "manifest.json").read_text()).get("errors")
         )
     baselines = list(dict.fromkeys(baselines))
     if args.include_updates and not baselines:
@@ -173,12 +208,24 @@ def main() -> int:
         if not (folder / "changes.patch").exists():
             try:
                 save_json(folder / "commits.json", api_list(f"repos/{repo}/pulls/{number}/commits?per_page=100"))
-                save_json(folder / "files.json", api_list(f"repos/{repo}/pulls/{number}/files?per_page=100"))
-                (folder / "changes.patch").write_text(
-                    call(["gh", "pr", "diff", str(number), "-R", repo, "--patch"])
-                )
             except Exception as error:
-                errors.append(f"PR {number} patch or file list: {error}")
+                errors.append(f"PR {number} commits: {error}")
+            try:
+                save_json(folder / "files.json", api_list(f"repos/{repo}/pulls/{number}/files?per_page=100"))
+            except Exception as error:
+                errors.append(f"PR {number} file list: {error}")
+            try:
+                if pull.get("changed_files", 0) > 300:
+                    git_patch(pull, folder)
+                else:
+                    try:
+                        (folder / "changes.patch").write_text(
+                            call(["gh", "pr", "diff", str(number), "-R", repo, "--patch"])
+                        )
+                    except RuntimeError:
+                        git_patch(pull, folder)
+            except Exception as error:
+                errors.append(f"PR {number} patch: {error}")
         if index % 25 == 0:
             print(f"Pull requests: {index}/{len(pulls)}", flush=True)
 
