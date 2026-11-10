@@ -1,0 +1,1623 @@
+From 62e162003f49512ed9088ca46e50674a76f6dd24 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 8 Nov 2026 19:01:18 -0800
+Subject: [PATCH 1/4] feat(mcp): serve the MCP tool table live from inside the
+ GUI
+
+An opt-in server (--mcp-port <n> or CAMCRAFT_MCP_PORT; off by default)
+listens on 127.0.0.1 only and carries the same newline-delimited JSON-RPC
+`camcraft-cli mcp` speaks on stdio. A listener thread moves lines to the
+UI thread over a channel (waking the idle loop with an empty winit user
+event); the UI answers them in State::drain_actions through the new
+app::mcp::answer_live seam, which runs the existing tool dispatch against
+the window's own world (a shared flecs handle) and History (lent for the
+call). An agent's step is therefore an entry on the app's History: the
+browser shows it and Ctrl+Z undoes it like a user step. open_project is
+refused in the live session (it would skip the unsaved-changes prompt).
+
+`camcraft-cli mcp --connect <host:port>` bridges stdio to the live
+session for MCP clients that launch stdio servers. The status strip shows
+"MCP listening on 127.0.0.1:<port>" while the server runs; dropping the
+inbox at shutdown stops and joins the listener thread.
+
+Pinned by crates/app/tests/mcp_live.rs (seam + undo, loopback socket,
+bridge, port flag) and the ui lib tests egui_app::tests::mcp_live.
+Decisions in docs/decisions/183-mcp-live-gui.md.
+
+Fixes #183
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/cli.rs                    |  25 ++-
+ crates/app/src/mcp/bridge.rs             |  44 ++++
+ crates/app/src/mcp/listen.rs             | 255 +++++++++++++++++++++++
+ crates/app/src/mcp/live.rs               |  72 +++++++
+ crates/app/src/mcp/mod.rs                |   9 +
+ crates/app/tests/mcp_live.rs             | 199 ++++++++++++++++++
+ crates/ui/src/egui_app/mod.rs            |  11 +-
+ crates/ui/src/egui_app/panes.rs          |   4 +
+ crates/ui/src/egui_app/shell.rs          |  32 ++-
+ crates/ui/src/egui_app/tests.rs          |   1 +
+ crates/ui/src/egui_app/tests/mcp_live.rs |  97 +++++++++
+ crates/ui/src/lib.rs                     |   1 +
+ crates/ui/src/mcp_host.rs                |  38 ++++
+ crates/ui/src/state.rs                   |   6 +
+ docs/decisions/183-mcp-live-gui.md       |  52 +++++
+ 15 files changed, 839 insertions(+), 7 deletions(-)
+ create mode 100644 crates/app/src/mcp/bridge.rs
+ create mode 100644 crates/app/src/mcp/listen.rs
+ create mode 100644 crates/app/src/mcp/live.rs
+ create mode 100644 crates/app/tests/mcp_live.rs
+ create mode 100644 crates/ui/src/egui_app/tests/mcp_live.rs
+ create mode 100644 crates/ui/src/mcp_host.rs
+ create mode 100644 docs/decisions/183-mcp-live-gui.md
+
+diff --git a/crates/app/src/cli.rs b/crates/app/src/cli.rs
+index 8445109e..fd9316a2 100644
+--- a/crates/app/src/cli.rs
++++ b/crates/app/src/cli.rs
+@@ -24,7 +24,7 @@ camcraft-cli - CamCraft headless batch lane (clean-room)
+ USAGE:
+     camcraft-cli script   <job.js>
+     camcraft-cli process  <job.camproj> [-o <out.nc>] [--cps <name|file.cps>]
+-    camcraft-cli mcp
++    camcraft-cli mcp      [--connect <host:port>]
+     camcraft-cli help
+     camcraft-cli version
+ 
+@@ -34,7 +34,9 @@ COMMANDS:
+     process   headless project processing: load, generate, and - with
+               -o - post; verify's verdict is the exit code
+     mcp       a Model Context Protocol server on stdio (JSON-RPC 2.0):
+-              an AI agent drives one headless document through tools
++              an AI agent drives one headless document through tools;
++              with --connect, a stdio bridge to a running app started
++              with --mcp-port (the agent drives the open window live)
+ 
+ A clean run prints its logs, then the last verb's JSON answer on
+ stdout; refusals print on stderr. Exit: 0 stood, 1 refused, 2 usage.
+@@ -184,9 +186,22 @@ fn lane_process(args: &[String]) -> i32 {
+ /// may print on stdout; a broken pipe or unreadable input ends the
+ /// session with exit 1 and the reason on stderr.
+ fn lane_mcp(args: &[String]) -> i32 {
+-    if !args.is_empty() {
+-        eprintln!("camcraft-cli: mcp takes no arguments");
+-        return 2;
++    match args {
++        [] => {}
++        // #183: bridge stdio to a running app's live session.
++        [flag, addr] if flag == "--connect" => {
++            return match crate::mcp::bridge(addr, std::io::stdin(), std::io::stdout().lock()) {
++                Ok(()) => 0,
++                Err(e) => {
++                    eprintln!("camcraft-cli: mcp --connect {addr}: {e}");
++                    1
++                }
++            };
++        }
++        _ => {
++            eprintln!("camcraft-cli: mcp takes no arguments, or --connect <host:port>");
++            return 2;
++        }
+     }
+     let stdin = std::io::stdin();
+     match crate::mcp::serve(stdin.lock(), std::io::stdout().lock()) {
+diff --git a/crates/app/src/mcp/bridge.rs b/crates/app/src/mcp/bridge.rs
+new file mode 100644
+index 00000000..8d066c00
+--- /dev/null
++++ b/crates/app/src/mcp/bridge.rs
+@@ -0,0 +1,44 @@
++//! `camcraft-cli mcp --connect <addr>` (#183): a stdio <-> TCP bridge, so
++//! an MCP client that only launches stdio servers can drive a running
++//! app's live session. Bytes are copied both ways untouched; the app
++//! end speaks the protocol.
++//!
++//! Provenance: our own std::net code; the MCP stdio transport
++//! (modelcontextprotocol.io, revision 2025-06-18) on the client side.
++//! Clean-room, public sources only.
++
++use std::io::{Read, Write};
++use std::net::{Shutdown, TcpStream, ToSocketAddrs};
++
++/// Copy `input` to the app at `addr` and its answers to `output` until
++/// the app closes the connection. End of `input` half-closes the socket,
++/// so the answers still in flight arrive before the bridge ends.
++///
++/// # Errors
++/// The address does not resolve or connect, or a stream fails.
++pub fn bridge(addr: &str, input: impl Read + Send + 'static, mut output: impl Write) -> std::io::Result<()> {
++    let target = addr
++        .to_socket_addrs()?
++        .next()
++        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("'{addr}' names no address")))?;
++    let mut from_app = TcpStream::connect(target)?;
++    let mut to_app = from_app.try_clone()?;
++    // Detached on purpose: a blocked stdin read cannot be interrupted, and
++    // the process ends when the app's side closes anyway.
++    let _pump = std::thread::Builder::new().name("camcraft-mcp-bridge".into()).spawn(move || {
++        let mut input = input;
++        if let Err(e) = std::io::copy(&mut input, &mut to_app) {
++            eprintln!("camcraft-cli: mcp bridge: sending failed: {e}");
++        }
++        let _ = to_app.shutdown(Shutdown::Write);
++    })?;
++    let mut chunk = [0u8; 8192];
++    loop {
++        let n = from_app.read(&mut chunk)?;
++        if n == 0 {
++            return Ok(());
++        }
++        output.write_all(&chunk[..n])?;
++        output.flush()?;
++    }
++}
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+new file mode 100644
+index 00000000..f4795de2
+--- /dev/null
++++ b/crates/app/src/mcp/listen.rs
+@@ -0,0 +1,255 @@
++//! The live transport (#183): a loopback-only TCP listener carrying the
++//! same newline-delimited JSON-RPC `camcraft-cli mcp` speaks on stdio,
++//! handing each line to the owning (UI) thread over a channel and
++//! writing that thread's answer back to the client.
++//!
++//! Provenance: our own std::net + std::sync::mpsc code; the framing is
++//! the MCP stdio transport's (modelcontextprotocol.io, revision
++//! 2025-06-18: one JSON-RPC message per line), carried over a socket.
++//! Clean-room, public sources only.
++//!
++//! The thread never touches a world: it only moves text. One client at
++//! a time; a dropped client, a closed channel or an unreadable line is
++//! logged and the listener goes on (or ends with the app), never a panic.
++//! Dropping the [`Inbox`] stops and joins the thread.
++
++use std::io::{BufRead, BufReader, Write};
++use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
++use std::sync::Arc;
++use std::thread::JoinHandle;
++use std::time::Duration;
++
++/// How often a blocked wait looks at the stop flag: the bound on how
++/// long dropping an [`Inbox`] can take.
++const POLL: Duration = Duration::from_millis(50);
++
++/// A line longer than this is refused and its client dropped - a client
++/// that never sends a newline must not grow the app's memory forever.
++const MAX_LINE: usize = 16 * 1024 * 1024;
++
++/// The waker the listener calls after queueing a request, so an idle
++/// GUI loop draws (and drains) a frame. Any thread may call it.
++pub type Wake = Box<dyn Fn() + Send + 'static>;
++
++/// One wire line from the client, waiting for the owning thread.
++pub struct Request {
++    line: String,
++    reply: Sender<Option<String>>,
++}
++
++impl Request {
++    /// An in-process request and the receiver its answer arrives on -
++    /// what the listener makes per line, and what a test or an embedder
++    /// hands an [`Inbox::channel`] directly.
++    #[must_use]
++    pub fn pair(line: impl Into<String>) -> (Self, Receiver<Option<String>>) {
++        let (reply, rx) = mpsc::channel();
++        (Self { line: line.into(), reply }, rx)
++    }
++
++    #[must_use]
++    pub fn line(&self) -> &str {
++        &self.line
++    }
++
++    /// Send the answer back (`None` for a notification). A client that
++    /// went away meanwhile is logged, not an error for the caller.
++    pub fn answer(self, reply: Option<String>) {
++        if self.reply.send(reply).is_err() {
++            tracing::info!("mcp: the client left before its answer was ready");
++        }
++    }
++}
++
++/// The owning thread's end: requests to answer, and (when listening on
++/// a socket) the listener thread it stops and joins on drop.
++pub struct Inbox {
++    rx: Receiver<Request>,
++    addr: Option<SocketAddr>,
++    stop: Arc<AtomicBool>,
++    thread: Option<JoinHandle<()>>,
++}
++
++impl Inbox {
++    /// Listen on 127.0.0.1:`port` (0 picks a free port; [`Inbox::addr`]
++    /// says which). Loopback only by construction: no other interface
++    /// is ever bound.
++    ///
++    /// # Errors
++    /// The bind (port in use, no permission) or the thread spawn failed.
++    pub fn listen(port: u16, wake: Wake) -> std::io::Result<Self> {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
++        listener.set_nonblocking(true)?;
++        let addr = listener.local_addr()?;
++        let (tx, rx) = mpsc::channel();
++        let stop = Arc::new(AtomicBool::new(false));
++        let flag = Arc::clone(&stop);
++        let thread = std::thread::Builder::new()
++            .name("camcraft-mcp".into())
++            .spawn(move || accept_loop(&listener, &tx, &flag, &wake))?;
++        tracing::info!("mcp: listening on {addr}");
++        Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread) })
++    }
++
++    /// An inbox with no socket: requests arrive through the returned
++    /// sender. The in-process door the UI tests drive.
++    #[must_use]
++    pub fn channel() -> (Sender<Request>, Self) {
++        let (tx, rx) = mpsc::channel();
++        (tx, Self { rx, addr: None, stop: Arc::new(AtomicBool::new(false)), thread: None })
++    }
++
++    /// The next waiting request, never blocking.
++    #[must_use]
++    pub fn next(&self) -> Option<Request> {
++        // Empty and disconnected alike: nothing to answer this frame.
++        self.rx.try_recv().ok()
++    }
++
++    /// The bound address, when listening on a socket.
++    #[must_use]
++    pub fn addr(&self) -> Option<SocketAddr> {
++        self.addr
++    }
++}
++
++impl Drop for Inbox {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::Relaxed);
++        if let Some(thread) = self.thread.take()
++            && thread.join().is_err()
++        {
++            tracing::warn!("mcp: the listener thread ended abnormally");
++        }
++    }
++}
++
++/// `--mcp-port <n>` / `--mcp-port=<n>` over `CAMCRAFT_MCP_PORT`: `None`
++/// when neither asks for the server (it is off by default).
++///
++/// # Errors
++/// The flag without a value, or a value that is not a port number.
++pub fn port_from(args: &[String], env: Option<&str>) -> Result<Option<u16>, String> {
++    let flag = args.iter().enumerate().find_map(|(i, a)| {
++        if a == "--mcp-port" {
++            Some(args.get(i + 1).cloned())
++        } else {
++            a.strip_prefix("--mcp-port=").map(|v| Some(v.to_owned()))
++        }
++    });
++    let text = match flag {
++        Some(None) => return Err("--mcp-port needs a port number".into()),
++        Some(Some(v)) => v,
++        None => match env.map(str::trim).filter(|v| !v.is_empty()) {
++            Some(v) => v.to_owned(),
++            None => return Ok(None),
++        },
++    };
++    text.trim()
++        .parse::<u16>()
++        .map(Some)
++        .map_err(|_| format!("MCP port must be a number from 0 to 65535, got '{text}'"))
++}
++
++fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake) {
++    while !stop.load(Ordering::Relaxed) {
++        match listener.accept() {
++            Ok((stream, peer)) => {
++                tracing::info!("mcp: client {peer} connected");
++                match serve_client(stream, tx, stop, wake) {
++                    Ok(()) => tracing::info!("mcp: client {peer} left"),
++                    Err(e) => tracing::warn!("mcp: client {peer} dropped: {e}"),
++                }
++            }
++            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
++            Err(e) => {
++                tracing::warn!("mcp: accept failed: {e}");
++                std::thread::sleep(POLL);
++            }
++        }
++    }
++}
++
++/// One client until it hangs up, the app stops, or the app's end of
++/// the channel is gone.
++fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake) -> std::io::Result<()> {
++    // An accepted socket may inherit the listener's non-blocking mode
++    // (BSD does); reads wait, but only a POLL at a time.
++    stream.set_nonblocking(false)?;
++    stream.set_read_timeout(Some(POLL))?;
++    let mut writer = stream.try_clone()?;
++    let mut reader = BufReader::new(stream);
++    let mut buf = Vec::new();
++    loop {
++        if stop.load(Ordering::Relaxed) {
++            return Ok(());
++        }
++        match reader.read_until(b'\n', &mut buf) {
++            Ok(0) => {
++                // End of input: a last unterminated line still counts,
++                // as it does on stdio.
++                if !buf.is_empty() {
++                    let line = std::mem::take(&mut buf);
++                    forward(&line, tx, &mut writer, stop, wake)?;
++                }
++                return Ok(());
++            }
++            Ok(_) if buf.ends_with(b"\n") => {
++                let line = std::mem::take(&mut buf);
++                if !forward(&line, tx, &mut writer, stop, wake)? {
++                    return Ok(());
++                }
++            }
++            // Bytes without a newline: the next read returns 0 (EOF).
++            Ok(_) => {}
++            Err(e)
++                if matches!(
++                    e.kind(),
++                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
++                ) => {}
++            Err(e) => return Err(e),
++        }
++        if buf.len() > MAX_LINE {
++            let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"message too long - the connection is closed"}}"#;
++            writeln!(writer, "{refusal}")?;
++            writer.flush()?;
++            return Ok(());
++        }
++    }
++}
++
++/// Hand one line to the owning thread and write its answer. `Ok(false)`
++/// when the session cannot go on (the app is stopping or gone).
++fn forward(bytes: &[u8], tx: &Sender<Request>, writer: &mut TcpStream, stop: &AtomicBool, wake: &Wake) -> std::io::Result<bool> {
++    let line = String::from_utf8_lossy(bytes).into_owned();
++    if line.trim().is_empty() {
++        return Ok(true);
++    }
++    let (request, answer) = Request::pair(line);
++    if tx.send(request).is_err() {
++        tracing::info!("mcp: the app closed its end; ending the session");
++        return Ok(false);
++    }
++    wake();
++    loop {
++        match answer.recv_timeout(POLL) {
++            Ok(Some(reply)) => {
++                writeln!(writer, "{reply}")?;
++                writer.flush()?;
++                return Ok(true);
++            }
++            Ok(None) => return Ok(true),
++            Err(RecvTimeoutError::Timeout) => {
++                if stop.load(Ordering::Relaxed) {
++                    return Ok(false);
++                }
++            }
++            Err(RecvTimeoutError::Disconnected) => {
++                tracing::warn!("mcp: a request was dropped unanswered");
++                return Ok(true);
++            }
++        }
++    }
++}
+diff --git a/crates/app/src/mcp/live.rs b/crates/app/src/mcp/live.rs
+new file mode 100644
+index 00000000..19f7f812
+--- /dev/null
++++ b/crates/app/src/mcp/live.rs
+@@ -0,0 +1,72 @@
++//! The live seam (#183): one MCP wire line answered against a document
++//! the caller already owns - the GUI's world and its command History -
++//! instead of the headless session's own. Same tool table, same
++//! dispatch, same commands: an agent's step lands on the app's own
++//! History, so the app's Ctrl+Z undoes it like any user step.
++//!
++//! Provenance: our own seam over this module's JSON-RPC handler
++//! (JSON-RPC 2.0 framed as the public MCP specification, 2025-06-18).
++//! Clean-room, public sources only.
++
++use super::{tool_err, Server};
++use crate::commands::History;
++use crate::script::Env;
++
++use flecs_ecs::prelude::World;
++use serde_json::{json, Value};
++use std::path::Path;
++
++/// Tools the live session refuses, with the reason an agent reads. The
++/// app owns these: opening a file over the user's document skips the
++/// app's unsaved-changes prompt and its per-document reset.
++const LIVE_REFUSED: &[(&str, &str)] = &[(
++    "open_project",
++    "open_project is not available in a live app session - it would replace the user's document \
++without the app's unsaved-changes prompt; ask the user to open the file (File > Open)",
++)];
++
++/// What one live line did.
++#[derive(Debug, Default)]
++pub struct LiveAnswer {
++    /// The wire answer, `None` for a notification.
++    pub reply: Option<String>,
++    /// The tool a `tools/call` named, when the line was one: the document
++    /// may have changed (a read-only tool too - the caller refreshes its
++    /// views, which is cheap and never wrong).
++    pub tool: Option<String>,
++}
++
++/// Answer one wire line against `world` and `history`. `doc_path` is
++/// the file the app has open, so a bare `save_project` saves over it the
++/// way the app's Ctrl+S does. The world is shared by handle (a flecs
++/// world clone is a reference, not a copy); the history is lent for the
++/// call and handed back whatever happens - a refused or failed tool
++/// included.
++pub fn answer_live(world: &World, history: &mut History, doc_path: Option<&Path>, line: &str) -> LiveAnswer {
++    let parsed = serde_json::from_str::<Value>(line.trim()).ok();
++    let tool = parsed
++        .as_ref()
++        .filter(|m| m.get("method").and_then(Value::as_str) == Some("tools/call"))
++        .and_then(|m| m.get("params")?.get("name")?.as_str().map(str::to_owned));
++    if let (Some(msg), Some(name)) = (&parsed, &tool)
++        && let Some((_, why)) = LIVE_REFUSED.iter().find(|(n, _)| n == name)
++        && let Some(id) = msg.get("id")
++    {
++        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": tool_err(why) });
++        return LiveAnswer { reply: Some(reply.to_string()), tool: None };
++    }
++    let mut server = Server {
++        env: Env {
++            world: world.clone(),
++            history: std::mem::take(history),
++            logs: Vec::new(),
++            errors: Vec::new(),
++            doc_path: doc_path.map(Path::to_path_buf),
++            posted: None,
++            last_value: Value::Null,
++        },
++    };
++    let reply = server.handle_line(line);
++    *history = std::mem::take(&mut server.env.history);
++    LiveAnswer { reply, tool }
++}
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index cadb7823..cbe4c38a 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -15,10 +15,19 @@
+ //! and every failure is an MCP tool error (`isError: true`) naming the
+ //! reason - never a panic, never a silent success.
+ 
++mod bridge;
+ mod edit;
+ mod job;
++mod listen;
++mod live;
+ mod tools;
+ 
++// #183: the same tool table served live from inside the GUI, over a
++// loopback socket, against the app's own document and History.
++pub use bridge::bridge;
++pub use listen::{port_from, Inbox, Request, Wake};
++pub use live::{answer_live, LiveAnswer};
++
+ use crate::script::Env;
+ 
+ use serde_json::{json, Value};
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+new file mode 100644
+index 00000000..304b7bad
+--- /dev/null
++++ b/crates/app/tests/mcp_live.rs
+@@ -0,0 +1,199 @@
++//! The live MCP seam (#183): the tool table answered against a world and
++//! History the caller owns (the GUI's), so undo there reverts an agent's
++//! step; the loopback listener that carries it; and the CLI's flag.
++//!
++//! Gate map (M4.4): covers app::mcp (live, listen, bridge).
++
++use camcraft_app::commands::History;
++use camcraft_app::mcp::{answer_live, port_from, Inbox};
++use camcraft_app::model;
++use camcraft_app::world::new_world;
++
++use flecs_ecs::prelude::World;
++use serde_json::{json, Value};
++use std::io::{BufRead, BufReader, Write};
++use std::net::TcpStream;
++use std::time::{Duration, Instant};
++
++fn call(id: u64, name: &str, args: Value) -> String {
++    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } })
++        .to_string()
++}
++
++/// One live call; the answer must be a tool success.
++fn ok(world: &World, history: &mut History, id: u64, name: &str, args: Value) -> Value {
++    let answer = answer_live(world, history, None, &call(id, name, args));
++    assert_eq!(answer.tool.as_deref(), Some(name));
++    let reply: Value = serde_json::from_str(&answer.reply.expect("a reply")).expect("json");
++    assert_eq!(reply["id"], json!(id));
++    assert_eq!(reply["result"]["isError"], json!(false), "{name}: {reply}");
++    reply["result"]["structuredContent"].clone()
++}
++
++fn face_job(world: &World, history: &mut History) {
++    ok(world, history, 1, "set_stock", json!({ "box": { "dx": 60.0, "dy": 60.0, "dz": 20.0 } }));
++    ok(world, history, 2, "add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    let add = ok(world, history, 3, "add_operation", json!({ "kind": "Face", "tool": "EM-0400-2FL" }));
++    assert_eq!(add["operation"], json!("Face1"));
++}
++
++#[test]
++fn a_live_call_lands_on_the_callers_history_and_its_undo_reverts_it() {
++    let world = new_world();
++    let mut history = History::default();
++    face_job(&world, &mut history);
++    // The caller's own world shows the operation, and the caller's own
++    // history - not a copy the session kept - holds the step.
++    assert!(model::find_by_name(&world, "Face1").is_some_and(|e| model::is_operation(&world, &e)));
++    assert!(history.can_undo());
++    assert!(history.undo(&world), "the caller's undo walks the agent's step");
++    assert!(model::find_by_name(&world, "Face1").is_none(), "undo removed the agent's operation");
++    assert!(history.redo(&world));
++    assert!(model::find_by_name(&world, "Face1").is_some(), "redo brings it back");
++    // The session's own undo tool walks the same history.
++    ok(&world, &mut history, 4, "undo", json!({}));
++    assert!(model::find_by_name(&world, "Face1").is_none());
++}
++
++#[test]
++fn each_agent_step_is_one_undo_step_on_the_shared_history() {
++    let world = new_world();
++    let mut history = History::default();
++    ok(&world, &mut history, 1, "set_stock", json!({ "box": { "dx": 50.0, "dy": 50.0, "dz": 10.0 } }));
++    ok(&world, &mut history, 2, "add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    // Three agent steps, three undos, then nothing: no step was lost or
++    // duplicated in the hand-over.
++    ok(&world, &mut history, 3, "add_operation", json!({ "kind": "Face", "tool": "EM-0400-2FL" }));
++    assert!(history.undo(&world) && history.undo(&world) && history.undo(&world));
++    assert!(!history.can_undo());
++}
++
++#[test]
++fn the_live_session_refuses_open_project_and_reads_bad_lines_as_errors() {
++    let world = new_world();
++    let mut history = History::default();
++    let a = answer_live(&world, &mut history, None, &call(9, "open_project", json!({ "path": "x.camproj" })));
++    let reply: Value = serde_json::from_str(&a.reply.expect("reply")).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(true));
++    assert!(reply["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("File > Open")));
++    // Malformed JSON: a parse error, the history untouched.
++    let bad = answer_live(&world, &mut history, None, "{not json");
++    assert!(bad.reply.is_some_and(|r| r.contains("-32700")));
++    assert!(bad.tool.is_none());
++    // A notification: no answer.
++    let note = answer_live(&world, &mut history, None, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
++    assert!(note.reply.is_none());
++    assert!(!history.can_undo());
++}
++
++#[test]
++fn the_port_flag_is_opt_in_and_checked() {
++    let args = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
++    assert_eq!(port_from(&args(&[]), None), Ok(None));
++    assert_eq!(port_from(&args(&["--mcp-port", "7333"]), None), Ok(Some(7333)));
++    assert_eq!(port_from(&args(&["--mcp-port=0"]), None), Ok(Some(0)));
++    assert_eq!(port_from(&args(&[]), Some("7400")), Ok(Some(7400)));
++    assert_eq!(port_from(&args(&["--mcp-port", "7333"]), Some("7400")), Ok(Some(7333)), "the flag wins");
++    assert_eq!(port_from(&args(&[]), Some("  ")), Ok(None));
++    assert!(port_from(&args(&["--mcp-port"]), None).is_err());
++    assert!(port_from(&args(&["--mcp-port", "99999"]), None).is_err());
++}
++
++/// Answer the inbox's requests against `world` until `done` or timeout.
++fn pump_until(inbox: &Inbox, world: &World, history: &mut History, done: &dyn Fn() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(20);
++    while !done() {
++        assert!(Instant::now() < deadline, "the client did not finish in time");
++        match inbox.next() {
++            Some(req) => {
++                let a = answer_live(world, history, None, req.line());
++                req.answer(a.reply);
++            }
++            None => std::thread::sleep(Duration::from_millis(5)),
++        }
++    }
++}
++
++#[test]
++fn a_loopback_client_drives_the_owners_document_and_survives_bad_input() {
++    let woke = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let w = std::sync::Arc::clone(&woke);
++    let inbox = Inbox::listen(0, Box::new(move || {
++        w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }))
++    .expect("listen on loopback");
++    let addr = inbox.addr().expect("bound address");
++    assert!(addr.ip().is_loopback(), "bound to loopback only: {addr}");
++
++    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let fin = std::sync::Arc::clone(&finished);
++    let client = std::thread::spawn(move || -> Vec<Value> {
++        // A first client that sends junk and hangs up mid-line.
++        {
++            let mut s = TcpStream::connect(addr).expect("connect");
++            s.write_all(b"{garbage\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}").expect("write");
++            let mut r = BufReader::new(s);
++            let mut line = String::new();
++            r.read_line(&mut line).expect("parse error line");
++            assert!(line.contains("-32700"), "{line}");
++        }
++        // The listener takes the next client.
++        let s = TcpStream::connect(addr).expect("reconnect");
++        let mut w = s.try_clone().expect("clone");
++        let mut r = BufReader::new(s);
++        let mut replies = Vec::new();
++        let lines = [
++            json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }).to_string(),
++            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_owned(),
++            call(1, "set_stock", json!({ "box": { "dx": 60.0, "dy": 60.0, "dz": 20.0 } })),
++            call(2, "add_tool", json!({ "catalog": "EM-0400-2FL" })),
++            call(3, "add_operation", json!({ "kind": "Face", "tool": "EM-0400-2FL" })),
++        ];
++        for l in &lines {
++            writeln!(w, "{l}").expect("send");
++            if l.contains("\"id\"") {
++                let mut line = String::new();
++                r.read_line(&mut line).expect("answer");
++                replies.push(serde_json::from_str(&line).expect("json answer"));
++            }
++        }
++        fin.store(true, std::sync::atomic::Ordering::Relaxed);
++        replies
++    });
++
++    let world = new_world();
++    let mut history = History::default();
++    pump_until(&inbox, &world, &mut history, &|| finished.load(std::sync::atomic::Ordering::Relaxed));
++    let replies = client.join().expect("client thread");
++    assert_eq!(replies.len(), 4);
++    assert_eq!(replies[0]["result"]["serverInfo"]["name"], json!("camcraft"));
++    assert_eq!(replies[3]["result"]["isError"], json!(false), "{}", replies[3]);
++    assert!(model::find_by_name(&world, "Face1").is_some(), "the agent's operation is in the owner's world");
++    assert!(history.undo(&world) && model::find_by_name(&world, "Face1").is_none());
++    assert!(woke.load(std::sync::atomic::Ordering::Relaxed) >= 4, "each request woke the owner");
++
++    // Dropping the inbox stops and joins the listener promptly, and the
++    // port is free again.
++    let t = Instant::now();
++    drop(inbox);
++    assert!(t.elapsed() < Duration::from_secs(2), "the listener stopped in {:?}", t.elapsed());
++    assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(), "nothing listens after drop");
++}
++
++#[test]
++fn the_bridge_copies_stdio_to_a_live_session_and_back() {
++    let inbox = Inbox::listen(0, Box::new(|| {})).expect("listen");
++    let addr = inbox.addr().expect("addr").to_string();
++    let input = format!("{}\n", json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }));
++    let bridge = std::thread::spawn(move || {
++        let mut out = Vec::new();
++        camcraft_app::mcp::bridge(&addr, std::io::Cursor::new(input.into_bytes()), &mut out).map(|()| out)
++    });
++    let world = new_world();
++    let mut history = History::default();
++    pump_until(&inbox, &world, &mut history, &|| bridge.is_finished());
++    let out = bridge.join().expect("bridge thread").expect("bridge ran");
++    let text = String::from_utf8(out).expect("utf8");
++    assert!(text.contains("\"id\":7") && text.contains("\"result\""), "{text}");
++    assert!(camcraft_app::mcp::bridge("127.0.0.1:1", std::io::empty(), std::io::sink()).is_err(), "no server: a clean error");
++}
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index eb7ff581..5674569f 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -170,6 +170,15 @@ pub fn run(args: &[String]) -> i32 {
+             return 2;
+         }
+     };
++    // #183: the live MCP server is opt-in - off unless asked for.
++    let mcp_env = std::env::var("CAMCRAFT_MCP_PORT").ok();
++    let mcp_port = match camcraft_app::mcp::port_from(args, mcp_env.as_deref()) {
++        Ok(p) => p,
++        Err(err) => {
++            eprintln!("mcp: {err}");
++            return 2;
++        }
++    };
+     if args.iter().any(|a| a == "--headless") {
+         if pick != gpu::GpuPick::Auto || want.is_some() {
+             println!("gpu: --headless pins the fallback adapter for determinism; backend and adapter picks ignored");
+@@ -185,6 +194,6 @@ pub fn run(args: &[String]) -> i32 {
+             }
+         }
+     } else {
+-        shell::run_windowed(pick, want)
++        shell::run_windowed(pick, want, mcp_port)
+     }
+ }
+diff --git a/crates/ui/src/egui_app/panes.rs b/crates/ui/src/egui_app/panes.rs
+index 093e8d69..c90496bb 100644
+--- a/crates/ui/src/egui_app/panes.rs
++++ b/crates/ui/src/egui_app/panes.rs
+@@ -1423,6 +1423,10 @@ pub fn status(ui: &mut Ui, state: &mut State, pal: &Tokens, icons: Option<&IconS
+                     .color(pal.text_faint)
+                     .small(),
+             );
++            // #183: the live MCP server says it is listening.
++            if let Some(note) = crate::mcp_host::badge(state) {
++                ui.label(RichText::new(note).color(pal.text_faint).small());
++            }
+             if stale > 0 {
+                 let button = ui.button(format!("Regenerate all stale ({stale})"));
+                 if button.clicked() {
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index ae01696e..1b7b70be 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -59,7 +59,7 @@ const STATUS_H: f32 = 22.0;
+ 
+ /// The windowed shell (the `--ui egui` entry without `--headless`); returns
+ /// the process exit code.
+-pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>) -> i32 {
++pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: Option<u16>) -> i32 {
+     let event_loop = match EventLoop::new() {
+         Ok(el) => el,
+         Err(err) => {
+@@ -69,6 +69,26 @@ pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>) -> i32 {
+     };
+     event_loop.set_control_flow(ControlFlow::Wait);
+     let mut shell = Shell::new(pick, want);
++    // #183: the opt-in live MCP server. Its waker posts an empty user
++    // event, which wakes the idle loop for a frame that answers the call.
++    if let Some(port) = mcp_port {
++        let proxy = event_loop.create_proxy();
++        let wake: camcraft_app::mcp::Wake = Box::new(move || {
++            let _ = proxy.send_event(());
++        });
++        match camcraft_app::mcp::Inbox::listen(port, wake) {
++            Ok(inbox) => {
++                if let Some(addr) = inbox.addr() {
++                    eprintln!("mcp: listening on {addr} (connect with: camcraft-cli mcp --connect {addr})");
++                }
++                shell.state.mcp = Some(inbox);
++            }
++            Err(err) => {
++                eprintln!("mcp: cannot listen on 127.0.0.1:{port}: {err}");
++                shell.state.status = format!("MCP server not started: 127.0.0.1:{port}: {err}");
++            }
++        }
++    }
+     let code = match event_loop.run_app(&mut shell) {
+         Ok(()) => shell.exit_code,
+         Err(err) => {
+@@ -694,6 +714,13 @@ impl winit::application::ApplicationHandler for Shell {
+         }
+     }
+ 
++    /// #183: the MCP listener's wake-up - draw a frame, which answers it.
++    fn user_event(&mut self, _el: &ActiveEventLoop, _event: ()) {
++        if let Some(window) = &self.window {
++            window.request_redraw();
++        }
++    }
++
+     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+         if let WindowEvent::Occluded(occluded) = &event {
+             self.occluded = *occluded;
+@@ -856,6 +883,9 @@ impl Shell {
+     fn shutdown(&mut self) {
+         // Surface/renderer first, window last (see the field-order note);
+         // `state` (and its world) drops after all GPU objects.
++        // #183: the MCP listener stops (and its thread is joined) first,
++        // so no wake-up reaches a closing loop.
++        self.state.mcp = None;
+         self.renderer = None;
+         self.view = None;
+         self.surface = None;
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index b533772f..d9adddd7 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -85,6 +85,7 @@ mod first_setup;
+ mod one_wcs;
+ // #343: the per-setup browser tree.
+ mod setup_tree;
++mod mcp_live;
+ 
+ /// What the per-frame state of `Shell` is, minus the GPU half: the fields
+ /// `shell_layout` touches, so the harness exercises the window's real body.
+diff --git a/crates/ui/src/egui_app/tests/mcp_live.rs b/crates/ui/src/egui_app/tests/mcp_live.rs
+new file mode 100644
+index 00000000..7a96380d
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/mcp_live.rs
+@@ -0,0 +1,97 @@
++//! #183 in the window: an agent's `add_operation`, queued on the live MCP
++//! inbox, is answered by the shell's own frame loop against the window's
++//! document - the browser shows the operation - and the user's Ctrl+Z
++//! removes it, because the agent's step sits on the window's History.
++//! Provenance: our own tests over our own shell; no HSMWorks material.
++
++use super::*;
++use super::super::browser_tree::Leaf;
++use camcraft_app::mcp::{Inbox, Request};
++use serde_json::{Value, json};
++use std::sync::mpsc::Receiver;
++
++fn call(id: u64, name: &str, args: Value) -> String {
++    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } })
++        .to_string()
++}
++
++/// The browser pane paints exactly these rows (they are not egui labels).
++fn has_op_row(state: &State, name: &str) -> bool {
++    let (_, leaves) = panes::browser_rows(state);
++    leaves.iter().any(|l| *l == Leaf::Op(name.to_owned()))
++}
++
++/// The answer a frame gave, as JSON; it must be a tool success.
++fn answered(rx: &Receiver<Option<String>>) -> Value {
++    let line = rx.try_recv().expect("the frame answered").expect("a reply line");
++    let v: Value = serde_json::from_str(&line).expect("json");
++    assert_eq!(v["result"]["isError"], json!(false), "{v}");
++    v
++}
++
++fn ctrl_z(harness: &mut Harness<'static, ShellUi>) {
++    harness.input_mut().events.push(Event::ModifiersChanged(Modifiers::COMMAND));
++    harness.input_mut().events.push(Event::Key {
++        key: Key::Z,
++        physical_key: None,
++        pressed: true,
++        repeat: false,
++        modifiers: Modifiers::COMMAND,
++    });
++    harness.run_steps(2);
++}
++
++#[test]
++fn an_agents_operation_shows_in_the_browser_and_ctrl_z_removes_it() {
++    let mut harness = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, ShellUi::blank());
++    let (tx, inbox) = Inbox::channel();
++    harness.state_mut().state.mcp = Some(inbox);
++
++    let mut answers = Vec::new();
++    for line in [
++        call(1, "set_stock", json!({ "box": { "dx": 60.0, "dy": 60.0, "dz": 20.0 } })),
++        call(2, "add_tool", json!({ "catalog": "EM-0400-2FL" })),
++        call(3, "add_operation", json!({ "kind": "Face", "tool": "EM-0400-2FL" })),
++    ] {
++        let (req, rx) = Request::pair(line);
++        tx.send(req).expect("inbox open");
++        answers.push(rx);
++    }
++    // Nothing runs off the frame loop: the queue waits for a frame.
++    assert!(!has_op_row(&harness.state().state, "Face1"));
++    harness.run();
++    for rx in &answers {
++        answered(rx);
++    }
++    let st = &harness.state().state;
++    assert!(has_op_row(st, "Face1"), "the browser lists the agent's operation");
++    assert_eq!(st.status, "agent: add_operation");
++
++    // The user's own Ctrl+Z undoes the agent's last step.
++    ctrl_z(&mut harness);
++    let st = &harness.state().state;
++    assert!(!has_op_row(st, "Face1"), "Ctrl+Z removed the agent's operation");
++    assert!(st.history.can_redo());
++
++    // And the agent sees the user's undo: its own redo brings it back.
++    let (req, rx) = Request::pair(call(4, "redo", json!({})));
++    tx.send(req).expect("inbox open");
++    harness.run();
++    answered(&rx);
++    assert!(has_op_row(&harness.state().state, "Face1"));
++}
++
++#[test]
++fn the_status_strip_says_the_server_is_listening() {
++    let mut harness = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, ShellUi::blank());
++    assert!(harness.query_by_label_contains("MCP listening").is_none(), "off by default");
++    let inbox = Inbox::listen(0, Box::new(|| {})).expect("listen on loopback");
++    let addr = inbox.addr().expect("addr");
++    harness.state_mut().state.mcp = Some(inbox);
++    harness.run();
++    assert!(harness.query_by_label(&format!("MCP listening on {addr}")).is_some());
++}
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 1d50e0fa..a9bb13d3 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod egui_app;
+ pub mod feedback;
+ pub mod interact;
+ pub mod machined;
++pub mod mcp_host;
+ pub mod operations;
+ pub mod plane_pick;
+ pub mod state;
+diff --git a/crates/ui/src/mcp_host.rs b/crates/ui/src/mcp_host.rs
+new file mode 100644
+index 00000000..85afe83f
+--- /dev/null
++++ b/crates/ui/src/mcp_host.rs
+@@ -0,0 +1,38 @@
++//! The GUI's live MCP host (#183): each frame, the agent's waiting calls
++//! are answered on the UI thread against the window's own document and
++//! History through `camcraft_app::mcp::answer_live`, so the browser
++//! shows an agent's step and Ctrl+Z undoes it like any user step.
++//! Provenance: our own code over our own app seam; no HSMWorks material.
++
++use crate::state::State;
++
++/// Answer every waiting request. Safe to call every frame; never blocks
++/// (each agent waits for its answer, so there is rarely more than one).
++pub fn pump(state: &mut State) {
++    let Some(inbox) = state.mcp.as_ref() else {
++        return;
++    };
++    let waiting: Vec<_> = std::iter::from_fn(|| inbox.next()).collect();
++    for request in waiting {
++        let answer = camcraft_app::mcp::answer_live(
++            &state.world,
++            &mut state.history,
++            state.project_path.as_deref(),
++            request.line(),
++        );
++        if let Some(tool) = &answer.tool {
++            // A tool may have changed the document: every view keyed on
++            // the document version refetches, the same as after an undo.
++            state.doc_version += 1;
++            state.status = format!("agent: {tool}");
++        }
++        request.answer(answer.reply);
++    }
++}
++
++/// The status strip's note while the server listens, so the user can
++/// see the window is open to an agent.
++#[must_use]
++pub fn badge(state: &State) -> Option<String> {
++    state.mcp.as_ref()?.addr().map(|addr| format!("MCP listening on {addr}"))
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 3fbb03ae..91ac362e 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1208,6 +1208,9 @@ pub struct State {
+     /// Operation key being dragged in the browser; discarded on release.
+     pub dragging_op: Option<String>,
+     pub pending: VecDeque<CommandKind>,
++    /// #183: the live MCP session's inbox when the app was started with
++    /// `--mcp-port` / `CAMCRAFT_MCP_PORT`; drained with `pending`.
++    pub mcp: Option<camcraft_app::mcp::Inbox>,
+     pub request_quit: bool,
+     /// #107: a New / Open / Quit held back because the document has
+     /// unsaved changes; while Some, the shell shows the Save / Don't Save
+@@ -1466,6 +1469,7 @@ impl State {
+             rename_draft: None,
+             dragging_op: None,
+             pending: VecDeque::new(),
++            mcp: None,
+             request_quit: false,
+             unsaved_prompt: None,
+             discard_confirmed: false,
+@@ -2293,6 +2297,8 @@ impl State {
+         while let Some(action) = self.pending.pop_front() {
+             self.run(action);
+         }
++        // #183: an agent's live calls, after the user's own clicks.
++        crate::mcp_host::pump(self);
+         self.poll_import();
+         // A refusal that no longer describes the page retires, with its
+         // status-strip mirror (crate::feedback).
+diff --git a/docs/decisions/183-mcp-live-gui.md b/docs/decisions/183-mcp-live-gui.md
+new file mode 100644
+index 00000000..6f119e82
+--- /dev/null
++++ b/docs/decisions/183-mcp-live-gui.md
+@@ -0,0 +1,52 @@
++## #183 - MCP server mode inside the GUI app (2026-11-08)
++
++- **Chosen: transport.** A plain TCP socket on 127.0.0.1 carrying the same
++  newline-delimited JSON-RPC `camcraft-cli mcp` speaks on stdio, plus a
++  stdio bridge, `camcraft-cli mcp --connect 127.0.0.1:<port>`, for MCP
++  clients that only launch stdio servers (`nc -w 3 127.0.0.1 <port>` works
++  too). std::net and std::thread only.
++  **Why:** the smallest transport that reuses the existing framing byte for
++  byte; no async runtime, no HTTP stack, nothing platform-specific.
++  **Dropped:** streamable HTTP (needs an HTTP server and session headers for
++  no gain to a local single-user session); a named pipe / Unix socket (not
++  the same code on Windows).
++- **Chosen: opt-in.** Off unless `--mcp-port <n>` (or `--mcp-port=<n>`) or
++  `CAMCRAFT_MCP_PORT` asks for it; the flag wins over the variable; `0`
++  picks a free port. Bound to 127.0.0.1 only, by construction. A bad value
++  refuses the start (exit 2, like `--gpu-backend`); a port that cannot be
++  bound starts the app anyway with the reason on stderr and the status
++  line. While listening, the status strip shows "MCP listening on
++  127.0.0.1:<port>". No authentication: anything on the local machine that
++  can reach the port can drive the document, which is why it is off by
++  default. **Dropped:** a menu toggle (more UI for a developer feature; can
++  be added on the same `Inbox` later).
++- **Chosen: threading.** A listener thread accepts one client at a time and
++  only moves text: each line goes over an mpsc channel to the UI thread
++  with a per-request reply channel, and the thread wakes the idle winit loop
++  with an empty user event (`EventLoopProxy`). The UI thread answers in
++  `State::drain_actions` (after the user's own queued commands), so no world
++  access ever happens off the UI thread. Dropping the `Inbox` (app exit; the
++  shell drops it first in `shutdown`) stops and joins the thread within
++  ~50 ms. Malformed JSON is a JSON-RPC parse error; a dropped client, a
++  closed channel or a line over 16 MiB is logged and the listener carries on.
++- **Chosen: the seam.** `app::mcp::answer_live(world, history, doc_path,
++  line)` runs the existing `Server` dispatch over an `Env` built for the
++  call: the world is the GUI's own (a flecs `World` clone is a refcounted
++  handle to the same world, not a copy) and the History is the GUI's own,
++  lent with `mem::take` and handed back after the call. So an agent's step
++  is an entry on the window's History: Ctrl+Z undoes it, and the agent's
++  `undo`/`redo` tools walk the user's steps too. No tool was duplicated;
++  `mcp/tools.rs` and `mcp/edit.rs` are untouched. After any `tools/call` the
++  UI bumps `doc_version` (views refetch) and the status line reads
++  "agent: <tool>". **Dropped:** a `CommandKind::Mcp` variant on the pending
++  queue (the reply channel and JSON would leak into the ui command enum for
++  nothing - the drain point is the same); giving `Env` borrowed fields
++  (would change every tool signature in files other PRs edit).
++- **Chosen: `open_project` is refused in the live session** with a reason
++  pointing at File > Open: through the session it would replace the user's
++  document without the app's unsaved-changes prompt and per-document reset.
++  `save_project` stays: with no path it saves over the app's open project
++  (the window's path is passed in), and it does not mark the app's document
++  clean, so the app may still ask to save - the safe side.
++- **Cost to change later:** the transport is one file (`mcp/listen.rs`);
++  an HTTP front end or a menu toggle would build the same `Inbox`.
+
+From c051ba9d08a8e9991ca644420daf1ca1c947bdd1 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 9 Nov 2026 14:32:42 -0800
+Subject: [PATCH 2/4] fix(mcp): the live listener serves JSON-RPC lines only -
+ a browser POST is refused
+
+Review of #474: any web page can POST to 127.0.0.1, and the listener
+read each line as JSON-RPC, so the HTTP headers failed but the body ran
+- a page could call save_project, post or export_tool_library with its
+own paths. Every non-blank line must now open a JSON object or array;
+anything else is refused (-32600) and the connection closed before a
+line reaches the app. Reads are bounded to the cap as they happen and
+writes time out, so a client can neither grow memory nor stall the
+listener.
+
+Pinned by mcp_live::a_browser_post_never_reaches_the_app.
+
+Refs #183
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/app/src/mcp/listen.rs       | 39 +++++++++++++++++++--
+ crates/app/tests/mcp_live.rs       | 56 ++++++++++++++++++++++++++++++
+ docs/decisions/183-mcp-live-gui.md |  2 ++
+ 3 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index f4795de2..f66bc816 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -12,8 +12,17 @@
+ //! a time; a dropped client, a closed channel or an unreadable line is
+ //! logged and the listener goes on (or ends with the app), never a panic.
+ //! Dropping the [`Inbox`] stops and joins the thread.
++//!
++//! **Only JSON-RPC speaks** (review of #474): loopback is not a trust
++//! boundary - any web page in the user's browser can POST to
++//! 127.0.0.1. Every non-blank line must open a JSON object or array;
++//! anything else (an HTTP request line, a header) closes the
++//! connection before a single line of it reaches the app, so a page can
++//! never smuggle a JSON-RPC body past its own HTTP headers. Reads are
++//! bounded to [`MAX_LINE`] as they happen, and writes time out, so a
++//! client can neither grow memory nor stall the listener.
+ 
+-use std::io::{BufRead, BufReader, Write};
++use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+@@ -29,6 +38,20 @@ const POLL: Duration = Duration::from_millis(50);
+ /// that never sends a newline must not grow the app's memory forever.
+ const MAX_LINE: usize = 16 * 1024 * 1024;
+ 
++/// How long a write to a client may block before the client is dropped -
++/// a client that stops reading must not hold the listener.
++const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// Whether a wire line may be handed to the app: JSON-RPC is always an
++/// object or a batch array. An HTTP request line or header is neither.
++#[must_use]
++pub(crate) fn is_json_rpc_line(bytes: &[u8]) -> bool {
++    bytes
++        .iter()
++        .find(|b| !b.is_ascii_whitespace())
++        .is_none_or(|b| *b == b'{' || *b == b'[')
++}
++
+ /// The waker the listener calls after queueing a request, so an idle
+ /// GUI loop draws (and drains) a frame. Any thread may call it.
+ pub type Wake = Box<dyn Fn() + Send + 'static>;
+@@ -179,6 +202,7 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+     // (BSD does); reads wait, but only a POLL at a time.
+     stream.set_nonblocking(false)?;
+     stream.set_read_timeout(Some(POLL))?;
++    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+     let mut writer = stream.try_clone()?;
+     let mut reader = BufReader::new(stream);
+     let mut buf = Vec::new();
+@@ -186,7 +210,9 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+         if stop.load(Ordering::Relaxed) {
+             return Ok(());
+         }
+-        match reader.read_until(b'\n', &mut buf) {
++        // Bounded as it reads: never more than one byte past the cap.
++        let room = (MAX_LINE + 1).saturating_sub(buf.len()) as u64;
++        match Read::by_ref(&mut reader).take(room).read_until(b'\n', &mut buf) {
+             Ok(0) => {
+                 // End of input: a last unterminated line still counts,
+                 // as it does on stdio.
+@@ -221,8 +247,15 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+ }
+ 
+ /// Hand one line to the owning thread and write its answer. `Ok(false)`
+-/// when the session cannot go on (the app is stopping or gone).
++/// when the session cannot go on (the app is stopping or gone, or the
++/// client is not speaking JSON-RPC).
+ fn forward(bytes: &[u8], tx: &Sender<Request>, writer: &mut TcpStream, stop: &AtomicBool, wake: &Wake) -> std::io::Result<bool> {
++    if !is_json_rpc_line(bytes) {
++        tracing::warn!("mcp: a client sent a line that is not JSON-RPC (an HTTP request?) - connection closed");
++        let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"not a JSON-RPC message - the connection is closed"}}"#;
++        let _ = writeln!(writer, "{refusal}").and_then(|()| writer.flush());
++        return Ok(false);
++    }
+     let line = String::from_utf8_lossy(bytes).into_owned();
+     if line.trim().is_empty() {
+         return Ok(true);
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index 304b7bad..e3be7015 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -197,3 +197,59 @@ fn the_bridge_copies_stdio_to_a_live_session_and_back() {
+     assert!(text.contains("\"id\":7") && text.contains("\"result\""), "{text}");
+     assert!(camcraft_app::mcp::bridge("127.0.0.1:1", std::io::empty(), std::io::sink()).is_err(), "no server: a clean error");
+ }
++
++/// #474 review: loopback is no trust boundary - a web page in the user's
++/// browser can POST to 127.0.0.1. Its HTTP request line closes the
++/// connection, so the JSON-RPC body it carries never reaches the app;
++/// a real client on the next connection is served as before.
++#[test]
++fn a_browser_post_never_reaches_the_app() {
++    let inbox = Inbox::listen(0, Box::new(|| {})).expect("listen on loopback");
++    let addr = inbox.addr().expect("bound address");
++    let body = call(9, "save_project", json!({ "path": "/tmp/camcraft-drive-by.ccam" }));
++    let post = format!(
++        "POST / HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}\n",
++        body.len() + 1
++    );
++    let mut s = TcpStream::connect(addr).expect("connect");
++    // A regression must fail, never hang: without the JSON-only rule the
++    // page's body would sit unanswered in the app's inbox.
++    s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
++    s.write_all(post.as_bytes()).expect("write");
++    let mut r = BufReader::new(s);
++    let mut line = String::new();
++    r.read_line(&mut line).expect("a refusal, not silence - the page's request reached the app");
++    assert!(line.contains("-32600") && line.contains("not a JSON-RPC message"), "{line}");
++    let mut rest = String::new();
++    let n = r.read_line(&mut rest).unwrap_or(0);
++    assert_eq!(n, 0, "the connection is closed after the refusal, not reading on: {rest:?}");
++    // Nothing of the page's request was handed to the app.
++    let deadline = Instant::now() + Duration::from_millis(300);
++    while Instant::now() < deadline {
++        assert!(inbox.next().is_none(), "a browser line reached the app");
++        std::thread::sleep(Duration::from_millis(10));
++    }
++
++    // A JSON-RPC client is still served on the next connection.
++    let s = TcpStream::connect(addr).expect("reconnect");
++    let mut w = s.try_clone().expect("clone");
++    let mut r = BufReader::new(s);
++    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
++    writeln!(w, "{ping}").expect("send");
++    let world = new_world();
++    let mut history = History::default();
++    let deadline = Instant::now() + Duration::from_secs(10);
++    let req = loop {
++        if let Some(req) = inbox.next() {
++            break req;
++        }
++        assert!(Instant::now() < deadline, "the JSON client was not served");
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    assert_eq!(req.line().trim(), ping);
++    let a = answer_live(&world, &mut history, None, req.line());
++    req.answer(a.reply);
++    let mut line = String::new();
++    r.read_line(&mut line).expect("answer");
++    assert!(line.contains("\"id\":1"), "{line}");
++}
+diff --git a/docs/decisions/183-mcp-live-gui.md b/docs/decisions/183-mcp-live-gui.md
+index 6f119e82..ea6ab6fe 100644
+--- a/docs/decisions/183-mcp-live-gui.md
++++ b/docs/decisions/183-mcp-live-gui.md
+@@ -50,3 +50,5 @@
+   clean, so the app may still ask to save - the safe side.
+ - **Cost to change later:** the transport is one file (`mcp/listen.rs`);
+   an HTTP front end or a menu toggle would build the same `Inbox`.
++
++**Security fix from review (live MCP listener):** loopback is not a trust boundary, since any web page in the user's browser can POST to 127.0.0.1. Every non-blank wire line must now open a JSON object or array; anything else (an HTTP request line or header) gets a -32600 refusal and the connection is closed before a single line reaches the app. So a page cannot smuggle a JSON-RPC body (`save_project`, `post`, `export_tool_library` with its own paths) past its HTTP headers. Reads are bounded to the 16 MiB cap as they happen, and writes time out after 5 s, so a client can neither grow memory nor stall the listener. A per-session token was considered and dropped for now: the JSON-only rule already closes the browser route, and a token would complicate `camcraft-cli mcp --connect`. It can be added if a non-browser local attacker matters.
+
+From c33f8f9ffe7bb2e0eef69eccc9c0492df5ed66de Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Mon, 9 Nov 2026 14:46:42 -0800
+Subject: [PATCH 3/4] feat(mcp): an idle live-session client is dropped after a
+ timeout
+
+The live listener serves one client at a time; a local client that
+connected and sent nothing held the session until it hung up. Now a
+client that sends no complete line for the idle window (5 minutes by
+default; Inbox::listen_with_idle sets another, floored at the 50 ms
+poll step) gets an MCP notifications/message saying why, is closed,
+is logged by peer address ("client <peer> dropped: idle ..."), and the
+next client is served. The clock resets after each answered line, so
+the app's own answering time never counts. A newcomer does not
+pre-empt a connected client before that.
+
+Fixes #567
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/mcp/listen.rs |  74 +++++++++++++++++++-----
+ crates/app/src/mcp/mod.rs    |   2 +-
+ crates/app/tests/mcp_live.rs | 109 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 171 insertions(+), 14 deletions(-)
+
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index f66bc816..d29f82b4 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -21,6 +21,13 @@
+ //! never smuggle a JSON-RPC body past its own HTTP headers. Reads are
+ //! bounded to [`MAX_LINE`] as they happen, and writes time out, so a
+ //! client can neither grow memory nor stall the listener.
++//!
++//! **An idle client lets go** (#567): one client holds the session, so
++//! a client that sends no complete line for [`IDLE_TIMEOUT`] (time the
++//! app spends answering does not count) is told why in an MCP
++//! `notifications/message`, closed, logged by its peer address, and the
++//! next client is served. A newcomer never pre-empts a connected client
++//! before that: an agent pausing between calls keeps its session.
+ 
+ use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+@@ -28,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+ use std::sync::Arc;
+ use std::thread::JoinHandle;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ /// How often a blocked wait looks at the stop flag: the bound on how
+ /// long dropping an [`Inbox`] can take.
+@@ -42,6 +49,18 @@ const MAX_LINE: usize = 16 * 1024 * 1024;
+ /// a client that stops reading must not hold the listener.
+ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+ 
++/// How long a client may go without sending a complete line before it
++/// is dropped so the next one can be served (#567).
++pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
++
++/// How a served client's session ended, for the listener's log line.
++enum End {
++    /// It hung up, was refused, or the app is stopping.
++    Closed,
++    /// It sent no complete line for the idle window.
++    Idle(Duration),
++}
++
+ /// Whether a wire line may be handed to the app: JSON-RPC is always an
+ /// object or a batch array. An HTTP request line or header is neither.
+ #[must_use]
+@@ -103,6 +122,17 @@ impl Inbox {
+     /// # Errors
+     /// The bind (port in use, no permission) or the thread spawn failed.
+     pub fn listen(port: u16, wake: Wake) -> std::io::Result<Self> {
++        Self::listen_with_idle(port, wake, IDLE_TIMEOUT)
++    }
++
++    /// [`Inbox::listen`] with its own idle window: a client sending no
++    /// complete line for `idle` is dropped (a window shorter than the
++    /// poll step is read as the poll step). Tests use a short one.
++    ///
++    /// # Errors
++    /// The bind (port in use, no permission) or the thread spawn failed.
++    pub fn listen_with_idle(port: u16, wake: Wake, idle: Duration) -> std::io::Result<Self> {
++        let idle = idle.max(POLL);
+         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+         listener.set_nonblocking(true)?;
+         let addr = listener.local_addr()?;
+@@ -111,8 +141,8 @@ impl Inbox {
+         let flag = Arc::clone(&stop);
+         let thread = std::thread::Builder::new()
+             .name("camcraft-mcp".into())
+-            .spawn(move || accept_loop(&listener, &tx, &flag, &wake))?;
+-        tracing::info!("mcp: listening on {addr}");
++            .spawn(move || accept_loop(&listener, &tx, &flag, &wake, idle))?;
++        tracing::info!("mcp: listening on {addr} (an idle client is dropped after {}s)", idle.as_secs());
+         Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread) })
+     }
+ 
+@@ -176,13 +206,17 @@ pub fn port_from(args: &[String], env: Option<&str>) -> Result<Option<u16>, Stri
+         .map_err(|_| format!("MCP port must be a number from 0 to 65535, got '{text}'"))
+ }
+ 
+-fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake) {
++fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration) {
+     while !stop.load(Ordering::Relaxed) {
+         match listener.accept() {
+             Ok((stream, peer)) => {
+                 tracing::info!("mcp: client {peer} connected");
+-                match serve_client(stream, tx, stop, wake) {
+-                    Ok(()) => tracing::info!("mcp: client {peer} left"),
++                match serve_client(stream, tx, stop, wake, idle) {
++                    Ok(End::Closed) => tracing::info!("mcp: client {peer} left"),
++                    Ok(End::Idle(after)) => tracing::warn!(
++                        "mcp: client {peer} dropped: idle - no complete line for {:.1}s; serving the next client",
++                        after.as_secs_f64()
++                    ),
+                     Err(e) => tracing::warn!("mcp: client {peer} dropped: {e}"),
+                 }
+             }
+@@ -195,9 +229,9 @@ fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool,
+     }
+ }
+ 
+-/// One client until it hangs up, the app stops, or the app's end of
+-/// the channel is gone.
+-fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake) -> std::io::Result<()> {
++/// One client until it hangs up, the app stops, the app's end of the
++/// channel is gone, or it sends no complete line for `idle`.
++fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration) -> std::io::Result<End> {
+     // An accepted socket may inherit the listener's non-blocking mode
+     // (BSD does); reads wait, but only a POLL at a time.
+     stream.set_nonblocking(false)?;
+@@ -206,9 +240,22 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+     let mut writer = stream.try_clone()?;
+     let mut reader = BufReader::new(stream);
+     let mut buf = Vec::new();
++    // The idle clock: reset by each complete line once it is answered,
++    // so the app's own answering time never counts against the client.
++    let mut active = Instant::now();
+     loop {
+         if stop.load(Ordering::Relaxed) {
+-            return Ok(());
++            return Ok(End::Closed);
++        }
++        let quiet = active.elapsed();
++        if quiet >= idle {
++            let note = format!(
++                r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
++                quiet.as_secs()
++            );
++            // Best effort: the write times out, and the client goes either way.
++            let _ = writeln!(writer, "{note}").and_then(|()| writer.flush());
++            return Ok(End::Idle(quiet));
+         }
+         // Bounded as it reads: never more than one byte past the cap.
+         let room = (MAX_LINE + 1).saturating_sub(buf.len()) as u64;
+@@ -220,13 +267,14 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+                     let line = std::mem::take(&mut buf);
+                     forward(&line, tx, &mut writer, stop, wake)?;
+                 }
+-                return Ok(());
++                return Ok(End::Closed);
+             }
+             Ok(_) if buf.ends_with(b"\n") => {
+                 let line = std::mem::take(&mut buf);
+                 if !forward(&line, tx, &mut writer, stop, wake)? {
+-                    return Ok(());
++                    return Ok(End::Closed);
+                 }
++                active = Instant::now();
+             }
+             // Bytes without a newline: the next read returns 0 (EOF).
+             Ok(_) => {}
+@@ -241,7 +289,7 @@ fn serve_client(stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake
+             let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"message too long - the connection is closed"}}"#;
+             writeln!(writer, "{refusal}")?;
+             writer.flush()?;
+-            return Ok(());
++            return Ok(End::Closed);
+         }
+     }
+ }
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 17839e66..0894d1b0 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -31,7 +31,7 @@ mod tools;
+ // #183: the same tool table served live from inside the GUI, over a
+ // loopback socket, against the app's own document and History.
+ pub use bridge::bridge;
+-pub use listen::{port_from, Inbox, Request, Wake};
++pub use listen::{port_from, Inbox, Request, Wake, IDLE_TIMEOUT};
+ pub use live::{answer_live, LiveAnswer};
+ 
+ use crate::script::Env;
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index e3be7015..b530f80e 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -253,3 +253,112 @@ fn a_browser_post_never_reaches_the_app() {
+     r.read_line(&mut line).expect("answer");
+     assert!(line.contains("\"id\":1"), "{line}");
+ }
++
++/// The listener's log lines, captured: a global subscriber writing into
++/// a shared buffer (only the idle test installs it).
++#[derive(Clone, Default)]
++struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
++
++impl Write for LogBuf {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        self.0.lock().expect("log lock").extend_from_slice(bytes);
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++/// Wait for one request and answer it against `world`.
++fn answer_one(inbox: &Inbox, world: &World, history: &mut History) -> String {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    loop {
++        if let Some(req) = inbox.next() {
++            let line = req.line().to_owned();
++            let a = answer_live(world, history, None, req.line());
++            req.answer(a.reply);
++            return line;
++        }
++        assert!(Instant::now() < deadline, "the client was not served");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++
++/// #567: a client that connects and says nothing holds the single
++/// session only for the idle window; then it is told why, closed,
++/// logged by its address, and the next client is served.
++#[test]
++fn an_idle_client_is_dropped_by_name_and_the_next_one_is_served() {
++    let log = LogBuf::default();
++    let sink = log.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .with_ansi(false)
++        .with_writer(move || sink.clone())
++        .finish();
++    let captured = tracing::subscriber::set_global_default(subscriber).is_ok();
++
++    let inbox = Inbox::listen_with_idle(0, Box::new(|| {}), Duration::from_millis(300)).expect("listen");
++    let addr = inbox.addr().expect("bound address");
++    let silent = TcpStream::connect(addr).expect("connect");
++    let silent_addr = silent.local_addr().expect("client address");
++    // A regression must fail, never hang.
++    silent.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
++    let t = Instant::now();
++    let mut r = BufReader::new(silent);
++    let mut line = String::new();
++    r.read_line(&mut line).expect("an idle note, not silence - the idle client was never dropped");
++    assert!(line.contains("notifications/message") && line.contains("idle"), "{line}");
++    let mut rest = String::new();
++    assert_eq!(r.read_line(&mut rest).unwrap_or(0), 0, "the connection is closed after the note: {rest:?}");
++    assert!(t.elapsed() >= Duration::from_millis(250), "dropped before the window: {:?}", t.elapsed());
++
++    // The next client is served.
++    let s = TcpStream::connect(addr).expect("reconnect");
++    let mut w = s.try_clone().expect("clone");
++    let mut r = BufReader::new(s);
++    writeln!(w, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).expect("send");
++    let world = new_world();
++    let mut history = History::default();
++    answer_one(&inbox, &world, &mut history);
++    let mut answer = String::new();
++    r.read_line(&mut answer).expect("answer");
++    assert!(answer.contains("\"id\":1") && answer.contains("\"result\""), "{answer}");
++
++    if captured {
++        let text = String::from_utf8_lossy(&log.0.lock().expect("log lock")).into_owned();
++        assert!(text.contains(&format!("client {silent_addr} dropped: idle")), "the log names the idle client: {text}");
++    }
++}
++
++/// #567: a client that keeps sending complete lines inside the window
++/// keeps its session however long it runs.
++#[test]
++fn a_client_that_keeps_talking_is_never_dropped_as_idle() {
++    let window = Duration::from_millis(400);
++    let inbox = Inbox::listen_with_idle(0, Box::new(|| {}), window).expect("listen");
++    let addr = inbox.addr().expect("bound address");
++    let client = std::thread::spawn(move || -> Vec<String> {
++        let s = TcpStream::connect(addr).expect("connect");
++        s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
++        let mut w = s.try_clone().expect("clone");
++        let mut r = BufReader::new(s);
++        let mut answers = Vec::new();
++        // Eight calls 150 ms apart: three windows long in all.
++        for id in 0..8 {
++            std::thread::sleep(Duration::from_millis(150));
++            writeln!(w, r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#).expect("send");
++            let mut line = String::new();
++            r.read_line(&mut line).expect("answer");
++            answers.push(line);
++        }
++        answers
++    });
++    let world = new_world();
++    let mut history = History::default();
++    pump_until(&inbox, &world, &mut history, &|| client.is_finished());
++    let answers = client.join().expect("client thread");
++    assert_eq!(answers.len(), 8);
++    for (id, a) in answers.iter().enumerate() {
++        assert!(a.contains(&format!("\"id\":{id}")) && !a.contains("idle"), "call {id}: {a}");
++    }
++}
+
+From 6acf142578af0cbe9feca978add337ad6428b858 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Mon, 9 Nov 2026 14:47:16 -0800
+Subject: [PATCH 4/4] docs(decisions): #567 idle timeout - 5 min window, no
+ idle-client replacement
+
+Refs #567
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ docs/decisions/567-mcp-idle-timeout.md | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+ create mode 100644 docs/decisions/567-mcp-idle-timeout.md
+
+diff --git a/docs/decisions/567-mcp-idle-timeout.md b/docs/decisions/567-mcp-idle-timeout.md
+new file mode 100644
+index 00000000..0bcad406
+--- /dev/null
++++ b/docs/decisions/567-mcp-idle-timeout.md
+@@ -0,0 +1,14 @@
++## #567 - An idle live-session MCP client is dropped after a timeout
++
++**Decided:**
++- The live listener (`crates/app/src/mcp/listen.rs`) drops a client that sends no complete line for `IDLE_TIMEOUT` (5 minutes). Before closing, it sends one best-effort `notifications/message` warning that says why. The accept loop logs `client <peer> dropped: idle …` and serves the next client.
++- The idle clock restarts after each answered line. Time the app spends answering doesn't count, and a partial line doesn't reset the clock.
++- Windows shorter than the 50 ms poll step are raised to it, so a zero window can't drop every client at once.
++
++**Why:** the listener serves one client at a time. Before this change, a silent local connection held the session until it hung up, and no real agent could connect meanwhile. Since #474, non-JSON traffic (browsers, TLS hellos) is refused at once, so this only concerns a silent or slow local client.
++
++**Considered and dropped:**
++- **A new client replacing an idle one (the issue's optional part).** It would let any local process kick a live agent off while that agent pauses between calls. The timeout alone frees the session.
++- **A shorter default (e.g. 30 s).** An agent can legitimately think for minutes between calls; 5 minutes keeps those sessions.
++
++**Cost to change later:** small. The window is one constant, and `Inbox::listen_with_idle` takes any duration. Replacement could be added behind an opt-in flag.
