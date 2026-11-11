@@ -1,0 +1,1071 @@
+From f31943396d7b3ad7199e0c5edd0aef6117fc8d42 Mon Sep 17 00:00:00 2001
+From: jnz-1 <jnz-1@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:14:25 +0100
+Subject: [PATCH] feat(ops): one machining-frame seam - OpFrame composes
+ part_alignment and TiltedFrame
+
+Phase 1 of #763: OpFrame (crates/app/src/operation/frame.rs) is the one
+machining-frame seam - the setup's part_alignment (#326) and the op's
+3+2 Tilt (M5.1 B) composed behind one door. collect_job reads material
+and heights through it and builds its tilt frame from
+OpFrame::checked_frame (one construction site, the refusal keeping its
+exact words and precedence). Heights and bounds in the local frame
+resolve against fully transformed geometry, never a z - origin.z shift.
+
+No refusal lifted, no post change, no generator change; behavior is
+byte-identical (the zero-tilt index reproduces the prismatic path
+exactly, move for move).
+
+Tests: crates/app/tests/opframe_seam.rs (8) + the seam's inline unit
+tests (6) - identity, zero-tilt exactness, tilted plane run, 90/180
+alignment, alignment x tilt composition, transformed local heights and
+boxes, picks' Phase 1 refusal boundary. Battery green: plane_align (9),
+plane_align_edges (5), axis_align (10), points_align (8), turn_pivot
+(5), area_controls (13), after_op (10), inverted_post (15 - the
+capability gates), rest_across_setups (7), carried_verify (8). Clippy
+clean on camcraft-app.
+
+Refs #763
+---
+ crates/app/src/operation/frame.rs  | 439 ++++++++++++++++++++++++++++
+ crates/app/src/operation/job.rs    |  27 +-
+ crates/app/src/operation/mod.rs    |   4 +
+ crates/app/tests/opframe_seam.rs   | 445 +++++++++++++++++++++++++++++
+ docs/decisions/763-opframe-seam.md |  69 +++++
+ 5 files changed, 967 insertions(+), 17 deletions(-)
+ create mode 100644 crates/app/src/operation/frame.rs
+ create mode 100644 crates/app/tests/opframe_seam.rs
+ create mode 100644 docs/decisions/763-opframe-seam.md
+
+diff --git a/crates/app/src/operation/frame.rs b/crates/app/src/operation/frame.rs
+new file mode 100644
+index 00000000..5558cc8f
+--- /dev/null
++++ b/crates/app/src/operation/frame.rs
+@@ -0,0 +1,439 @@
++//! The one machining-frame seam (#763): the single door an operation's
++//! world reads and CL wrap go through, composing the two existing frame
++//! mechanisms — the setup's `part_alignment` (#326) and the op's 3+2
++//! `Tilt` (M5.1 B) — without adding a third.
++//!
++//! Provenance: our own frame doctrine, specced from the repo's public
++//! design notes; rigid-body math, no vendor implementation inspected.
++//!
++//! ## The contract
++//!
++//! Three coordinate systems, never a fourth:
++//!
++//! - **D** — the document frame (as modelled); part entities carry
++//!   their `Location` in D.
++//! - **S** — the setup frame: the table frame, and the world the CL
++//!   stream and the post speak. The stock, the work offsets and the
++//!   fixtures are setup FURNITURE — stored IN S already (#326's law),
++//!   so the alignment never applies to them; only the tilt reads them
++//!   local.
++//! - **L** — the local machining frame: XY the cutting plane, +Z the
++//!   tool axis; exists only while the op tilts.
++//!
++//! Point maps, right-to-left application (the `setup_align::compose`
++//! convention — the rightmost map applies first):
++//!
++//! - D → S: `A` = the setup's `part_alignment`, baked into the PART
++//!   reads (`facets_in` and siblings, reused verbatim below). Never
++//!   inverted — the CL never maps back to D.
++//! - S → L: `T` = the op's tilt frame (`TiltedFrame::to_local`),
++//!   composed AFTER the alignment read: `p_L = T(A(p_D))`.
++//! - L → S (the CL out): `T.to_world`, the tilt's inverse — one wrap
++//!   over the whole stream ([`Self::world_path`]), a clone when no
++//!   tilt exists (the identity law: bits included).
++//!
++//! Heights and bounds in L resolve against FULLY TRANSFORMED geometry —
++//! the box of `T(A(f))`, never a `z - origin.z` shift of the S box: a
++//! Z shift is only correct while the tool axis is the world Z, and the
++//! seam must be right for every tilt it will ever carry. Machine
++//! capability stays gated where it is: a tilted orientation rides the
++//! stream stamped, never flattened to plain XYZ, and the post's
++//! tilted-move refusals keep their verdicts (`tests/inverted_post.rs`
++//! pins them).
++
++use flecs_ecs::prelude::{Entity, World};
++
++use super::*;
++use crate::geometry::Aabb;
++
++/// One operation's frame story: the setup it runs in, and its tilt.
++/// The alignment is not held here — it is the setup's own state, read
++/// by the `setup_align` helpers at every S-frame read below (one
++/// owner, no second copy to drift).
++#[derive(Clone, Debug)]
++pub struct OpFrame {
++    /// The op's declared setup (`None` = the first setup, the
++    /// implicit-setup law of [`crate::setup`]).
++    setup: Option<String>,
++    /// The stored 3+2 letters, never normalized — the letters ARE the
++    /// claim. `None` is no index: the ordinary prismatic op.
++    tilt: Option<Tilt>,
++    /// The letters' one reading ([`Tilt::frame`]); also `None` when
++    /// the letters state no direction, which [`Self::checked_frame`]
++    /// refuses by name — never guessed here.
++    frame: Option<crate::cl::TiltedFrame>,
++}
++
++impl OpFrame {
++    /// Read an operation's frame story.
++    #[must_use]
++    pub fn of(op: &Operation) -> Self {
++        Self::new(op.setup.clone(), op.params.tilt())
++    }
++
++    /// The same construction from the pieces (the seam's tests, and the
++    /// later phases' call sites, hold no `Operation`).
++    #[must_use]
++    pub fn new(setup: Option<String>, tilt: Option<Tilt>) -> Self {
++        let frame = tilt.and_then(|t| t.frame());
++        Self { setup, tilt, frame }
++    }
++
++    /// The tilt frame, refusing letters that state no direction with
++    /// the parameter door's own words. The refusal's PRECEDENCE stays
++    /// the caller's: `collect_job` asks after the heights resolve,
++    /// exactly where the old head asked (the job's error-order law).
++    pub fn checked_frame(&self) -> Result<Option<crate::cl::TiltedFrame>, GenError> {
++        if self.tilt.is_some() && self.frame.is_none() {
++            return Err(GenError::Invalid(boundary_ctx::TILT_NO_DIRECTION.into()));
++        }
++        Ok(self.frame)
++    }
++
++    // ---- S-frame reads: the alignment applied, never the tilt ----
++
++    /// A part entity's facets in S (#326: an aligned part reads turned;
++    /// an unaligned setup reads exactly the world facets it always
++    /// did). This is the door Phase 2 reads picks through too.
++    #[must_use]
++    pub fn facets_in_setup(&self, world: &World, entity: &Entity) -> Option<Vec<Triangle>> {
++        crate::setup_align::facets_in(world, entity, self.setup.as_deref())
++    }
++
++    /// One entity's bounds in S.
++    #[must_use]
++    pub fn entity_aabb_in_setup(&self, world: &World, entity: &Entity) -> Option<Aabb> {
++        crate::setup_align::entity_aabb_in(world, entity, self.setup.as_deref())
++    }
++
++    /// The whole solid's bounds in S.
++    #[must_use]
++    pub fn solid_aabb_in_setup(&self, world: &World) -> Option<Aabb> {
++        crate::setup_align::solid_aabb_in(world, self.setup.as_deref())
++    }
++
++    /// The parts (fixtures left out) as facets in S.
++    #[must_use]
++    pub fn parts_facets_in_setup(&self, world: &World) -> Vec<Triangle> {
++        crate::setup_align::parts_facets_in(world, self.setup.as_deref())
++    }
++
++    /// Setup furniture (the stock, the WCS, fixtures): stored IN S, so
++    /// the alignment NEVER applies (#326's furniture law). The tilt
++    /// still reads them local ([`Self::local_facets`]).
++    #[must_use]
++    pub fn furniture_facets(&self, world: &World, entity: &Entity) -> Option<Vec<Triangle>> {
++        model::world_facets(world, entity)
++    }
++
++    // ---- heights: today's S-frame resolve, what collect_job stores ----
++
++    /// The height bag every kind resolves today: S-frame world Zs,
++    /// alignment-aware, unshifted (the tilt's own fold stays
++    /// `run_job`'s, unchanged by this seam).
++    pub fn resolve_heights(
++        &self,
++        world: &World,
++        src: Option<&SrcRef>,
++        params: &OpParams,
++    ) -> Result<ResolvedHeights, String> {
++        resolve_params(world, self.setup.as_deref(), src, params)
++    }
++
++    /// The op's material, read through the seam (the S-frame read
++    /// `collect_job` always made — one name on it now).
++    pub(super) fn material_of(&self, world: &World, src: &SrcRef) -> Result<Material, GenError> {
++        material_of(world, self.setup.as_deref(), src)
++    }
++
++    // ---- the composed seam: L-frame math (fully transformed) ----
++
++    /// S-facets into L: the tilt applied, a clone when none exists.
++    #[must_use]
++    pub fn local_facets(&self, facets_s: &[Triangle]) -> Vec<Triangle> {
++        match &self.frame {
++            Some(f) => f.local_facets(facets_s),
++            None => facets_s.to_vec(),
++        }
++    }
++
++    /// A world (S-frame) point's height along the tool axis.
++    #[must_use]
++    pub fn z_local(&self, p: Point3) -> f64 {
++        match &self.frame {
++            Some(f) => f.z_local(p),
++            None => p.z,
++        }
++    }
++
++    /// The tool axis in S: the world's +Z when no tilt exists, the
++    /// tilt's commanded axis otherwise — the direction the post's
++    /// tilted-move gates read.
++    #[must_use]
++    pub fn tool_axis(&self) -> [f64; 3] {
++        self.frame.map_or([0.0, 0.0, 1.0], |f| f.axis)
++    }
++
++    /// The local bounds of S-facets: the box of the FULLY TRANSFORMED
++    /// geometry — never a shift of the S box (a Z shift is not
++    /// generally correct for a tilted plane).
++    #[must_use]
++    pub fn aabb_local_of(&self, facets_s: &[Triangle]) -> Option<Aabb> {
++        let local = self.local_facets(facets_s);
++        bounds(local.iter().flat_map(|t| [t.a, t.b, t.c]))
++    }
++
++    /// The solid's bounds in L.
++    #[must_use]
++    pub fn solid_aabb_local(&self, world: &World) -> Option<Aabb> {
++        self.aabb_local_of(&self.parts_facets_in_setup(world))
++    }
++
++    /// One entity's bounds in L.
++    #[must_use]
++    pub fn entity_aabb_local(&self, world: &World, entity: &Entity) -> Option<Aabb> {
++        self.facets_in_setup(world, entity)
++            .and_then(|f| self.aabb_local_of(&f))
++    }
++
++    /// Furniture bounds in L (the stock a tilted cut plane stands in).
++    #[must_use]
++    pub fn furniture_aabb_local(&self, world: &World, entity: &Entity) -> Option<Aabb> {
++        self.furniture_facets(world, entity)
++            .and_then(|f| self.aabb_local_of(&f))
++    }
++
++    /// A height reference resolved in L, against fully transformed
++    /// geometry: Top/BottomOfModel read the local solid bounds,
++    /// Top/BottomOfStock the furniture's local bounds, WorkOffset the
++    /// WCS origin's [`Self::z_local`], Fixed passes through as spoken
++    /// along the tool axis. A Selection reference stays `None` here —
++    /// picks are refused in an aligned setup until Phase 2 reads them
++    /// through the seam, and a height is never guessed.
++    #[must_use]
++    pub fn height_z_local(&self, world: &World, h: Height) -> Option<f64> {
++        let base = match h.reference {
++            HeightReference::Fixed => return h.offset.is_finite().then_some(h.offset),
++            HeightReference::TopOfModel => self.solid_aabb_local(world)?.max.z,
++            HeightReference::BottomOfModel => self.solid_aabb_local(world)?.min.z,
++            HeightReference::TopOfStock | HeightReference::BottomOfStock => {
++                let name = crate::setup::stock_entity_name(world, self.setup.as_deref());
++                let entity = model::find_by_name(world, &name)?;
++                let b = self.furniture_aabb_local(world, &entity)?;
++                if matches!(h.reference, HeightReference::TopOfStock) {
++                    b.max.z
++                } else {
++                    b.min.z
++                }
++            }
++            HeightReference::WorkOffset => {
++                let entity = crate::setup::wcs_entity(world, self.setup.as_deref())?;
++                let pos = model::transform_of(world, &entity).unwrap_or_default().pos;
++                self.z_local(pos)
++            }
++            HeightReference::TopOfSelection | HeightReference::BottomOfSelection => return None,
++        };
++        (base + h.offset).is_finite().then_some(base + h.offset)
++    }
++
++    /// The CL wrap, L -> S, over the whole stream — the tilt's own
++    /// contract (every record, arcs chorded when tilted, the pose
++    /// stamped); a clone when no tilt exists.
++    #[must_use]
++    pub fn world_path(&self, local: &Toolpath, chord_tol: f64) -> Toolpath {
++        match &self.frame {
++            Some(f) => f.world_path(local, chord_tol),
++            None => local.clone(),
++        }
++    }
++}
++
++/// The box of points (the `setup_align::bounds` law, mirrored here for
++/// the seam's local reads — that one is private to its module).
++fn bounds(points: impl Iterator<Item = Point3>) -> Option<Aabb> {
++    let mut it = points;
++    let first = it.next()?;
++    let (mut min, mut max) = (first, first);
++    for p in it {
++        min.x = min.x.min(p.x);
++        min.y = min.y.min(p.y);
++        min.z = min.z.min(p.z);
++        max.x = max.x.max(p.x);
++        max.y = max.y.max(p.y);
++        max.z = max.z.max(p.z);
++    }
++    Some(Aabb { min, max })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const TIGHT: f64 = 1e-12;
++
++    fn tri(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Triangle {
++        Triangle::new(
++            Point3::new(a[0], a[1], a[2]),
++            Point3::new(b[0], b[1], b[2]),
++            Point3::new(c[0], c[1], c[2]),
++        )
++    }
++
++    /// A 45-degree X index: axis = Rx(45)z = (0, -s, c); the Gram-Schmidt
++    /// seed is X (axis has no X component), so u = X and v = axis x u =
++    /// (0, c, s) — hand math, pinned against the frame the seam builds.
++    fn t45x() -> Tilt {
++        Tilt {
++            a_deg: 45.0,
++            b_deg: 0.0,
++            origin: [0.0, 0.0, 0.0],
++        }
++    }
++
++    #[test]
++    fn identity_is_a_passthrough() {
++        let f = OpFrame::new(None, None);
++        assert!(f.checked_frame().expect("no tilt to refuse").is_none());
++        let facets = vec![tri([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0])];
++        let local = f.local_facets(&facets);
++        assert_eq!((local[0].a.x, local[0].a.y, local[0].a.z), (1.0, 2.0, 3.0));
++        assert_eq!((local[0].b.x, local[0].b.y, local[0].b.z), (4.0, 5.0, 6.0));
++        assert_eq!((local[0].c.x, local[0].c.y, local[0].c.z), (7.0, 8.0, 9.0));
++        assert_eq!(f.tool_axis(), [0.0, 0.0, 1.0]);
++        assert!((f.z_local(Point3::new(3.0, -4.0, 12.5)) - 12.5).abs() < TIGHT);
++        let b = f.aabb_local_of(&facets).expect("a box");
++        assert!((b.min.x - 1.0).abs() < TIGHT && (b.max.z - 9.0).abs() < TIGHT);
++    }
++
++    #[test]
++    fn local_facets_compose_against_hand_math() {
++        let f = OpFrame::new(None, Some(t45x()));
++        let frame = f.checked_frame().expect("finite letters").expect("a frame");
++        let (s, c) = (f64::to_radians(45.0).sin(), f64::to_radians(45.0).cos());
++        let axis = [0.0, -s, c];
++        let u = [1.0, 0.0, 0.0];
++        let v = [0.0, c, s];
++        for (got, want) in [(frame.axis, axis), (frame.u, u), (frame.v, v)] {
++            for i in 0..3 {
++                assert!(
++                    (got[i] - want[i]).abs() < TIGHT,
++                    "basis [{i}]: {got:?} vs {want:?}"
++                );
++            }
++        }
++        // p_L = ((p - o) . u, (p - o) . v, (p - o) . axis), by hand.
++        let facets = vec![tri([3.0, -2.0, 7.0], [0.0, 0.0, 0.0], [10.0, 4.0, -1.0])];
++        let local = f.local_facets(&facets);
++        for (got, p) in [
++            (local[0].a, [3.0, -2.0, 7.0]),
++            (local[0].c, [10.0, 4.0, -1.0]),
++        ] {
++            let want = [
++                p[0] * u[0] + p[1] * u[1] + p[2] * u[2],
++                p[0] * v[0] + p[1] * v[1] + p[2] * v[2],
++                p[0] * axis[0] + p[1] * axis[1] + p[2] * axis[2],
++            ];
++            assert!(
++                (got.x - want[0]).abs() < TIGHT,
++                "x: {} vs {}",
++                got.x,
++                want[0]
++            );
++            assert!(
++                (got.y - want[1]).abs() < TIGHT,
++                "y: {} vs {}",
++                got.y,
++                want[1]
++            );
++            assert!(
++                (got.z - want[2]).abs() < TIGHT,
++                "z: {} vs {}",
++                got.z,
++                want[2]
++            );
++        }
++    }
++
++    #[test]
++    fn aabb_local_is_the_tight_box_of_transformed_geometry() {
++        let f = OpFrame::new(None, Some(t45x()));
++        let (s, c) = (f64::to_radians(45.0).sin(), f64::to_radians(45.0).cos());
++        // A wedge in the XZ plane: (0,0,0), (10,0,0), (0,0,10).
++        let facets = vec![tri([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 10.0])];
++        let b = f.aabb_local_of(&facets).expect("a box");
++        // Hand: u keeps x; v = (0, c, s) folds z into y; axis = (0, -s, c).
++        // (0,0,0) -> (0,0,0); (10,0,0) -> (10,0,0); (0,0,10) -> (0, 10s, 10c).
++        assert!((b.min.x - 0.0).abs() < TIGHT && (b.max.x - 10.0).abs() < TIGHT);
++        assert!((b.max.y - 10.0 * s).abs() < TIGHT, "max.y: {}", b.max.y);
++        assert!((b.max.z - 10.0 * c).abs() < TIGHT, "max.z: {}", b.max.z);
++        // The L1 shift of the S box would read max.z = 10 - origin.z = 10:
++        // the seam does not do that (the condition-2 law).
++        assert!(
++            (b.max.z - 10.0).abs() > 1.0,
++            "the local box is transformed, not z-shifted"
++        );
++    }
++
++    #[test]
++    fn tool_axis_and_z_local_read_the_commanded_letters() {
++        let f = OpFrame::new(
++            None,
++            Some(Tilt {
++                a_deg: 30.0,
++                b_deg: 0.0,
++                origin: [5.0, -1.0, 2.0],
++            }),
++        );
++        let axis = f.tool_axis();
++        let want = [0.0, -0.5, 0.75_f64.sqrt()];
++        for i in 0..3 {
++            assert!((axis[i] - want[i]).abs() < TIGHT, "axis [{i}]: {}", axis[i]);
++        }
++        let o = Point3::new(5.0, -1.0, 2.0);
++        assert!(f.z_local(o).abs() < TIGHT, "the origin's local height is 0");
++        let q = Point3::new(
++            5.0 + 3.0 * axis[0],
++            -1.0 + 3.0 * axis[1],
++            2.0 + 3.0 * axis[2],
++        );
++        assert!(
++            (f.z_local(q) - 3.0).abs() < TIGHT,
++            "3mm along the axis reads 3"
++        );
++    }
++
++    #[test]
++    fn letters_without_a_direction_refuse_by_name() {
++        let f = OpFrame::new(
++            None,
++            Some(Tilt {
++                a_deg: f64::NAN,
++                b_deg: 0.0,
++                origin: [0.0; 3],
++            }),
++        );
++        let err = f.checked_frame().expect_err("non-finite letters refuse");
++        assert!(
++            err.to_string()
++                .contains("the 3+2 index commands no direction"),
++            "{err}"
++        );
++    }
++
++    #[test]
++    fn zero_tilt_is_the_exact_identity_basis() {
++        let f = OpFrame::new(
++            None,
++            Some(Tilt {
++                a_deg: 0.0,
++                b_deg: 0.0,
++                origin: [0.0; 3],
++            }),
++        );
++        let frame = f.checked_frame().expect("finite letters").expect("a frame");
++        assert_eq!(frame.u, [1.0, 0.0, 0.0]);
++        assert_eq!(frame.v, [0.0, 1.0, 0.0]);
++        assert_eq!(frame.axis, [0.0, 0.0, 1.0]);
++        assert!(frame.is_upright());
++    }
++}
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index 906d40bb..2e4a9b84 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -151,7 +151,12 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     if let Some(why) = crate::setup_align::generation_problem(world, op) {
+         return Err(GenError::Invalid(why));
+     }
+-    let material = material_of(world, setup, &op.src)?;
++    // #763: the one machining-frame seam. Built before the first read;
++    // the tilt's own refusal keeps its place below (`checked_frame`,
++    // after the heights resolve) exactly where the old head raised it -
++    // the job's error-order law.
++    let opframe = OpFrame::of(op);
++    let material = opframe.material_of(world, &op.src)?;
+     let part_solid = part_solid_of(world, setup, &op.src, &material);
+     // Setup stock, when it is not the source itself: the swarf column
+     // around a smaller model (the head read at `generate` - same call).
+@@ -170,23 +175,11 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     // The height seam, refused by name before anything else (as the old
+     // head refused it, `resolve_params` being the first fallible read
+     // after the material).
+-    let hs = resolve_params(world, setup, Some(&op.src), &op.params).map_err(GenError::Invalid)?;
++    let hs = opframe.resolve_heights(world, Some(&op.src), &op.params).map_err(GenError::Invalid)?;
+ 
+-    // The 3+2 wrap (M5.1 B), same refusals, same order: non-finite
+-    // letters first, then the tilted-selection lock.
+-    let frame = match op.params.tilt() {
+-        None => None,
+-        Some(t) => match t.frame() {
+-            Some(f) => Some(f),
+-            // Only a non-finite letter could get here (the parameter
+-            // door refuses it); naming it beats inventing a plane.
+-            None => {
+-                return Err(GenError::Invalid(
+-                    "the 3+2 index commands no direction - its angles are not finite".into(),
+-                ));
+-            }
+-        },
+-    };
++    // The 3+2 wrap (M5.1 B), read through the seam: the same refusal,
++    // the same words, at the same statement - one construction site.
++    let frame = opframe.checked_frame()?;
+     // The one refusal the wrap owes (M5.1 B): a picked selection is
+     // read as world geometry by the selection walk - projecting a pick
+     // onto a tilted plane is not implemented, and a shadow of the pick
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index dd5af8d0..46f191dc 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -125,6 +125,10 @@ pub use boundary_picks::{
+ };
+ pub use boundary_ctx::op_stamp;
+ use boundary_ctx::*;
++// #763: the one machining-frame seam — the composed door for an
++// operation's world reads and CL wrap (part_alignment x Tilt).
++mod frame;
++pub use frame::OpFrame;
+ mod job;
+ pub use job::*;
+ mod generate;
+diff --git a/crates/app/tests/opframe_seam.rs b/crates/app/tests/opframe_seam.rs
+new file mode 100644
+index 00000000..1385c1d9
+--- /dev/null
++++ b/crates/app/tests/opframe_seam.rs
+@@ -0,0 +1,445 @@
++//! #763 Phase 1: the machining-frame seam's contract, pinned where it
++//! reads the world — the plain and zero-tilt paths byte-identical, a
++//! tilted face running in its own plane, the 90/180-degree alignments,
++//! the alignment x tilt composition against hand math, local heights and
++//! boxes read from fully transformed geometry, and the Phase 1 refusal
++//! boundary (picks stay refused, by name). The post's tilted-move gate
++//! keeps its own pin in `tests/inverted_post.rs`; the four verified
++//! kinds keep theirs in the #326 suites (`plane_align`, `axis_align`,
++//! `rest_across_setups`), all run by the same gate.
++//!
++//! Provenance: our own fixtures over plain datum-face practice; no
++//! vendor material consulted.
++//!
++//! Gate map (#763): covers app::operation::frame, app::operation::job
++//! (the collect seam), app::setup_align (composed reads).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, AlignPartToSetup, CreateOperation, CreateSetup, History, ImportModel, SetStock,
++};
++use camcraft_app::geometry::{Point3, cube, transform_point};
++use camcraft_app::model;
++use camcraft_app::operation::{
++    FeatureSel, GeoSel, Height, HeightReference, OpFrame, OpParams, SrcRef, Tilt, generate,
++};
++use camcraft_app::setup_align;
++use camcraft_app::setup_turn::TurnPivot;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++const TIGHT: f64 = 1e-9;
++const EM: &str = "EM-0400-2FL";
++
++/// A 20 x 20 x 10 block at the origin, Setup1, box stock, one end mill.
++fn block() -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(
++        &world,
++        ImportModel::from_mesh(
++            "block",
++            cube(Point3::new(0.0, 0.0, 0.0), Point3::new(20.0, 20.0, 10.0)),
++        ),
++    );
++    h.execute(
++        &world,
++        CreateSetup::new(&world, None, None).expect("Setup1"),
++    );
++    h.execute(
++        &world,
++        SetStock::new(
++            &world,
++            StockShape::Box {
++                dx: 60.0,
++                dy: 60.0,
++                dz: 20.0,
++            },
++            Default::default(),
++        )
++        .expect("box stock"),
++    );
++    let tool = catalog()
++        .into_iter()
++        .find(|(n, _)| *n == EM)
++        .map(|(_, t)| t)
++        .expect("catalog end mill");
++    h.execute(
++        &world,
++        AddTool::new(&world, EM, tool).expect("rack the end mill"),
++    );
++    (world, h)
++}
++
++fn face(cut: Height, clearance: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        blend_turns: false,
++        tilt: None,
++        stepover: 3.0,
++        clearance_z: Height::fixed(clearance),
++        cut_z: cut,
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    }
++}
++
++fn add_face(world: &World, h: &mut History, name: &str, src: SrcRef, params: OpParams) {
++    h.execute(
++        world,
++        CreateOperation::new(world, name, EM, src, params).expect("create the face op"),
++    );
++}
++
++fn op_of(world: &World, name: &str) -> camcraft_app::schema::Operation {
++    let e = model::find_by_name(world, name).expect("the op exists");
++    model::operation_of(world, &e).expect("an operation")
++}
++
++fn t45x(origin: [f64; 3]) -> Tilt {
++    Tilt {
++        a_deg: 45.0,
++        b_deg: 0.0,
++        origin,
++    }
++}
++
++#[test]
++fn a_plain_face_keeps_its_prismatic_numbers_through_the_seam() {
++    let (world, mut h) = block();
++    add_face(
++        &world,
++        &mut h,
++        "Face1",
++        SrcRef::Entity("block".into()),
++        face(Height::fixed(9.0), 25.0),
++    );
++    let (path, _) =
++        generate(&world, &op_of(&world, "Face1"), "Face1").expect("the plain face generates");
++    assert!(
++        path.moves.len() > 10,
++        "a real sweep: {} moves",
++        path.moves.len()
++    );
++    let mut fed_at_cut = false;
++    for m in &path.moves {
++        assert!(
++            m.to.z <= 25.0 + TIGHT,
++            "nothing above the clearance: {:?}",
++            m.to
++        );
++        assert!(
++            m.to.z >= 9.0 - TIGHT,
++            "nothing below the cut plane: {:?}",
++            m.to
++        );
++        if m.feed.is_some() && (m.to.z - 9.0).abs() < TIGHT {
++            fed_at_cut = true;
++        }
++    }
++    assert!(fed_at_cut, "the sweep feeds at the cut plane");
++}
++
++#[test]
++fn a_zero_tilt_index_reproduces_the_prismatic_path_exactly() {
++    let (world, mut h) = block();
++    add_face(
++        &world,
++        &mut h,
++        "Plain",
++        SrcRef::Entity("block".into()),
++        face(Height::fixed(9.0), 25.0),
++    );
++    let mut tilted = face(Height::fixed(9.0), 25.0);
++    if let OpParams::Face { tilt, .. } = &mut tilted {
++        *tilt = Some(Tilt {
++            a_deg: 0.0,
++            b_deg: 0.0,
++            origin: [0.0; 3],
++        });
++    }
++    add_face(
++        &world,
++        &mut h,
++        "ZeroTilt",
++        SrcRef::Entity("block".into()),
++        tilted,
++    );
++    let (plain, _) = generate(&world, &op_of(&world, "Plain"), "Plain").expect("plain generates");
++    let (zero, _) =
++        generate(&world, &op_of(&world, "ZeroTilt"), "ZeroTilt").expect("zero tilt generates");
++    assert_eq!(
++        plain.moves.len(),
++        zero.moves.len(),
++        "the identity frame adds no move"
++    );
++    for (a, b) in plain.moves.iter().zip(zero.moves.iter()) {
++        assert_eq!(a.kind, b.kind, "kinds match");
++        assert_eq!(a.feed, b.feed, "feeds match");
++        assert_eq!(a.from, b.from, "from matches: {:?} vs {:?}", a.from, b.from);
++        assert_eq!(a.to, b.to, "to matches: {:?} vs {:?}", a.to, b.to);
++    }
++}
++
++#[test]
++fn a_tilted_face_runs_in_its_own_plane() {
++    let (world, mut h) = block();
++    let mut p = face(Height::fixed(9.0), 25.0);
++    if let OpParams::Face { tilt, .. } = &mut p {
++        *tilt = Some(t45x([10.0, 10.0, 5.0]));
++    }
++    add_face(&world, &mut h, "Tilted", SrcRef::Entity("block".into()), p);
++    let (path, _) =
++        generate(&world, &op_of(&world, "Tilted"), "Tilted").expect("the tilted face generates");
++    assert!(!path.moves.is_empty(), "a real path");
++    let opframe = OpFrame::new(None, Some(t45x([10.0, 10.0, 5.0])));
++    let frame = opframe
++        .checked_frame()
++        .expect("finite letters")
++        .expect("a frame");
++    // The L1 fold reads the heights in the frame: cut 9 - origin.z 5 = 4,
++    // clearance 25 - 5 = 20. Every endpoint maps back into that band,
++    // and the run stays over the block's local silhouette.
++    let mut fed_at_cut = false;
++    // The sweep covers the local silhouette plus the cutter's radius
++    // (a 4 mm end mill: the turnaround at x = -12 is 10 + r) and its
++    // clearance hops; the height band is the L1-folded pair exactly.
++    for m in &path.moves {
++        for p in [m.from, m.to] {
++            let l = frame.to_local(p);
++            assert!(
++                l.z >= 4.0 - TIGHT && l.z <= 20.0 + TIGHT,
++                "local height {} out of band at {:?}",
++                l.z,
++                p
++            );
++            assert!(
++                l.x.abs() <= 12.5,
++                "local x {} off the sweep at {:?}",
++                l.x,
++                p
++            );
++            assert!(
++                l.y.abs() <= 13.1,
++                "local y {} off the sweep at {:?}",
++                l.y,
++                p
++            );
++        }
++        if m.feed.is_some() && (frame.to_local(m.to).z - 4.0).abs() < TIGHT {
++            fed_at_cut = true;
++        }
++    }
++    assert!(fed_at_cut, "the sweep feeds at the tilted cut plane");
++    // The tool axis the gates read: the commanded 45-degree X letters.
++    let axis = opframe.tool_axis();
++    assert!(
++        (axis[0] - 0.0).abs() < TIGHT
++            && (axis[1] + 1.0 / 2.0_f64.sqrt()).abs() < TIGHT
++            && (axis[2] - 1.0 / 2.0_f64.sqrt()).abs() < TIGHT
++    );
++}
++
++#[test]
++fn aligned_ninety_turns_the_solid_and_its_heights() {
++    let (world, mut h) = block();
++    h.execute(
++        &world,
++        AlignPartToSetup::turn(&world, "Setup1", [90.0, 0.0, 0.0], TurnPivot::PartCentre)
++            .expect("turn 90"),
++    );
++    let f = OpFrame::new(Some("Setup1".into()), None);
++    // The 20-deep Y becomes the Z, about the bounds centre (10, 10, 5).
++    let b = f.solid_aabb_in_setup(&world).expect("the solid reads");
++    assert!((b.max.z - 15.0).abs() < TIGHT, "turned top: {}", b.max.z);
++    assert!((b.min.z + 5.0).abs() < TIGHT, "turned bottom: {}", b.min.z);
++    // The seam's S resolve reads the turned bounds: TopOfModel - 2 = 13
++    // (the unaligned frame would say 8 - the numbers the part gives).
++    let mut p = face(
++        Height {
++            reference: HeightReference::TopOfModel,
++            offset: -2.0,
++        },
++        25.0,
++    );
++    if let OpParams::Face { tilt, .. } = &mut p {
++        *tilt = None;
++    }
++    add_face(&world, &mut h, "FaceA", SrcRef::Entity("block".into()), p);
++    let op = op_of(&world, "FaceA");
++    let opframe = OpFrame::of(&op);
++    let hs = opframe
++        .resolve_heights(&world, Some(&op.src), &op.params)
++        .expect("the heights resolve");
++    assert!(
++        (hs.bottom.expect("the face cut") - 13.0).abs() < TIGHT,
++        "cut reads the turned top"
++    );
++}
++
++#[test]
++fn aligned_one_eighty_mirrors_the_facets() {
++    let (world, mut h) = block();
++    h.execute(
++        &world,
++        AlignPartToSetup::preset(&world, "Setup1", setup_align::AlignPreset::TurnZ180)
++            .expect("preset"),
++    );
++    let f = OpFrame::new(Some("Setup1".into()), None);
++    let e = model::find_by_name(&world, "block").expect("block");
++    let turned = f.facets_in_setup(&world, &e).expect("turned facets");
++    let doc = model::world_facets(&world, &e).expect("world facets");
++    assert_eq!(turned.len(), doc.len(), "the mirror moves no triangle");
++    // TurnZ180 about the bounds centre (10, 10, 5): x -> 20 - x, y -> 20 - y.
++    for (ts, td) in turned.iter().zip(doc.iter()) {
++        for (ps, pd) in [(ts.a, td.a), (ts.b, td.b), (ts.c, td.c)] {
++            assert!(
++                (ps.x - (20.0 - pd.x)).abs() < TIGHT,
++                "x mirrors: {ps:?} vs {pd:?}"
++            );
++            assert!(
++                (ps.y - (20.0 - pd.y)).abs() < TIGHT,
++                "y mirrors: {ps:?} vs {pd:?}"
++            );
++            assert!((ps.z - pd.z).abs() < TIGHT, "z holds: {ps:?} vs {pd:?}");
++        }
++    }
++}
++
++#[test]
++fn alignment_times_tilt_composes_at_the_seam() {
++    let (world, mut h) = block();
++    h.execute(
++        &world,
++        AlignPartToSetup::turn(&world, "Setup1", [90.0, 0.0, 0.0], TurnPivot::PartCentre)
++            .expect("turn 90"),
++    );
++    let opframe = OpFrame::new(Some("Setup1".into()), Some(t45x([10.0, 10.0, 5.0])));
++    let e = model::find_by_name(&world, "block").expect("block");
++    let facets_s = opframe
++        .facets_in_setup(&world, &e)
++        .expect("the aligned read");
++    let local = opframe.local_facets(&facets_s);
++    // Expected A: the alignment composed with the entity's Location.
++    let a = setup_align::alignment(&world, Some("Setup1")).expect("stored alignment");
++    let loc = setup_align::compose(a, model::transform_of(&world, &e).unwrap_or_default());
++    let doc = model::world_facets(&world, &e).expect("document facets");
++    assert_eq!(local.len(), doc.len());
++    // Expected T, by hand: axis = (0, -s, c), u = X, v = (0, c, s).
++    let (s, c) = ((45.0_f64).to_radians().sin(), (45.0_f64).to_radians().cos());
++    let o = [10.0, 10.0, 5.0];
++    for (tl, td) in local.iter().zip(doc.iter()) {
++        for (pl, pd) in [(tl.a, td.a), (tl.b, td.b), (tl.c, td.c)] {
++            let w = transform_point(pd, loc.pos, loc.rot);
++            let d = [w.x - o[0], w.y - o[1], w.z - o[2]];
++            let want = [d[0], d[1] * c + d[2] * s, -d[1] * s + d[2] * c];
++            assert!((pl.x - want[0]).abs() < TIGHT, "x: {pl:?} vs {want:?}");
++            assert!((pl.y - want[1]).abs() < TIGHT, "y: {pl:?} vs {want:?}");
++            assert!((pl.z - want[2]).abs() < TIGHT, "z: {pl:?} vs {want:?}");
++        }
++    }
++}
++
++#[test]
++fn local_heights_and_boxes_read_fully_transformed_geometry() {
++    let (world, _h) = block();
++    let f = OpFrame::new(None, Some(t45x([0.0, 0.0, 0.0])));
++    // The block (0..20, 0..20, 0..10) turned 45 deg about X: local z runs
++    // -20s .. 10c (hand), never the S box's 0..10 shifted by -origin.z.
++    let b = f.solid_aabb_local(&world).expect("the local box");
++    let (s, c) = ((45.0_f64).to_radians().sin(), (45.0_f64).to_radians().cos());
++    assert!((b.max.z - 10.0 * c).abs() < TIGHT, "local top: {}", b.max.z);
++    assert!(
++        (b.min.z + 20.0 * s).abs() < TIGHT,
++        "local bottom: {}",
++        b.min.z
++    );
++    assert!(
++        (b.max.z - 10.0).abs() > 1.0,
++        "the local box is transformed, not z-shifted"
++    );
++    // The same law resolves heights: TopOfModel is the local top.
++    let top = f.height_z_local(
++        &world,
++        Height {
++            reference: HeightReference::TopOfModel,
++            offset: 0.0,
++        },
++    );
++    assert!((top.expect("the model top resolves") - 10.0 * c).abs() < TIGHT);
++    // Fixed passes through as spoken along the tool axis; a missing WCS
++    // is None, never guessed.
++    let fixed = f.height_z_local(&world, Height::fixed(7.5));
++    assert!((fixed.expect("fixed reads through") - 7.5).abs() < TIGHT);
++    assert!(
++        f.height_z_local(
++            &world,
++            Height {
++                reference: HeightReference::WorkOffset,
++                offset: 0.0
++            }
++        )
++        .is_none(),
++        "no WCS placed: unresolved, never guessed"
++    );
++}
++
++#[test]
++fn picks_in_an_aligned_setup_stay_refused_phase_one() {
++    let (world, mut h) = block();
++    h.execute(
++        &world,
++        AlignPartToSetup::turn(&world, "Setup1", [90.0, 0.0, 0.0], TurnPivot::PartCentre)
++            .expect("turn 90"),
++    );
++    let e = model::find_by_name(&world, "block").expect("block");
++    let feats = model::features_of(&world, &e).expect("features");
++    let id = feats.faces.first().expect("a face").id;
++    let sel = SrcRef::Selection(vec![GeoSel {
++        entity: "block".into(),
++        feature: FeatureSel::Face(id),
++    }]);
++    add_face(
++        &world,
++        &mut h,
++        "FacePick",
++        sel,
++        face(Height::fixed(9.0), 25.0),
++    );
++    let op = op_of(&world, "FacePick");
++    let err = generate(&world, &op, "FacePick").expect_err("picks refuse in an aligned setup");
++    let msg = err.to_string();
++    assert!(msg.contains("picked"), "names the picks: {msg}");
++    assert!(
++        msg.contains("aligned setup"),
++        "names the aligned setup: {msg}"
++    );
++    // The door Phase 2 will read them through is already aligned: the
++    // picked entity's facets carry the turn, composed by hand.
++    let opframe = OpFrame::of(&op);
++    let aligned = opframe
++        .facets_in_setup(&world, &e)
++        .expect("the aligned door reads");
++    assert_eq!(
++        aligned.len(),
++        model::world_facets(&world, &e).expect("world facets").len()
++    );
++    let a = setup_align::alignment(&world, Some("Setup1")).expect("stored alignment");
++    let loc = setup_align::compose(a, model::transform_of(&world, &e).unwrap_or_default());
++    let doc = model::world_facets(&world, &e).expect("world facets");
++    let want = transform_point(doc[0].a, loc.pos, loc.rot);
++    assert!(
++        (aligned[0].a.x - want.x).abs() < TIGHT
++            && (aligned[0].a.y - want.y).abs() < TIGHT
++            && (aligned[0].a.z - want.z).abs() < TIGHT,
++        "the door reads the composed alignment: {:?} vs {:?}",
++        aligned[0].a,
++        want
++    );
++}
+diff --git a/docs/decisions/763-opframe-seam.md b/docs/decisions/763-opframe-seam.md
+new file mode 100644
+index 00000000..ac395f62
+--- /dev/null
++++ b/docs/decisions/763-opframe-seam.md
+@@ -0,0 +1,69 @@
++# #763 - One machining-frame seam: OpFrame composes part_alignment and TiltedFrame
++
++## What was decided
++
++Phase 1 ships `OpFrame` (`crates/app/src/operation/frame.rs`) as the single
++machining-frame seam, composing the two existing frame mechanisms — the
++setup's `part_alignment` (#326) and the op's 3+2 `Tilt` (M5.1 B) — with no
++third mechanism. `collect_job` reads material and heights through it and
++builds its tilt frame from `OpFrame::checked_frame`, one construction
++site. No refusal lifted, no post change, no generator change; behavior is
++byte-identical (the zero-tilt index reproduces the prismatic path
++exactly, move for move).
++
++The contract, stated once in the module header: three coordinate systems
++(D document, S setup = the CL/post world, L local machining plane);
++point maps applied right-to-left — `p_L = T(A(p_D))` with `A` the
++alignment baked into part reads and `T` the tilt's `to_local`; the CL
++wraps back L → S via `TiltedFrame::world_path` (a clone with no tilt).
++Setup furniture (stock, WCS, fixtures) is stored in S: the alignment
++never applies to it, the tilt reads it local.
++
++Two seams ship correct from day one even though only tests exercise
++them yet: heights and bounding boxes in L resolve against FULLY
++TRANSFORMED geometry (`aabb_local_of`, `height_z_local`) — never a
++`z − origin.z` shift of the S box, which is only correct while the tool
++axis is the world Z (the user's condition 2, pinned by
++`aabb_local_is_the_tight_box_of_transformed_geometry`).
++
++## Why
++
++`generation_problem` allowed exactly four kinds in an aligned setup
++because the two frame mechanisms were built independently and refuse to
++combine — a verification gap, not a mathematical one: they compose as
++plain function composition. Building the seam first (a) makes the later
++phases (picks, more kinds, alignment × tilt) read/wrap changes at ONE
++place instead of scattered call sites, (b) pins the composition math
++numerically before any refusal lifts, and (c) keeps every existing
++behavior byte-identical while it lands.
++
++## Considered and dropped
++
++- **Carrying the rotated work offset instead** (#760's original heavy
++  part): for normal 3-axis work, alignment coverage supersedes
++  offset-rotation carry — the part can be aligned, the offset stays a
++  plain translation, the post is untouched. #760 stays parked and is
++  re-evaluated after this seam lands (its phase 4).
++- **An `align` field on `OpFrame`** (holding the resolved
++  `part_alignment`): rejected as a second copy that can drift — the
++  alignment stays the setup's own state, read by the `setup_align`
++  helpers through the seam's S-frame methods. One owner.
++- **Routing the boundary/region builders through the seam in Phase 1**:
++  deferred to the later phases; Phase 1 wires `collect_job`'s reads
++  (material, heights, frame) only, so the diff stays reviewable and
++  behavior-identical.
++- **A new end-to-end post-gate test for tilted output**: the gate ("a
++  tilted (A/B/C rotary) move is not supported") is already pinned
++  verbatim by `tests/inverted_post.rs`; Phase 1 changes no gate, so the
++  existing pin plus the suite run carries it. Phase 2+ adds its own
++  when a tilt path actually moves.
++
++## What it would cost to change later
++
++The frame contract (D/S/L, right-to-left composition, furniture law) is
++now the stated interface for every later phase — picks in aligned
++setups, more kinds, alignment × tilt. Changing the composition order or
++the furniture law later means re-deriving every numeric pin in
++`opframe_seam.rs` and the seam's unit tests, and re-reviewing which
++refusals can still lift. Machine kinematics (parked by the user) would
++compose ON TOP of this seam, not beside it.
