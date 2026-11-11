@@ -1,0 +1,1052 @@
+From b1335bd77ebcb9b7a3fcf28bb1d6761f4c10f4d9 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sun, 8 Nov 2026 11:26:40 +0100
+Subject: [PATCH] feat(sim): dual contouring for the machined-stock mesh
+
+Extract the stock field's surface by dual contouring (Ju, Losasso,
+Schaefer & Warren, SIGGRAPH 2002) by default: one clamped QEF vertex per
+sign-changing cell, Hermite normals read from the crossing sheet, and
+ridge-biased corner crossings replaced by the trusted planes around them.
+A pocket's floor/wall edge now survives (slot edge gap 0.0000 cells vs
+0.36 with marching tetrahedra; box volume 480.000 vs 472.3). Marching
+tetrahedra stays as IsoMethod::Marching and as the logged fallback for
+any dual mesh that is not closed.
+
+Fixes #23
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/sim/src/stock_sim/dual.rs     | 248 +++++++++++++++++++++++++++
+ crates/sim/src/stock_sim/hermite.rs  | 208 ++++++++++++++++++++++
+ crates/sim/src/stock_sim/iso.rs      | 107 ++++++++++--
+ crates/sim/src/stock_sim/mod.rs      |   3 +
+ crates/sim/src/stock_sim/qef.rs      | 166 ++++++++++++++++++
+ crates/sim/tests/stock_dual.rs       | 130 ++++++++++++++
+ docs/decisions/23-dual-contouring.md |  41 +++++
+ 7 files changed, 884 insertions(+), 19 deletions(-)
+ create mode 100644 crates/sim/src/stock_sim/dual.rs
+ create mode 100644 crates/sim/src/stock_sim/hermite.rs
+ create mode 100644 crates/sim/src/stock_sim/qef.rs
+ create mode 100644 crates/sim/tests/stock_dual.rs
+ create mode 100644 docs/decisions/23-dual-contouring.md
+
+diff --git a/crates/sim/src/stock_sim/dual.rs b/crates/sim/src/stock_sim/dual.rs
+new file mode 100644
+index 00000000..efb348f8
+--- /dev/null
++++ b/crates/sim/src/stock_sim/dual.rs
+@@ -0,0 +1,248 @@
++//! Dual contouring of the stock field (M13.1, #23): the extracted
++//! machined-stock mesh keeps its sharp interior corners - a pocket's
++//! floor/wall edge stays an edge, where marching tetrahedra (`iso`)
++//! chamfers it across a cell.
++//! Provenance: Ju, Losasso, Schaefer & Warren, "Dual Contouring of
++//! Hermite Data", SIGGRAPH 2002 - one vertex per sign-changing cell at
++//! the minimizer of its QEF (`qef`), one quad per sign-changing lattice
++//! edge joining the four cells around it. The Hermite data (`hermite`)
++//! are the field's own: crossings on the sampled lattice, normals read
++//! from the crossing sheet. Our own Rust; nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Same samples, same sign rule.** The lattice is `iso::sample`'s;
++//!   inside is d < 0 exactly as the marching extractor reads it, so the
++//!   two meshes bound the same set of cells.
++//! - **A corner is read from trusted planes.** A cell whose own crossing
++//!   sits beside a ridge (the cell AT a corner, `Hermite::tight` false)
++//!   borrows the trusted, same-facing planes of the 3x3x3 cells around
++//!   it, so the face it misread still pins the vertex; a smooth cell
++//!   reads only its own, as in the paper. The vertex stays clamped into
++//!   its own cell (`qef`).
++//! - **Closed or not at all.** Every sign-changing edge inside the
++//!   lattice gets its quad, wound so the normal points from material to
++//!   air. A sign change on the lattice's pad (or any cell left without a
++//!   vertex) leaves an open edge; `iso::extract_with` then refuses the
++//!   dual mesh and serves the marching one, never a mesh with a hole.
++//! - **Total input.** A NaN sample reads as air (the sampler already
++//!   refuses NaN by name); a crossing with no normal gives no plane, and
++//!   a cell with none is its mass point (`qef`).
++
++use std::collections::HashMap;
++
++use crate::geometry::{Point3, Triangle};
++
++use super::hermite::{self, inside, EdgeKey, Hermite};
++use super::iso::{Grid, CORNER};
++use super::qef;
++
++type V3 = [f64; 3];
++
++/// The twelve cube edges, as pairs of `CORNER` indices.
++const EDGES: [(usize, usize); 12] = [
++    (0, 1),
++    (2, 3),
++    (4, 5),
++    (6, 7),
++    (0, 2),
++    (1, 3),
++    (4, 6),
++    (5, 7),
++    (0, 4),
++    (1, 5),
++    (2, 6),
++    (3, 7),
++];
++
++fn v3(p: Point3) -> V3 {
++    [p.x, p.y, p.z]
++}
++
++fn offset(s: [usize; 3], o: [usize; 3]) -> [usize; 3] {
++    [s[0] + o[0], s[1] + o[1], s[2] + o[2]]
++}
++
++/// The trusted planes of the 3x3x3 cells around `c` facing along
++/// `facing`: every tight lattice edge of the 4x4x4-sample block.
++fn block_planes(data: &HashMap<EdgeKey, Hermite>, c: [usize; 3], facing: V3) -> Vec<(V3, V3)> {
++    let mut planes = Vec::new();
++    for dk in 0..4usize {
++        for dj in 0..4usize {
++            for di in 0..4usize {
++                let d = [di, dj, dk];
++                let (Some(x), Some(y), Some(z)) =
++                    ((c[0] + di).checked_sub(1), (c[1] + dj).checked_sub(1), (c[2] + dk).checked_sub(1))
++                else {
++                    continue;
++                };
++                for k in (0..3).filter(|&k| d[k] < 3) {
++                    let Some(h) = data.get(&([x, y, z], k)).filter(|h| h.tight) else { continue };
++                    let Some(n) = h.n else { continue };
++                    if n.iter().zip(facing).map(|(a, b)| a * b).sum::<f64>() > 0.0 {
++                        planes.push((h.p, n));
++                    }
++                }
++            }
++        }
++    }
++    planes
++}
++
++/// The QEF vertex of cell `c`, or `None` when the cell has no crossing.
++fn cell_vertex(g: &Grid, data: &HashMap<EdgeKey, Hermite>, c: [usize; 3]) -> Option<Point3> {
++    let own: Vec<&Hermite> = EDGES
++        .iter()
++        .filter_map(|(ea, eb)| {
++            let (sa, sb) = (offset(c, CORNER[*ea]), offset(c, CORNER[*eb]));
++            let k = (0..3).find(|&k| sb[k] != sa[k])?;
++            data.get(&(sa, k))
++        })
++        .collect();
++    if own.is_empty() {
++        return None;
++    }
++    let m = own.len() as f64;
++    let mass = own.iter().fold([0.0; 3], |s, h| [s[0] + h.p[0] / m, s[1] + h.p[1] / m, s[2] + h.p[2] / m]);
++    let all: Vec<(V3, V3)> = own.iter().filter_map(|h| h.n.map(|n| (h.p, n))).collect();
++    let planes = if own.iter().all(|h| h.tight) {
++        all
++    } else {
++        let facing = all.iter().fold([0.0; 3], |s, (_, n)| [s[0] + n[0], s[1] + n[1], s[2] + n[2]]);
++        let borrowed = block_planes(data, c, facing);
++        if borrowed.is_empty() {
++            all
++        } else {
++            borrowed
++        }
++    };
++    let (lo, hi) = (v3(g.at(c)), v3(g.at(offset(c, [1, 1, 1]))));
++    let x = qef::solve(&planes, mass, lo, hi);
++    Some(Point3::new(x[0], x[1], x[2]))
++}
++
++/// Dual-contour the sampled lattice: one QEF vertex per sign-changing
++/// cell, one quad (two triangles) per sign-changing lattice edge.
++pub(crate) fn contour(g: &Grid) -> Vec<Triangle> {
++    let data = hermite::edges(g);
++    let mut verts: HashMap<[usize; 3], Point3> = HashMap::new();
++    for k in 0..g.n[2] {
++        for j in 0..g.n[1] {
++            for i in 0..g.n[0] {
++                let c = [i, j, k];
++                let ins = CORNER.iter().filter(|o| inside(g.val(offset(c, **o)))).count();
++                if ins == 0 || ins == 8 {
++                    continue;
++                }
++                if let Some(v) = cell_vertex(g, &data, c) {
++                    verts.insert(c, v);
++                }
++            }
++        }
++    }
++    let mut out = Vec::new();
++    for k in 0..=g.n[2] {
++        for j in 0..=g.n[1] {
++            for i in 0..=g.n[0] {
++                for a in 0..3 {
++                    quad(g, &verts, [i, j, k], a, &mut out);
++                }
++            }
++        }
++    }
++    out
++}
++
++/// The quad of the lattice edge from sample `s` along axis `a`, if it
++/// changes sign and all four cells around it carry a vertex.
++fn quad(g: &Grid, verts: &HashMap<[usize; 3], Point3>, s: [usize; 3], a: usize, out: &mut Vec<Triangle>) {
++    if s[a] >= g.n[a] {
++        return;
++    }
++    let mut e = s;
++    e[a] += 1;
++    let lower_in = inside(g.val(s));
++    if lower_in == inside(g.val(e)) {
++        return;
++    }
++    let (b, c) = ((a + 1) % 3, (a + 2) % 3);
++    if s[b] == 0 || s[c] == 0 || s[b] >= g.n[b] || s[c] >= g.n[c] {
++        return; // on the pad: the open edge hands the mesh to marching
++    }
++    // Counter-clockwise about +a in the (b, c) plane (b x c = a).
++    let mut q = [Point3::ZERO; 4];
++    for (slot, (db, dc)) in q.iter_mut().zip([(1, 1), (0, 1), (0, 0), (1, 0)]) {
++        let mut cell = s;
++        cell[b] -= db;
++        cell[c] -= dc;
++        let Some(v) = verts.get(&cell) else { return };
++        *slot = *v;
++    }
++    if !lower_in {
++        q.swap(1, 3); // material above: the outward normal is -a
++    }
++    let len2 = |u: Point3, v: Point3| (u - v).dot(u - v);
++    let tris = if len2(q[0], q[2]) <= len2(q[1], q[3]) {
++        [(q[0], q[1], q[2]), (q[0], q[2], q[3])]
++    } else {
++        [(q[0], q[1], q[3]), (q[1], q[2], q[3])]
++    };
++    for (x, y, z) in tris {
++        if x == y || y == z || z == x {
++            continue; // two cells clamped to one point: no surface here
++        }
++        out.push(Triangle::new(x, y, z));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn grid(n: usize, f: impl Fn(Point3) -> f64) -> Grid {
++        let mut g = Grid { lo: Point3::ZERO, step: 1.0, n: [n; 3], d: Vec::new() };
++        for k in 0..=n {
++            for j in 0..=n {
++                for i in 0..=n {
++                    let p = g.at([i, j, k]);
++                    g.d.push(f(p));
++                }
++            }
++        }
++        g
++    }
++
++    #[test]
++    fn an_all_air_or_all_material_lattice_is_empty() {
++        assert!(contour(&grid(3, |_| 1.0)).is_empty());
++        assert!(contour(&grid(3, |_| -1.0)).is_empty());
++        assert!(contour(&Grid { lo: Point3::ZERO, step: 1.0, n: [0; 3], d: vec![-1.0] }).is_empty());
++    }
++
++    #[test]
++    fn a_single_material_sample_closes_around_itself() {
++        // One inside sample in a 2-cell lattice: its six lattice edges
++        // give six quads around it - a closed shell, wound outward.
++        let g = grid(2, |p| if p == Point3::new(1.0, 1.0, 1.0) { -0.5 } else { 0.5 });
++        let tris = contour(&g);
++        assert!(!tris.is_empty());
++        assert_eq!(super::super::iso::open_edges(&tris), 0);
++        let vol: f64 = tris.iter().map(|t| t.a.dot(t.b.cross(t.c)) / 6.0).sum();
++        assert!(vol > 0.0, "outward: {vol}");
++    }
++
++    #[test]
++    fn nan_samples_never_panic_and_stay_in_their_cells() {
++        let g = grid(4, |p| if p.x == 2.0 { f64::NAN } else { p.z - 1.7 });
++        let tris = contour(&g);
++        for t in &tris {
++            for p in [t.a, t.b, t.c] {
++                assert!(p.is_finite() && (0.0..=4.0).contains(&p.z), "{p:?}");
++            }
++        }
++        // A truncated lattice (fewer values than samples) reads NaN too.
++        let mut short = grid(3, |p| p.z - 1.5);
++        short.d.truncate(10);
++        let _ = contour(&short);
++    }
++}
+diff --git a/crates/sim/src/stock_sim/hermite.rs b/crates/sim/src/stock_sim/hermite.rs
+new file mode 100644
+index 00000000..98f52be0
+--- /dev/null
++++ b/crates/sim/src/stock_sim/hermite.rs
+@@ -0,0 +1,208 @@
++//! The Hermite data dual contouring reads (M13.1, #23): per sign-changing
++//! lattice edge, the zero crossing and the surface normal there, plus
++//! whether the crossing can be trusted.
++//! Provenance: the Hermite-data formulation of Ju, Losasso, Schaefer &
++//! Warren, "Dual Contouring of Hermite Data" (SIGGRAPH 2002); the normal
++//! and trust estimators are our own reading of two textbook properties
++//! of a signed distance field - its gradient is the unit surface normal,
++//! and |d| at a sample never exceeds the distance to the surface along
++//! any path, a lattice edge included. Nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **A normal is read from its own face.** Central differences of the
++//!   samples blend two faces' normals across the ridge an edge throws -
++//!   the samples next to a corner straddle it. So a crossing's normal is
++//!   read from the crossings of the parallel lattice edges beside it, the
++//!   sheet as a height field over the edge's axis; a side whose parallel
++//!   edge does not cross the same way is another face and is not read,
++//!   and where the two sides disagree the flatter one is the edge's own
++//!   face. With no neighbour on some axis the sample gradient answers,
++//!   each endpoint weighted by how nearly it obeys |grad d| = 1.
++//! - **A crossing next to a ridge is flagged, never trusted.** On a plane
++//!   the two endpoint magnitudes sum to the edge length times |n_k|; a
++//!   ridge endpoint reads the OTHER face's distance and the sum falls
++//!   short, so the interpolated crossing is biased. Such an edge is
++//!   `tight == false`: its crossing still places the cell's mass point,
++//!   but its plane is replaced by trusted neighbours' (`dual`), and the
++//!   normals are re-read from trusted neighbours only.
++//! - **Total.** NaN reads as air; a normal that cannot be formed is
++//!   `None`, never a made-up direction.
++
++use std::collections::HashMap;
++
++use super::iso::Grid;
++
++type V3 = [f64; 3];
++
++/// A lattice edge: its lower sample and its axis.
++pub(crate) type EdgeKey = ([usize; 3], usize);
++
++/// One sign-changing edge's Hermite datum.
++pub(crate) struct Hermite {
++    /// The zero crossing, world coordinates.
++    pub(crate) p: V3,
++    /// Unit normal, material to air.
++    pub(crate) n: Option<V3>,
++    /// The crossing is not biased by a ridge endpoint.
++    pub(crate) tight: bool,
++}
++
++/// Slopes closer than this (cells per cell) are one smooth sheet.
++const SLOPE_AGREE: f64 = 0.5;
++/// A sheet steeper than this (cells per cell) reads as no slope at all.
++const SLOPE_MAX: f64 = 1e3;
++/// Slack in the eikonal weight of the gradient fallback.
++const EIKONAL_EPS: f64 = 0.05;
++/// How far the endpoint sum may fall short of a plane's before the
++/// crossing counts as ridge-biased.
++const TIGHT_TOL: f64 = 0.05;
++
++pub(crate) fn inside(v: f64) -> bool {
++    v < 0.0
++}
++
++/// Where d crosses zero on the edge from value `a` to `b`.
++pub(crate) fn crossing(a: f64, b: f64) -> f64 {
++    if (a - b).abs() > f64::EPSILON {
++        (a / (a - b)).clamp(0.0, 1.0)
++    } else {
++        0.5
++    }
++}
++
++fn unit(n: V3) -> Option<V3> {
++    let len = n.iter().map(|c| c * c).sum::<f64>().sqrt();
++    (len.is_finite() && len > 1e-12).then(|| n.map(|c| c / len))
++}
++
++/// Raw edge record: crossing parameter, lower end inside, |va| + |vb|.
++#[derive(Clone, Copy)]
++struct Raw {
++    t: f64,
++    lower_in: bool,
++    sum: f64,
++}
++
++/// Every sign-changing lattice edge's Hermite datum.
++pub(crate) fn edges(g: &Grid) -> HashMap<EdgeKey, Hermite> {
++    let mut raw: HashMap<EdgeKey, Raw> = HashMap::new();
++    for k in 0..=g.n[2] {
++        for j in 0..=g.n[1] {
++            for i in 0..=g.n[0] {
++                let s = [i, j, k];
++                for a in 0..3 {
++                    if s[a] >= g.n[a] {
++                        continue;
++                    }
++                    let mut e = s;
++                    e[a] += 1;
++                    let (va, vb) = (g.val(s), g.val(e));
++                    if inside(va) != inside(vb) {
++                        let sum = va.abs() + vb.abs();
++                        raw.insert((s, a), Raw { t: crossing(va, vb), lower_in: inside(va), sum });
++                    }
++                }
++            }
++        }
++    }
++    let tight_of = |key: &EdgeKey, r: &Raw, n: Option<V3>| match n {
++        Some(n) => r.sum.is_finite() && r.sum >= (1.0 - TIGHT_TOL) * g.step * n[key.1].abs(),
++        None => false,
++    };
++    // Pass one: normals from every neighbour, and the trust they imply.
++    let mut first: HashMap<EdgeKey, (Option<V3>, bool)> = HashMap::with_capacity(raw.len());
++    for (key, r) in &raw {
++        let n = sheet_normal(&raw, *key, r, |_| true).or_else(|| gradient_normal(g, *key, r.t));
++        first.insert(*key, (n, tight_of(key, r, n)));
++    }
++    // Pass two: normals re-read from trusted neighbours only.
++    let mut out = HashMap::with_capacity(raw.len());
++    for (key, r) in &raw {
++        let trusted = |nb: &EdgeKey| first.get(nb).is_some_and(|f| f.1);
++        let prior = first.get(key).and_then(|f| f.0);
++        let n = sheet_normal(&raw, *key, r, trusted).or(prior);
++        let (s, k) = *key;
++        let pa = g.at(s);
++        let mut p = [pa.x, pa.y, pa.z];
++        p[k] += r.t * g.step;
++        out.insert(*key, Hermite { p, n, tight: tight_of(key, r, n) });
++    }
++    out
++}
++
++/// The sheet-slope normal of edge `key`; `None` when some cross axis
++/// has no accepted neighbour crossing the same way.
++fn sheet_normal(raw: &HashMap<EdgeKey, Raw>, key: EdgeKey, r: &Raw, accept: impl Fn(&EdgeKey) -> bool) -> Option<V3> {
++    let (s, k) = key;
++    let out = if r.lower_in { 1.0 } else { -1.0 };
++    let mut n = [0.0; 3];
++    n[k] = out;
++    let read = |nb: EdgeKey| raw.get(&nb).filter(|q| q.lower_in == r.lower_in && accept(&nb)).map(|q| q.t);
++    for j in (0..3).filter(|&j| j != k) {
++        let mut up = s;
++        up[j] += 1;
++        let fwd = read((up, k)).map(|u| u - r.t);
++        let back = s[j].checked_sub(1).and_then(|d| {
++            let mut dn = s;
++            dn[j] = d;
++            read((dn, k)).map(|u| r.t - u)
++        });
++        let slope = match (fwd, back) {
++            (Some(a), Some(b)) if (a - b).abs() < SLOPE_AGREE => 0.5 * (a + b),
++            (Some(a), Some(b)) => {
++                if a.abs() <= b.abs() {
++                    a
++                } else {
++                    b
++                }
++            }
++            (Some(a), None) | (None, Some(a)) => a,
++            (None, None) => return None,
++        };
++        n[j] = -out * slope.clamp(-SLOPE_MAX, SLOPE_MAX);
++    }
++    unit(n)
++}
++
++/// The central-difference gradient at sample `s` (one-sided on the
++/// lattice's faces); `None` when any read is non-finite.
++fn gradient(g: &Grid, s: [usize; 3]) -> Option<V3> {
++    let mut out = [0.0; 3];
++    for (k, o) in out.iter_mut().enumerate() {
++        let (mut up, mut dn) = (s, s);
++        if s[k] < g.n[k] {
++            up[k] += 1;
++        }
++        if s[k] > 0 {
++            dn[k] -= 1;
++        }
++        let span = up[k].saturating_sub(dn[k]) as f64 * g.step;
++        if span.is_nan() || span <= 0.0 {
++            return None;
++        }
++        *o = (g.val(up) - g.val(dn)) / span;
++    }
++    out.iter().all(|c| c.is_finite()).then_some(out)
++}
++
++/// The fallback normal: both endpoints' gradient directions, weighted
++/// by position and by how nearly each obeys |grad d| = 1.
++fn gradient_normal(g: &Grid, key: EdgeKey, t: f64) -> Option<V3> {
++    let (a, k) = key;
++    let mut b = a;
++    b[k] += 1;
++    let mut n = [0.0; 3];
++    for (s, w) in [(a, 1.0 - t), (b, t)] {
++        let Some(gr) = gradient(g, s) else { continue };
++        let len = gr.iter().map(|c| c * c).sum::<f64>().sqrt();
++        if len.is_nan() || len <= f64::MIN_POSITIVE {
++            continue;
++        }
++        let w = w / (EIKONAL_EPS + (len - 1.0).abs());
++        for (o, c) in n.iter_mut().zip(gr) {
++            *o += w * c / len;
++        }
++    }
++    unit(n)
++}
+diff --git a/crates/sim/src/stock_sim/iso.rs b/crates/sim/src/stock_sim/iso.rs
+index c97dbd85..1a0d0240 100644
+--- a/crates/sim/src/stock_sim/iso.rs
++++ b/crates/sim/src/stock_sim/iso.rs
+@@ -4,8 +4,9 @@
+ //! tetrahedral form - each cube split into six tetrahedra around one
+ //! main diagonal (marching tetrahedra, as in Bloomenthal's "An Implicit
+ //! Surface Polygonizer", Graphics Gems IV, 1994), which needs no case
+-//! table and has no ambiguous faces. Our own Rust; nothing from vendor
+-//! binaries.
++//! table and has no ambiguous faces; the default extractor is dual
++//! contouring (Ju, Losasso, Schaefer & Warren, SIGGRAPH 2002, `dual`)
++//! over the same samples. Our own Rust; nothing from vendor binaries.
+ //!
+ //! ## The laws here
+ //!
+@@ -34,7 +35,7 @@ use super::kernel::StockError;
+ pub const MAX_SAMPLES: usize = 1 << 23;
+ 
+ /// Cube corners as (dx, dy, dz) offsets, bit 0 = x, bit 1 = y, bit 2 = z.
+-const CORNER: [[usize; 3]; 8] = [
++pub(crate) const CORNER: [[usize; 3]; 8] = [
+     [0, 0, 0],
+     [1, 0, 0],
+     [0, 1, 0],
+@@ -55,15 +56,79 @@ const TETS: [[usize; 4]; 6] = [
+     [0, 5, 1, 7],
+ ];
+ 
++/// How the d = 0 surface is polygonized. Dual contouring is the
++/// default: it keeps a machined pocket's floor/wall edge sharp where
++/// marching tetrahedra chamfers it; marching tetrahedra stays callable
++/// by name and is the fallback whenever a dual mesh is not closed.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum IsoMethod {
++    /// Dual contouring of Hermite data (`dual`), one QEF vertex a cell.
++    #[default]
++    Dual,
++    /// Marching tetrahedra: crossings interpolated on the cell edges.
++    Marching,
++}
++
+ /// Extract the field's d = 0 surface at the field's own cell.
+ pub fn extract(f: &SdfField) -> Result<Vec<Triangle>, StockError> {
+-    extract_at(f, f.cell())
++    extract_with(f, f.cell(), IsoMethod::default())
+ }
+ 
+ /// Extract at a sample spacing `step`, the grid anchored on the field's
+ /// cell centres (`step` = the cell samples each centre exactly once;
+ /// coarser skips cells for a lighter mesh).
+ pub fn extract_at(f: &SdfField, step: f64) -> Result<Vec<Triangle>, StockError> {
++    extract_with(f, step, IsoMethod::default())
++}
++
++/// Extract at `step` by `method`. A dual mesh that is not closed (a
++/// surface reaching the grid's pad, a fold no quad ring closes) is never
++/// returned: the marching mesh of the same samples stands in, logged.
++pub fn extract_with(f: &SdfField, step: f64, method: IsoMethod) -> Result<Vec<Triangle>, StockError> {
++    let g = sample(f, step)?;
++    match method {
++        IsoMethod::Marching => Ok(marching(&g)),
++        IsoMethod::Dual => {
++            let tris = super::dual::contour(&g);
++            let open = open_edges(&tris);
++            if open == 0 {
++                Ok(tris)
++            } else {
++                eprintln!("iso-surface: the dual mesh has {open} open edges - marching tetrahedra stands in");
++                Ok(marching(&g))
++            }
++        }
++    }
++}
++
++/// The sampled lattice both extractors read: `(n + 1)^3` field values
++/// on cell centres, `n` cells a side, origin `lo`, spacing `step`.
++pub(crate) struct Grid {
++    pub(crate) lo: Point3,
++    pub(crate) step: f64,
++    pub(crate) n: [usize; 3],
++    pub(crate) d: Vec<f64>,
++}
++
++impl Grid {
++    /// World position of sample `s`.
++    pub(crate) fn at(&self, s: [usize; 3]) -> Point3 {
++        let st = self.step;
++        Point3::new(self.lo.x + s[0] as f64 * st, self.lo.y + s[1] as f64 * st, self.lo.z + s[2] as f64 * st)
++    }
++
++    /// The value at sample `s`; NaN off the lattice (never a panic).
++    pub(crate) fn val(&self, s: [usize; 3]) -> f64 {
++        if s.iter().zip(self.n).any(|(&c, n)| c > n) {
++            return f64::NAN;
++        }
++        let i = (s[2] * (self.n[1] + 1) + s[1]) * (self.n[0] + 1) + s[0];
++        self.d.get(i).copied().unwrap_or(f64::NAN)
++    }
++}
++
++/// Sample the field on the extraction lattice; refusals by name.
++pub(crate) fn sample(f: &SdfField, step: f64) -> Result<Grid, StockError> {
+     let refuse = |s: String| Err(StockError::Invalid(format!("iso-surface: {s}")));
+     if !(step.is_finite() && step > 0.0) {
+         return refuse(format!("the sample step must be finite and positive, not {step}"));
+@@ -96,32 +161,34 @@ pub fn extract_at(f: &SdfField, step: f64) -> Result<Vec<Triangle>, StockError>
+     let Some(samples) = samples else {
+         return refuse(format!("a {}x{}x{} grid is past the {MAX_SAMPLES}-sample budget", n[0], n[1], n[2]));
+     };
+-    let at = |i: usize, j: usize, k: usize| {
+-        Point3::new(lo.x + i as f64 * step, lo.y + j as f64 * step, lo.z + k as f64 * step)
+-    };
+-    let idx = |i: usize, j: usize, k: usize| (k * (n[1] + 1) + j) * (n[0] + 1) + i;
+-    let mut d = vec![0.0f64; samples];
++    let mut g = Grid { lo, step, n, d: Vec::with_capacity(samples) };
+     for k in 0..=n[2] {
+         for j in 0..=n[1] {
+             for i in 0..=n[0] {
+-                let v = f.distance(at(i, j, k));
++                let p = g.at([i, j, k]);
++                let v = f.distance(p);
+                 if v.is_nan() {
+-                    return refuse(format!("the field answered NaN at {:?} - no surface to extract", at(i, j, k)));
++                    return refuse(format!("the field answered NaN at {p:?} - no surface to extract"));
+                 }
+-                d[idx(i, j, k)] = v;
++                g.d.push(v);
+             }
+         }
+     }
++    Ok(g)
++}
++
++/// Marching tetrahedra over the sampled lattice.
++pub(crate) fn marching(g: &Grid) -> Vec<Triangle> {
+     let mut out = Vec::new();
+-    for k in 0..n[2] {
+-        for j in 0..n[1] {
+-            for i in 0..n[0] {
++    for k in 0..g.n[2] {
++        for j in 0..g.n[1] {
++            for i in 0..g.n[0] {
+                 let mut p = [Point3::ZERO; 8];
+                 let mut v = [0.0f64; 8];
+                 for (c, o) in CORNER.iter().enumerate() {
+-                    let (a, bb, cc) = (i + o[0], j + o[1], k + o[2]);
+-                    p[c] = at(a, bb, cc);
+-                    v[c] = d[idx(a, bb, cc)];
++                    let s = [i + o[0], j + o[1], k + o[2]];
++                    p[c] = g.at(s);
++                    v[c] = g.val(s);
+                 }
+                 if v.iter().all(|x| *x < 0.0) || v.iter().all(|x| *x >= 0.0) {
+                     continue;
+@@ -132,7 +199,7 @@ pub fn extract_at(f: &SdfField, step: f64) -> Result<Vec<Triangle>, StockError>
+             }
+         }
+     }
+-    Ok(out)
++    out
+ }
+ 
+ /// Polygonize one tetrahedron: inside is d < 0.
+@@ -205,6 +272,8 @@ mod tests {
+         assert!(!tris.is_empty());
+         assert_eq!(open_edges(&tris), 0, "the extracted shell is watertight");
+         let v = volume(&tris);
++        let mt = volume(&extract_with(&f, 1.0, IsoMethod::Marching).unwrap());
++        eprintln!("box volume: dual {v:.3}, marching {mt:.3}, true 480");
+         // Outward normals give a positive volume; faces land exactly on
+         // the cell-centre crossing, edges and corners are chamfered by
+         // the tetrahedral split, so within 5% of 480.
+diff --git a/crates/sim/src/stock_sim/mod.rs b/crates/sim/src/stock_sim/mod.rs
+index 5bc35a02..eb27d609 100644
+--- a/crates/sim/src/stock_sim/mod.rs
++++ b/crates/sim/src/stock_sim/mod.rs
+@@ -61,6 +61,7 @@ mod dexel;
+ mod dexel_bull;
+ mod deviate;
+ mod display;
++mod dual;
+ mod field;
+ mod field_batch;
+ mod field_bull;
+@@ -72,9 +73,11 @@ mod field_rotary;
+ mod field_solid;
+ mod field_sweep;
+ mod gouge;
++mod hermite;
+ mod kernel;
+ mod march;
+ mod march_verdicts;
++mod qef;
+ pub mod iso;
+ pub mod preview;
+ mod ridge;
+diff --git a/crates/sim/src/stock_sim/qef.rs b/crates/sim/src/stock_sim/qef.rs
+new file mode 100644
+index 00000000..a7a6e0c9
+--- /dev/null
++++ b/crates/sim/src/stock_sim/qef.rs
+@@ -0,0 +1,166 @@
++//! The quadratic error function a dual-contouring cell minimizes (M13.1,
++//! #23): the point closest, in the least-squares sense, to every
++//! tangent plane of the cell's Hermite data.
++//! Provenance: Ju, Losasso, Schaefer & Warren, "Dual Contouring of
++//! Hermite Data" (SIGGRAPH 2002) - the QEF E(x) = sum (n_i . (x - p_i))^2,
++//! solved by a pseudo-inverse whose small singular values are truncated
++//! so an under-constrained direction keeps the mass point's coordinate;
++//! the symmetric eigensolver is the cyclic Jacobi method (Golub & Van
++//! Loan, "Matrix Computations", sec. 8.5). Our own Rust; nothing from
++//! vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Ill-conditioned is the mass point, never a guess.** A direction
++//!   whose singular value is under `TRUNC` of the largest is dropped from
++//!   the solve: a flat face's vertex rides its mass point in-plane, a
++//!   cell with no usable normal is its mass point outright.
++//! - **The vertex stays in its cell.** The answer is clamped to the
++//!   cell's box, so no quad can reach across the lattice; a non-finite
++//!   answer is the mass point, clamped the same way.
++//! - **Bounded work.** The Jacobi sweep count is capped: no input hangs.
++
++type V3 = [f64; 3];
++
++/// Singular values below this fraction of the largest are truncated
++/// (Ju et al. 2002 truncate at 0.1 on unit normals).
++const TRUNC: f64 = 0.1;
++
++/// Jacobi sweeps at most; a 3x3 converges in a handful.
++const MAX_SWEEPS: usize = 32;
++
++/// The cell vertex: minimize the QEF of `planes` (point, unit normal),
++/// solved about `mass`, clamped into `[lo, hi]`.
++pub(crate) fn solve(planes: &[(V3, V3)], mass: V3, lo: V3, hi: V3) -> V3 {
++    let clamp = |x: V3| -> V3 {
++        let mut o = [0.0; 3];
++        for k in 0..3 {
++            let (a, b) = (lo[k].min(hi[k]), lo[k].max(hi[k]));
++            o[k] = if x[k].is_finite() { x[k].clamp(a, b) } else { 0.5 * (a + b) };
++        }
++        o
++    };
++    let mut a = [[0.0f64; 3]; 3];
++    let mut rhs = [0.0f64; 3];
++    for (p, n) in planes {
++        let r = (0..3).map(|k| n[k] * (p[k] - mass[k])).sum::<f64>();
++        if !r.is_finite() || n.iter().any(|c| !c.is_finite()) {
++            continue;
++        }
++        for i in 0..3 {
++            rhs[i] += n[i] * r;
++            for j in 0..3 {
++                a[i][j] += n[i] * n[j];
++            }
++        }
++    }
++    let (lam, v) = eigen_sym(a);
++    let top = lam.iter().fold(0.0f64, |m, l| m.max(*l));
++    let mut x = mass;
++    if top > f64::MIN_POSITIVE {
++        for k in 0..3 {
++            // Singular values are the square roots of A's eigenvalues.
++            if lam[k] > 0.0 && lam[k] >= TRUNC * TRUNC * top {
++                let vk = [v[0][k], v[1][k], v[2][k]];
++                let c = (0..3).map(|i| vk[i] * rhs[i]).sum::<f64>() / lam[k];
++                for i in 0..3 {
++                    x[i] += c * vk[i];
++                }
++            }
++        }
++    }
++    if x.iter().any(|c| !c.is_finite()) {
++        x = mass;
++    }
++    clamp(x)
++}
++
++/// Eigenvalues and eigenvectors (columns of the matrix) of a symmetric
++/// 3x3, cyclic Jacobi.
++fn eigen_sym(mut a: [[f64; 3]; 3]) -> (V3, [[f64; 3]; 3]) {
++    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
++    for _ in 0..MAX_SWEEPS {
++        let off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
++        let diag = a[0][0] * a[0][0] + a[1][1] * a[1][1] + a[2][2] * a[2][2];
++        if off.is_nan() || off <= 1e-30 * diag.max(f64::MIN_POSITIVE) {
++            break;
++        }
++        for (p, q) in [(0usize, 1usize), (0, 2), (1, 2)] {
++            if a[p][q].abs() <= f64::MIN_POSITIVE {
++                continue;
++            }
++            let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
++            // signum(0) = 1: a zero theta rotates by 45 degrees.
++            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
++            let c = 1.0 / (t * t + 1.0).sqrt();
++            let s = t * c;
++            for row in a.iter_mut() {
++                let (akp, akq) = (row[p], row[q]);
++                row[p] = c * akp - s * akq;
++                row[q] = s * akp + c * akq;
++            }
++            let (rp, rq) = (a[p], a[q]);
++            a[p] = std::array::from_fn(|k| c * rp[k] - s * rq[k]);
++            a[q] = std::array::from_fn(|k| s * rp[k] + c * rq[k]);
++            for row in v.iter_mut() {
++                let (vp, vq) = (row[p], row[q]);
++                row[p] = c * vp - s * vq;
++                row[q] = s * vp + c * vq;
++            }
++        }
++    }
++    ([a[0][0], a[1][1], a[2][2]], v)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const LO: V3 = [0.0, 0.0, 0.0];
++    const HI: V3 = [1.0, 1.0, 1.0];
++
++    #[test]
++    fn three_planes_meet_at_their_corner() {
++        let planes = [
++            ([0.3, 0.1, 0.9], [1.0, 0.0, 0.0]),
++            ([0.8, 0.4, 0.2], [0.0, 1.0, 0.0]),
++            ([0.1, 0.9, 0.7], [0.0, 0.0, 1.0]),
++        ];
++        let x = solve(&planes, [0.5, 0.5, 0.5], LO, HI);
++        for (got, want) in x.iter().zip([0.3, 0.4, 0.7]) {
++            assert!((got - want).abs() < 1e-9, "{x:?}");
++        }
++    }
++
++    #[test]
++    fn an_edge_keeps_the_mass_point_along_it() {
++        // Two planes: x = 0.2, z = 0.6; the edge runs along y.
++        let planes = [([0.2, 0.1, 0.0], [1.0, 0.0, 0.0]), ([0.9, 0.8, 0.6], [0.0, 0.0, 1.0])];
++        let x = solve(&planes, [0.5, 0.45, 0.5], LO, HI);
++        assert!((x[0] - 0.2).abs() < 1e-9 && (x[2] - 0.6).abs() < 1e-9, "{x:?}");
++        assert!((x[1] - 0.45).abs() < 1e-9, "the free direction keeps the mass point: {x:?}");
++    }
++
++    #[test]
++    fn ill_conditioned_and_empty_cells_are_their_clamped_mass_point() {
++        assert_eq!(solve(&[], [0.25, 0.5, 0.75], LO, HI), [0.25, 0.5, 0.75]);
++        let zero = [([0.5, 0.5, 0.5], [0.0, 0.0, 0.0])];
++        assert_eq!(solve(&zero, [0.25, 0.5, 0.75], LO, HI), [0.25, 0.5, 0.75]);
++        let nan = [([f64::NAN, 0.5, 0.5], [1.0, 0.0, 0.0]), ([0.5, 0.5, 0.5], [f64::NAN, 0.0, 1.0])];
++        let x = solve(&nan, [0.25, 0.5, 0.75], LO, HI);
++        assert!(x.iter().all(|c| c.is_finite()), "{x:?}");
++        // Two nearly parallel planes would meet far outside: truncated.
++        let s = 1e-3f64;
++        let near = [([0.5, 0.5, 0.4], [0.0, 0.0, 1.0]), ([0.5, 0.5, 0.6], [s, 0.0, (1.0 - s * s).sqrt()])];
++        let x = solve(&near, [0.5, 0.5, 0.5], LO, HI);
++        assert!(x.iter().zip(HI).all(|(c, h)| (0.0..=h).contains(c)), "clamped in the cell: {x:?}");
++        assert!((x[0] - 0.5).abs() < 1e-6, "the degenerate direction keeps the mass point: {x:?}");
++    }
++
++    #[test]
++    fn a_far_intersection_is_clamped_into_the_cell() {
++        // Planes x = 5 and y = -3 meet outside the unit cell.
++        let planes = [([5.0, 0.5, 0.5], [1.0, 0.0, 0.0]), ([0.5, -3.0, 0.5], [0.0, 1.0, 0.0])];
++        assert_eq!(solve(&planes, [0.5, 0.5, 0.5], LO, HI), [1.0, 0.0, 0.5]);
++    }
++}
+diff --git a/crates/sim/tests/stock_dual.rs b/crates/sim/tests/stock_dual.rs
+new file mode 100644
+index 00000000..52a7ce0e
+--- /dev/null
++++ b/crates/sim/tests/stock_dual.rs
+@@ -0,0 +1,130 @@
++//! M13.1 (#23): dual contouring keeps a machined pocket's sharp interior
++//! corner. A flat endmill slots a box; the slot's floor/wall edge is a
++//! true 90-degree concave line. The dual mesh passes within a small
++//! twentieth of a cell of that line, where marching tetrahedra chamfers
++//! it by about a third of a cell; both stay closed. Degenerate fields
++//! (everything cut away, a body smaller than a cell) answer cleanly.
++//! Provenance: our own fixtures over the M7.1 field engine and the
++//! extraction of Ju, Losasso, Schaefer & Warren (SIGGRAPH 2002); nothing
++//! from vendor binaries.
++//!
++//! Gate map (M4.4): covers camcraft_sim::stock_sim::iso, stock_sim::dual, stock_sim::qef.
++
++use camcraft_sim::cl::{Move, MoveKind};
++use camcraft_sim::geometry::{cube, Point3, Triangle};
++use camcraft_sim::stock_sim::iso::{extract, extract_with, open_edges, IsoMethod};
++use camcraft_sim::stock_sim::{dist_seg_tri, SdfField, SdfTool, FIELD_BAND};
++
++const CELL: f64 = 1.0;
++/// The slot: a flat endmill of radius 2 at tip z 6.2 along y = 5.3, so
++/// its walls stand at y = 3.3 and 7.3 - off the lattice's samples and
++/// faces both, the generic case.
++const R: f64 = 2.0;
++const FLOOR: f64 = 6.2;
++const AXIS_Y: f64 = 5.3;
++
++fn feed(from: Point3, to: Point3) -> Move {
++    Move { kind: MoveKind::Feed, from, to, feed: Some(500.0), arc: None, axis: None }
++}
++
++fn slotted() -> SdfField {
++    let m = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 10.0));
++    let mut f = SdfField::from_mesh(&m.facets, CELL, FIELD_BAND).expect("box field");
++    let tool = SdfTool::Flat { r: R, flank: 20.0 };
++    let moves = [
++        feed(Point3::new(2.0, AXIS_Y, 14.0), Point3::new(2.0, AXIS_Y, FLOOR)),
++        feed(Point3::new(2.0, AXIS_Y, FLOOR), Point3::new(8.0, AXIS_Y, FLOOR)),
++    ];
++    f.subtract_batch(&moves, &tool, 0.01).expect("the slot cuts");
++    f
++}
++
++/// The farthest the mesh stands from the slot's straight floor/wall
++/// edges, sampled along their middle (clear of the round ends).
++fn edge_gap(tris: &[Triangle]) -> f64 {
++    let mut worst = 0.0f64;
++    for y in [AXIS_Y - R, AXIS_Y + R] {
++        for s in 0..=16 {
++            let e = Point3::new(3.5 + 3.0 * s as f64 / 16.0, y, FLOOR);
++            let d = tris.iter().map(|t| dist_seg_tri(e, e, t)).fold(f64::INFINITY, f64::min);
++            worst = worst.max(d);
++        }
++    }
++    worst
++}
++
++#[test]
++fn dual_contouring_keeps_the_slot_floor_wall_edge_sharp() {
++    let f = slotted();
++    let dual = extract_with(&f, CELL, IsoMethod::Dual).expect("dual mesh");
++    let mt = extract_with(&f, CELL, IsoMethod::Marching).expect("marching mesh");
++    assert_eq!(open_edges(&dual), 0, "the dual shell is closed");
++    assert_eq!(open_edges(&mt), 0, "the marching shell is closed");
++    let (gd, gm) = (edge_gap(&dual), edge_gap(&mt));
++    eprintln!("floor/wall edge gap: dual {gd:.4}, marching {gm:.4} (cells of {CELL})");
++    assert!(gm > 0.2 * CELL, "marching tetrahedra chamfers the corner: {gm}");
++    assert!(gd < 0.05 * CELL, "the dual mesh keeps the corner within a twentieth of a cell: {gd}");
++    assert!(gd < 0.5 * gm, "dual {gd} vs marching {gm}");
++}
++
++#[test]
++fn dual_is_the_default_extractor() {
++    let f = slotted();
++    let a = extract(&f).expect("default mesh");
++    let b = extract_with(&f, CELL, IsoMethod::Dual).expect("dual mesh");
++    assert_eq!(a.len(), b.len());
++    assert_eq!(IsoMethod::default(), IsoMethod::Dual);
++}
++
++#[test]
++fn a_fully_cut_field_extracts_nothing_without_error() {
++    let m = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(4.0, 4.0, 4.0));
++    let mut f = SdfField::from_mesh(&m.facets, CELL, FIELD_BAND).expect("box field");
++    let tool = SdfTool::Flat { r: 10.0, flank: 30.0 };
++    f.subtract(&feed(Point3::new(2.0, 2.0, 20.0), Point3::new(2.0, 2.0, -5.0)), &tool, 0.01).expect("cut");
++    for method in [IsoMethod::Dual, IsoMethod::Marching] {
++        let tris = extract_with(&f, CELL, method).expect("an empty answer, not an error");
++        assert!(tris.is_empty(), "{method:?}: nothing is left, {} triangles", tris.len());
++    }
++}
++
++#[test]
++fn a_body_under_one_cell_never_panics_and_never_opens() {
++    let m = cube(Point3::new(0.1, 0.1, 0.1), Point3::new(0.6, 0.6, 0.6));
++    let Ok(f) = SdfField::from_mesh(&m.facets, CELL, FIELD_BAND) else {
++        return; // refused by the field gate: a clean answer too
++    };
++    for method in [IsoMethod::Dual, IsoMethod::Marching] {
++        if let Ok(tris) = extract_with(&f, CELL, method) {
++            assert_eq!(open_edges(&tris), 0, "{method:?}: closed or empty");
++            assert!(tris.iter().all(|t| t.a.is_finite() && t.b.is_finite() && t.c.is_finite()));
++        }
++    }
++    for s in [0.0, -1.0, f64::NAN, f64::INFINITY] {
++        assert!(extract_with(&f, s, IsoMethod::Dual).is_err(), "step {s} must refuse");
++    }
++}
++
++
++#[test]
++fn a_curved_ball_pocket_stays_closed_and_never_bulges() {
++    // A ball nose of radius 2.5 plunged 3 deep: a sphere-capped hole,
++    // curved everywhere at under three cells of radius. The dual mesh
++    // borrows no corner planes here and must agree with the field's
++    // volume as closely as marching does.
++    let m = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 10.0));
++    let mut f = SdfField::from_mesh(&m.facets, CELL, FIELD_BAND).expect("box field");
++    let tool = SdfTool::Shanked { r: 2.5, shank: 20.0 };
++    f.subtract(&feed(Point3::new(5.1, 4.9, 14.0), Point3::new(5.1, 4.9, 7.0)), &tool, 0.01).expect("cut");
++    let vol = |t: &[Triangle]| t.iter().map(|t| t.a.dot(t.b.cross(t.c)) / 6.0).sum::<f64>();
++    let dual = extract_with(&f, CELL, IsoMethod::Dual).expect("dual mesh");
++    let mt = extract_with(&f, CELL, IsoMethod::Marching).expect("marching mesh");
++    assert_eq!(open_edges(&dual), 0);
++    let r = 2.5f64;
++    // Box minus the cylinder above the ball centre (z 9.5..10) and the
++    // lower hemisphere (centre z 9.5).
++    let truth = 1000.0 - std::f64::consts::PI * r * r * 0.5 - 2.0 / 3.0 * std::f64::consts::PI * r.powi(3);
++    let (vd, vm) = (vol(&dual), vol(&mt));
++    eprintln!("ball pocket volume: dual {vd:.3}, marching {vm:.3}, true {truth:.3}");
++    assert!((vd - truth).abs() <= (vm - truth).abs().max(0.005 * truth), "dual {vd} vs marching {vm}, truth {truth}");
++}
+diff --git a/docs/decisions/23-dual-contouring.md b/docs/decisions/23-dual-contouring.md
+new file mode 100644
+index 00000000..45c5ffb8
+--- /dev/null
++++ b/docs/decisions/23-dual-contouring.md
+@@ -0,0 +1,41 @@
++## #23 - dual contouring for the machined-stock mesh
++
++- **Chosen:** Dual contouring (Ju, Losasso, Schaefer & Warren, SIGGRAPH 2002)
++  over the same cell-centre samples marching tetrahedra already read
++  (`stock_sim::dual`, `hermite`, `qef`), selected by a new
++  `iso::IsoMethod { Dual, Marching }` with `Dual` the default. `iso::extract` /
++  `extract_at` (the STL export and the viewer's `MeshCache`) now return the
++  dual mesh; `extract_with(.., IsoMethod::Marching)` keeps the old one by name.
++- **Why default, not an option:** every existing stock/sim/export law stayed
++  green with it (sim crate suites, the app `stock_export` suite, the ui
++  machined-mesh tests) and it is strictly closer to the field: a 10x8x6 box at
++  a 1 mm cell extracts to 480.000 mm^3 (marching: 472.3), and a slot's
++  floor/wall edge is reproduced to 0.0000 cells (marching chamfers it by 0.36).
++  The mesh is a display/export cache of the field, not a machining strategy,
++  so it is an API parameter with a default rather than a user-facing op
++  parameter; no UI toggle or command was added.
++- **Safety:** a dual mesh with any open edge is never returned - the marching
++  mesh of the same samples stands in, logged (`eprintln!`), and the app's
++  existing open-edge refusal still guards the STL. QEF vertices are clamped
++  into their cell; truncated pseudo-inverse (singular values under 0.1 of the
++  largest) keeps the mass point along ill-conditioned directions; NaN/zero
++  normals give no plane; the Jacobi solver is sweep-capped.
++- **Hermite normals - own estimator:** plain central-difference gradients blend
++  the two faces across the ridge a corner throws, and the crossings beside a
++  corner are themselves biased by that ridge. Measured: gradient normals gave
++  0.35 cells of corner error (no better than marching). So normals are read
++  from the slope of the crossing sheet across neighbouring parallel edges (the
++  sheet as a height field), a crossing whose endpoint magnitudes fall short of
++  the plane law (|va| + |vb| < 0.95 h |n_k|) is flagged untrusted, and a cell
++  holding an untrusted crossing solves its QEF from the trusted, same-facing
++  planes of its 3x3x3 block. Smooth cells read only their own planes, as in
++  the paper. Gradient blend (eikonal-weighted) is the fallback normal.
++- **Considered and dropped:** gradient-only Hermite normals (measured no gain);
++  borrowing neighbour planes in every cell (would bulge small-radius curved
++  surfaces); making DC a user op parameter (no CAM strategy fork - display
++  fidelity only); replacing marching outright (it stays as the fallback and as
++  a named method).
++- **Cost to change later:** flip `IsoMethod`'s `#[default]`; the extractor API
++  is unchanged for callers. A thin wall under ~1 cell can still read one face's
++  plane from the other side's block only if the normals face the same way -
++  opposite-facing planes are filtered out.

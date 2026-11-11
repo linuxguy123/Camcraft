@@ -1,0 +1,1355 @@
+From 53798496715c0e1cc717a96b89a2a3c53619ed34 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sun, 8 Nov 2026 12:17:37 +0100
+Subject: [PATCH] feat(kernel): union/intersect and edge blends on the kernel
+ seam, benched (M12.1 stage 2)
+
+The dual-kernel agreement bench grows from subtract/offset to all three
+booleans and constant-radius edge blends:
+
+- Kernel trait: boolean_union, boolean_intersect, blend_edges(solid,
+  picks, radius, Round | Chamfer). truck implements the booleans via
+  truck-shapeops or/and; its blend_edges is Unsupported (truck has none).
+- agreement.rs: four new boolean fixtures (box|box, box|cylinder boss,
+  box&box, box&cylinder) through both engines vs closed forms; the heavy
+  lane's fine-tessellation leg now covers them too.
+- blend.rs: eleven solidcore blend fixtures vs closed forms (cube rounds
+  and chamfers on 1/4/12 edges, concave L-block blends, cylinder and hole
+  rims via Pappus). The circular-rim chamfer misses on the port's default
+  path (upstream WR-421) and is pinned as "not yet", with a second test
+  showing the opt-in fillet_chamfer_cone_on_arc fix closes it.
+- Seam guards: edge picks must name exactly one edge (sampled +
+  golden-section distance; vertex/seam picks refused as ambiguous); a
+  conservative blend radius guard; a result law (manifold, inside the
+  source box, volume moved); face-less boolean operands refused (the port
+  answers box & empty with the whole box - pinned).
+- corrupt_input.rs: seam rows for every new op and a separate pinned
+  table of the port's own stage-2 verdicts (stage 1's table unchanged).
+
+No production path switched; nothing outside camcraft-kernel depends on
+it. Decisions in docs/decisions/27-solidcore-bench.md.
+
+Refs #27
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/kernel/src/lib.rs             |  41 +++-
+ crates/kernel/src/solidcore_blend.rs | 170 ++++++++++++++++
+ crates/kernel/src/solidcore_impl.rs  |  53 ++++-
+ crates/kernel/src/truck_impl.rs      |  55 +++--
+ crates/kernel/tests/agreement.rs     | 221 ++++++++++----------
+ crates/kernel/tests/blend.rs         | 289 +++++++++++++++++++++++++++
+ crates/kernel/tests/common/mod.rs    |  51 +++++
+ crates/kernel/tests/corrupt_input.rs | 110 +++++++++-
+ docs/decisions/27-solidcore-bench.md |  63 ++++++
+ 9 files changed, 926 insertions(+), 127 deletions(-)
+ create mode 100644 crates/kernel/src/solidcore_blend.rs
+ create mode 100644 crates/kernel/tests/blend.rs
+ create mode 100644 crates/kernel/tests/common/mod.rs
+ create mode 100644 docs/decisions/27-solidcore-bench.md
+
+diff --git a/crates/kernel/src/lib.rs b/crates/kernel/src/lib.rs
+index 1e514f56..783f821d 100644
+--- a/crates/kernel/src/lib.rs
++++ b/crates/kernel/src/lib.rs
+@@ -1,7 +1,8 @@
+-//! camcraft-kernel - the B-rep kernel seam of M12.1, stage 1 (evaluation +
++//! camcraft-kernel - the B-rep kernel seam of M12.1, stages 1-2 (evaluation +
+ //! agreement bench). A thin [`Kernel`] trait carries only the operations both
+ //! candidate engines can be asked for: primitive construction (box, Z
+-//! cylinder), boolean subtract, whole-solid offset, and a [`Measure`]
++//! cylinder), the three booleans (subtract, union, intersect), whole-solid
++//! offset, constant-radius edge blends (round, chamfer), and a [`Measure`]
+ //! (volume + bounding box) the bench compares. Nothing else in the workspace
+ //! depends on this crate yet; truck stays the live engine.
+ //!
+@@ -20,6 +21,7 @@
+ 
+ mod error;
+ mod measure;
++mod solidcore_blend;
+ pub mod solidcore_impl;
+ #[cfg(feature = "truck")]
+ pub mod truck_impl;
+@@ -58,14 +60,49 @@ pub trait Kernel {
+         b: Self::Solid,
+     ) -> Result<Self::Solid, KernelError>;
+ 
++    /// `a` united with `b`.
++    fn boolean_union(&mut self, a: Self::Solid, b: Self::Solid) -> Result<Self::Solid, KernelError>;
++
++    /// The common part of `a` and `b`. An empty result is an `Err`.
++    fn boolean_intersect(
++        &mut self,
++        a: Self::Solid,
++        b: Self::Solid,
++    ) -> Result<Self::Solid, KernelError>;
++
+     /// Whole-solid offset by `distance` (negative = inset), convex edges
+     /// rounded. Engines without an offset return [`KernelError::Unsupported`].
+     fn offset(&mut self, s: &mut Self::Solid, distance: f64) -> Result<Self::Solid, KernelError>;
+ 
++    /// Constant-radius blend of the edges nearest each of `picks` (every
++    /// pick must lie on an edge, within [`PICK_TOL`]; two picks on one edge
++    /// are refused). `Round` is a circular section of `radius`; `Chamfer` a
++    /// flat one with setback `radius` on both faces. Engines without edge
++    /// blends return [`KernelError::Unsupported`].
++    fn blend_edges(
++        &mut self,
++        s: Self::Solid,
++        picks: &[P3],
++        radius: f64,
++        kind: Blend,
++    ) -> Result<Self::Solid, KernelError>;
++
+     /// Volume and bounding box of a closed solid.
+     fn measure(&mut self, s: &mut Self::Solid) -> Result<Measure, KernelError>;
+ }
+ 
++/// The edge-blend cross-section.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Blend {
++    /// Circular section (a fillet on a concave edge, a round on a convex one).
++    Round,
++    /// Flat section, equal setback on both faces.
++    Chamfer,
++}
++
++/// How far a blend pick may lie from the edge it names (model units).
++pub const PICK_TOL: f64 = 1e-3;
++
+ /// Rejects non-finite coordinates (shared input guard of both impls).
+ pub(crate) fn finite_point(op: &'static str, p: P3) -> Result<(), KernelError> {
+     if p.iter().all(|c| c.is_finite()) {
+diff --git a/crates/kernel/src/solidcore_blend.rs b/crates/kernel/src/solidcore_blend.rs
+new file mode 100644
+index 00000000..c4db3126
+--- /dev/null
++++ b/crates/kernel/src/solidcore_blend.rs
+@@ -0,0 +1,170 @@
++//! Edge blends (round, chamfer) through solidcore: picks resolved to edges by
++//! sampling each edge's curve, then the port's `fillet_edges` (SmApiFilletEdges)
++//! and a result law around it. The pick distance is sampling plus a
++//! golden-section refinement (Kiefer 1953).
++//! Provenance: calls solidcore 1.0.1's public fillet API as documented in its
++//! rustdoc (blend::fillet_executive::api) and its public tests (the
++//! nearest-edge pick follows tests/issue_398_shell_box_rounds_chamfer_fillet.rs);
++//! the guards are our own design.
++
++use solidcore::EdgeId;
++use solidcore::blend::fillet_executive::api::fillet_edges;
++use solidcore::math::Point3;
++use solidcore::topology::{Brep, Edge};
++
++use crate::solidcore_impl::{SolidcoreKernel, VOLUME_ACCURACY, checked, failed};
++use crate::{Blend, Kernel, KernelError, Measure, P3, PICK_TOL, finite_point, positive_len};
++
++/// Samples per edge for the nearest-edge search.
++const SAMPLES: u32 = 256;
++/// Golden-section steps after sampling (0.618^60 of one sample interval).
++const REFINE_STEPS: u32 = 60;
++
++/// SmApiFilletEdges cross-section codes (0 linear, any other circular).
++const XSECT_LINEAR: u32 = 0;
++const XSECT_CIRCULAR: u32 = 1;
++
++fn invalid(detail: String) -> KernelError {
++    KernelError::InvalidInput {
++        op: "blend_edges",
++        detail,
++    }
++}
++
++/// Distance from `p` to the nearest sample of the edge's curve, `None` for
++/// an edge without a curve or a curve that does not evaluate.
++fn edge_distance(k: &solidcore::Kernel, e: &Edge, p: Point3) -> Option<f64> {
++    let c = e.curve.as_ref()?;
++    let (t0, t1) = (e.interval.min(), e.interval.max());
++    let dist = |t: f64| -> Option<f64> {
++        let q = c.evaluate_point(k, t).ok()?;
++        Some(((q.x - p.x).powi(2) + (q.y - p.y).powi(2) + (q.z - p.z).powi(2)).sqrt())
++    };
++    let step = (t1 - t0) / f64::from(SAMPLES);
++    let mut best = (f64::INFINITY, t0);
++    for i in 0..=SAMPLES {
++        let t = t0 + step * f64::from(i);
++        let d = dist(t)?;
++        if d < best.0 {
++            best = (d, t);
++        }
++    }
++    // Golden-section refinement over the bracketing sample interval: the
++    // distance along a smooth curve is unimodal between two samples this
++    // close (Kiefer 1953; any numerical-methods text).
++    let (mut a, mut b) = ((best.1 - step).max(t0), (best.1 + step).min(t1));
++    let g = (5.0_f64.sqrt() - 1.0) / 2.0;
++    for _ in 0..REFINE_STEPS {
++        let (x1, x2) = (b - g * (b - a), a + g * (b - a));
++        if dist(x1)? < dist(x2)? {
++            b = x2;
++        } else {
++            a = x1;
++        }
++    }
++    let refined = dist(0.5 * (a + b))?.min(best.0);
++    refined.is_finite().then_some(refined)
++}
++
++/// The edge each pick names: the nearest one, which must lie within
++/// [`PICK_TOL`]. Refused: a pick within tolerance of two edges (a vertex, or
++/// a rim point on a cylinder's seam - which one was meant is a guess), and a
++/// pick naming an edge another pick already named.
++fn resolve_picks(
++    k: &solidcore::Kernel,
++    b: &Brep,
++    picks: &[P3],
++) -> Result<Vec<EdgeId>, KernelError> {
++    if picks.is_empty() {
++        return Err(invalid("no edge picks".into()));
++    }
++    let mut out: Vec<EdgeId> = Vec::with_capacity(picks.len());
++    for &pick in picks {
++        finite_point("blend_edges", pick)?;
++        let p = Point3::new(pick[0], pick[1], pick[2]);
++        let mut near: Vec<(f64, EdgeId)> = b
++            .edges()
++            .iter()
++            .filter_map(|(id, e)| edge_distance(k, e, p).map(|d| (d, id)))
++            .collect();
++        near.sort_by(|a, c| a.0.total_cmp(&c.0));
++        if let Some((d2, _)) = near.get(1)
++            && *d2 <= PICK_TOL
++        {
++            return Err(invalid(format!(
++                "pick {pick:?} is ambiguous: it lies on more than one edge (second at {d2:.3e})"
++            )));
++        }
++        match near.first().copied() {
++            Some((d, id)) if d <= PICK_TOL => {
++                if out.contains(&id) {
++                    return Err(invalid(format!(
++                        "pick {pick:?} names an edge already picked"
++                    )));
++                }
++                out.push(id);
++            }
++            Some((d, _)) => {
++                return Err(invalid(format!(
++                    "pick {pick:?} is {d:.3e} from the nearest edge (tolerance {PICK_TOL})"
++                )));
++            }
++            None => return Err(invalid(format!("pick {pick:?}: the solid has no edges"))),
++        }
++    }
++    Ok(out)
++}
++
++/// The result law: a closed manifold solid (`checked`), inside the source's
++/// bounding box (a blend only trims or fills between the faces it joins),
++/// and a volume that actually moved (a blend that changed nothing did not
++/// happen). A backstop, not a proof: a blend that ate a neighbouring face
++/// but stayed inside the box passes this law - the bench's closed forms are
++/// what prove the port.
++fn result_law(before: &Measure, after: &Measure, b: Brep, tol: f64) -> Result<Brep, KernelError> {
++    let outside =
++        (0..3).any(|i| after.min[i] < before.min[i] - tol || after.max[i] > before.max[i] + tol);
++    // Ten times the integrator's relative accuracy: below that a change is noise.
++    let unmoved = (after.volume - before.volume).abs() <= 10.0 * VOLUME_ACCURACY * before.volume;
++    if outside || unmoved {
++        Err(KernelError::InvalidResult {
++            kernel: "solidcore",
++            op: "blend_edges",
++            detail: format!(
++                "blend left the source envelope or did not change the volume: {before:?} -> {after:?}"
++            ),
++        })
++    } else {
++        Ok(b)
++    }
++}
++
++/// [`Kernel::blend_edges`] for solidcore.
++pub(crate) fn blend_edges(
++    sk: &mut SolidcoreKernel,
++    mut s: Brep,
++    picks: &[P3],
++    radius: f64,
++    kind: Blend,
++) -> Result<Brep, KernelError> {
++    positive_len("blend_edges", "radius", radius)?;
++    let before = sk.measure(&mut s)?;
++    let thinnest = (0..3)
++        .map(|i| before.max[i] - before.min[i])
++        .fold(f64::INFINITY, f64::min);
++    if radius * 2.0 >= thinnest {
++        return Err(invalid(format!(
++            "radius {radius} does not fit a solid whose thinnest extent is {thinnest}"
++        )));
++    }
++    let edges = resolve_picks(&sk.k, &s, picks)?;
++    let xsect = match kind {
++        Blend::Round => XSECT_CIRCULAR,
++        Blend::Chamfer => XSECT_LINEAR,
++    };
++    fillet_edges(&mut sk.k, &mut s, &edges, radius, xsect, 1, 1.0)
++        .map_err(|e| failed("blend_edges", &e))?;
++    let mut r = checked("blend_edges", s)?;
++    let after = sk.measure(&mut r)?;
++    result_law(&before, &after, r, 1e-9 * thinnest.max(1.0))
++}
+diff --git a/crates/kernel/src/solidcore_impl.rs b/crates/kernel/src/solidcore_impl.rs
+index 74cfa423..71604880 100644
+--- a/crates/kernel/src/solidcore_impl.rs
++++ b/crates/kernel/src/solidcore_impl.rs
+@@ -1,11 +1,11 @@
+-//! The solidcore (SMLib port) impl of the kernel seam: primitives, boolean
+-//! difference, whole offset, and exact measure via the port's mass-property
++//! The solidcore (SMLib port) impl of the kernel seam: primitives, the three
++//! booleans, whole offset, edge blends (solidcore_blend.rs), and exact measure via the port's mass-property
+ //! integrator and tight bounding box.
+ //! Provenance: calls solidcore 1.0.1's public API as documented in its
+ //! rustdoc and its own public tests (boolean_api.rs, offset fixtures); no
+ //! SMLib/solidcore internals reimplemented here.
+ 
+-use solidcore::boolean::api_brep::boolean_difference;
++use solidcore::boolean::api_brep::{boolean_difference, boolean_intersection, boolean_union};
+ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
+ use solidcore::mass::integrator::properties::{PropertyAttributes, brep_volume};
+ use solidcore::math::Point3;
+@@ -14,7 +14,9 @@ use solidcore::primitive::api_primitives as prim;
+ use solidcore::query::brep::{BoundingBoxOptions, calculate_bounding_box};
+ use solidcore::topology::Brep;
+ 
+-use crate::{Kernel, KernelError, Measure, P3, finite_point, offset_distance, positive_len};
++use crate::{
++    Blend, Kernel, KernelError, Measure, P3, finite_point, offset_distance, positive_len,
++};
+ 
+ const NAME: &str = "solidcore";
+ 
+@@ -31,7 +33,7 @@ pub struct SolidcoreKernel {
+     pub k: solidcore::Kernel,
+ }
+ 
+-fn failed(op: &'static str, e: &solidcore::SolidError) -> KernelError {
++pub(crate) fn failed(op: &'static str, e: &solidcore::SolidError) -> KernelError {
+     KernelError::Failed {
+         kernel: NAME,
+         op,
+@@ -43,9 +45,24 @@ fn p(v: P3) -> Point3 {
+     Point3::new(v[0], v[1], v[2])
+ }
+ 
++/// An operand with no faces is refused before the port sees it: the port
++/// answers `box & empty` with the whole box, a wrong answer dressed as a
++/// solid (pinned in tests/corrupt_input.rs), and an empty operand is a
++/// caller bug for every boolean.
++fn operands(op: &'static str, a: &Brep, b: &Brep) -> Result<(), KernelError> {
++    if a.faces().is_empty() || b.faces().is_empty() {
++        Err(KernelError::InvalidInput {
++            op,
++            detail: "empty operand (a B-rep with no faces)".into(),
++        })
++    } else {
++        Ok(())
++    }
++}
++
+ /// A result must pass the port's integrity check and be a closed manifold
+ /// solid before the seam hands it out.
+-fn checked(op: &'static str, b: Brep) -> Result<Brep, KernelError> {
++pub(crate) fn checked(op: &'static str, b: Brep) -> Result<Brep, KernelError> {
+     solidcore::topology::integrity::check(&b).map_err(|e| KernelError::InvalidResult {
+         kernel: NAME,
+         op,
+@@ -90,10 +107,34 @@ impl Kernel for SolidcoreKernel {
+     }
+ 
+     fn boolean_subtract(&mut self, a: Brep, b: Brep) -> Result<Brep, KernelError> {
++        operands("boolean_subtract", &a, &b)?;
+         let r = boolean_difference(&mut self.k, a, b).map_err(|e| failed("boolean_subtract", &e))?;
+         checked("boolean_subtract", r)
+     }
+ 
++    fn boolean_union(&mut self, a: Brep, b: Brep) -> Result<Brep, KernelError> {
++        operands("boolean_union", &a, &b)?;
++        let r = boolean_union(&mut self.k, a, b).map_err(|e| failed("boolean_union", &e))?;
++        checked("boolean_union", r)
++    }
++
++    fn boolean_intersect(&mut self, a: Brep, b: Brep) -> Result<Brep, KernelError> {
++        operands("boolean_intersect", &a, &b)?;
++        let r = boolean_intersection(&mut self.k, a, b)
++            .map_err(|e| failed("boolean_intersect", &e))?;
++        checked("boolean_intersect", r)
++    }
++
++    fn blend_edges(
++        &mut self,
++        s: Brep,
++        picks: &[P3],
++        radius: f64,
++        kind: Blend,
++    ) -> Result<Brep, KernelError> {
++        crate::solidcore_blend::blend_edges(self, s, picks, radius, kind)
++    }
++
+     /// Guards around the port's offset, each one answering a bench finding
+     /// (see tests/corrupt_input.rs `KNOWN_PORT_FINDINGS`):
+     /// - `merge_results: true` - with SMLib's default `false`, a plain box
+diff --git a/crates/kernel/src/truck_impl.rs b/crates/kernel/src/truck_impl.rs
+index 0b8f9591..c7325b2f 100644
+--- a/crates/kernel/src/truck_impl.rs
++++ b/crates/kernel/src/truck_impl.rs
+@@ -1,7 +1,7 @@
+ //! The truck reference impl of the kernel seam (feature `truck`, bench only):
+-//! sweep-built primitives, boolean subtract via truck-shapeops `and` with the
+-//! tool inverted, measure via truck-meshalgo tessellation. truck has no solid
+-//! offset, so `offset` is `Unsupported`.
++//! sweep-built primitives, booleans via truck-shapeops `and` / `or` (subtract
++//! is `and` with the tool inverted), measure via truck-meshalgo tessellation.
++//! truck has no solid offset and no edge blend: both are `Unsupported`.
+ //! Provenance: calls truck's public API as shown in its published examples
+ //! (truck-shapeops `punched-cube-shapeops`, truck-meshalgo rustdoc); no truck
+ //! internals reimplemented.
+@@ -12,7 +12,7 @@ use truck_meshalgo::tessellation::{MeshedShape, RobustMeshableShape};
+ use truck_modeling::{Point3, Rad, Solid, Vector3, builder};
+ 
+ use crate::{
+-    Kernel, KernelError, Measure, P3, finite_point, mesh_signed_volume, positive_len,
++    Blend, Kernel, KernelError, Measure, P3, finite_point, mesh_signed_volume, positive_len,
+ };
+ 
+ const NAME: &str = "truck";
+@@ -55,6 +55,19 @@ fn contained<T>(op: &'static str, f: impl FnOnce() -> Option<T>) -> Result<T, Ke
+     }
+ }
+ 
++/// A boolean result with no boundary shell is empty: an `Err`, not a solid.
++fn non_empty(op: &'static str, r: Solid) -> Result<Solid, KernelError> {
++    if r.boundaries().is_empty() {
++        Err(KernelError::InvalidResult {
++            kernel: NAME,
++            op,
++            detail: "empty result".into(),
++        })
++    } else {
++        Ok(r)
++    }
++}
++
+ impl Kernel for TruckKernel {
+     type Solid = Solid;
+ 
+@@ -95,14 +108,32 @@ impl Kernel for TruckKernel {
+             b.not();
+             truck_shapeops::and(&a, &b, tol)
+         })?;
+-        if r.boundaries().is_empty() {
+-            return Err(KernelError::InvalidResult {
+-                kernel: NAME,
+-                op: "boolean_subtract",
+-                detail: "empty result".into(),
+-            });
+-        }
+-        Ok(r)
++        non_empty("boolean_subtract", r)
++    }
++
++    fn boolean_union(&mut self, a: Solid, b: Solid) -> Result<Solid, KernelError> {
++        let tol = self.boolean_tol;
++        let r = contained("boolean_union", || truck_shapeops::or(&a, &b, tol))?;
++        non_empty("boolean_union", r)
++    }
++
++    fn boolean_intersect(&mut self, a: Solid, b: Solid) -> Result<Solid, KernelError> {
++        let tol = self.boolean_tol;
++        let r = contained("boolean_intersect", || truck_shapeops::and(&a, &b, tol))?;
++        non_empty("boolean_intersect", r)
++    }
++
++    fn blend_edges(
++        &mut self,
++        _s: Solid,
++        _picks: &[P3],
++        _radius: f64,
++        _kind: Blend,
++    ) -> Result<Solid, KernelError> {
++        Err(KernelError::Unsupported {
++            kernel: NAME,
++            op: "blend_edges",
++        })
+     }
+ 
+     fn offset(&mut self, _s: &mut Solid, _distance: f64) -> Result<Solid, KernelError> {
+diff --git a/crates/kernel/tests/agreement.rs b/crates/kernel/tests/agreement.rs
+index fe334ec1..7dfd04da 100644
+--- a/crates/kernel/tests/agreement.rs
++++ b/crates/kernel/tests/agreement.rs
+@@ -1,8 +1,9 @@
+-//! The dual-kernel agreement bench (M12.1 retirement gate, stage 1): the same
+-//! boolean/offset fixtures through truck and solidcore, measured (volume +
+-//! bounding box) and compared against each other AND against the closed-form
+-//! answer, so a disagreement is located to the engine that left the analytic
+-//! value - a finding against that engine, never a tolerance to widen.
++//! The dual-kernel agreement bench (M12.1 retirement gate): the same
++//! boolean (subtract, union, intersect) and offset fixtures through truck and
++//! solidcore, measured (volume + bounding box) and compared against each other
++//! AND against the closed-form answer, so a disagreement is located to the
++//! engine that left the analytic value - a finding against that engine, never
++//! a tolerance to widen. Edge blends live in blend.rs (solidcore only).
+ //! Provenance: our own fixtures; closed forms are elementary solid geometry
+ //! (box/cylinder volumes, Steiner's formula for the rounded box offset).
+ //!
+@@ -15,13 +16,21 @@
+ //! (planar faces tessellate exactly), with a 1e-6 relative floor. solidcore
+ //! integrates exactly at 1e-7 relative, so it is held to 1e-6 relative.
+ 
++mod common;
++
+ use std::f64::consts::PI;
+ 
+ use camcraft_kernel::solidcore_impl::SolidcoreKernel;
+ use camcraft_kernel::truck_impl::TruckKernel;
+ use camcraft_kernel::{Kernel, KernelError, Measure, P3};
++use common::{REL_FLOOR, Want, verdict};
+ 
+-const REL_FLOOR: f64 = 1e-6;
++#[derive(Clone, Copy)]
++enum Op {
++    Subtract,
++    Union,
++    Intersect,
++}
+ 
+ enum Tool {
+     Box(P3, P3),
+@@ -29,49 +38,79 @@ enum Tool {
+ }
+ 
+ struct Fixture {
+-    name: &'static str,
++    want: Want,
++    op: Op,
+     stock: (P3, P3),
+     tool: Tool,
+-    volume: f64,
+-    bbox: (P3, P3),
+     /// Curved surface area of the result (drives truck's volume budget).
+     curved_area: f64,
+ }
+ 
++fn fx(name: &'static str, op: Op, stock: (P3, P3), tool: Tool, volume: f64, bbox: (P3, P3), curved_area: f64) -> Fixture {
++    Fixture {
++        want: Want { name, volume, bbox },
++        op,
++        stock,
++        tool,
++        curved_area,
++    }
++}
++
+ fn fixtures() -> Vec<Fixture> {
++    use Op::*;
++    let cube = ([0.0; 3], [10.0; 3]);
+     vec![
+-        Fixture {
+-            name: "box-minus-box-corner",
+-            stock: ([0.0; 3], [10.0; 3]),
+-            tool: Tool::Box([5.0; 3], [10.0; 3]),
+-            volume: 875.0,
+-            bbox: ([0.0; 3], [10.0; 3]),
+-            curved_area: 0.0,
+-        },
+-        Fixture {
+-            name: "box-minus-box-slot",
+-            stock: ([0.0; 3], [20.0, 10.0, 10.0]),
+-            tool: Tool::Box([5.0, -1.0, 5.0], [10.0, 12.0, 10.0]),
+-            volume: 1500.0,
+-            bbox: ([0.0; 3], [20.0, 10.0, 10.0]),
+-            curved_area: 0.0,
+-        },
+-        Fixture {
+-            name: "cylinder-through-box",
+-            stock: ([0.0; 3], [10.0; 3]),
+-            tool: Tool::Cyl([5.0, 5.0, -1.0], 2.0, 12.0),
+-            volume: 1000.0 - 40.0 * PI,
+-            bbox: ([0.0; 3], [10.0; 3]),
+-            curved_area: 2.0 * PI * 2.0 * 10.0,
+-        },
+-        Fixture {
+-            name: "cylinder-blind-pocket",
+-            stock: ([0.0; 3], [20.0, 20.0, 10.0]),
+-            tool: Tool::Cyl([10.0, 10.0, 5.0], 3.0, 10.0),
+-            volume: 4000.0 - 45.0 * PI,
+-            bbox: ([0.0; 3], [20.0, 20.0, 10.0]),
+-            curved_area: 2.0 * PI * 3.0 * 5.0,
+-        },
++        fx("box-minus-box-corner", Subtract, cube, Tool::Box([5.0; 3], [10.0; 3]), 875.0, cube, 0.0),
++        fx(
++            "box-minus-box-slot",
++            Subtract,
++            ([0.0; 3], [20.0, 10.0, 10.0]),
++            Tool::Box([5.0, -1.0, 5.0], [10.0, 12.0, 10.0]),
++            1500.0,
++            ([0.0; 3], [20.0, 10.0, 10.0]),
++            0.0,
++        ),
++        fx(
++            "cylinder-through-box",
++            Subtract,
++            cube,
++            Tool::Cyl([5.0, 5.0, -1.0], 2.0, 12.0),
++            1000.0 - 40.0 * PI,
++            cube,
++            2.0 * PI * 2.0 * 10.0,
++        ),
++        fx(
++            "cylinder-blind-pocket",
++            Subtract,
++            ([0.0; 3], [20.0, 20.0, 10.0]),
++            Tool::Cyl([10.0, 10.0, 5.0], 3.0, 10.0),
++            4000.0 - 45.0 * PI,
++            ([0.0; 3], [20.0, 20.0, 10.0]),
++            2.0 * PI * 3.0 * 5.0,
++        ),
++        // Union: 2 * 1000 minus the shared 5-cube.
++        fx("box-union-box-corner", Union, cube, Tool::Box([5.0; 3], [10.0; 3]), 1875.0, ([0.0; 3], [15.0; 3]), 0.0),
++        // A r2 boss standing 5 above the top face.
++        fx(
++            "box-union-cylinder-boss",
++            Union,
++            cube,
++            Tool::Cyl([5.0, 5.0, 5.0], 2.0, 10.0),
++            1000.0 + 20.0 * PI,
++            ([0.0; 3], [10.0, 10.0, 15.0]),
++            2.0 * PI * 2.0 * 5.0,
++        ),
++        fx("box-intersect-box-corner", Intersect, cube, Tool::Box([5.0; 3], [10.0; 3]), 125.0, ([5.0; 3], [10.0; 3]), 0.0),
++        // The cylinder clipped to the cube's height.
++        fx(
++            "box-intersect-cylinder",
++            Intersect,
++            cube,
++            Tool::Cyl([5.0, 5.0, -1.0], 2.0, 12.0),
++            40.0 * PI,
++            ([3.0, 3.0, 0.0], [7.0, 7.0, 10.0]),
++            2.0 * PI * 2.0 * 10.0,
++        ),
+     ]
+ }
+ 
+@@ -81,60 +120,38 @@ fn run<K: Kernel>(k: &mut K, f: &Fixture) -> Result<Measure, KernelError> {
+         Tool::Box(o, s) => k.make_box(o, s)?,
+         Tool::Cyl(b, r, h) => k.make_cylinder(b, r, h)?,
+     };
+-    let mut r = k.boolean_subtract(stock, tool)?;
++    let mut r = match f.op {
++        Op::Subtract => k.boolean_subtract(stock, tool)?,
++        Op::Union => k.boolean_union(stock, tool)?,
++        Op::Intersect => k.boolean_intersect(stock, tool)?,
++    };
+     k.measure(&mut r)
+ }
+ 
+-fn want(f: &Fixture) -> Measure {
+-    Measure {
+-        volume: f.volume,
+-        min: f.bbox.0,
+-        max: f.bbox.1,
+-    }
+-}
+-
+-/// One engine's verdict on one fixture, `Err` = a located finding.
+-fn verdict(engine: &str, m: &Measure, f: &Fixture, vol_tol: f64, box_tol: f64) -> Result<(), String> {
+-    let w = want(f);
+-    let dv = (m.volume - w.volume).abs();
+-    let db = m.bbox_deviation(&w);
+-    println!(
+-        "{:<24} {:<9} V={:.9} (analytic {:.9}, |dV|={:.3e} tol {:.3e}) bbox dev {:.3e} tol {:.3e}",
+-        f.name, engine, m.volume, w.volume, dv, vol_tol, db, box_tol
+-    );
+-    if dv > vol_tol || db > box_tol {
+-        Err(format!(
+-            "{}: {engine} left the closed form (|dV|={dv:.3e} > {vol_tol:.3e} or bbox {db:.3e} > {box_tol:.3e}); measured {m:?}",
+-            f.name
+-        ))
+-    } else {
+-        Ok(())
+-    }
+-}
+-
+ fn bench(f: &Fixture, truck: &mut TruckKernel) -> Vec<String> {
+     let mut findings = Vec::new();
++    let name = f.want.name;
+     let mut sc = SolidcoreKernel::default();
+-    let sc_tol = REL_FLOOR * f.volume;
++    let sc_tol = REL_FLOOR * f.want.volume;
+     let t = truck.mesh_tol + truck.boolean_tol;
+     let tr_vol_tol = (f.curved_area * t).max(sc_tol);
+     let tr_box_tol = if f.curved_area > 0.0 { t } else { 1e-6 };
+     let sc_m = run(&mut sc, f);
+     let tr_m = run(truck, f);
+     match &sc_m {
+-        Ok(m) => findings.extend(verdict("solidcore", m, f, sc_tol, 1e-6).err()),
+-        Err(e) => findings.push(format!("{}: solidcore error: {e}", f.name)),
++        Ok(m) => findings.extend(verdict("solidcore", m, &f.want, sc_tol, 1e-6).err()),
++        Err(e) => findings.push(format!("{name}: solidcore error: {e}")),
+     }
+     match &tr_m {
+-        Ok(m) => findings.extend(verdict("truck", m, f, tr_vol_tol, tr_box_tol).err()),
+-        Err(e) => findings.push(format!("{}: truck error: {e}", f.name)),
++        Ok(m) => findings.extend(verdict("truck", m, &f.want, tr_vol_tol, tr_box_tol).err()),
++        Err(e) => findings.push(format!("{name}: truck error: {e}")),
+     }
+     if let (Ok(a), Ok(b)) = (&sc_m, &tr_m) {
+         // The cross-engine check: within the looser (truck) budget.
+         let dv = (a.volume - b.volume).abs();
+-        println!("{:<24} cross     |V_sc - V_truck| = {dv:.3e}", f.name);
++        println!("{name:<26} cross     |V_sc - V_truck| = {dv:.3e}");
+         if dv > tr_vol_tol + sc_tol || a.bbox_deviation(b) > tr_box_tol + 1e-6 {
+-            findings.push(format!("{}: engines disagree: solidcore {a:?} vs truck {b:?}", f.name));
++            findings.push(format!("{name}: engines disagree: solidcore {a:?} vs truck {b:?}"));
+         }
+     }
+     findings
+@@ -164,17 +181,25 @@ fn boolean_fixtures_agree_at_fine_tessellation() {
+ /// solidcore is benched against the closed form alone.
+ #[test]
+ fn offset_fixtures_match_closed_form() {
+-    // (name, distance, volume, bbox)
+     let a = 10.0_f64;
+-    let cases: [(&str, f64, f64, (P3, P3)); 2] = [
++    let cases = [
++        // Steiner: V + S d + (pi d^2 / 4) * sum(edges) + 4/3 pi d^3
+         (
+-            // Steiner: V + S d + (pi d^2 / 4) * sum(edges) + 4/3 pi d^3
+-            "box-offset-out-1",
+             1.0,
+-            a.powi(3) + 6.0 * a * a + PI / 4.0 * 12.0 * a + 4.0 / 3.0 * PI,
+-            ([-1.0; 3], [11.0; 3]),
++            Want {
++                name: "box-offset-out-1",
++                volume: a.powi(3) + 6.0 * a * a + PI / 4.0 * 12.0 * a + 4.0 / 3.0 * PI,
++                bbox: ([-1.0; 3], [11.0; 3]),
++            },
++        ),
++        (
++            -1.0,
++            Want {
++                name: "box-offset-in-1",
++                volume: 8.0_f64.powi(3),
++                bbox: ([1.0; 3], [9.0; 3]),
++            },
+         ),
+-        ("box-offset-in-1", -1.0, 8.0_f64.powi(3), ([1.0; 3], [9.0; 3])),
+     ];
+     let mut truck = TruckKernel::default();
+     let mut tb = truck.make_box([0.0; 3], [a; 3]).ok();
+@@ -182,23 +207,15 @@ fn offset_fixtures_match_closed_form() {
+         assert!(matches!(truck.offset(b, 1.0), Err(KernelError::Unsupported { .. })));
+     }
+     let mut findings = Vec::new();
+-    for (name, d, volume, bbox) in cases {
++    for (d, w) in cases {
+         let mut sc = SolidcoreKernel::default();
+-        let f = Fixture {
+-            name,
+-            stock: ([0.0; 3], [a; 3]),
+-            tool: Tool::Box([0.0; 3], [1.0; 3]),
+-            volume,
+-            bbox,
+-            curved_area: 0.0,
+-        };
+         let m = sc
+             .make_box([0.0; 3], [a; 3])
+             .and_then(|mut b| sc.offset(&mut b, d))
+             .and_then(|mut r| sc.measure(&mut r));
+         match m {
+-            Ok(m) => findings.extend(verdict("solidcore", &m, &f, REL_FLOOR * volume, 1e-6).err()),
+-            Err(e) => findings.push(format!("{name}: solidcore error: {e}")),
++            Ok(m) => findings.extend(verdict("solidcore", &m, &w, REL_FLOOR * w.volume, 1e-6).err()),
++            Err(e) => findings.push(format!("{}: solidcore error: {e}", w.name)),
+         }
+     }
+     assert!(findings.is_empty(), "offset findings:\n{}", findings.join("\n"));
+@@ -209,7 +226,11 @@ fn offset_fixtures_match_closed_form() {
+ #[ignore = "heavy lane: offset of a boolean result (cylinder-through-box, inset 0.5)"]
+ fn holed_box_inset_matches_closed_form() {
+     let mut sc = SolidcoreKernel::default();
+-    let want_v = 9.0_f64.powi(3) - PI * 2.5 * 2.5 * 9.0;
++    let w = Want {
++        name: "holed-box-inset-0.5",
++        volume: 9.0_f64.powi(3) - PI * 2.5 * 2.5 * 9.0,
++        bbox: ([0.5; 3], [9.5; 3]),
++    };
+     let m = (|| {
+         let s = sc.make_box([0.0; 3], [10.0; 3])?;
+         let c = sc.make_cylinder([5.0, 5.0, -1.0], 2.0, 12.0)?;
+@@ -217,17 +238,9 @@ fn holed_box_inset_matches_closed_form() {
+         let mut r = sc.offset(&mut holed, -0.5)?;
+         sc.measure(&mut r)
+     })();
+-    let f = Fixture {
+-        name: "holed-box-inset-0.5",
+-        stock: ([0.0; 3], [10.0; 3]),
+-        tool: Tool::Box([0.0; 3], [1.0; 3]),
+-        volume: want_v,
+-        bbox: ([0.5; 3], [9.5; 3]),
+-        curved_area: 0.0,
+-    };
+     match m {
+         Ok(m) => {
+-            let r = verdict("solidcore", &m, &f, REL_FLOOR * want_v, 1e-6);
++            let r = verdict("solidcore", &m, &w, REL_FLOOR * w.volume, 1e-6);
+             assert!(r.is_ok(), "{r:?}");
+         }
+         Err(e) => panic!("holed-box-inset-0.5: solidcore error: {e}"),
+diff --git a/crates/kernel/tests/blend.rs b/crates/kernel/tests/blend.rs
+new file mode 100644
+index 00000000..231050e4
+--- /dev/null
++++ b/crates/kernel/tests/blend.rs
+@@ -0,0 +1,289 @@
++//! Edge-blend bench (M12.1 retirement gate, fillets): constant-radius rounds
++//! and chamfers through solidcore, measured against closed forms. truck has
++//! no edge blend (`Unsupported`, asserted) - so this is a one-engine bench,
++//! and the cross-engine leg is "not yet" for every blend, never a pass.
++//! Provenance: our own fixtures; closed forms are elementary solid geometry -
++//! a round of radius r on a right-angle edge of length L removes
++//! r^2 (1 - pi/4) L, a chamfer of setback d removes d^2 L / 2, a blend along
++//! a circular rim removes its section area times the path of the section's
++//! centroid (Pappus's second theorem), a box rounded on all edges is the
++//! inner box grown by a ball (Steiner's formula), and the all-edge chamfer
++//! is inclusion-exclusion over the edge prisms.
++//!
++//! Gate map (M12.1): covers camcraft_kernel::{solidcore_impl, solidcore_blend}.
++
++mod common;
++
++use std::f64::consts::PI;
++
++use camcraft_kernel::solidcore_impl::SolidcoreKernel;
++use camcraft_kernel::truck_impl::TruckKernel;
++use camcraft_kernel::{Blend, Kernel, KernelError, Measure, P3};
++use common::{REL_FLOOR, Want, verdict};
++
++const CUBE: (P3, P3) = ([0.0; 3], [10.0; 3]);
++/// The four vertical edges of the 10-cube, picked at mid-height.
++const VERTICAL: [P3; 4] = [
++    [0.0, 0.0, 5.0],
++    [10.0, 0.0, 5.0],
++    [0.0, 10.0, 5.0],
++    [10.0, 10.0, 5.0],
++];
++const CYL_V: f64 = PI * 9.0 * 10.0;
++const CYL_BOX: (P3, P3) = ([-3.0, -3.0, 0.0], [3.0, 3.0, 10.0]);
++
++/// Section area a round of radius `r` removes from a right-angle edge.
++fn round_section(r: f64) -> f64 {
++    r * r * (1.0 - PI / 4.0)
++}
++
++/// Centroid of that section, measured from the edge's corner along either
++/// face: r (10 - 3 pi) / (12 - 3 pi).
++fn round_centroid(r: f64) -> f64 {
++    r * (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI)
++}
++
++fn blended_cube(picks: &[P3], r: f64, kind: Blend) -> Result<Measure, KernelError> {
++    let mut sc = SolidcoreKernel::default();
++    let b = sc.make_box(CUBE.0, CUBE.1)?;
++    let mut out = sc.blend_edges(b, picks, r, kind)?;
++    sc.measure(&mut out)
++}
++
++/// An L block: a 20x10x10 slab with a 10-cube standing on its left half
++/// (united), blended along the concave edge where they meet.
++fn blended_l(r: f64, kind: Blend) -> Result<Measure, KernelError> {
++    let mut sc = SolidcoreKernel::default();
++    let slab = sc.make_box([0.0; 3], [20.0, 10.0, 10.0])?;
++    let tower = sc.make_box([0.0, 0.0, 10.0], [10.0; 3])?;
++    let l = sc.boolean_union(slab, tower)?;
++    let mut out = sc.blend_edges(l, &[[10.0, 5.0, 10.0]], r, kind)?;
++    sc.measure(&mut out)
++}
++
++/// A r3 x 10 cylinder at the origin with rims blended (picks clear of the
++/// seam line at +X, so each names a rim and not the seam).
++fn blended_cylinder(
++    sc: &mut SolidcoreKernel,
++    picks: &[P3],
++    r: f64,
++    kind: Blend,
++) -> Result<Measure, KernelError> {
++    let c = sc.make_cylinder([0.0; 3], 3.0, 10.0)?;
++    let mut out = sc.blend_edges(c, picks, r, kind)?;
++    sc.measure(&mut out)
++}
++
++fn check(w: &Want, m: Result<Measure, KernelError>) -> Option<String> {
++    match m {
++        Ok(m) => verdict("solidcore", &m, w, REL_FLOOR * w.volume, 1e-6).err(),
++        Err(e) => Some(format!("{}: solidcore error: {e}", w.name)),
++    }
++}
++
++fn want(name: &'static str, volume: f64, bbox: (P3, P3)) -> Want {
++    Want { name, volume, bbox }
++}
++
++#[test]
++fn truck_offers_no_edge_blend() {
++    let mut truck = TruckKernel::default();
++    let r = truck
++        .make_box(CUBE.0, CUBE.1)
++        .and_then(|b| truck.blend_edges(b, &[[5.0, 0.0, 0.0]], 2.0, Blend::Round));
++    assert!(
++        matches!(
++            r,
++            Err(KernelError::Unsupported {
++                kernel: "truck",
++                op: "blend_edges"
++            })
++        ),
++        "truck blend: {:?}",
++        r.map(|_| "Ok")
++    );
++}
++
++#[test]
++fn cube_blends_match_closed_form() {
++    let one: Vec<P3> = vec![[5.0, 0.0, 0.0]];
++    let mut all = VERTICAL.to_vec();
++    for z in [0.0, 10.0] {
++        all.extend([[5.0, 0.0, z], [5.0, 10.0, z], [0.0, 5.0, z], [10.0, 5.0, z]]);
++    }
++    let (a, d) = (10.0_f64, 2.0_f64);
++    let core = a - 2.0 * d;
++    // Steiner: the 6-cube grown by a radius-2 ball (spherical corners).
++    let all_round =
++        core.powi(3) + 6.0 * core * core * d + 3.0 * PI * d * d * core + 4.0 / 3.0 * PI * d.powi(3);
++    // Inclusion-exclusion over the 12 edge prisms (d^2 a / 2 each; at each of
++    // the 8 corners three pairs overlap d^3 / 3 and the triple d^3 / 4), less
++    // the tetrahedron each corner's flat bevel triangle (through the three
++    // setback points) cuts off, d^3 / 12.
++    let all_chamfer = a.powi(3) - 6.0 * a * d * d + 6.0 * d.powi(3) - 8.0 * d.powi(3) / 12.0;
++    let cases: [(&[P3], Blend, Want); 6] = [
++        (
++            &one,
++            Blend::Round,
++            want(
++                "cube-round-1-edge-r2",
++                1000.0 - 10.0 * round_section(d),
++                CUBE,
++            ),
++        ),
++        (
++            &VERTICAL,
++            Blend::Round,
++            want(
++                "cube-round-4-vertical-r2",
++                1000.0 - 40.0 * round_section(d),
++                CUBE,
++            ),
++        ),
++        (
++            &all,
++            Blend::Round,
++            want("cube-round-all-12-r2", all_round, CUBE),
++        ),
++        (
++            &one,
++            Blend::Chamfer,
++            want("cube-chamfer-1-edge-d2", 1000.0 - 10.0 * d * d / 2.0, CUBE),
++        ),
++        (
++            &VERTICAL,
++            Blend::Chamfer,
++            want(
++                "cube-chamfer-4-vertical-d2",
++                1000.0 - 40.0 * d * d / 2.0,
++                CUBE,
++            ),
++        ),
++        (
++            &all,
++            Blend::Chamfer,
++            want("cube-chamfer-all-12-d2", all_chamfer, CUBE),
++        ),
++    ];
++    let findings: Vec<String> = cases
++        .iter()
++        .filter_map(|(picks, kind, w)| check(w, blended_cube(picks, d, *kind)))
++        .collect();
++    assert!(
++        findings.is_empty(),
++        "blend findings:\n{}",
++        findings.join("\n")
++    );
++}
++
++/// Concave edges: the blend ADDS the section (the result law's envelope
++/// check must not mistake that for growth).
++#[test]
++fn concave_l_blends_match_closed_form() {
++    let bbox = ([0.0; 3], [20.0, 10.0, 20.0]);
++    let findings: Vec<String> = [
++        (
++            Blend::Round,
++            want(
++                "l-concave-round-r2",
++                3000.0 + 10.0 * round_section(2.0),
++                bbox,
++            ),
++        ),
++        (
++            Blend::Chamfer,
++            want("l-concave-chamfer-d2", 3000.0 + 10.0 * 2.0, bbox),
++        ),
++    ]
++    .iter()
++    .filter_map(|(kind, w)| check(w, blended_l(2.0, *kind)))
++    .collect();
++    assert!(
++        findings.is_empty(),
++        "blend findings:\n{}",
++        findings.join("\n")
++    );
++}
++
++/// Rounds along circular rims (Pappus), including a hole's rim in a boolean
++/// result, where the section sits outside the hole.
++#[test]
++fn rim_rounds_match_pappus() {
++    let r = 1.0;
++    let rim = round_section(r) * 2.0 * PI * (3.0 - round_centroid(r));
++    let mut findings = Vec::new();
++    let mut sc = SolidcoreKernel::default();
++    let w = want("cylinder-top-rim-round-r1", CYL_V - rim, CYL_BOX);
++    findings.extend(check(
++        &w,
++        blended_cylinder(&mut sc, &[[0.0, 3.0, 10.0]], r, Blend::Round),
++    ));
++    let w = want("cylinder-both-rims-round-r1", CYL_V - 2.0 * rim, CYL_BOX);
++    let both = [[0.0, 3.0, 10.0], [0.0, -3.0, 0.0]];
++    findings.extend(check(&w, blended_cylinder(&mut sc, &both, r, Blend::Round)));
++    let hole_r = 2.0;
++    let removed = round_section(r) * 2.0 * PI * (hole_r + round_centroid(r));
++    let w = want("hole-rim-round-r1", 1000.0 - 40.0 * PI - removed, CUBE);
++    let m = (|| {
++        let s = sc.make_box(CUBE.0, CUBE.1)?;
++        let c = sc.make_cylinder([5.0, 5.0, -1.0], hole_r, 12.0)?;
++        let holed = sc.boolean_subtract(s, c)?;
++        let mut out = sc.blend_edges(holed, &[[5.0, 5.0 + hole_r, 10.0]], r, Blend::Round)?;
++        sc.measure(&mut out)
++    })();
++    findings.extend(check(&w, m));
++    assert!(
++        findings.is_empty(),
++        "blend findings:\n{}",
++        findings.join("\n")
++    );
++}
++
++/// The chamfer of a circular rim is a cone; removed: (d^2 / 2) 2 pi (R - d/3).
++fn rim_chamfer_want() -> Want {
++    want(
++        "cylinder-top-rim-chamfer-d1",
++        CYL_V - 0.5 * 2.0 * PI * (3.0 - 1.0 / 3.0),
++        CYL_BOX,
++    )
++}
++
++/// NOT YET - a finding against the port's default path, pinned: SMLib 1.0.1
++/// traces a chamfer along an arc as an offset intersection instead of a cone
++/// (upstream WR-421, solidcore#420), leaving the closed form by ~1.9e-6
++/// relative. Must stay a finding; an upstream default that fixes it fails
++/// here and is promoted into the passing bench. Never counted as agreement.
++#[test]
++fn not_yet_rim_chamfer_default_path_stays_a_finding() {
++    let w = rim_chamfer_want();
++    let mut sc = SolidcoreKernel::default();
++    let f = check(
++        &w,
++        blended_cylinder(&mut sc, &[[0.0, 3.0, 10.0]], 1.0, Blend::Chamfer),
++    );
++    println!(
++        "{} not yet (WR-421, default path): {}",
++        w.name,
++        f.as_deref().unwrap_or("NOW AGREES")
++    );
++    assert!(
++        f.is_some(),
++        "{} now agrees on the default path - promote it",
++        w.name
++    );
++}
++
++/// The same chamfer with the port's opt-in fix `fillet_chamfer_cone_on_arc`
++/// agrees - what turning that fix on at the seam would buy (decision 3 in
++/// docs/decisions/27-solidcore-bench.md).
++#[test]
++fn rim_chamfer_agrees_with_cone_on_arc_fix() {
++    let mut sc = SolidcoreKernel::default();
++    sc.k.fixes.fillet_chamfer_cone_on_arc = true;
++    let w = rim_chamfer_want();
++    let f = check(
++        &w,
++        blended_cylinder(&mut sc, &[[0.0, 3.0, 10.0]], 1.0, Blend::Chamfer),
++    );
++    assert!(f.is_none(), "{f:?}");
++}
+diff --git a/crates/kernel/tests/common/mod.rs b/crates/kernel/tests/common/mod.rs
+new file mode 100644
+index 00000000..ee201562
+--- /dev/null
++++ b/crates/kernel/tests/common/mod.rs
+@@ -0,0 +1,51 @@
++//! Shared verdict helpers of the kernel benches: a closed-form answer and the
++//! check that locates a measured solid's departure from it to one engine.
++//! Provenance: our own bench design (M12.1 retirement gate).
++
++use camcraft_kernel::{Measure, P3};
++
++/// Relative volume floor every engine is held to (solidcore integrates at
++/// 1e-7 relative; the floor leaves one decade for the booleans' own error).
++pub const REL_FLOOR: f64 = 1e-6;
++
++/// The closed-form answer for one fixture.
++pub struct Want {
++    pub name: &'static str,
++    pub volume: f64,
++    pub bbox: (P3, P3),
++}
++
++impl Want {
++    pub fn measure(&self) -> Measure {
++        Measure {
++            volume: self.volume,
++            min: self.bbox.0,
++            max: self.bbox.1,
++        }
++    }
++}
++
++/// One engine's verdict on one fixture, `Err` = a located finding.
++pub fn verdict(
++    engine: &str,
++    m: &Measure,
++    w: &Want,
++    vol_tol: f64,
++    box_tol: f64,
++) -> Result<(), String> {
++    let wm = w.measure();
++    let dv = (m.volume - wm.volume).abs();
++    let db = m.bbox_deviation(&wm);
++    println!(
++        "{:<26} {:<9} V={:.9} (analytic {:.9}, |dV|={:.3e} tol {:.3e}) bbox dev {:.3e} tol {:.3e}",
++        w.name, engine, m.volume, wm.volume, dv, vol_tol, db, box_tol
++    );
++    if dv > vol_tol || db > box_tol {
++        Err(format!(
++            "{}: {engine} left the closed form (|dV|={dv:.3e} > {vol_tol:.3e} or bbox {db:.3e} > {box_tol:.3e}); measured {m:?}",
++            w.name
++        ))
++    } else {
++        Ok(())
++    }
++}
+diff --git a/crates/kernel/tests/corrupt_input.rs b/crates/kernel/tests/corrupt_input.rs
+index 061bd842..61f508e3 100644
+--- a/crates/kernel/tests/corrupt_input.rs
++++ b/crates/kernel/tests/corrupt_input.rs
+@@ -9,11 +9,13 @@
+ //! input list (zero/NaN/inf sizes, empty and open shells, collapsing offsets).
+ //!
+ //! Gate map (M12.1): covers camcraft_kernel::solidcore_impl and solidcore's
+-//! public primitive/boolean/offset/mass/query entry points.
++//! public primitive/boolean/offset/mass/query entry points, and the seam's
++//! blend and union/intersect guards (camcraft_kernel::solidcore_blend).
+ 
+-use camcraft_kernel::Kernel;
++use camcraft_kernel::{Blend, Kernel};
+ use camcraft_kernel::solidcore_impl::{SolidcoreKernel, VOLUME_ACCURACY};
+-use solidcore::boolean::api_brep::boolean_difference;
++use solidcore::blend::fillet_executive::api::fillet_edges;
++use solidcore::boolean::api_brep::{boolean_difference, boolean_intersection, boolean_union};
+ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
+ use solidcore::mass::integrator::properties::{PropertyAttributes, brep_volume};
+ use solidcore::math::Point3;
+@@ -224,3 +226,105 @@ fn seam_turns_every_degenerate_case_into_err() {
+     let m = k.measure(&mut Brep::new());
+     assert!(m.is_err(), "seam measure of an empty brep: {m:?}");
+ }
++
++/// The stage-2 ops at the seam: nonsense blend input and empty booleans are
++/// clean `Err`s, never a panic and never an unchanged or invalid solid.
++#[test]
++fn seam_refuses_degenerate_blends_and_empty_booleans() {
++    let mut k = SolidcoreKernel::default();
++    let edge: [[f64; 3]; 1] = [[5.0, 0.0, 0.0]];
++    let cases: [(&str, Vec<[f64; 3]>, f64); 10] = [
++        ("NaN radius", edge.to_vec(), f64::NAN),
++        ("zero radius", edge.to_vec(), 0.0),
++        ("negative radius", edge.to_vec(), -1.0),
++        ("inf radius", edge.to_vec(), f64::INFINITY),
++        ("radius past the conservative guard", edge.to_vec(), 6.0),
++        ("no picks", Vec::new(), 1.0),
++        ("pick off every edge", vec![[5.0, 5.0, 5.0]], 1.0),
++        ("NaN pick", vec![[f64::NAN, 0.0, 0.0]], 1.0),
++        ("one edge picked twice", vec![[5.0, 0.0, 0.0], [6.0, 0.0, 0.0]], 1.0),
++        ("pick at a vertex (ambiguous)", vec![[0.0, 0.0, 0.0]], 1.0),
++    ];
++    for (name, picks, r) in cases {
++        for kind in [Blend::Round, Blend::Chamfer] {
++            let r = k
++                .make_box([0.0; 3], [10.0; 3])
++                .and_then(|b| k.blend_edges(b, &picks, r, kind));
++            println!("blend {name:<28} {kind:?} -> {:?}", r.as_ref().map(|_| "Ok"));
++            assert!(r.is_err(), "seam blend {name} ({kind:?}) came back Ok");
++        }
++    }
++    assert!(k.blend_edges(Brep::new(), &edge, 1.0, Blend::Round).is_err(), "blend of an empty brep");
++    // disjoint operands: the intersection is empty -> Err
++    let a = k.make_box([0.0; 3], [10.0; 3]);
++    let b = k.make_box([20.0; 3], [10.0; 3]);
++    if let (Ok(a), Ok(b)) = (a, b) {
++        let r = k.boolean_intersect(a, b);
++        println!("intersect disjoint -> {:?}", r.as_ref().map(|_| "Ok"));
++        assert!(r.is_err(), "intersect of disjoint boxes came back Ok");
++    }
++    let b = k.make_box([0.0; 3], [10.0; 3]);
++    if let Ok(b) = b {
++        let r = k.boolean_intersect(b, Brep::new());
++        assert!(r.is_err(), "intersect with an empty brep came back Ok");
++    }
++    let b = k.make_box([0.0; 3], [10.0; 3]);
++    if let Ok(b) = b {
++        // empty + box: either refused or exactly the box, never anything else
++        let r = k.boolean_union(Brep::new(), b).and_then(|mut u| k.measure(&mut u));
++        println!("union empty + box -> {r:?}");
++        if let Ok(m) = r {
++            assert!((m.volume - 1000.0).abs() < 1e-6, "union empty + box: {m:?}");
++        }
++    }
++}
++
++/// The port's own answers on the stage-2 degenerate inputs, pinned like
++/// `KNOWN_PORT_VERDICTS` (a separate table so stage 1's stays unchanged).
++/// `box & empty` returning the whole box is a FINDING against the port;
++/// the seam refuses empty operands up front. `box & disjoint box` is an
++/// `Ok` non-solid the seam's result check turns into `Err`. The r6 round
++/// is CORRECT (1000 - 360 (1 - pi/4)); the seam still refuses it on
++/// purpose - its radius guard is conservative (decision 4 in
++/// docs/decisions/27-solidcore-bench.md).
++const KNOWN_PORT_VERDICTS_STAGE2: &[(&str, &str)] = &[
++    ("box & empty", "Ok solid V=1000.000"),
++    ("empty | box", "Err"),
++    ("box & disjoint box", "Ok non-solid"),
++    ("fillet r6 on a 10-box edge", "Ok solid V=922.743"),
++    ("fillet r NaN on a 10-box edge", "Err"),
++];
++
++#[test]
++fn port_stage2_degenerates_never_panic_and_match_pinned_verdicts() {
++    let mut observed: Vec<(String, String)> = Vec::new();
++    let mut k = solidcore::Kernel::default();
++    let b = unit_box(&mut k);
++    let r = boolean_intersection(&mut k, b, Brep::new());
++    observed.push(("box & empty".into(), verdict(&k, r.as_ref())));
++    let b = unit_box(&mut k);
++    let r = boolean_union(&mut k, Brep::new(), b);
++    observed.push(("empty | box".into(), verdict(&k, r.as_ref())));
++    let a = unit_box(&mut k);
++    let far = prim::create_box(&mut k, Point3::new(20.0, 20.0, 20.0), 10.0, 10.0, 10.0);
++    let r = far.and_then(|f| boolean_intersection(&mut k, a, f));
++    observed.push(("box & disjoint box".into(), verdict(&k, r.as_ref())));
++    for (name, radius) in [("fillet r6 on a 10-box edge", 6.0), ("fillet r NaN on a 10-box edge", f64::NAN)] {
++        let mut k = solidcore::Kernel::default();
++        let mut b = unit_box(&mut k);
++        let edge = b.edges().ids().next();
++        let r = match edge {
++            Some(e) => fillet_edges(&mut k, &mut b, &[e], radius, 1, 1, 1.0).map(|()| b),
++            None => Ok(Brep::new()),
++        };
++        observed.push((name.into(), verdict(&k, r.as_ref())));
++    }
++    for (n, v) in &observed {
++        println!("{n:<36} -> {v}");
++    }
++    let pinned: Vec<(String, String)> = KNOWN_PORT_VERDICTS_STAGE2
++        .iter()
++        .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
++        .collect();
++    assert_eq!(observed, pinned, "port verdicts changed - re-triage the findings");
++}
+diff --git a/docs/decisions/27-solidcore-bench.md b/docs/decisions/27-solidcore-bench.md
+new file mode 100644
+index 00000000..ac1c48d7
+--- /dev/null
++++ b/docs/decisions/27-solidcore-bench.md
+@@ -0,0 +1,63 @@
++## #27 - M12.1 stage 2: union/intersect and edge blends on the kernel seam, benched (2026-11-08)
++
++(1) **The seam grew three operations, nothing else.** `boolean_union`,
++`boolean_intersect` and `blend_edges(solid, picks, radius, Round | Chamfer)`
++join stage 1's subtract/offset/measure. Both engines implement the booleans
++(truck through truck-shapeops `or` / `and`); truck has no edge blend, so its
++`blend_edges` is `Unsupported` and the blend bench is solidcore against closed
++forms only - recorded as a one-engine bench, never as cross-engine agreement.
++No production path moved: nothing outside `camcraft-kernel` depends on it.
++Dropped: variable-radius and surface-surface fillets (no closed form we can
++pin cheaply, and no consumer yet); tessellation (still unported upstream).
++
++(2) **Edges are named by points, not ids.** A pick is a model-space point
++that must lie within `PICK_TOL` (1e-3) of exactly one edge: the distance is
++256 samples per edge plus a golden-section refinement. A pick within
++tolerance of two edges (a vertex, or a rim point on a cylinder's seam line)
++is refused as ambiguous, as is a second pick on an already-picked edge. Why:
++engine edge ids are not stable across engines or across a boolean, and the
++first probe showed a rim pick at the seam silently resolving to the seam
++edge. Dropped: picking by face pair (needs a face-naming scheme the seam
++does not have yet - face/island recognition, M13.x).
++
++(3) **The port stays on its default path; the arc-chamfer finding is pinned
++as "not yet".** A chamfer along a circular rim leaves the Pappus closed form
++by ~1.9e-6 relative on SMLib 1.0.1's default path (upstream WR-421,
++solidcore#420: the chamfer is traced as an offset intersection, not made as
++a cone). The port's opt-in fix `fixes.fillet_chamfer_cone_on_arc` closes it
++to 4e-8. The seam keeps the default (stage 1's rule: bench numbers mean
++something only against the pinned upstream behaviour);
++`not_yet_rim_chamfer_default_path_stays_a_finding` pins the miss and
++`rim_chamfer_agrees_with_cone_on_arc_fix` pins the fix. Cost to change:
++flip the flag in `SolidcoreKernel::default()` and promote the fixture - do it
++when a production path first chamfers arcs.
++
++(4) **The blend radius guard is conservative on purpose.** `blend_edges`
++refuses a radius of half the solid's thinnest extent or more, then requires
++the result to be a closed manifold solid, inside the source's bounding box,
++whose volume actually moved. The port computes an r6 round on a 10-cube
++edge correctly (pinned in the stage-2 port table), but two such rounds on
++one face would collide, and the seam cannot tell those cases apart without
++per-face geometry. A visible refusal beats a guessed pass. Like stage 1's
++offset guard, it sees only the overall extent - a per-feature check is owed
++with face recognition.
++
++(5) **Empty boolean operands are refused at the seam.** The port answers
++`box & empty` with the whole box (`Ok solid V=1000`) - a wrong answer
++dressed as a solid, pinned in `KNOWN_PORT_VERDICTS_STAGE2` and owed
++upstream. The seam refuses a face-less operand for all three booleans
++before the port sees it (`box - empty` was right, but an empty operand is a
++caller bug). Stage 1's pinned table is unchanged; the new rows sit in their
++own table.
++
++(6) **Agreement verdict, stage 2.** Union and intersection agree on the four
++new fixtures: solidcore within 1e-8 of the closed forms, truck within its
++mesh budget, cross-engine gap at most 3.4e-2 (truck's tessellation, and it
++closes at the heavy lane's finer tolerance). Eleven blend fixtures (cube
++rounds/chamfers on 1, 4 and 12 edges, concave L-block blends, cylinder and
++hole rims) match their closed forms within 1e-6 relative; the arc
++chamfer agrees only with the opt-in fix (decision 3). Still owed before truck's kernel role retires: a
++corrupt-input corpus through a solidcore importer (none exists - STEP stays
++on truck-stepio), M4.2's wasm CI job taking the crate (a local `cargo check
++--target wasm32-unknown-unknown -p camcraft-kernel` passes), healing, and
++the first production consumer switched behind this bench.

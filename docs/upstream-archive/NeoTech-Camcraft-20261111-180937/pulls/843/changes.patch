@@ -1,0 +1,2215 @@
+From f298637c81ad6be4c018742d8bd89f5d6ad884e1 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 14:16:20 +0100
+Subject: [PATCH 1/3] feat(sim): draw the simulated tool as the revolved
+ outline the collision laws judge
+
+The tool at the playhead is now one revolved body built from the two
+reads the fixture laws make: the judged tool record for the cutter and
+shank, and the band stack (`tool_body::stack`) above it - the holder
+cylinder, an imported body's revolved envelope (#368) or a drawn
+holder's bands (#93). Before, a tool with a body drew the body's own
+facets, which no law reads.
+
+The mesh is cached for the one tool at the playhead, keyed by its
+outline, and dropped when the tool, its operation or the transport is
+gone. A degenerate or misfitting tool draws nothing and is logged by
+name. Display only: no verdict and no posted output changes.
+
+Part 2 of #743 (STEP body to an editable DXF half-profile) is not in
+this commit.
+
+Refs #743
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/lib.rs                        |   2 +
+ crates/app/src/sim_tool_body.rs              | 229 ++++++++++++++
+ crates/app/tests/sim_tool_body.rs            | 300 +++++++++++++++++++
+ crates/ui/src/egui_app/tests/tool_body.rs    |  11 +
+ crates/ui/src/egui_app/world.rs              |  36 ++-
+ crates/ui/src/state.rs                       |   7 +
+ docs/decisions/743-sim-revolved-tool-body.md |  63 ++++
+ 7 files changed, 638 insertions(+), 10 deletions(-)
+ create mode 100644 crates/app/src/sim_tool_body.rs
+ create mode 100644 crates/app/tests/sim_tool_body.rs
+ create mode 100644 docs/decisions/743-sim-revolved-tool-body.md
+
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index bdd44ad3..a0d1e9db 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -96,6 +96,8 @@ pub mod tool_body;
+ pub mod tool_body_view;
+ // #369: lathe-held tool bodies (the turning tool frame).
+ pub mod tool_body_lathe;
++// #743: the simulated tool as the collision laws read it, revolved.
++pub mod sim_tool_body;
+ pub mod units;
+ pub use camcraft_sim::verify;
+ // #261: the moves a cached path's warnings name.
+diff --git a/crates/app/src/sim_tool_body.rs b/crates/app/src/sim_tool_body.rs
+new file mode 100644
+index 00000000..1075a314
+--- /dev/null
++++ b/crates/app/src/sim_tool_body.rs
+@@ -0,0 +1,229 @@
++//! The simulated tool as the collision laws read it (#743 part 1): the
++//! cutter and shank from the judged tool record, and above them the very
++//! band stack the fixture laws sweep (`tool_body::stack` - the holder
++//! cylinder, a modelled body's revolved envelope (#368) or a drawn spun
++//! holder's bands (#93)), spun about the tool axis into a display mesh.
++//! What is drawn is what is checked: a modelled body's own facets (flats,
++//! slots, its turn about the axis) are not what any law reads, so the
++//! simulation draws the envelope instead. A solid of revolution from its
++//! meridian is elementary geometry; our own design, no vendor file or
++//! source consulted.
++//!
++//! Display only: nothing here writes the world or feeds a verdict. A
++//! degenerate outline (non-finite, negative, running back down the axis,
++//! no radius, past the body caps) draws nothing and is logged by name,
++//! never a crash. The mesh is cached for the one tool at the playhead
++//! and dropped when that tool or operation is gone, its outline changes,
++//! or the transport closes ([`SimToolCache`]).
++
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use camcraft_tools::holder_profile::{HolderBand, HolderStack, MAX_BODY_HEIGHT, MAX_BODY_RADIUS};
++
++use crate::geometry::Triangle;
++use crate::tools::Tool;
++use crate::{model, tool_body, tool_body_view};
++
++/// Float dust on the outline checks (mm).
++const EPS: f64 = 1e-9;
++
++/// Why an outline draws no body. Each refusal names itself.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum OutlineError {
++    NonFinite,
++    Negative,
++    RunsBack,
++    NoRadius,
++    TooLarge,
++}
++
++impl core::fmt::Display for OutlineError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.write_str(match self {
++            Self::NonFinite => "the tool outline has non-finite numbers",
++            Self::Negative => "the tool outline has a negative radius or length",
++            Self::RunsBack => "the tool outline runs back down the axis (it would cross itself)",
++            Self::NoRadius => "the tool outline has no radius or no length - nothing to draw",
++            Self::TooLarge => "the tool outline is larger than any tool a spindle carries",
++        })
++    }
++}
++
++impl std::error::Error for OutlineError {}
++
++/// The tool's judged shape, tool frame (tip at the origin, +Z to the
++/// spindle): the cutter-and-shank meridian and the holder bands.
++#[derive(Clone, Debug, PartialEq)]
++pub struct JudgedOutline {
++    /// `(z, r)` from the tip centre up the cutter and the shank, closed
++    /// to the axis at the shank's top - `Tool::profile` of the judged
++    /// record, whose breakpoints are the bands the shank laws sweep.
++    pub cutter: Vec<(f64, f64)>,
++    /// What stands above the shank, bottom-up: exactly the bands
++    /// `tool_body::stack` hands the fixture laws (empty bands dropped).
++    pub holder: Vec<HolderBand>,
++}
++
++impl JudgedOutline {
++    /// The outline of `tool` (the record as the laws read it,
++    /// `tool_body::judged`) under `stack` (`tool_body::stack` of its
++    /// geometry). Refuses a degenerate outline by name.
++    pub fn new(tool: &Tool, stack: &HolderStack) -> Result<Self, OutlineError> {
++        let cutter = Tool { holder_len: 0.0, ..tool.clone() }.profile();
++        if !cutter.iter().all(|p| p.0.is_finite() && p.1.is_finite())
++            || !stack.bands.iter().all(|b| b.above.is_finite() && b.len.is_finite() && b.r.is_finite())
++        {
++            return Err(OutlineError::NonFinite);
++        }
++        if cutter.iter().any(|p| p.0 < -EPS || p.1 < 0.0) || stack.bands.iter().any(|b| b.above < -EPS || b.len < 0.0 || b.r < 0.0) {
++            return Err(OutlineError::Negative);
++        }
++        let holder: Vec<HolderBand> = stack.bands.iter().copied().filter(|b| b.len > EPS && b.r > EPS).collect();
++        if cutter.windows(2).any(|w| w[1].0 < w[0].0 - EPS) || holder.windows(2).any(|w| w[1].above < w[0].above + w[0].len - EPS) {
++            return Err(OutlineError::RunsBack);
++        }
++        let out = Self { cutter, holder };
++        let (top, wide) = (out.top(), out.max_radius());
++        if wide <= EPS || top <= EPS {
++            return Err(OutlineError::NoRadius);
++        }
++        if wide > MAX_BODY_RADIUS || top > MAX_BODY_HEIGHT {
++            return Err(OutlineError::TooLarge);
++        }
++        Ok(out)
++    }
++
++    /// The highest point above the tip.
++    #[must_use]
++    pub fn top(&self) -> f64 {
++        let c = self.cutter.iter().fold(0.0_f64, |m, p| m.max(p.0));
++        self.holder.iter().fold(c, |m, b| m.max(b.above + b.len))
++    }
++
++    /// The farthest point from the axis.
++    #[must_use]
++    pub fn max_radius(&self) -> f64 {
++        let c = self.cutter.iter().fold(0.0_f64, |m, p| m.max(p.1));
++        self.holder.iter().fold(c, |m, b| m.max(b.r))
++    }
++
++    /// The holder bands as one `(z, r)` meridian: each band a cylinder,
++    /// flat steps between them, closed to the axis at the foot, the top
++    /// and across any gap.
++    #[must_use]
++    pub fn holder_meridian(&self) -> Vec<(f64, f64)> {
++        let mut m: Vec<(f64, f64)> = Vec::with_capacity(self.holder.len() * 2 + 2);
++        for b in &self.holder {
++            match m.last().copied() {
++                None => m.push((b.above, 0.0)),
++                Some((z, _)) if b.above > z + EPS => m.extend([(z, 0.0), (b.above, 0.0)]),
++                Some(_) => {}
++            }
++            m.extend([(b.above, b.r), (b.above + b.len, b.r)]);
++        }
++        if let Some((z, _)) = m.last().copied() {
++            m.push((z, 0.0));
++        }
++        m
++    }
++
++    /// The outline spun about +Z, tool frame.
++    #[must_use]
++    pub fn mesh(&self) -> Vec<Triangle> {
++        let mut tris = tool_body_view::revolve(&self.cutter);
++        tris.extend(tool_body_view::revolve(&self.holder_meridian()));
++        tris
++    }
++}
++
++/// The judged outline of the tool operation `op` runs. `Ok(None)` when
++/// there is nothing to spin: the operation or its tool is gone, or the
++/// tool is a lathe insert kind (its truth lives in the work's meridian;
++/// it keeps the axis marker only). `Err` names why a tool that should
++/// draw does not - its body no longer fits it, or its outline is
++/// degenerate.
++pub fn for_operation(world: &World, op: &str) -> Result<Option<JudgedOutline>, String> {
++    let Some(e) = model::find_by_name(world, op) else { return Ok(None) };
++    let Some(name) = model::operation_of(world, &e).map(|o| o.tool) else { return Ok(None) };
++    let Some(te) = model::find_by_name(world, &name) else { return Ok(None) };
++    let Some(tool) = model::tool_of(world, &te) else { return Ok(None) };
++    if tool_body::LATHE_HELD.contains(&tool.kind) {
++        return Ok(None);
++    }
++    // The same two reads every fixture law makes (`fixture_struck`,
++    // `operation::generate`): the judged record, then its stack.
++    let (judged, body) = tool_body::judged(world, &te, tool).map_err(|e| format!("tool {name}: {e}"))?;
++    let stack = tool_body::stack(&judged.geom(), body.as_ref());
++    JudgedOutline::new(&judged, &stack).map(Some).map_err(|e| format!("tool {name}: {e}"))
++}
++
++/// The revolved mesh of the one tool at the playhead. Keyed by the
++/// outline itself: an edit to the tool or its body that moves a judged
++/// number rebuilds it, anything else reuses it. Holds nothing once the
++/// tool or operation is gone or refused.
++#[derive(Debug, Default)]
++pub struct SimToolCache {
++    built: Option<(JudgedOutline, Arc<[Triangle]>)>,
++    refused: Option<String>,
++}
++
++impl SimToolCache {
++    /// The tool-frame mesh for `op`'s tool, rebuilt only when its judged
++    /// outline changed. `None` (and the cache emptied) when nothing is
++    /// to be drawn; a refusal is logged once per distinct reason.
++    pub fn tool_frame(&mut self, world: &World, op: &str) -> Option<Arc<[Triangle]>> {
++        match for_operation(world, op) {
++            Ok(Some(outline)) => {
++                self.refused = None;
++                if let Some((held, tris)) = &self.built
++                    && *held == outline
++                {
++                    return Some(Arc::clone(tris));
++                }
++                let tris: Arc<[Triangle]> = Arc::from(outline.mesh());
++                self.built = Some((outline, Arc::clone(&tris)));
++                Some(tris)
++            }
++            Ok(None) => {
++                self.clear();
++                None
++            }
++            Err(why) => {
++                if self.refused.as_deref() != Some(why.as_str()) {
++                    tracing::warn!(op, "simulated tool not drawn: {why}");
++                }
++                self.built = None;
++                self.refused = Some(why);
++                None
++            }
++        }
++    }
++
++    /// [`Self::tool_frame`] posed at a tool position: `tip` in world,
++    /// `axis` the unit tip-to-spindle direction (`sim::Frame::axis`) -
++    /// the body follows a tilted axis, not only Z.
++    pub fn posed(&mut self, world: &World, op: &str, tip: [f64; 3], axis: [f64; 3]) -> Option<Vec<Triangle>> {
++        let tris = self.tool_frame(world, op)?;
++        Some(tool_body_view::posed(&tris, tip, axis))
++    }
++
++    /// Drop the mesh and any remembered refusal (the transport closed).
++    pub fn clear(&mut self) {
++        self.built = None;
++        self.refused = None;
++    }
++
++    /// Does the cache hold no mesh?
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.built.is_none()
++    }
++
++    /// Why the last tool asked for was not drawn, if it was refused.
++    #[must_use]
++    pub fn refusal(&self) -> Option<&str> {
++        self.refused.as_deref()
++    }
++}
+diff --git a/crates/app/tests/sim_tool_body.rs b/crates/app/tests/sim_tool_body.rs
+new file mode 100644
+index 00000000..15058bd5
+--- /dev/null
++++ b/crates/app/tests/sim_tool_body.rs
+@@ -0,0 +1,300 @@
++//! #743 part 1: the simulated tool is drawn as a revolved body from the
++//! very outline the collision laws read - the judged tool record's
++//! cutter and shank, and the band stack the fixture laws sweep above
++//! them. The mesh's meridian is exactly that outline, it follows a
++//! tilted tool axis, a degenerate outline draws nothing (never a panic),
++//! and the cached mesh is dropped with its tool, its operation or a
++//! change of outline. Our own tests.
++//!
++//! Gate map (M4.4): covers app::sim_tool_body, app::tool_body, app::tool_body_view.
++
++use std::sync::Arc;
++
++use camcraft_app::commands::{AddTool, CreateOperation, DeleteOperation, DeleteTool, History, SetStock, SetToolBody, ToolBodySpec};
++use camcraft_app::geometry::{Point3, Triangle};
++use camcraft_app::model;
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::sim_tool_body::{self as sim_body, JudgedOutline, OutlineError, SimToolCache};
++use camcraft_app::spun::SpunPoint;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tool_body;
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::world::new_world;
++use camcraft_tools::holder_profile::{HolderBand, HolderStack};
++use flecs_ecs::prelude::World;
++
++const TOOL: &str = "EM-0400-2FL";
++const OP: &str = "Face1";
++
++fn catalog_tool(name: &str) -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog entry")
++}
++
++fn shank_top() -> f64 {
++    let t = catalog_tool(TOOL);
++    t.flute_len + t.shank_len
++}
++
++/// A closed `n`-gon prism of circumradius `r` about model Z over `[z0, z1]`.
++fn prism(r: f64, z0: f64, z1: f64, n: usize) -> Vec<Triangle> {
++    let q = |k: usize, z: f64| {
++        let a = std::f64::consts::TAU * k as f64 / n as f64;
++        Point3::new(r * a.cos(), r * a.sin(), z)
++    };
++    let mut v = Vec::new();
++    for k in 0..n {
++        let (a0, a1, b0, b1) = (q(k, z0), q(k + 1, z0), q(k, z1), q(k + 1, z1));
++        v.push(Triangle::new(a0, a1, b1));
++        v.push(Triangle::new(a0, b1, b0));
++        v.push(Triangle::new(Point3::new(0.0, 0.0, z0), a1, a0));
++        v.push(Triangle::new(Point3::new(0.0, 0.0, z1), b0, b1));
++    }
++    v
++}
++
++fn face_world() -> (World, History) {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, Location::default()).expect("stock"),
++    );
++    history.execute(&world, AddTool::new(&world, TOOL, catalog_tool(TOOL)).expect("tool"));
++    let face = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(19.5),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    };
++    history.execute(&world, CreateOperation::new(&world, OP, TOOL, SrcRef::Stock, face).expect("op"));
++    (world, history)
++}
++
++fn tool_entity(world: &World) -> flecs_ecs::prelude::Entity {
++    model::find_by_name(world, TOOL).expect("tool")
++}
++
++/// The judged record and stack, read the way `fixture_struck` and
++/// `operation::generate` read them.
++fn judged_stack(world: &World) -> (Tool, HolderStack) {
++    let (judged, body) = tool_body::judged(world, &tool_entity(world), catalog_tool(TOOL)).expect("fits");
++    let stack = tool_body::stack(&judged.geom(), body.as_ref());
++    (judged, stack)
++}
++
++/// Every vertex of a tool-frame mesh as `(z, r)`.
++fn meridian_of(tris: &[Triangle]) -> Vec<(f64, f64)> {
++    tris.iter().flat_map(|t| [t.a, t.b, t.c]).map(|p| (p.z, p.x.hypot(p.y))).collect()
++}
++
++fn has(points: &[(f64, f64)], z: f64, r: f64) -> bool {
++    points.iter().any(|q| (q.0 - z).abs() < 1e-9 && (q.1 - r).abs() < 1e-9)
++}
++
++/// The mesh's meridian is exactly the outline: every mesh vertex sits on
++/// an outline vertex, and every outline vertex is in the mesh.
++fn assert_mesh_is_outline(outline: &JudgedOutline, tris: &[Triangle]) {
++    let mut want = outline.cutter.clone();
++    want.extend(outline.holder_meridian());
++    let got = meridian_of(tris);
++    assert!(!got.is_empty(), "a body is drawn");
++    for &(z, r) in &got {
++        assert!(has(&want, z, r), "mesh vertex (z {z}, r {r}) is not on the judged outline {want:?}");
++    }
++    for &(z, r) in &want {
++        assert!(has(&got, z, r), "outline vertex (z {z}, r {r}) is missing from the mesh");
++    }
++}
++
++#[test]
++fn the_bare_tool_is_spun_from_the_cylinder_the_laws_sweep() {
++    let (world, _history) = face_world();
++    let t = catalog_tool(TOOL);
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("a mill draws");
++    // The holder is the one cylinder `HolderStack::cylinder` hands the laws.
++    assert_eq!(outline.holder, HolderStack::cylinder(&t.geom()).bands);
++    assert_eq!(outline.holder, vec![HolderBand { above: shank_top(), len: t.holder_len, r: t.holder_d * 0.5 }]);
++    // The cutter and shank are the record's own profile up to the shank top.
++    assert!(has(&outline.cutter, 0.0, t.diameter * 0.5), "the cutter's rim at the tip");
++    assert!(has(&outline.cutter, t.flute_len, t.shank_d * 0.5), "the shank band starts at the flute top");
++    assert!(has(&outline.cutter, shank_top(), 0.0), "closed to the axis at the shank top");
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    let m = meridian_of(&tris);
++    let top = m.iter().fold(0.0f64, |a, q| a.max(q.0));
++    let wide = m.iter().fold(0.0f64, |a, q| a.max(q.1));
++    assert_eq!(top, shank_top() + t.holder_len, "tip to the holder's top");
++    assert!((wide - t.holder_d * 0.5).abs() < 1e-9, "the holder's radius is the widest");
++    assert_eq!(outline.top(), top);
++    assert!((outline.max_radius() - wide).abs() < 1e-9);
++}
++
++#[test]
++fn a_modelled_body_is_drawn_as_its_judged_envelope_not_its_facets() {
++    let (world, mut history) = face_world();
++    let z0 = shank_top();
++    // A hexagonal collar: its facets reach r = 20 only at six corners.
++    let spec = ToolBodySpec { source: "hex.stl".into(), facets: prism(20.0, z0, z0 + 30.0, 6), axis: [0.0, 0.0, 1.0], offset: 0.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    let (judged, stack) = judged_stack(&world);
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("draws");
++    assert_eq!(outline.holder, stack.bands, "the drawn holder is the stack the fixture laws sweep");
++    assert_eq!(outline, JudgedOutline::new(&judged, &stack).expect("sane"));
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    // Revolved: the body is at its envelope radius all the way round,
++    // not only at the hexagon's corners (its flats sit at r = 17.3).
++    let rim: Vec<f64> = meridian_of(&tris).into_iter().filter(|q| (q.0 - (z0 + 30.0)).abs() < 1e-9 && q.1 > 1.0).map(|q| q.1).collect();
++    assert!(rim.len() >= 32, "a full ring at the body's top: {}", rim.len());
++    let band_r = stack.bands.last().expect("a band").r;
++    assert!(rim.iter().all(|r| (r - band_r).abs() < 1e-9), "every rim vertex at the judged radius {band_r}");
++    assert!(band_r >= 20.0, "never smaller than the solid");
++}
++
++#[test]
++fn a_drawn_cone_is_drawn_as_the_stepped_bands_the_laws_judge() {
++    let (world, mut history) = face_world();
++    let z0 = shank_top();
++    // A cone from r = 10 to r = 30 over 20 mm: judged as one band at 30.
++    let cone = vec![SpunPoint::line(z0, 0.0), SpunPoint::line(z0, 10.0), SpunPoint::line(z0 + 20.0, 30.0), SpunPoint::line(z0 + 20.0, 0.0)];
++    history.execute(&world, SetToolBody::spun(&world, TOOL, Some(cone)).expect("a sane profile"));
++    let (_, stack) = judged_stack(&world);
++    assert_eq!(stack.bands, vec![HolderBand { above: z0, len: 20.0, r: 30.0 }], "the law's reading of the cone");
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("draws");
++    assert_eq!(outline.holder, stack.bands);
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    assert!(has(&meridian_of(&tris), z0, 30.0), "the foot is drawn at the judged 30, not the drawn 10");
++}
++
++#[test]
++fn the_body_follows_a_tilted_tool_axis() {
++    let (world, _history) = face_world();
++    let mut cache = SimToolCache::default();
++    let frame = cache.tool_frame(&world, OP).expect("a mesh");
++    let want = meridian_of(&frame);
++    let tip = [10.0, -20.0, 30.0];
++    let n = (0.3f64 * 0.3 + 0.2 * 0.2 + 0.9 * 0.9).sqrt();
++    for axis in [[0.3 / n, -0.2 / n, 0.9 / n], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 0.0, 1.0]] {
++        let posed = cache.posed(&world, OP, tip, axis).expect("posed");
++        assert_eq!(posed.len(), frame.len());
++        // Each vertex keeps its height along the axis and its distance from it.
++        let got: Vec<(f64, f64)> = posed
++            .iter()
++            .flat_map(|t| [t.a, t.b, t.c])
++            .map(|p| {
++                let d = [p.x - tip[0], p.y - tip[1], p.z - tip[2]];
++                let h = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
++                let off = [d[0] - h * axis[0], d[1] - h * axis[1], d[2] - h * axis[2]];
++                (h, (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt())
++            })
++            .collect();
++        for (g, w) in got.iter().zip(&want) {
++            assert!((g.0 - w.0).abs() < 1e-9 && (g.1 - w.1).abs() < 1e-9, "axis {axis:?}: {g:?} vs {w:?}");
++        }
++    }
++    // A prismatic frame is the tool frame moved to the tip.
++    let up = cache.posed(&world, OP, tip, [0.0, 0.0, 1.0]).expect("posed");
++    assert!((up[0].a.x - (frame[0].a.x + tip[0])).abs() < 1e-12 && (up[0].a.z - (frame[0].a.z + tip[2])).abs() < 1e-12);
++}
++
++#[test]
++fn a_degenerate_outline_draws_nothing_and_names_itself() {
++    let t = catalog_tool(TOOL);
++    let stack = HolderStack::cylinder(&t.geom());
++    assert!(JudgedOutline::new(&t, &stack).is_ok(), "the sane tool draws");
++    let band = |above: f64, len: f64, r: f64| HolderStack { bands: vec![HolderBand { above, len, r }], top: above + len };
++    assert_eq!(JudgedOutline::new(&Tool { diameter: f64::INFINITY, ..t.clone() }, &stack), Err(OutlineError::NonFinite));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, f64::NAN, 5.0)), Err(OutlineError::NonFinite));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, 10.0, -5.0)), Err(OutlineError::Negative));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, -10.0, 5.0)), Err(OutlineError::Negative));
++    // Bands that overlap along the axis: the outline would cross itself.
++    let crossing = HolderStack {
++        bands: vec![HolderBand { above: 50.0, len: 20.0, r: 10.0 }, HolderBand { above: 60.0, len: 20.0, r: 15.0 }],
++        top: 80.0,
++    };
++    assert_eq!(JudgedOutline::new(&t, &crossing), Err(OutlineError::RunsBack));
++    // No radius anywhere, and no length anywhere.
++    let none = HolderStack { bands: Vec::new(), top: 0.0 };
++    let thin = Tool { diameter: 0.0, shank_d: 0.0, ..t.clone() };
++    assert_eq!(JudgedOutline::new(&thin, &none), Err(OutlineError::NoRadius));
++    let flat = Tool { flute_len: 0.0, shank_len: 0.0, ..t.clone() };
++    assert_eq!(JudgedOutline::new(&flat, &none), Err(OutlineError::NoRadius));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, 10.0, 501.0)), Err(OutlineError::TooLarge));
++    assert_eq!(JudgedOutline::new(&t, &band(1995.0, 10.0, 5.0)), Err(OutlineError::TooLarge));
++    // A half-typed draft (NaN numbers) never panics: it draws short or not at all.
++    let draft = Tool { diameter: f64::NAN, flute_len: f64::NAN, ..t.clone() };
++    let _ = JudgedOutline::new(&draft, &stack).map(|o| o.mesh());
++    // An empty holder band is no holder, not an error.
++    let bare = JudgedOutline::new(&t, &band(50.0, 0.0, 22.0)).expect("the cutter still draws");
++    assert!(bare.holder.is_empty() && bare.holder_meridian().is_empty());
++    // Every catalog tool either draws a sane mesh or is a lathe kind.
++    for (name, tool) in catalog() {
++        let o = JudgedOutline::new(&tool, &HolderStack::cylinder(&tool.geom())).unwrap_or_else(|e| panic!("{name}: {e}"));
++        assert!(o.mesh().iter().all(|q| [q.a, q.b, q.c].iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite())), "{name}");
++    }
++}
++
++#[test]
++fn a_body_that_no_longer_fits_draws_nothing_and_says_why() {
++    let (world, _history) = face_world();
++    let mut cache = SimToolCache::default();
++    assert!(cache.tool_frame(&world, OP).is_some());
++    // Past the commands' own guard: a body standing over the flutes.
++    let low = tool_body::build("low.stl", [0.0, 0.0, 1.0], 0.0, prism(20.0, 1.0, 30.0, 12)).expect("an envelope");
++    tool_body::set_body(&world, &tool_entity(&world), Some(&low));
++    assert!(sim_body::for_operation(&world, OP).is_err());
++    assert!(cache.tool_frame(&world, OP).is_none(), "nothing is drawn");
++    assert!(cache.is_empty(), "and the stale mesh is dropped");
++    assert!(cache.refusal().is_some_and(|w| w.contains(TOOL) && w.contains("flutes")), "{:?}", cache.refusal());
++    assert!(cache.posed(&world, OP, [0.0; 3], [0.0, 0.0, 1.0]).is_none());
++    tool_body::set_body(&world, &tool_entity(&world), None);
++    assert!(cache.tool_frame(&world, OP).is_some(), "drawn again once it fits");
++    assert!(cache.refusal().is_none());
++}
++
++#[test]
++fn the_cached_mesh_is_reused_rebuilt_on_a_new_outline_and_freed_with_its_tool() {
++    let (world, mut history) = face_world();
++    let mut cache = SimToolCache::default();
++    assert!(cache.is_empty());
++    let first = cache.tool_frame(&world, OP).expect("a mesh");
++    let again = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(Arc::ptr_eq(&first, &again), "an unchanged outline reuses the mesh");
++    // A new body changes the judged outline: the old mesh is let go.
++    let z0 = shank_top();
++    let spec = ToolBodySpec { source: "c.stl".into(), facets: prism(20.0, z0, z0 + 30.0, 16), axis: [0.0, 0.0, 1.0], offset: 0.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    drop(again);
++    let weak = Arc::downgrade(&first);
++    drop(first);
++    let bodied = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(weak.upgrade().is_none(), "the replaced mesh is freed");
++    // Undo restores the old outline; the cache follows.
++    history.undo(&world);
++    let back = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(!Arc::ptr_eq(&bodied, &back));
++    let weak = Arc::downgrade(&back);
++    drop((bodied, back));
++    // Deleting the operation leaves nothing to draw and nothing held.
++    history.execute(&world, DeleteOperation::new(&world, OP).expect("delete op"));
++    assert!(cache.tool_frame(&world, OP).is_none());
++    assert!(cache.is_empty() && weak.upgrade().is_none(), "the op's mesh is freed");
++    history.undo(&world);
++    let held = Arc::downgrade(&cache.tool_frame(&world, OP).expect("drawn again"));
++    // Deleting the tool does the same.
++    history.execute(&world, DeleteTool::new(&world, TOOL).expect("delete tool"));
++    assert!(cache.tool_frame(&world, OP).is_none());
++    assert!(cache.is_empty() && held.upgrade().is_none(), "the tool's mesh is freed");
++    assert!(cache.refusal().is_none(), "a missing tool is not a refusal");
++    cache.clear();
++    assert!(cache.is_empty());
++}
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index 45b4655f..286e2a99 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -204,8 +204,19 @@ fn the_simulation_draws_the_tool_with_its_holder_cylinder_or_its_body() {
+     let (lo, hi) = zr(&verts);
+     assert!((lo - tip).abs() < 1e-3, "tip at {tip}: {lo}");
+     assert!((hi - (tip + top + 30.0)).abs() < 1e-3, "body top at tip + {top} + 30: {hi}");
++    // #743: what is drawn is the outline the laws judge, revolved - the
++    // 24-gon's envelope band all the way round - and its mesh is cached
++    // only while the transport is up.
++    let op = f.op.and_then(|i| sc.ops.get(i)).expect("an op at the playhead");
++    let outline = camcraft_app::sim_tool_body::for_operation(&st.world, op).expect("no refusal").expect("an outline");
++    let band = outline.holder.last().expect("the body's band");
++    assert_eq!(world::sim_tool_tris(st).map(|t| t.len()), Some(outline.mesh().len()), "the scene draws the judged outline's mesh");
++    let local: Vec<[f32; 3]> = verts.iter().map(|p| [p[0] - f.pos.x as f32, p[1] - f.pos.y as f32, p[2]]).collect();
++    assert!((r_at(&local, tip + top + 30.0) - band.r).abs() < 1e-3, "the judged band's radius at the body's top");
++    assert!(!st.sim_tool_cache.lock().unwrap().is_empty(), "the mesh is held while simulating");
+     st.sim = None;
+     assert_eq!(world::collect(st).parts.len(), parts_no_body - 1, "no transport, no tool drawn");
++    assert!(st.sim_tool_cache.lock().unwrap().is_empty(), "and the mesh is dropped with the transport");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
+ 
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 7ed42dfa..6075a831 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -300,15 +300,32 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+     parts
+ }
+ 
+-/// #371: the running tool's assembly at the playhead - cutter and shank
+-/// revolved from its numbers, then its modelled body, or without one the
+-/// holder cylinder from its own numbers (what the collision laws judge),
+-/// posed by the frame's tip and axis, world space. Only while the
+-/// transport is up and its timeline is this document's (`cached_script`
+-/// refreshes it before the next frame), any playhead including 0 and the
+-/// end, playing or paused, the op fresh or stale (display reads the
+-/// cached path). Lathe insert kinds yield nothing (marker only).
++/// #371, #743: the running tool at the playhead as a revolved body -
++/// the cutter and shank of the judged tool record and, above them, the
++/// very band stack the fixture laws sweep (the holder cylinder, a
++/// modelled body's revolved envelope, a drawn holder's bands), so what
++/// is drawn is what is checked - posed by the frame's tip and axis,
++/// world space. Only while the transport is up and its timeline is this
++/// document's (`cached_script` refreshes it before the next frame), any
++/// playhead including 0 and the end, playing or paused, the op fresh or
++/// stale (display reads the cached path). Lathe insert kinds yield
++/// nothing (marker only); a degenerate or misfitting tool yields nothing
++/// and is logged. The mesh lives in `State::sim_tool_cache` and is
++/// dropped as soon as there is no tool to draw.
+ pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry::Triangle>> {
++    // A poisoned lock only means a draw panicked mid-update: the cache
++    // is display data, rebuilt from the world, so it is safe to reuse.
++    let mut cache = state.sim_tool_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let Some((op, tip, axis)) = sim_tool_pose(state) else {
++        cache.clear();
++        return None;
++    };
++    cache.posed(&state.world, op, tip, axis)
++}
++
++/// The operation at the playhead with its tool tip and axis, when the
++/// transport is up on this document's timeline.
++fn sim_tool_pose(state: &State) -> Option<(&str, [f64; 3], [f64; 3])> {
+     let sim = state.sim?;
+     let (version, sc) = state.sim_script_cache.as_ref()?;
+     if *version != state.doc_version || sc.is_empty() {
+@@ -316,8 +333,7 @@ pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry:
+     }
+     let f = sc.at(sim.t);
+     let op = sc.ops.get(f.op?)?;
+-    let tris = camcraft_app::tool_body_view::assembly_for_operation(&state.world, op)?;
+-    Some(camcraft_app::tool_body_view::posed(&tris, [f.pos.x, f.pos.y, f.pos.z], f.axis))
++    Some((op.as_str(), [f.pos.x, f.pos.y, f.pos.z], f.axis))
+ }
+ 
+ /// [`sim_tool_tris`] as a model part (depth-tested, shaded).
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 7c6e922e..b4583b56 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1296,6 +1296,12 @@ pub struct State {
+     /// The transport's timeline, built once per `doc_version` (never
+     /// per frame: it walks every op's path) - see `shell::cached_script`.
+     pub sim_script_cache: Option<(u64, std::sync::Arc<camcraft_app::sim::Script>)>,
++    /// #743: the revolved mesh of the tool at the playhead, as the
++    /// collision laws read it - rebuilt only when its judged outline
++    /// changes, emptied when the tool, its operation or the transport
++    /// is gone. Display-only (a Mutex because the scene is collected
++    /// from `&State`).
++    pub sim_tool_cache: std::sync::Mutex<camcraft_app::sim_tool_body::SimToolCache>,
+     /// What `field_view` was walked for: (transport up, Deviate armed,
+     /// the document version a playback plan was frozen at). A change
+     /// retires the view and the playback - never a stale picture.
+@@ -1650,6 +1656,7 @@ impl State {
+             field_view: None,
+             field_play: None,
+             sim_script_cache: None,
++            sim_tool_cache: std::sync::Mutex::default(),
+             field_mode: None,
+             stock_mesh: camcraft_app::stock_export::MeshCache::default(),
+             ribbon_more: None,
+diff --git a/docs/decisions/743-sim-revolved-tool-body.md b/docs/decisions/743-sim-revolved-tool-body.md
+new file mode 100644
+index 00000000..5e896baf
+--- /dev/null
++++ b/docs/decisions/743-sim-revolved-tool-body.md
+@@ -0,0 +1,63 @@
++## #743 - the simulated tool is drawn as the revolved outline the laws judge (part 1)
++
++**What was decided.**
++
++1. *The simulation draws the judged outline, not the body's own facets.*
++   The tool at the playhead is one revolved body built from two reads the
++   collision laws already make: the judged tool record
++   (`tool_body::judged`) for the cutter and shank, and the band stack the
++   fixture laws sweep (`tool_body::stack`) for everything above the shank -
++   the holder cylinder, an imported body's revolved envelope (#368) or a
++   drawn holder's bands (#93). Before this, a tool with a body drew the
++   body's raw facets (an imported mesh with its flats and slots at a fixed
++   turn; a drawn profile with its cones and arcs).
++2. *A cone or an arc is therefore drawn stepped.* The laws read a drawn
++   cone as one cylinder at its larger end (`SpunProfile::bands`), so the
++   simulation now shows that cylinder. It looks coarser than the drawing,
++   and it is exactly what is checked. The tool editor's preview still
++   shows the drawn outline.
++3. *One mesh, cached, keyed by the outline itself.* `SimToolCache` holds
++   the mesh of the one tool at the playhead. The key is the judged
++   outline, so any edit that moves a judged number rebuilds it and nothing
++   else does; it empties when the tool or operation is gone, the tool is
++   refused, or the transport closes. It lives in `State` behind a `Mutex`
++   because the scene is collected from `&State`.
++4. *A tool that cannot be drawn draws nothing and is logged once.* A body
++   that no longer fits its tool, or a degenerate outline (non-finite,
++   negative, running back down the axis, no radius, past the body caps),
++   gives no body and one `tracing::warn!` per distinct reason. Before, a
++   misfitting body was still drawn.
++5. *No new command, no MCP tool.* Playback position is ephemeral; nothing
++   here writes the world.
++
++**Why.** The issue asks for "the same profile the collision laws judge, so
++what you see is what is checked". Calling the laws' own two functions is
++the only way the picture cannot drift from the verdict; a second
++derivation of the holder shape for display would be a second truth.
++
++**Considered and dropped.**
++
++- *Keep drawing the body's facets and add the envelope as a second,
++  translucent shell.* The viewport's model parts have no translucent
++  class, and two bodies on screen leave it unclear which one is judged.
++- *Draw the smooth drawn outline for a spun holder.* Prettier, but it
++  shows a cone where the law sweeps a cylinder - a tool that looks clear
++  of a clamp can be reported as striking it.
++- *A cache keyed by `doc_version`.* Every command bumps it, so the mesh
++  would be rebuilt after edits that do not touch the tool, and the app
++  layer could not test the cache without the UI.
++- *A per-tool map of meshes.* Only one tool is at the playhead; a map
++  would need its own eviction on tool/op deletion for no visible gain (a
++  rebuild is a few hundred triangles).
++- *Drawing the lathe insert kinds.* Their profile is a stand-in envelope;
++  they keep the axis marker, as before.
++
++**Known gap, filed not fixed.** The laws that read one holder cylinder
++(shank reach, gouge and the rest) judge the cylinder *enclosing* the body
++(`HolderProfile::enclose`), which is wider than the band stack drawn here
++wherever the body is stepped. This slice does not touch any law; the
++difference is filed as #835.
++
++**Cost to change later.** Small: `JudgedOutline::new` is the one place the
++drawn shape is assembled, and `world::sim_tool_tris` the one caller.
++Part 2 of #743 (STEP body to an editable DXF half-profile) is untouched.
+
+From e148edd179debf86035510ed147732ef192e9ca0 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 14:52:41 +0100
+Subject: [PATCH 2/3] fix(sim): judge a tool body by the band stack the
+ simulation draws
+
+Law (c) shank/holder reach, the (c3) mid-turn sweep and every law that
+reads verify::Cutter (solid b2, containment solid, posed rapids, rotary
+field) now read a modelled body's band stack - the shape the fixture
+laws sweep and the simulation draws - instead of the single cylinder
+enclosing it. The bands ride on the cutter (Cutter::body, a fixed-
+capacity BodyBands), refused back to the cylinder when they do not fit
+the judged record; a tool with no body reads bit-identically. Law (c)
+reports a move once per group (shank, then holder or body bands).
+
+The drill-reach, cross-drill and probe stylus laws keep the enclosing
+cylinder and now say so by name (operation::body_judged); moving them
+is #842.
+
+Fixes #835
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/body_judged.rs      |  49 +++
+ crates/app/src/operation/generate.rs         |  30 +-
+ crates/app/src/operation/mod.rs              |   1 +
+ crates/app/src/operation/probe_op.rs         |   4 +
+ crates/app/src/operation/rotary_law.rs       |   4 +-
+ crates/app/tests/tool_body_judged.rs         | 343 +++++++++++++++++++
+ crates/motion/tests/solid_law.rs             |   8 +-
+ crates/sim/src/verify/body_bands.rs          |  92 +++++
+ crates/sim/src/verify/mod.rs                 |   2 +
+ crates/sim/src/verify/probe.rs               |  47 ++-
+ crates/sim/src/verify/reach.rs               | 145 ++++----
+ crates/sim/tests/midmove_pose.rs             |   1 +
+ crates/sim/tests/overhang_laws.rs            |   1 +
+ docs/decisions/835-reach-reads-band-stack.md |  49 +++
+ 14 files changed, 692 insertions(+), 84 deletions(-)
+ create mode 100644 crates/app/src/operation/body_judged.rs
+ create mode 100644 crates/app/tests/tool_body_judged.rs
+ create mode 100644 crates/sim/src/verify/body_bands.rs
+ create mode 100644 docs/decisions/835-reach-reads-band-stack.md
+
+diff --git a/crates/app/src/operation/body_judged.rs b/crates/app/src/operation/body_judged.rs
+new file mode 100644
+index 00000000..1356361e
+--- /dev/null
++++ b/crates/app/src/operation/body_judged.rs
+@@ -0,0 +1,49 @@
++//! Which shape of a modelled tool body each law judges (#835). The
++//! verdict laws - reach (c), the mid-turn sweep (c3), the solid (b2),
++//! containment and rotary laws, and the fixture laws - read the body's
++//! band stack, the shape the simulation draws. The laws that read one
++//! cylinder by construction keep the cylinder enclosing the body and say
++//! so by name: the drill-reach and cross-drill refusals, and the touch
++//! probe's stylus reach (its stem and holder are one band). The stepped
++//! reading of a solid of revolution is machine-tool handbook practice;
++//! our own design, no vendor source consulted.
++
++use camcraft_tools::holder_profile::HolderProfile;
++
++use crate::machining2d::GenError;
++use crate::tools::Tool;
++
++/// The words every kept-cylinder law adds for a tool with a body.
++#[must_use]
++pub fn enclosure_words(tool: &Tool) -> String {
++    format!(
++        "the tool body is judged here by the cylinder enclosing it, Ø{:.3} mm to {:.3} mm above the tip",
++        tool.holder_d,
++        tool.flute_len + tool.shank_len + tool.holder_len
++    )
++}
++
++/// A generator refusal that names the holder, for a tool carrying a
++/// body (`tool` is the judged record, its holder the enclosing
++/// cylinder): the refusal says the body was judged by that cylinder.
++/// Every other refusal, and every refusal of a tool with no body, is
++/// returned unchanged.
++#[must_use]
++pub fn name_enclosure(e: GenError, tool: &Tool, body: Option<&HolderProfile>) -> GenError {
++    if body.is_none() {
++        return e;
++    }
++    let say = |m: String| if m.contains("holder") { format!("{m} ({})", enclosure_words(tool)) } else { m };
++    match e {
++        GenError::Invalid(m) => GenError::Invalid(say(m)),
++        GenError::At { msg, at } => GenError::At { msg: say(msg), at },
++        other => other,
++    }
++}
++
++/// The touch probe's note for a tool with a body: its stylus reach
++/// reads stem and holder as one enclosing band.
++#[must_use]
++pub fn probe_note(tool: &Tool, body: Option<&HolderProfile>) -> Option<String> {
++    body.map(|_| format!("probe reach: {}", enclosure_words(tool)))
++}
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 0bb274b8..2d73d8c0 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -38,10 +38,14 @@ pub fn run_job(mut job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // in (a 3+2 tilt's local one); the UI draws in world, so it is
+     // carried out through the same frame the path would have been.
+     let frame = job.frame;
++    // #835: a refusal naming the holder of a tool with a body says it
++    // judged the cylinder enclosing that body.
++    let (judged_tool, body) = (job.tool.clone(), job.body.clone());
+     let _span = tracing::info_span!("generate", op = %job.op_name).entered();
+     let started = std::time::Instant::now();
+     tracing::debug!(kind = %kind, "generation started");
+     let (mut path, warns) = run_job_arms(job)
++        .map_err(|e| super::body_judged::name_enclosure(e, &judged_tool, body.as_ref()))
+         .map_err(|e| e.map_location(|p| frame.map_or(p, |f| f.to_world(p))))
+         .inspect_err(|e| {
+             tracing::warn!(kind = %kind, ms = crate::logging::elapsed_ms(started), "generation refused: {e}");
+@@ -103,7 +107,13 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // The probe (#108) cuts nothing: its own protected-move law judges
+     // the stylus against the model, and no cutting law or region applies.
+     if matches!(params, OpParams::Probe { .. }) {
+-        return super::probe_op::generate_probe(&params, &tool, hs.clearance, &material.facets);
++        // #835: its stylus reads stem and holder as one band - a body is
++        // judged by the cylinder enclosing it, and the path says so.
++        let note = super::body_judged::probe_note(&tool, body.as_ref());
++        return super::probe_op::generate_probe(&params, &tool, hs.clearance, &material.facets).map(|(mut p, w)| {
++            p.notes.extend(note);
++            (p, w)
++        });
+     }
+     // The plasma cut (#670) is its own law: picked contours (or the
+     // model's through-silhouette) cut with the torch's kerf; no milling
+@@ -2556,6 +2566,10 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     let geom = tool.geom();
+     // #368: what the fixture laws sweep above the shank.
+     let holder = crate::tool_body::stack(&geom, body.as_ref());
++    // #835: the cutter every stack law reads - its tip (M13.7) and,
++    // with a body, the same bands above the shank, never the cylinder
++    // enclosing them.
++    let cutter = verify::Cutter::of(&tool).with_body(&geom, &holder);
+     let fixture_boxes = fixtures;
+     let stl = match &params {
+         OpParams::Face { .. }
+@@ -2737,7 +2751,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     .or((depth_law == DepthLaw::Section).then_some(&material.facets[..])),
+                     tool: &geom,
+                     // The op's real tip for the solid law (M13.7).
+-                    cutter: Some(verify::Cutter::of(&tool)),
++                    cutter: Some(cutter),
+                     mode,
+                     stock_top_z,
+                     clearance_z: hl.clearance,
+@@ -2951,7 +2965,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // along every move against the part solid. The Section kinds
+             // answer the same law inside `verify` (b2), real tip (M13.7).
+             if depth_law == DepthLaw::Contain {
+-                contain_into(&mut warns, &path, &material.facets, &tool, depth_law, stl);
++                contain_into(&mut warns, &path, &material.facets, &cutter, depth_law, stl);
+             }
+             // The rotary kinds' bands and rapids (M13): `Mode::Rotary`
+             // stood the vertical-column laws down; the radial field
+@@ -2962,7 +2976,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     &path,
+                     &material.facets,
+                     stock_facets.as_deref(),
+-                    &tool,
++                    &cutter,
+                     tol,
+                 );
+             }
+@@ -3043,7 +3057,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     model: (depth_law == DepthLaw::Section).then_some(&m_gen.facets[..]),
+                     tool: &geom,
+                     // The op's real tip for the solid law (M13.7).
+-                    cutter: Some(verify::Cutter::of(&tool)),
++                    cutter: Some(cutter),
+                     mode,
+                     stock_top_z: st_local,
+                     clearance_z: hl.clearance,
+@@ -3062,7 +3076,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // along every move against the part solid. The Section kinds
+             // answer the same law inside `verify` (b2), real tip (M13.7).
+             if depth_law == DepthLaw::Contain {
+-                contain_into(&mut warns, &path, &m_gen.facets, &tool, depth_law, stl);
++                contain_into(&mut warns, &path, &m_gen.facets, &cutter, depth_law, stl);
+             }
+             warns.extend(workholding_warnings(
+                 &path_world,
+@@ -3198,7 +3212,7 @@ fn contain_into(
+     warns: &mut Vec<Warning>,
+     path: &Toolpath,
+     facets: &[Triangle],
+-    tool: &crate::tools::Tool,
++    cutter: &verify::Cutter,
+     law: DepthLaw,
+     stl: f64,
+ ) {
+@@ -3207,7 +3221,7 @@ fn contain_into(
+         allow: GOUGE_TOL + (-stl).max(0.0),
+         hole_walls: law == DepthLaw::Contain,
+     };
+-    for w in verify::solid_hits(path, facets, &verify::Cutter::of(tool), &law) {
++    for w in verify::solid_hits(path, facets, cutter, &law) {
+         if !warns.contains(&w) {
+             warns.push(w);
+         }
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index dd5af8d0..879e8e85 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -128,6 +128,7 @@ use boundary_ctx::*;
+ mod job;
+ pub use job::*;
+ mod generate;
++pub mod body_judged;
+ mod cross_entry;
+ mod cross_sag;
+ mod cross_part;
+diff --git a/crates/app/src/operation/probe_op.rs b/crates/app/src/operation/probe_op.rs
+index 5f9536b6..246db1be 100644
+--- a/crates/app/src/operation/probe_op.rs
++++ b/crates/app/src/operation/probe_op.rs
+@@ -156,6 +156,10 @@ pub fn stylus_cutter(tool: &Tool) -> Cutter {
+         shank_len: (g.flute_len - r).max(0.0),
+         holder_radius: body_r,
+         holder_len: body_len,
++        // The stylus folds shank and holder into one band (#835: a
++        // probe's body is judged by that enclosing band; the probe
++        // reach note names it).
++        body: None,
+     }
+ }
+ 
+diff --git a/crates/app/src/operation/rotary_law.rs b/crates/app/src/operation/rotary_law.rs
+index 03561aea..9a1d5ae5 100644
+--- a/crates/app/src/operation/rotary_law.rs
++++ b/crates/app/src/operation/rotary_law.rs
+@@ -38,7 +38,7 @@ pub(super) fn rotary_into(
+     path: &crate::cl::Toolpath,
+     part: &[Triangle],
+     stock: Option<&[Triangle]>,
+-    tool: &crate::tools::Tool,
++    cutter: &verify::Cutter,
+     tolerance: f64,
+ ) {
+     let hits = match crate::multiaxis::axis::fit(part) {
+@@ -47,7 +47,7 @@ pub(super) fn rotary_into(
+             &verify::RotaryAxis { origin: ax.origin, dir: [ax.dir.x, ax.dir.y, ax.dir.z] },
+             stock,
+             part,
+-            &verify::Cutter::of(tool),
++            cutter,
+             &verify::RotaryLaw {
+                 cell: CELL,
+                 step: STEP,
+diff --git a/crates/app/tests/tool_body_judged.rs b/crates/app/tests/tool_body_judged.rs
+new file mode 100644
+index 00000000..c36cab5c
+--- /dev/null
++++ b/crates/app/tests/tool_body_judged.rs
+@@ -0,0 +1,343 @@
++//! #835: a tool body is judged as ONE shape - the band stack the fixture
++//! laws sweep and the simulation draws - by the reach laws too, not the
++//! single cylinder enclosing it. Pinned here: the stack is never smaller
++//! than the body (an imported mesh, a drawn profile with cones and arcs),
++//! a stepped body whose nose clears a wall is no longer warned while a
++//! band that reaches the wall still is, a tool with no body reads
++//! unchanged, the drawn and judged stacks agree, and the laws that keep
++//! the enclosing cylinder say so by name.
++//!
++//! Gate map (M4.4): covers sim::verify::reach, sim::verify::probe, sim::verify::body_bands, app::operation::body_judged, app::operation::generate, app::sim_tool_body, app::tool_body.
++
++use camcraft_app::cl::{Move, MoveKind, Toolpath};
++use camcraft_app::commands::{AddTool, CreateOperation, History, SetStock, SetToolBody};
++use camcraft_app::geo2d::{Loop, Point2, Region};
++use camcraft_app::geometry::Point3;
++use camcraft_app::machining2d::GenError;
++use camcraft_app::model;
++use camcraft_app::operation::body_judged;
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::sim_tool_body;
++use camcraft_app::spun::{SpunPoint, SpunProfile};
++use camcraft_app::stock::StockShape;
++use camcraft_app::tool_body;
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::verify::{verify, BodyBands, Cutter, Mode, ToolGeom, VerifyContext, Warning};
++use camcraft_app::world::new_world;
++use camcraft_tools::holder_profile::{HolderBand, HolderProfile, HolderStack};
++
++const TOOL: &str = "EM-0400-2FL";
++
++fn catalog_tool() -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog entry")
++}
++
++// ---- the stack is never smaller than the body ----------------------
++
++/// The farthest any band covering height `z` reaches (touching ends
++/// count) - what the laws read at `z`.
++fn reach_at(bands: &[HolderBand], z: f64) -> f64 {
++    bands.iter().filter(|b| b.above - 1e-9 <= z && z <= b.above + b.len + 1e-9).fold(f64::NEG_INFINITY, |a, b| a.max(b.r))
++}
++
++/// A faceted solid of revolution of the meridian `m` ((z, r) points),
++/// `n` sides, turned by `turn` radians and lifted `lift` - a stand-in
++/// for an imported holder mesh whose vertices sit on no band edge.
++fn revolve(m: &[(f64, f64)], n: usize, turn: f64, lift: f64) -> Vec<[[f64; 3]; 3]> {
++    let at = |(z, r): (f64, f64), k: usize| {
++        let a = turn + std::f64::consts::TAU * k as f64 / n as f64;
++        [r * a.cos(), r * a.sin(), z + lift]
++    };
++    let mut out = Vec::new();
++    for w in m.windows(2) {
++        for k in 0..n {
++            let (a, b, c, d) = (at(w[0], k), at(w[0], k + 1), at(w[1], k), at(w[1], k + 1));
++            out.push([a, b, d]);
++            out.push([a, d, c]);
++        }
++    }
++    out
++}
++
++/// Points spread over the facet (barycentric grid, edges included).
++fn samples(t: &[[f64; 3]; 3]) -> Vec<[f64; 3]> {
++    let n = 24;
++    let mut out = Vec::new();
++    for i in 0..=n {
++        for j in 0..=(n - i) {
++            let (u, v) = (i as f64 / n as f64, j as f64 / n as f64);
++            let w = 1.0 - u - v;
++            out.push([0, 1, 2].map(|k| u * t[0][k] + v * t[1][k] + w * t[2][k]));
++        }
++    }
++    out
++}
++
++#[test]
++fn the_band_stack_is_never_smaller_than_an_imported_mesh_body() {
++    // A nose, a cone up to a flange, the flange, a taper back in.
++    let m = [(0.0, 0.0), (0.0, 7.5), (11.3, 7.5), (19.7, 16.2), (31.1, 16.2), (37.0, 9.0), (37.0, 0.0)];
++    let tris = revolve(&m, 23, 0.37, 18.13);
++    let profile = HolderProfile::envelope(&tris).expect("a sane body");
++    let t = catalog_tool();
++    let judged = profile.enclose(&t).expect("the body sits above the flutes");
++    let g = judged.geom();
++    let stack = tool_body::stack(&g, Some(&profile));
++    let carried = BodyBands::of(&g, &stack).expect("the stack fits the tool it was read for");
++    let shank_top = g.flute_len + g.shank_len;
++    for tri in &tris {
++        for p in samples(tri) {
++            let (z, r) = (p[2], p[0].hypot(p[1]));
++            assert!(reach_at(profile.bands(), z) >= r - 1e-9, "envelope at z {z}: {} < body r {r}", reach_at(profile.bands(), z));
++            assert!(reach_at(&stack.bands, z) >= r - 1e-9, "swept stack at z {z} is smaller than the body r {r}");
++            // What the reach laws read: the shank beside it, the carried bands above.
++            let law = if z <= shank_top { g.shank_radius.max(reach_at(carried.bands(), z)) } else { reach_at(carried.bands(), z) };
++            assert!(law >= r - 1e-9, "the reach laws' stack at z {z} reads {law} < body r {r}");
++        }
++    }
++}
++
++fn pt(z: f64, r: f64) -> SpunPoint {
++    SpunPoint::line(z, r)
++}
++
++/// A drawn holder with a nose, a cone, a convex and a concave arc.
++fn drawn(z0: f64) -> Vec<SpunPoint> {
++    vec![
++        pt(z0, 0.0),
++        pt(z0, 6.0),
++        pt(z0 + 10.0, 6.0),
++        SpunPoint { z: z0 + 20.0, r: 14.0, arc: 8.0 },
++        SpunPoint { z: z0 + 30.0, r: 14.0, arc: -6.0 },
++        pt(z0 + 40.0, 14.0),
++        pt(z0 + 40.0, 0.0),
++    ]
++}
++
++/// Points on the drawn outline itself: lines exactly, arcs on their own
++/// circle (the minor arc through both ends, centre on the side the
++/// signed radius names).
++fn on_outline(pts: &[SpunPoint]) -> Vec<(f64, f64)> {
++    let mut out = Vec::new();
++    for w in pts.windows(2) {
++        let (a, b) = (w[0], w[1]);
++        let (dz, dr) = (b.z - a.z, b.r - a.r);
++        let len = dz.hypot(dr);
++        for k in 0..=200 {
++            let s = k as f64 / 200.0;
++            if a.arc == 0.0 {
++                out.push((a.z + dz * s, a.r + dr * s));
++                continue;
++            }
++            let rad = a.arc.abs();
++            let n = (-dr / len, dz / len);
++            let back = (rad * rad - len * len * 0.25).max(0.0).sqrt();
++            let mid = ((a.z + b.z) * 0.5, (a.r + b.r) * 0.5);
++            let c = (mid.0 - a.arc.signum() * back * n.0, mid.1 - a.arc.signum() * back * n.1);
++            let (u, v) = ((a.z - c.0, a.r - c.1), (b.z - c.0, b.r - c.1));
++            let q = (u.0 + (v.0 - u.0) * s, u.1 + (v.1 - u.1) * s);
++            let l = q.0.hypot(q.1);
++            out.push((c.0 + rad * q.0 / l, c.1 + rad * q.1 / l));
++        }
++    }
++    out
++}
++
++#[test]
++fn the_band_stack_is_never_smaller_than_a_drawn_profile_with_cones_and_arcs() {
++    let t = catalog_tool();
++    let z0 = t.flute_len + t.shank_len;
++    let pts = drawn(z0);
++    let spun = SpunProfile::new(pts.clone()).expect("a sane drawn profile");
++    let profile = spun.holder_profile();
++    let judged = profile.enclose(&t).expect("on the shank's top");
++    let g = judged.geom();
++    let stack = tool_body::stack(&g, Some(&profile));
++    let carried = BodyBands::of(&g, &stack).expect("the stack fits");
++    let outline = on_outline(&pts);
++    // The convex arc bulges past r 14: the test must see it.
++    assert!(outline.iter().any(|p| p.1 > 15.0), "the convex arc's bulge is sampled");
++    for (z, r) in outline {
++        assert!(reach_at(&stack.bands, z) >= r - 1e-9, "swept stack at z {z} < drawn r {r}");
++        assert!(reach_at(carried.bands(), z) >= r - 1e-9, "the reach laws' stack at z {z} < drawn r {r}");
++    }
++    // ...and it is tighter than the enclosing cylinder: the nose band is the nose.
++    assert!(reach_at(carried.bands(), z0 + 5.0) < g.holder_radius - 5.0, "{:?}", carried.bands());
++}
++
++// ---- law (c): the stepped body ------------------------------------
++
++/// Stepped body on a Ø8 end mill: an r 6 nose 14..34 above the tip, an
++/// r 20 flange 34..49. Its enclosing cylinder is r 20 from 14 to 49.
++fn stepped() -> (ToolGeom, HolderStack) {
++    let g = ToolGeom { radius: 4.0, nose_radius: 0.0, flute_len: 8.0, shank_radius: 4.0, shank_len: 6.0, holder_radius: 20.0, holder_len: 35.0 };
++    let stack = HolderStack {
++        bands: vec![HolderBand { above: 14.0, len: 20.0, r: 6.0 }, HolderBand { above: 34.0, len: 15.0, r: 20.0 }],
++        top: 49.0,
++    };
++    (g, stack)
++}
++
++fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++    Loop::new(vec![Point2::new(x0, y0), Point2::new(x1, y0), Point2::new(x1, y1), Point2::new(x0, y1)]).expect("loop")
++}
++
++/// A 100 mm plate with a 20 mm part island, its wall `gap` from the
++/// tool's axis; the tool plunges to `tip_z` beside it.
++fn plunge_beside_island(gap: f64, tip_z: f64, g: &ToolGeom, cutter: Option<Cutter>) -> Vec<Warning> {
++    let region = Region::new(vec![rect(0.0, 0.0, 100.0, 100.0), rect(40.0, 40.0, 60.0, 60.0)]).expect("region");
++    let stock = Region::new(vec![rect(0.0, 0.0, 100.0, 100.0)]).expect("stock");
++    let x = 40.0 - gap;
++    let t = Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, Point3::new(-20.0, -20.0, 5.0), Point3::new(x, 50.0, 5.0), None),
++        Move::new(MoveKind::Plunge, Point3::new(x, 50.0, 5.0), Point3::new(x, 50.0, tip_z), Some(80.0)),
++    ]);
++    let cx = VerifyContext {
++        region: &region,
++        stock: Some(&stock),
++        model: None,
++        tool: g,
++        cutter,
++        mode: Mode::Boundary,
++        stock_top_z: 0.0,
++        clearance_z: 5.0,
++        stock_to_leave: 0.0,
++        gouge_tol: 0.01,
++        z_tol: 1e-6,
++        finish_tol: None,
++        fixtures: &[],
++        spindle: None,
++    };
++    verify(&t, &cx).into_iter().filter(|w| matches!(w, Warning::ShankHit { .. } | Warning::SweepHit { .. })).collect()
++}
++
++#[test]
++fn a_stepped_nose_clear_of_the_wall_is_no_longer_warned() {
++    let (g, stack) = stepped();
++    let body = Cutter::flat(&g).with_body(&g, &stack);
++    assert!(body.body.is_some(), "the stepped stack fits its enclosing cylinder");
++    // Wall 10 mm off the axis, tip 30 deep: the nose (r 6) stands clear,
++    // the flange (r 20) stands 4 mm ABOVE the stock top. The enclosing
++    // cylinder (r 20 from 16 below the top) read a false hit.
++    let before = plunge_beside_island(10.0, -30.0, &g, None);
++    assert_eq!(before, vec![Warning::ShankHit { at: 1, part: true }], "the enclosing cylinder's reading");
++    let after = plunge_beside_island(10.0, -30.0, &g, Some(body));
++    assert_eq!(after, Vec::new(), "the drawn nose is clear and the flange is above the wall");
++}
++
++#[test]
++fn a_band_that_reaches_the_wall_is_still_warned() {
++    let (g, stack) = stepped();
++    let body = Cutter::flat(&g).with_body(&g, &stack);
++    // The flange sinks 6 mm below the top beside a wall 10 mm off.
++    assert_eq!(plunge_beside_island(10.0, -40.0, &g, Some(body)), vec![Warning::ShankHit { at: 1, part: true }]);
++    // The nose itself grazes a wall 5 mm off.
++    assert_eq!(plunge_beside_island(5.0, -30.0, &g, Some(body)), vec![Warning::ShankHit { at: 1, part: true }]);
++    // Both bands in the wall still report the move once.
++    assert_eq!(plunge_beside_island(5.0, -40.0, &g, Some(body)), vec![Warning::ShankHit { at: 1, part: true }]);
++}
++
++#[test]
++fn a_tool_with_no_body_reads_unchanged() {
++    let (g, _) = stepped();
++    let plain = Cutter::flat(&g);
++    // The plain holder cylinder is not carried: the cutter is the same value.
++    assert_eq!(plain.with_body(&g, &HolderStack::cylinder(&g)), plain);
++    assert_eq!(plain.holder_bands(), vec![(14.0, 20.0, 35.0)]);
++    for (gap, z) in [(10.0, -30.0), (10.0, -40.0), (5.0, -30.0), (30.0, -10.0)] {
++        assert_eq!(plunge_beside_island(gap, z, &g, None), plunge_beside_island(gap, z, &g, Some(plain)), "gap {gap}, tip {z}");
++    }
++}
++
++#[test]
++fn a_stack_that_is_not_this_tools_is_refused_and_the_cylinder_stands() {
++    let (g, stack) = stepped();
++    let wider = HolderStack { bands: vec![HolderBand { above: 14.0, len: 35.0, r: 25.0 }], top: 49.0 };
++    let shorter = HolderStack { bands: vec![stack.bands[0]], top: 34.0 };
++    let in_flutes = HolderStack { bands: vec![HolderBand { above: 2.0, len: 47.0, r: 3.0 }], top: 49.0 };
++    let nan = HolderStack { bands: vec![HolderBand { above: 14.0, len: f64::NAN, r: 6.0 }], top: 49.0 };
++    for s in [wider, shorter, in_flutes, nan] {
++        assert_eq!(BodyBands::of(&g, &s), None, "{s:?}");
++        assert_eq!(Cutter::flat(&g).with_body(&g, &s).holder_bands(), vec![(14.0, 20.0, 35.0)]);
++    }
++    // A cutter whose bands disagree with the geometry the laws read
++    // (the record's holder changed under it) judges by the cylinder.
++    let body = Cutter::flat(&g).with_body(&g, &stack);
++    let shrunk = ToolGeom { holder_radius: 10.0, ..g };
++    let shrunk_body = Cutter { holder_radius: 10.0, ..body };
++    assert_eq!(Cutter::judged(&shrunk, Some(shrunk_body)).body, None);
++    assert_eq!(Cutter::judged(&g, Some(body)).body, body.body);
++}
++
++// ---- drawn shape == judged shape ----------------------------------
++
++#[test]
++fn the_simulation_draws_the_stack_the_reach_laws_judge() {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(&world, SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, Location::default()).expect("stock"));
++    history.execute(&world, AddTool::new(&world, TOOL, catalog_tool()).expect("tool"));
++    history.execute(
++        &world,
++        CreateOperation::new(
++            &world,
++            "Face1",
++            TOOL,
++            SrcRef::Stock,
++            OpParams::Face {
++                holes: Default::default(),
++                tilt: None,
++                blend_turns: false,
++                stepover: 3.0,
++                clearance_z: Height::fixed(25.0),
++                cut_z: Height::fixed(19.5),
++                top_z: None,
++                stepdown: None,
++                feed: 1200.0,
++                plunge_feed: 300.0,
++                climb: true,
++            },
++        )
++        .expect("face op"),
++    );
++    let t = catalog_tool();
++    history.execute(&world, SetToolBody::spun(&world, TOOL, Some(drawn(t.flute_len + t.shank_len))).expect("a sane profile"));
++    let drawn_outline = sim_tool_body::for_operation(&world, "Face1").expect("drawable").expect("a milling tool");
++    // The judged cutter, read the way `operation::generate` builds it.
++    let te = model::find_by_name(&world, TOOL).expect("tool");
++    let (judged, body) = tool_body::judged(&world, &te, t).expect("fits");
++    let g = judged.geom();
++    let stack = tool_body::stack(&g, body.as_ref());
++    let cutter = Cutter::of(&judged).with_body(&g, &stack);
++    assert!(cutter.body.is_some(), "a drawn body is judged by its bands");
++    let judged_bands: Vec<(f64, f64, f64)> = cutter.holder_bands();
++    let drawn_bands: Vec<(f64, f64, f64)> = drawn_outline.holder.iter().map(|b| (b.above, b.r, b.len)).collect();
++    assert_eq!(judged_bands, drawn_bands, "the reach, solid and rotary laws judge what the simulation draws");
++    // The fixture laws sweep the same bands.
++    let fixture: Vec<(f64, f64, f64)> = stack.bands.iter().map(|b| (b.above, b.r, b.len)).collect();
++    assert_eq!(judged_bands, fixture);
++}
++
++// ---- kept cylinder, said by name ----------------------------------
++
++#[test]
++fn a_law_that_keeps_the_cylinder_names_it() {
++    let t = catalog_tool();
++    let z0 = t.flute_len + t.shank_len;
++    let profile = SpunProfile::new(drawn(z0)).expect("sane").holder_profile();
++    let judged = profile.enclose(&t).expect("fits");
++    let msg = format!("tool {TOOL}'s holder (dia. {:.3}) sinks into the stock", judged.holder_d);
++    let refusal = || GenError::Invalid(msg.clone());
++    let named = body_judged::name_enclosure(refusal(), &judged, Some(&profile)).to_string();
++    let words = format!("judged here by the cylinder enclosing it, Ø{:.3} mm", judged.holder_d);
++    assert!(named.contains(&words), "{named}");
++    // No body, or a refusal about something else: unchanged.
++    assert_eq!(body_judged::name_enclosure(refusal(), &t, None).to_string(), refusal().to_string());
++    let other = || GenError::Invalid("the hole is deeper than the flute".into());
++    assert_eq!(body_judged::name_enclosure(other(), &judged, Some(&profile)).to_string(), other().to_string());
++    // The touch probe's stylus reach folds stem and holder: its note says so.
++    let note = body_judged::probe_note(&judged, Some(&profile)).expect("a body is noted");
++    assert!(note.contains(&words), "{note}");
++    assert_eq!(body_judged::probe_note(&t, None), None);
++}
+diff --git a/crates/motion/tests/solid_law.rs b/crates/motion/tests/solid_law.rs
+index 44a6d0a9..9bf84622 100644
+--- a/crates/motion/tests/solid_law.rs
++++ b/crates/motion/tests/solid_law.rs
+@@ -383,7 +383,7 @@ fn the_tool_tip_shape_is_read_exactly() {
+         b.finish()
+     };
+     let law = SolidLaw { step: 0.25, allow: TOL, hole_walls: false };
+-    let ball = Cutter { radius: R, corner_r: R, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0 };
++    let ball = Cutter { radius: R, corner_r: R, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0, body: None };
+     let flat = Cutter { corner_r: 0.0, ..ball };
+     // A wall at x 3 over a floor at z 0, its foot broken by a 1 mm 45-
+     // degree chamfer (x 2..3). Tip 0.05 over the floor on the axis x 0:
+@@ -407,7 +407,7 @@ fn the_tool_tip_shape_is_read_exactly() {
+     // A 90-degree V groove along Y, apex on the axis at z 0: a 90-degree
+     // drill point stands in it exactly; a flat end at the same tip is in
+     // its flanks; the point 0.1 under the apex is a gouge.
+-    let drill = Cutter { radius: R, corner_r: 0.0, tip_angle: 90.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0 };
++    let drill = Cutter { radius: R, corner_r: 0.0, tip_angle: 90.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0, body: None };
+     let s = 10.0;
+     let v = vec![
+         tri(p(-s, -10.0, s), p(0.0, -10.0, 0.0), p(0.0, 10.0, 0.0)),
+@@ -423,7 +423,7 @@ fn the_tool_tip_shape_is_read_exactly() {
+ #[test]
+ fn degenerate_input_fails_closed_never_panics() {
+     let law = SolidLaw { step: 0.25, allow: TOL, hole_walls: false };
+-    let c = Cutter { radius: R, corner_r: 0.0, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0 };
++    let c = Cutter { radius: R, corner_r: 0.0, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0, body: None };
+     let mut b = camcraft_motion::cl::PathBuilder::new(Point3::new(50.0, 50.0, 30.0));
+     b.push(MoveKind::Feed, Point3::new(60.0, 50.0, 30.0), Some(100.0));
+     let t = b.finish();
+@@ -449,7 +449,7 @@ fn a_cutter_wholly_inside_the_solid_is_found_by_parity() {
+     // cutter, the ray parity says steel.
+     let f = mesh(&vec![([-100.0, -100.0, -100.0], [100.0, 100.0, 200.0])]);
+     let law = SolidLaw { step: 0.25, allow: TOL, hole_walls: false };
+-    let c = Cutter { radius: R, corner_r: 0.0, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0 };
++    let c = Cutter { radius: R, corner_r: 0.0, tip_angle: 0.0, flute_len: 20.0, shank_radius: R, shank_len: 30.0, holder_radius: 16.0, holder_len: 40.0, body: None };
+     let mut b = camcraft_motion::cl::PathBuilder::new(Point3::new(0.0, 0.0, 0.0));
+     b.push(MoveKind::Feed, Point3::new(10.0, 0.0, 0.0), Some(100.0));
+     b.push(MoveKind::Rapid, Point3::new(10.0, 0.0, 300.0), None);
+diff --git a/crates/sim/src/verify/body_bands.rs b/crates/sim/src/verify/body_bands.rs
+new file mode 100644
+index 00000000..19c30c69
+--- /dev/null
++++ b/crates/sim/src/verify/body_bands.rs
+@@ -0,0 +1,92 @@
++//! A modelled tool body's band stack, carried with the cutter (#835): the
++//! revolved envelope (#368) or drawn spun holder (#93) the fixture laws
++//! sweep and the simulation draws, handed to every law that reads the
++//! cutter's stack - so the reach, solid and rotary laws judge the same
++//! shape, not the single cylinder enclosing it. A band stack is the
++//! stepped-cylinder reading of a solid of revolution (machine-tool
++//! handbooks); our own design, no vendor source or file consulted.
++//!
++//! The laws here:
++//! - **Never larger than the cylinder it replaces, never smaller than
++//!   the body.** The bands are the envelope's own (each never smaller
++//!   than the body over its span, `HolderProfile`'s law); a stack that
++//!   reaches past the tool's enclosing holder or shank (the shank carried
++//!   up to a raised foot may stand wider than the holder - it is steel
++//!   the cylinder left out, so reading it can only add), starts in the
++//!   flutes, or tops out elsewhere is not this tool's and is refused
++//!   (`None`): the enclosing cylinder stands in, which can only
++//!   over-report.
++//! - **No body, no change.** The plain holder cylinder's stack is not
++//!   carried at all, so a tool with no body reads bit-identically.
++
++use camcraft_tools::holder_profile::{HolderBand, HolderStack, MAX_BANDS};
++
++use crate::tools::ToolGeom;
++
++/// Most bands one carried stack holds: the envelope's own cap, plus the
++/// shank carried up to the body's foot (`HolderProfile::stack`).
++pub const BODY_BANDS_CAP: usize = MAX_BANDS + 1;
++/// Float dust on the fit checks (mm).
++const EPS: f64 = 1e-6;
++
++/// The body's bands above the shank's top, bottom-up - fixed capacity,
++/// so the cutter stays `Copy`.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct BodyBands {
++    n: usize,
++    b: [HolderBand; BODY_BANDS_CAP],
++}
++
++impl BodyBands {
++    /// The bands of `stack` standing above the shank of `g` (the tool as
++    /// the laws read it, its holder the cylinder enclosing the body), or
++    /// `None` - the enclosing cylinder stands in - when `stack` is the
++    /// plain holder cylinder or does not fit `g`: non-finite or negative
++    /// numbers, more bands than [`BODY_BANDS_CAP`], a band reaching
++    /// below the flutes' top, past the shank beside it or past the
++    /// holder above it, or a top other than the holder's.
++    #[must_use]
++    pub fn of(g: &ToolGeom, stack: &HolderStack) -> Option<Self> {
++        if *stack == HolderStack::cylinder(g) || stack.bands.len() > BODY_BANDS_CAP {
++            return None;
++        }
++        let fl = g.flute_len;
++        let shank_top = fl + g.shank_len;
++        let ok = |v: f64| v.is_finite() && v >= 0.0;
++        if !(ok(fl) && ok(shank_top) && ok(g.shank_radius) && ok(g.holder_radius) && ok(g.holder_len)) {
++            return None;
++        }
++        let mut out = Self { n: 0, b: [HolderBand { above: 0.0, len: 0.0, r: 0.0 }; BODY_BANDS_CAP] };
++        let mut top = shank_top;
++        for band in &stack.bands {
++            if !(ok(band.above) && ok(band.len) && ok(band.r)) || band.above < fl - EPS {
++                return None;
++            }
++            let hi = band.above + band.len;
++            // Beside the shank the enclosing shank stands for it: the
++            // part there must sit inside it.
++            if band.above < shank_top && band.r > g.shank_radius + EPS {
++                return None;
++            }
++            if hi <= shank_top + EPS {
++                continue;
++            }
++            // Above it, the enclosing holder - or the shank carried up
++            // to a body's raised foot (the stack's own gap band).
++            if band.r > g.holder_radius.max(g.shank_radius) + EPS {
++                return None;
++            }
++            let above = band.above.max(shank_top);
++            out.b[out.n] = HolderBand { above, len: hi - above, r: band.r };
++            out.n += 1;
++            top = top.max(hi);
++        }
++        ((top - (shank_top + g.holder_len)).abs() <= EPS && out.n > 0).then_some(out)
++    }
++
++    /// The bands, bottom-up.
++    #[must_use]
++    pub fn bands(&self) -> &[HolderBand] {
++        &self.b[..self.n]
++    }
++}
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index f4cc5ab2..ec4c3853 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -168,6 +168,7 @@ mod midpose;
+ pub mod plasma;
+ mod posed_steel;
+ mod prior;
++mod body_bands;
+ mod probe;
+ mod rapids;
+ mod rapids_posed;
+@@ -199,6 +200,7 @@ pub use workholding::{
+     bands_vs_workholding, bands_vs_workholding_held, rapids_vs_workholding,
+     rapids_vs_workholding_held, Workholding,
+ };
++pub use body_bands::{BodyBands, BODY_BANDS_CAP};
+ pub use probe::Cutter;
+ pub use rotary::{rotary_hits, RotaryAxis, RotaryLaw};
+ pub use solid::{SolidLaw, solid_hits};
+diff --git a/crates/sim/src/verify/probe.rs b/crates/sim/src/verify/probe.rs
+index d9e5d770..4738aeb1 100644
+--- a/crates/sim/src/verify/probe.rs
++++ b/crates/sim/src/verify/probe.rs
+@@ -5,6 +5,9 @@
+ //! [`Tool::profile`] draws; the frame is plain linear algebra. Our own
+ //! design; no vendor source.
+ 
++use camcraft_tools::holder_profile::HolderStack;
++
++use super::body_bands::BodyBands;
+ use crate::geometry::{Point3, Triangle};
+ use crate::tools::{Tool, ToolGeom, ToolKind};
+ 
+@@ -23,6 +26,10 @@ pub struct Cutter {
+     pub shank_len: f64,
+     pub holder_radius: f64,
+     pub holder_len: f64,
++    /// A modelled tool body's bands (#835), standing in for the holder
++    /// band: the shape the fixture laws sweep and the simulation draws.
++    /// `None` reads the holder cylinder, as always.
++    pub body: Option<BodyBands>,
+ }
+ 
+ impl Cutter {
+@@ -39,6 +46,27 @@ impl Cutter {
+             shank_len: g.shank_len,
+             holder_radius: g.holder_radius,
+             holder_len: g.holder_len,
++            body: None,
++        }
++    }
++
++    /// The same cutter with its holder read as the body's band stack
++    /// `stack` (#835) - `tool_body::stack` of the tool `g` describes.
++    /// A stack that is the plain holder cylinder, or does not fit `g`
++    /// ([`BodyBands::of`]), leaves the cylinder: it can only over-report.
++    #[must_use]
++    pub fn with_body(self, g: &ToolGeom, stack: &HolderStack) -> Self {
++        Self { body: BodyBands::of(g, stack), ..self }
++    }
++
++    /// What stands above the shank as `(bottom above the tip, radius,
++    /// length)` bands, bottom-up: the body's bands, or the one holder
++    /// cylinder.
++    #[must_use]
++    pub fn holder_bands(&self) -> Vec<(f64, f64, f64)> {
++        match &self.body {
++            Some(b) => b.bands().iter().map(|h| (h.above, h.r, h.len)).collect(),
++            None => vec![(self.flute_len + self.shank_len, self.holder_radius, self.holder_len)],
+         }
+     }
+ 
+@@ -61,11 +89,19 @@ impl Cutter {
+     /// sits inside the square one - else the square stack. A tip that
+     /// disagrees with the geometry the other laws read is never
+     /// trusted to clear a move: the fallback can only over-report.
++    /// Its body bands (#835) ride along only while they still fit `g`
++    /// ([`BodyBands::of`]'s law); else the holder cylinder stands in.
+     #[must_use]
+     pub fn judged(g: &ToolGeom, real: Option<Self>) -> Self {
+         let flat = Self::flat(g);
+         match real {
+-            Some(c) if Self { corner_r: 0.0, tip_angle: 0.0, ..c } == flat => c,
++            Some(c) if Self { corner_r: 0.0, tip_angle: 0.0, body: None, ..c } == flat => {
++                let fits = c.body.is_some_and(|b| {
++                    let stack = HolderStack { bands: b.bands().to_vec(), top: g.flute_len + g.shank_len + g.holder_len };
++                    BodyBands::of(g, &stack).is_some()
++                });
++                Self { body: if fits { c.body } else { None }, ..c }
++            }
+             _ => flat,
+         }
+     }
+@@ -136,7 +172,14 @@ impl Cutter {
+             }
+         };
+         band(fl, self.shank_len, self.shank_radius);
+-        band(fl + self.shank_len, self.holder_len, self.holder_radius);
++        match &self.body {
++            Some(b) => {
++                for h in b.bands() {
++                    band(h.above, h.len, h.r);
++                }
++            }
++            None => band(fl + self.shank_len, self.holder_len, self.holder_radius),
++        }
+         v
+     }
+ }
+diff --git a/crates/sim/src/verify/reach.rs b/crates/sim/src/verify/reach.rs
+index 8be709c5..8a3e8a52 100644
+--- a/crates/sim/src/verify/reach.rs
++++ b/crates/sim/src/verify/reach.rs
+@@ -4,7 +4,7 @@ use super::laws::{boundary_samples, dist2_seg, law_points};
+ use super::rest::Rest;
+ use super::types::{Mode, VerifyContext, Warning};
+ 
+-use crate::cl::{is_vertical, MoveKind, Toolpath};
++use crate::cl::{MoveKind, Toolpath, is_vertical};
+ use crate::geo2d::{Point2, Region};
+ 
+ /// (c) Shank/holder reach against rest material, then (c3) its
+@@ -34,15 +34,15 @@ pub(super) fn band_reach(
+ 
+     // The band stack, law (c) and its fixture twin (c2) both read -
+     // [ (bottom offset above the cut, radius, length) ] for shank, then
+-    // holder.
+-    let bands = [
+-        (cx.tool.flute_len, cx.tool.shank_radius, cx.tool.shank_len),
+-        (
+-            cx.tool.flute_len + cx.tool.shank_len,
+-            cx.tool.holder_radius,
+-            cx.tool.holder_len,
+-        ),
+-    ];
++    // what stands above it: the holder cylinder, or a modelled body's
++    // own bands (#835) - the very stack (c2) sweeps and the simulation
++    // draws, never the cylinder enclosing it. Each group convicts a
++    // move once, the worst offender over its bands, so a body's many
++    // bands report as the one holder they stand for.
++    let shank = [(cx.tool.flute_len, cx.tool.shank_radius, cx.tool.shank_len)];
++    let holder = super::Cutter::judged(cx.tool, cx.cutter).holder_bands();
++    let groups: [&[(f64, f64, f64)]; 2] = [&shank, &holder];
++    let bands: Vec<(f64, f64, f64)> = groups.concat();
+ 
+     if !matches!(cx.mode, Mode::Engrave | Mode::Radial | Mode::Rotary) {
+         // Both boundaries matter: the region's loops carry the part
+@@ -103,70 +103,79 @@ pub(super) fn band_reach(
+             }
+             let pts = law_points(m, chord_tol);
+             let lean = m.axis.filter(|a| !is_vertical(a));
+-            for &(above, band_r, band_len) in &bands {
+-                if band_r <= r || band_len <= 0.0 {
+-                    continue;
+-                }
+-                let (offx, offy, r_band, h0) = match lean {
+-                    None => (0.0, 0.0, band_r, m.to.z + above),
+-                    Some(a) => {
+-                        let mid = above + band_len * 0.5;
+-                        let spread = (band_len * 0.5) * (a[0] * a[0] + a[1] * a[1]).sqrt();
+-                        let za = m.to.z + above * a[2];
+-                        let zb = m.to.z + (above + band_len) * a[2];
+-                        (mid * a[0], mid * a[1], band_r + spread, za.min(zb) - band_r)
++            for group in groups {
++                let mut convicted: Option<bool> = None;
++                for &(above, band_r, band_len) in group {
++                    if convicted == Some(true) {
++                        break; // the worst offender is already named
+                     }
+-                };
+-                // Z-window skip (M2.5 E): the law convicts only where
+-                // `h0 < surface(q)`, and no column's surface stands
+-                // above the stock top (`surface` ends in that `min`,
+-                // and a cleared column cannot exceed the stock it was
+-                // cut from). A band whose bottom stands at or above
+-                // the ceiling has nothing to meet in any column -
+-                // this is the same predicate read one step earlier,
+-                // not an approximation: the old loop asked every
+-                // sample's annulus to learn the answer it could see
+-                // in the band's own numbers. A continuous-Z path (a
+-                // flow line) multiplies that blind ask by its plane
+-                // count; on a level ladder the test rarely fires.
+-                if h0 >= cx.stock_top_z {
+-                    continue;
+-                }
+-                let r2 = (r_band + 1e-9) * (r_band + 1e-9);
+-                let mut hit = None;
+-                'worst: {
+-                    for p in &pts {
+-                        let pc = Point2::new(p.x + offx, p.y + offy);
+-                        for q in &samples {
+-                            let dd = dist2_seg(*q, pc, pc);
+-                            if dd > r2 || dd <= (r + cx.gouge_tol) * (r + cx.gouge_tol) {
+-                                continue; // outside this band's annulus
+-                            }
+-                            if !in_stock(*q) {
+-                                continue;
+-                            }
+-                            if h0 < surface(*q, i + 1) {
+-                                hit = Some(part_at(*q));
+-                                if hit == Some(true) {
+-                                    break 'worst; // report the worst offender
++                    if band_r <= r || band_len <= 0.0 {
++                        continue;
++                    }
++                    let (offx, offy, r_band, h0) = match lean {
++                        None => (0.0, 0.0, band_r, m.to.z + above),
++                        Some(a) => {
++                            let mid = above + band_len * 0.5;
++                            let spread = (band_len * 0.5) * (a[0] * a[0] + a[1] * a[1]).sqrt();
++                            let za = m.to.z + above * a[2];
++                            let zb = m.to.z + (above + band_len) * a[2];
++                            (mid * a[0], mid * a[1], band_r + spread, za.min(zb) - band_r)
++                        }
++                    };
++                    // Z-window skip (M2.5 E): the law convicts only where
++                    // `h0 < surface(q)`, and no column's surface stands
++                    // above the stock top (`surface` ends in that `min`,
++                    // and a cleared column cannot exceed the stock it was
++                    // cut from). A band whose bottom stands at or above
++                    // the ceiling has nothing to meet in any column -
++                    // this is the same predicate read one step earlier,
++                    // not an approximation: the old loop asked every
++                    // sample's annulus to learn the answer it could see
++                    // in the band's own numbers. A continuous-Z path (a
++                    // flow line) multiplies that blind ask by its plane
++                    // count; on a level ladder the test rarely fires.
++                    if h0 >= cx.stock_top_z {
++                        continue;
++                    }
++                    let r2 = (r_band + 1e-9) * (r_band + 1e-9);
++                    let mut hit = None;
++                    'worst: {
++                        for p in &pts {
++                            let pc = Point2::new(p.x + offx, p.y + offy);
++                            for q in &samples {
++                                let dd = dist2_seg(*q, pc, pc);
++                                if dd > r2 || dd <= (r + cx.gouge_tol) * (r + cx.gouge_tol) {
++                                    continue; // outside this band's annulus
++                                }
++                                if !in_stock(*q) {
++                                    continue;
++                                }
++                                if h0 < surface(*q, i + 1) {
++                                    hit = Some(part_at(*q));
++                                    if hit == Some(true) {
++                                        break 'worst; // report the worst offender
++                                    }
+                                 }
+                             }
+                         }
+                     }
++                    // The overhang backstop (M13.7 B): stock hidden under a
++                    // ledge stands outside every plane section, so no sample
++                    // above sees it - asked only where the section law found
++                    // nothing, it can add a conviction, never remove one.
++                    if hit.is_none()
++                        && pts.iter().any(|p| {
++                            let pc = Point2::new(p.x + offx, p.y + offy);
++                            rest.hidden_in_annulus(pc, r + cx.gouge_tol, r_band, h0, i + 1)
++                        })
++                    {
++                        hit = Some(false);
++                    }
++                    if let Some(part) = hit {
++                        convicted = Some(convicted.unwrap_or(false) || part);
++                    }
+                 }
+-                // The overhang backstop (M13.7 B): stock hidden under a
+-                // ledge stands outside every plane section, so no sample
+-                // above sees it - asked only where the section law found
+-                // nothing, it can add a conviction, never remove one.
+-                if hit.is_none()
+-                    && pts.iter().any(|p| {
+-                        let pc = Point2::new(p.x + offx, p.y + offy);
+-                        rest.hidden_in_annulus(pc, r + cx.gouge_tol, r_band, h0, i + 1)
+-                    })
+-                {
+-                    hit = Some(false);
+-                }
+-                if let Some(part) = hit {
++                if let Some(part) = convicted {
+                     shanked.push(i);
+                     warns.push(Warning::ShankHit { at: i, part });
+                 }
+diff --git a/crates/sim/tests/midmove_pose.rs b/crates/sim/tests/midmove_pose.rs
+index 7ba6a44e..887acf2f 100644
+--- a/crates/sim/tests/midmove_pose.rs
++++ b/crates/sim/tests/midmove_pose.rs
+@@ -29,6 +29,7 @@ fn cutter() -> Cutter {
+         shank_len: 10.0,
+         holder_radius: 4.0,
+         holder_len: 10.0,
++        body: None,
+     }
+ }
+ 
+diff --git a/crates/sim/tests/overhang_laws.rs b/crates/sim/tests/overhang_laws.rs
+index 95e60569..ebcca022 100644
+--- a/crates/sim/tests/overhang_laws.rs
++++ b/crates/sim/tests/overhang_laws.rs
+@@ -342,6 +342,7 @@ fn judge_ball(p: &Toolpath, facets: &[Triangle]) -> Vec<Warning> {
+         shank_len: tool.shank_len,
+         holder_radius: tool.holder_radius,
+         holder_len: tool.holder_len,
++        body: None,
+     };
+     let cx = VerifyContext {
+         region: &region,
+diff --git a/docs/decisions/835-reach-reads-band-stack.md b/docs/decisions/835-reach-reads-band-stack.md
+new file mode 100644
+index 00000000..77bdf575
+--- /dev/null
++++ b/docs/decisions/835-reach-reads-band-stack.md
+@@ -0,0 +1,49 @@
++## #835 - a tool body is judged by its band stack, not the cylinder enclosing it
++
++**Decided (option 1, by the orchestrating session; implemented here).**
++Every verdict law that reads the tool's stack above the shank now reads
++the same band stack the fixture laws sweep and the simulation draws
++(`tool_body::stack`): law (c) shank/holder reach, (c3) the mid-turn
++sweep, and every law that reads `verify::Cutter` - the solid law (b2),
++the containment kinds' solid law, the posed rapids and the rotary field
++law. The bands ride on the cutter (`Cutter::body`, a fixed-capacity
++`BodyBands`, so the cutter stays `Copy` and `VerifyContext` gains no
++field). Law (c) convicts a move once per group (the shank, then the
++holder or the body's bands), worst offender first, so a body's many
++bands report as the one holder they stand for.
++
++**Kept the enclosing cylinder, said by name.** The drill-reach and
++cross-drill refusals (one holder disc/tube by construction) and the
++touch probe's stylus reach (stem and holder folded into one band): a
++refusal that names the holder of a tool with a body gains "the tool
++body is judged here by the cylinder enclosing it, Ø..."
++(`operation::body_judged::name_enclosure`), and a probe path with a body
++carries the same words as a note. Also unchanged, not verdicts on the
++body's shape: the magazine fit (the changer's pocket takes the widest
++diameter), the 5-axis shank-avoidance dodge (a generator choice; the
++cylinder only leans more), and the posed-contact law's shank excuse.
++
++**Why.** #743 asks that what is drawn be what is checked. The cylinder
++over-reported: a stepped body (narrow nose under a wide flange) was
++warned for a flange that stood above the wall. The band stack is never
++smaller than the body (`HolderProfile`'s clipped envelope, the spun
++profile's tangent-polygon arcs), pinned here by sampling an imported
++mesh and a drawn profile with a cone, a convex and a concave arc.
++
++**Guards.** A stack that is the plain holder cylinder is not carried
++(no body, no change: byte-identical cutter and verdicts). A stack that
++does not fit the tool's judged record (non-finite, in the flutes, wider
++than the enclosing holder - or than the shank carried up to a raised
++foot, steel the cylinder left out - or topping out elsewhere) is
++refused and the cylinder stands in; `Cutter::judged` re-checks it.
++
++**Dropped.** Option 2 (keep the cylinder, explain it in the warning text
++and draw it on demand): it leaves the drawn and judged shapes different,
++which #743 asks to end. Moving drill reach and the probe stylus to bands
++too: each needs its own per-band reading (a disc at each band's face;
++the stylus's stem rebuilt under the body) - filed as follow-up work, not
++a blocker, since the cylinder only over-reports.
++
++**Cost to change later.** Small: `Cutter::with_body` is the one place
++the bands are attached (`operation::generate`); dropping it restores
++the cylinder everywhere.
+
+From f74f878dc5321d52612b0d30fd3edac72ba51998 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 16:20:45 +0100
+Subject: [PATCH 3/3] fix(sim): check band contiguity; keep a part swing
+ visible behind a stock shank hit
+
+Review of #843:
+- BodyBands::of refuses a stack that is not contiguous from the shank's
+  top (gap, late first band, overlap); the enclosing cylinder stands.
+- The raised-foot gap stays judged at the shank radius (nothing modelled
+  is wider there); both directions against the cylinder pinned.
+- Law (c3) is skipped only on moves (c) convicted for the part; on a
+  stock-only (c) conviction the sweep still runs and reports a part hit.
+
+Refs #835
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/tool_body_bands.rs          | 174 +++++++++++++++++++
+ crates/sim/src/verify/body_bands.rs          |  14 +-
+ crates/sim/src/verify/reach.rs               |  22 ++-
+ docs/decisions/835-reach-reads-band-stack.md |  33 ++++
+ 4 files changed, 237 insertions(+), 6 deletions(-)
+ create mode 100644 crates/app/tests/tool_body_bands.rs
+
+diff --git a/crates/app/tests/tool_body_bands.rs b/crates/app/tests/tool_body_bands.rs
+new file mode 100644
+index 00000000..2606c407
+--- /dev/null
++++ b/crates/app/tests/tool_body_bands.rs
+@@ -0,0 +1,174 @@
++//! #835 review: the band stack a body is judged by is a checked profile
++//! (contiguous from the shank's top, or the enclosing cylinder stands),
++//! the raised-foot gap is judged at the shank carried up to it - pinned
++//! on both sides - and a swing through the part is never hidden behind
++//! a stock-only shank conviction on the same move.
++//!
++//! Gate map (M4.4): covers sim::verify::reach, sim::verify::sweep, sim::verify::body_bands, sim::verify::probe, app::tool_body.
++
++use camcraft_app::cl::{Move, MoveKind, Toolpath};
++use camcraft_app::geo2d::{Loop, Point2, Region};
++use camcraft_app::geometry::Point3;
++use camcraft_app::spun::{SpunPoint, SpunProfile};
++use camcraft_app::tool_body;
++use camcraft_app::verify::{verify, BodyBands, Cutter, Mode, ToolGeom, VerifyContext, Warning};
++use camcraft_tools::holder_profile::{HolderBand, HolderStack};
++
++fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++    Loop::new(vec![Point2::new(x0, y0), Point2::new(x1, y0), Point2::new(x1, y1), Point2::new(x0, y1)]).expect("loop")
++}
++
++fn cx<'a>(region: &'a Region, stock: &'a Region, g: &'a ToolGeom, cutter: Option<Cutter>) -> VerifyContext<'a> {
++    VerifyContext {
++        region,
++        stock: Some(stock),
++        model: None,
++        tool: g,
++        cutter,
++        mode: Mode::Boundary,
++        stock_top_z: 0.0,
++        clearance_z: 5.0,
++        stock_to_leave: 0.0,
++        gouge_tol: 0.01,
++        z_tol: 1e-6,
++        finish_tol: None,
++        fixtures: &[],
++        spindle: None,
++    }
++}
++
++fn reach_warnings(w: Vec<Warning>) -> Vec<Warning> {
++    w.into_iter().filter(|w| matches!(w, Warning::ShankHit { .. } | Warning::SweepHit { .. })).collect()
++}
++
++/// Plunge to `tip_z` beside a 20 mm part island whose wall stands `gap`
++/// off the tool's axis.
++fn plunge_beside_island(gap: f64, tip_z: f64, g: &ToolGeom, cutter: Option<Cutter>) -> Vec<Warning> {
++    let region = Region::new(vec![rect(0.0, 0.0, 100.0, 100.0), rect(40.0, 40.0, 60.0, 60.0)]).expect("region");
++    let stock = Region::new(vec![rect(0.0, 0.0, 100.0, 100.0)]).expect("stock");
++    let x = 40.0 - gap;
++    let t = Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, Point3::new(-20.0, -20.0, 5.0), Point3::new(x, 50.0, 5.0), None),
++        Move::new(MoveKind::Plunge, Point3::new(x, 50.0, 5.0), Point3::new(x, 50.0, tip_z), Some(80.0)),
++    ]);
++    reach_warnings(verify(&t, &cx(&region, &stock, g, cutter)))
++}
++
++// ---- contiguity is checked, not assumed -----------------------------
++
++/// Flute 8, shank to 14, the enclosing holder r 20 to 49.
++fn geom() -> ToolGeom {
++    ToolGeom { radius: 4.0, nose_radius: 0.0, flute_len: 8.0, shank_radius: 4.0, shank_len: 6.0, holder_radius: 20.0, holder_len: 35.0 }
++}
++
++#[test]
++fn a_gapped_stack_is_refused_and_the_cylinder_stands() {
++    let g = geom();
++    // 14..30, nothing 30..34, 34..49.
++    let gapped = HolderStack {
++        bands: vec![HolderBand { above: 14.0, len: 16.0, r: 6.0 }, HolderBand { above: 34.0, len: 15.0, r: 20.0 }],
++        top: 49.0,
++    };
++    assert_eq!(BodyBands::of(&g, &gapped), None);
++    assert_eq!(Cutter::flat(&g).with_body(&g, &gapped).holder_bands(), vec![(14.0, 20.0, 35.0)]);
++    // The same stack closed up is carried.
++    let closed = HolderStack {
++        bands: vec![HolderBand { above: 14.0, len: 20.0, r: 6.0 }, HolderBand { above: 34.0, len: 15.0, r: 20.0 }],
++        top: 49.0,
++    };
++    assert!(BodyBands::of(&g, &closed).is_some());
++}
++
++#[test]
++fn a_late_starting_stack_is_refused_and_the_cylinder_stands() {
++    let g = geom();
++    // Nothing 14..20: the first band starts past the shank's top.
++    let late = HolderStack {
++        bands: vec![HolderBand { above: 20.0, len: 14.0, r: 6.0 }, HolderBand { above: 34.0, len: 15.0, r: 20.0 }],
++        top: 49.0,
++    };
++    assert_eq!(BodyBands::of(&g, &late), None);
++    assert_eq!(Cutter::flat(&g).with_body(&g, &late).holder_bands(), vec![(14.0, 20.0, 35.0)]);
++    // Overlapping bands (running back down the axis) are no profile either.
++    let overlap = HolderStack {
++        bands: vec![HolderBand { above: 14.0, len: 22.0, r: 6.0 }, HolderBand { above: 34.0, len: 15.0, r: 20.0 }],
++        top: 49.0,
++    };
++    assert_eq!(BodyBands::of(&g, &overlap), None);
++}
++
++// ---- the raised foot: the gap is the shank carried up ---------------
++
++/// A drawn body r `body_r` from 24 to 50 above the tip, its foot 10 mm
++/// above the shank's top (14): the stack and the record the laws read.
++fn raised_foot(shank_r: f64, body_r: f64) -> (ToolGeom, HolderStack) {
++    let profile = SpunProfile::new(vec![
++        SpunPoint::line(24.0, 0.0),
++        SpunPoint::line(24.0, body_r),
++        SpunPoint::line(50.0, body_r),
++        SpunPoint::line(50.0, 0.0),
++    ])
++    .expect("a sane profile")
++    .holder_profile();
++    // The judged record: `HolderProfile::enclose`'s holder, r body_r from
++    // the shank's top to the body's top.
++    let g = ToolGeom { radius: 4.0, nose_radius: 0.0, flute_len: 8.0, shank_radius: shank_r, shank_len: 6.0, holder_radius: body_r, holder_len: 36.0 };
++    let stack = tool_body::stack(&g, Some(&profile));
++    assert_eq!(stack.bands[0], HolderBand { above: 14.0, len: 10.0, r: shank_r }, "the gap is the shank carried up");
++    (g, stack)
++}
++
++#[test]
++fn a_raised_foot_over_a_slim_shank_is_judged_looser_than_the_cylinder() {
++    // Holder wider than the shank: the cylinder judged the gap at r 20,
++    // the stack at the shank's r 5. Wall 10 off, tip 20 deep: the gap
++    // (bottom 6 under the top) stands clear at r 5, the body's foot
++    // stands 4 above the top - only the cylinder hit.
++    let (g, stack) = raised_foot(5.0, 20.0);
++    let body = Cutter::flat(&g).with_body(&g, &stack);
++    assert_eq!(body.holder_bands(), vec![(14.0, 5.0, 10.0), (24.0, 20.0, 26.0)]);
++    assert_eq!(plunge_beside_island(10.0, -20.0, &g, None), vec![Warning::ShankHit { at: 1, part: true }]);
++    assert_eq!(plunge_beside_island(10.0, -20.0, &g, Some(body)), Vec::new());
++    // The body itself in the wall is still judged.
++    assert_eq!(plunge_beside_island(10.0, -30.0, &g, Some(body)), vec![Warning::ShankHit { at: 1, part: true }]);
++}
++
++#[test]
++fn a_raised_foot_over_a_fat_shank_is_judged_stricter_than_the_cylinder() {
++    // Shank wider than the body: the cylinder judged the gap at the
++    // body's r 6, the stack at the shank's r 8. Wall 7 off: the shank
++    // band convicts either way; the holder group now convicts too.
++    let (g, stack) = raised_foot(8.0, 6.0);
++    let body = Cutter::flat(&g).with_body(&g, &stack);
++    assert_eq!(body.holder_bands(), vec![(14.0, 8.0, 10.0), (24.0, 6.0, 26.0)]);
++    assert_eq!(plunge_beside_island(7.0, -20.0, &g, None), vec![Warning::ShankHit { at: 1, part: true }]);
++    assert_eq!(
++        plunge_beside_island(7.0, -20.0, &g, Some(body)),
++        vec![Warning::ShankHit { at: 1, part: true }, Warning::ShankHit { at: 1, part: true }]
++    );
++}
++
++// ---- (c3) is not hidden behind a stock-only (c) --------------------
++
++#[test]
++fn a_swing_through_the_part_is_not_hidden_behind_a_stock_shank_hit() {
++    // The region runs 10 mm past the stock on -X, so the stock's wall at
++    // x = 0 is uncut stock (inside the region, not part); the island wall
++    // at x = 17 is part. The plunge at x = 12 ends leaning 30 degrees
++    // toward -X: its shank column (centre x 6.5, r 8.5) reaches the stock
++    // wall only (law (c): stock). Turning there from home, the still-
++    // upright shank (r 7 about x 12) grazes the island (law (c3): part).
++    // Both must be reported.
++    let region = Region::new(vec![rect(-10.0, 0.0, 40.0, 30.0), rect(17.0, 5.0, 27.0, 25.0)]).expect("region");
++    let stock = Region::new(vec![rect(0.0, 0.0, 40.0, 30.0)]).expect("stock");
++    let g = ToolGeom { radius: 4.0, nose_radius: 0.0, flute_len: 8.0, shank_radius: 7.0, shank_len: 6.0, holder_radius: 0.0, holder_len: 0.0 };
++    let tilt = |deg: f64| [deg.to_radians().sin(), 0.0, deg.to_radians().cos()];
++    let t = Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, Point3::new(-20.0, -20.0, 5.0), Point3::new(12.0, 15.0, 5.0), None),
++        Move::new(MoveKind::Plunge, Point3::new(12.0, 15.0, 5.0), Point3::new(12.0, 15.0, -20.0), Some(80.0)).with_axis(tilt(-30.0)),
++    ]);
++    let w = reach_warnings(verify(&t, &cx(&region, &stock, &g, None)));
++    assert!(w.contains(&Warning::ShankHit { at: 1, part: false }), "law (c) sees the stock wall: {w:?}");
++    assert!(w.contains(&Warning::SweepHit { at: 1, part: true }), "the swing through the island is reported: {w:?}");
++    assert!(!w.contains(&Warning::SweepHit { at: 1, part: false }), "a stock sweep on the same move is the same event: {w:?}");
++}
+diff --git a/crates/sim/src/verify/body_bands.rs b/crates/sim/src/verify/body_bands.rs
+index 19c30c69..84e58c6e 100644
+--- a/crates/sim/src/verify/body_bands.rs
++++ b/crates/sim/src/verify/body_bands.rs
+@@ -44,7 +44,9 @@ impl BodyBands {
+     /// plain holder cylinder or does not fit `g`: non-finite or negative
+     /// numbers, more bands than [`BODY_BANDS_CAP`], a band reaching
+     /// below the flutes' top, past the shank beside it or past the
+-    /// holder above it, or a top other than the holder's.
++    /// holder above it, bands that are not contiguous from the shank's
++    /// top (a gap, a late start, an overlap), or a top other than the
++    /// holder's.
+     #[must_use]
+     pub fn of(g: &ToolGeom, stack: &HolderStack) -> Option<Self> {
+         if *stack == HolderStack::cylinder(g) || stack.bands.len() > BODY_BANDS_CAP {
+@@ -76,10 +78,18 @@ impl BodyBands {
+             if band.r > g.holder_radius.max(g.shank_radius) + EPS {
+                 return None;
+             }
++            // Contiguous from the shank's top: a band that starts past
++            // where the last one ended (or the first past the shank's
++            // top) leaves a span no band judges, one that starts below it
++            // runs back down the axis. Either way the stack is not a
++            // profile, and the enclosing cylinder stands.
+             let above = band.above.max(shank_top);
++            if (above - top).abs() > EPS {
++                return None;
++            }
+             out.b[out.n] = HolderBand { above, len: hi - above, r: band.r };
+             out.n += 1;
+-            top = top.max(hi);
++            top = hi;
+         }
+         ((top - (shank_top + g.holder_len)).abs() <= EPS && out.n > 0).then_some(out)
+     }
+diff --git a/crates/sim/src/verify/reach.rs b/crates/sim/src/verify/reach.rs
+index 8a3e8a52..86d1352d 100644
+--- a/crates/sim/src/verify/reach.rs
++++ b/crates/sim/src/verify/reach.rs
+@@ -95,8 +95,14 @@ pub(super) fn band_reach(
+         // h0, same r2, point p unshifted.
+         // Moves law (c) convicted, for law (c3) below: a mid-turn
+         // sweep of the same band on the same move is the same event
+-        // reported twice, and (c)'s verdict stands.
++        // reported twice, and (c)'s verdict stands - when (c) already
++        // named the part (`shanked_part`, the worst there is). A move
++        // (c) convicted for stock only still has its sweep asked: a
++        // swing through the PART is a worse event than the stock (c)
++        // saw, and is never hidden behind it (#835 review); a stock-
++        // only sweep on such a move is the same event and is dropped.
+         let mut shanked: Vec<usize> = Vec::new();
++        let mut shanked_part: Vec<usize> = Vec::new();
+         for (i, m) in path.moves.iter().enumerate() {
+             if m.kind == MoveKind::Rapid {
+                 continue;
+@@ -177,6 +183,9 @@ pub(super) fn band_reach(
+                 }
+                 if let Some(part) = convicted {
+                     shanked.push(i);
++                    if part {
++                        shanked_part.push(i);
++                    }
+                     warns.push(Warning::ShankHit { at: i, part });
+                 }
+             }
+@@ -195,19 +204,24 @@ pub(super) fn band_reach(
+         // generator ever touched hold every pose at home and convict
+         // nothing, exactly as before this law existed.
+         if cx.mode != Mode::Engrave {
+-            warns.extend(super::sweep::mid_turn_sweeps(
++            let sweeps = super::sweep::mid_turn_sweeps(
+                 path,
+                 &bands,
+                 r,
+                 cx.gouge_tol,
+                 chord_tol,
+-                &shanked,
++                &shanked_part,
+                 &samples,
+                 &in_stock,
+                 &|q: Point2| rest.surface_steps(q),
+                 &part_at,
+                 &|pc, r_in, r_out, h, upto| rest.hidden_in_annulus(pc, r_in, r_out, h, upto),
+-            ));
++            );
++            warns.extend(
++                sweeps
++                    .into_iter()
++                    .filter(|w| !matches!(w, Warning::SweepHit { at, part: false } if shanked.contains(at))),
++            );
+         }
+     }
+ }
+diff --git a/docs/decisions/835-reach-reads-band-stack.md b/docs/decisions/835-reach-reads-band-stack.md
+index 77bdf575..c99a7083 100644
+--- a/docs/decisions/835-reach-reads-band-stack.md
++++ b/docs/decisions/835-reach-reads-band-stack.md
+@@ -37,6 +37,39 @@ than the enclosing holder - or than the shank carried up to a raised
+ foot, steel the cylinder left out - or topping out elsewhere) is
+ refused and the cylinder stands in; `Cutter::judged` re-checks it.
+ 
++**Contiguity is a checked law (review finding 2).** `BodyBands::of`
++refuses a stack whose bands are not contiguous from the shank's top - a
++gap, a late first band, or an overlap - and the enclosing cylinder
++stands. Today's producers never make one; a gap band would otherwise go
++unjudged.
++
++**The raised foot (review finding 3).** When a body's foot stands above
++the shank's top, the stack judges that gap at the shank's radius (the
++shank carried up into the holder, `HolderProfile::stack`, as the fixture
++laws have since #368), where the cylinder judged it at the enclosing
++holder's radius. Direction: **looser** where the body is wider than the
++shank, **stricter** where the shank is wider. Both pinned
++(`tool_body_bands::a_raised_foot_over_a_slim_shank_is_judged_looser_than_the_cylinder`,
++`..._over_a_fat_shank_is_judged_stricter_than_the_cylinder`). Kept on the
++shank radius, because nothing modelled can be wider there: the body's
++envelope starts at its own lowest vertex (`HolderProfile::envelope`'s
++`z0`; a drawn profile at its first point), so no body steel stands below
++its foot, and with a body the record's own holder is replaced by the
++body (`tool_body::judged`) - it is not steel either. The only modelled
++steel in the gap is the shank. Taking the body's widest radius there
++would judge steel that is not in any model and would split the drawn
++shape (the simulation draws the stack) from the judged one again.
++
++**(c3) on a move (c) convicted (review note).** Law (c) used to stand the
++mid-turn sweep down on every move it convicted. Both block the post, but
++a stock-only `ShankHit` could hide a sweep through the PART on that move:
++a different severity, and the user is told the wrong thing. Now the
++sweep is skipped only where (c) already named the part; on a stock-only
++conviction it still runs and its part finding is reported (a stock-only
++sweep there is the same event and is dropped). This holds for tools
++without a body too (it can only add a part warning). Pinned by
++`tool_body_bands::a_swing_through_the_part_is_not_hidden_behind_a_stock_shank_hit`.
++
+ **Dropped.** Option 2 (keep the cylinder, explain it in the warning text
+ and draw it on demand): it leaves the drawn and judged shapes different,
+ which #743 asks to end. Moving drill reach and the probe stylus to bands

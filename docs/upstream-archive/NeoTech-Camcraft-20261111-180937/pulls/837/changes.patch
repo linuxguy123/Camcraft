@@ -1,0 +1,764 @@
+From f298637c81ad6be4c018742d8bd89f5d6ad884e1 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 14:16:20 +0100
+Subject: [PATCH] feat(sim): draw the simulated tool as the revolved outline
+ the collision laws judge
+
+The tool at the playhead is now one revolved body built from the two
+reads the fixture laws make: the judged tool record for the cutter and
+shank, and the band stack (`tool_body::stack`) above it - the holder
+cylinder, an imported body's revolved envelope (#368) or a drawn
+holder's bands (#93). Before, a tool with a body drew the body's own
+facets, which no law reads.
+
+The mesh is cached for the one tool at the playhead, keyed by its
+outline, and dropped when the tool, its operation or the transport is
+gone. A degenerate or misfitting tool draws nothing and is logged by
+name. Display only: no verdict and no posted output changes.
+
+Part 2 of #743 (STEP body to an editable DXF half-profile) is not in
+this commit.
+
+Refs #743
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/lib.rs                        |   2 +
+ crates/app/src/sim_tool_body.rs              | 229 ++++++++++++++
+ crates/app/tests/sim_tool_body.rs            | 300 +++++++++++++++++++
+ crates/ui/src/egui_app/tests/tool_body.rs    |  11 +
+ crates/ui/src/egui_app/world.rs              |  36 ++-
+ crates/ui/src/state.rs                       |   7 +
+ docs/decisions/743-sim-revolved-tool-body.md |  63 ++++
+ 7 files changed, 638 insertions(+), 10 deletions(-)
+ create mode 100644 crates/app/src/sim_tool_body.rs
+ create mode 100644 crates/app/tests/sim_tool_body.rs
+ create mode 100644 docs/decisions/743-sim-revolved-tool-body.md
+
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index bdd44ad3..a0d1e9db 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -96,6 +96,8 @@ pub mod tool_body;
+ pub mod tool_body_view;
+ // #369: lathe-held tool bodies (the turning tool frame).
+ pub mod tool_body_lathe;
++// #743: the simulated tool as the collision laws read it, revolved.
++pub mod sim_tool_body;
+ pub mod units;
+ pub use camcraft_sim::verify;
+ // #261: the moves a cached path's warnings name.
+diff --git a/crates/app/src/sim_tool_body.rs b/crates/app/src/sim_tool_body.rs
+new file mode 100644
+index 00000000..1075a314
+--- /dev/null
++++ b/crates/app/src/sim_tool_body.rs
+@@ -0,0 +1,229 @@
++//! The simulated tool as the collision laws read it (#743 part 1): the
++//! cutter and shank from the judged tool record, and above them the very
++//! band stack the fixture laws sweep (`tool_body::stack` - the holder
++//! cylinder, a modelled body's revolved envelope (#368) or a drawn spun
++//! holder's bands (#93)), spun about the tool axis into a display mesh.
++//! What is drawn is what is checked: a modelled body's own facets (flats,
++//! slots, its turn about the axis) are not what any law reads, so the
++//! simulation draws the envelope instead. A solid of revolution from its
++//! meridian is elementary geometry; our own design, no vendor file or
++//! source consulted.
++//!
++//! Display only: nothing here writes the world or feeds a verdict. A
++//! degenerate outline (non-finite, negative, running back down the axis,
++//! no radius, past the body caps) draws nothing and is logged by name,
++//! never a crash. The mesh is cached for the one tool at the playhead
++//! and dropped when that tool or operation is gone, its outline changes,
++//! or the transport closes ([`SimToolCache`]).
++
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use camcraft_tools::holder_profile::{HolderBand, HolderStack, MAX_BODY_HEIGHT, MAX_BODY_RADIUS};
++
++use crate::geometry::Triangle;
++use crate::tools::Tool;
++use crate::{model, tool_body, tool_body_view};
++
++/// Float dust on the outline checks (mm).
++const EPS: f64 = 1e-9;
++
++/// Why an outline draws no body. Each refusal names itself.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum OutlineError {
++    NonFinite,
++    Negative,
++    RunsBack,
++    NoRadius,
++    TooLarge,
++}
++
++impl core::fmt::Display for OutlineError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.write_str(match self {
++            Self::NonFinite => "the tool outline has non-finite numbers",
++            Self::Negative => "the tool outline has a negative radius or length",
++            Self::RunsBack => "the tool outline runs back down the axis (it would cross itself)",
++            Self::NoRadius => "the tool outline has no radius or no length - nothing to draw",
++            Self::TooLarge => "the tool outline is larger than any tool a spindle carries",
++        })
++    }
++}
++
++impl std::error::Error for OutlineError {}
++
++/// The tool's judged shape, tool frame (tip at the origin, +Z to the
++/// spindle): the cutter-and-shank meridian and the holder bands.
++#[derive(Clone, Debug, PartialEq)]
++pub struct JudgedOutline {
++    /// `(z, r)` from the tip centre up the cutter and the shank, closed
++    /// to the axis at the shank's top - `Tool::profile` of the judged
++    /// record, whose breakpoints are the bands the shank laws sweep.
++    pub cutter: Vec<(f64, f64)>,
++    /// What stands above the shank, bottom-up: exactly the bands
++    /// `tool_body::stack` hands the fixture laws (empty bands dropped).
++    pub holder: Vec<HolderBand>,
++}
++
++impl JudgedOutline {
++    /// The outline of `tool` (the record as the laws read it,
++    /// `tool_body::judged`) under `stack` (`tool_body::stack` of its
++    /// geometry). Refuses a degenerate outline by name.
++    pub fn new(tool: &Tool, stack: &HolderStack) -> Result<Self, OutlineError> {
++        let cutter = Tool { holder_len: 0.0, ..tool.clone() }.profile();
++        if !cutter.iter().all(|p| p.0.is_finite() && p.1.is_finite())
++            || !stack.bands.iter().all(|b| b.above.is_finite() && b.len.is_finite() && b.r.is_finite())
++        {
++            return Err(OutlineError::NonFinite);
++        }
++        if cutter.iter().any(|p| p.0 < -EPS || p.1 < 0.0) || stack.bands.iter().any(|b| b.above < -EPS || b.len < 0.0 || b.r < 0.0) {
++            return Err(OutlineError::Negative);
++        }
++        let holder: Vec<HolderBand> = stack.bands.iter().copied().filter(|b| b.len > EPS && b.r > EPS).collect();
++        if cutter.windows(2).any(|w| w[1].0 < w[0].0 - EPS) || holder.windows(2).any(|w| w[1].above < w[0].above + w[0].len - EPS) {
++            return Err(OutlineError::RunsBack);
++        }
++        let out = Self { cutter, holder };
++        let (top, wide) = (out.top(), out.max_radius());
++        if wide <= EPS || top <= EPS {
++            return Err(OutlineError::NoRadius);
++        }
++        if wide > MAX_BODY_RADIUS || top > MAX_BODY_HEIGHT {
++            return Err(OutlineError::TooLarge);
++        }
++        Ok(out)
++    }
++
++    /// The highest point above the tip.
++    #[must_use]
++    pub fn top(&self) -> f64 {
++        let c = self.cutter.iter().fold(0.0_f64, |m, p| m.max(p.0));
++        self.holder.iter().fold(c, |m, b| m.max(b.above + b.len))
++    }
++
++    /// The farthest point from the axis.
++    #[must_use]
++    pub fn max_radius(&self) -> f64 {
++        let c = self.cutter.iter().fold(0.0_f64, |m, p| m.max(p.1));
++        self.holder.iter().fold(c, |m, b| m.max(b.r))
++    }
++
++    /// The holder bands as one `(z, r)` meridian: each band a cylinder,
++    /// flat steps between them, closed to the axis at the foot, the top
++    /// and across any gap.
++    #[must_use]
++    pub fn holder_meridian(&self) -> Vec<(f64, f64)> {
++        let mut m: Vec<(f64, f64)> = Vec::with_capacity(self.holder.len() * 2 + 2);
++        for b in &self.holder {
++            match m.last().copied() {
++                None => m.push((b.above, 0.0)),
++                Some((z, _)) if b.above > z + EPS => m.extend([(z, 0.0), (b.above, 0.0)]),
++                Some(_) => {}
++            }
++            m.extend([(b.above, b.r), (b.above + b.len, b.r)]);
++        }
++        if let Some((z, _)) = m.last().copied() {
++            m.push((z, 0.0));
++        }
++        m
++    }
++
++    /// The outline spun about +Z, tool frame.
++    #[must_use]
++    pub fn mesh(&self) -> Vec<Triangle> {
++        let mut tris = tool_body_view::revolve(&self.cutter);
++        tris.extend(tool_body_view::revolve(&self.holder_meridian()));
++        tris
++    }
++}
++
++/// The judged outline of the tool operation `op` runs. `Ok(None)` when
++/// there is nothing to spin: the operation or its tool is gone, or the
++/// tool is a lathe insert kind (its truth lives in the work's meridian;
++/// it keeps the axis marker only). `Err` names why a tool that should
++/// draw does not - its body no longer fits it, or its outline is
++/// degenerate.
++pub fn for_operation(world: &World, op: &str) -> Result<Option<JudgedOutline>, String> {
++    let Some(e) = model::find_by_name(world, op) else { return Ok(None) };
++    let Some(name) = model::operation_of(world, &e).map(|o| o.tool) else { return Ok(None) };
++    let Some(te) = model::find_by_name(world, &name) else { return Ok(None) };
++    let Some(tool) = model::tool_of(world, &te) else { return Ok(None) };
++    if tool_body::LATHE_HELD.contains(&tool.kind) {
++        return Ok(None);
++    }
++    // The same two reads every fixture law makes (`fixture_struck`,
++    // `operation::generate`): the judged record, then its stack.
++    let (judged, body) = tool_body::judged(world, &te, tool).map_err(|e| format!("tool {name}: {e}"))?;
++    let stack = tool_body::stack(&judged.geom(), body.as_ref());
++    JudgedOutline::new(&judged, &stack).map(Some).map_err(|e| format!("tool {name}: {e}"))
++}
++
++/// The revolved mesh of the one tool at the playhead. Keyed by the
++/// outline itself: an edit to the tool or its body that moves a judged
++/// number rebuilds it, anything else reuses it. Holds nothing once the
++/// tool or operation is gone or refused.
++#[derive(Debug, Default)]
++pub struct SimToolCache {
++    built: Option<(JudgedOutline, Arc<[Triangle]>)>,
++    refused: Option<String>,
++}
++
++impl SimToolCache {
++    /// The tool-frame mesh for `op`'s tool, rebuilt only when its judged
++    /// outline changed. `None` (and the cache emptied) when nothing is
++    /// to be drawn; a refusal is logged once per distinct reason.
++    pub fn tool_frame(&mut self, world: &World, op: &str) -> Option<Arc<[Triangle]>> {
++        match for_operation(world, op) {
++            Ok(Some(outline)) => {
++                self.refused = None;
++                if let Some((held, tris)) = &self.built
++                    && *held == outline
++                {
++                    return Some(Arc::clone(tris));
++                }
++                let tris: Arc<[Triangle]> = Arc::from(outline.mesh());
++                self.built = Some((outline, Arc::clone(&tris)));
++                Some(tris)
++            }
++            Ok(None) => {
++                self.clear();
++                None
++            }
++            Err(why) => {
++                if self.refused.as_deref() != Some(why.as_str()) {
++                    tracing::warn!(op, "simulated tool not drawn: {why}");
++                }
++                self.built = None;
++                self.refused = Some(why);
++                None
++            }
++        }
++    }
++
++    /// [`Self::tool_frame`] posed at a tool position: `tip` in world,
++    /// `axis` the unit tip-to-spindle direction (`sim::Frame::axis`) -
++    /// the body follows a tilted axis, not only Z.
++    pub fn posed(&mut self, world: &World, op: &str, tip: [f64; 3], axis: [f64; 3]) -> Option<Vec<Triangle>> {
++        let tris = self.tool_frame(world, op)?;
++        Some(tool_body_view::posed(&tris, tip, axis))
++    }
++
++    /// Drop the mesh and any remembered refusal (the transport closed).
++    pub fn clear(&mut self) {
++        self.built = None;
++        self.refused = None;
++    }
++
++    /// Does the cache hold no mesh?
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.built.is_none()
++    }
++
++    /// Why the last tool asked for was not drawn, if it was refused.
++    #[must_use]
++    pub fn refusal(&self) -> Option<&str> {
++        self.refused.as_deref()
++    }
++}
+diff --git a/crates/app/tests/sim_tool_body.rs b/crates/app/tests/sim_tool_body.rs
+new file mode 100644
+index 00000000..15058bd5
+--- /dev/null
++++ b/crates/app/tests/sim_tool_body.rs
+@@ -0,0 +1,300 @@
++//! #743 part 1: the simulated tool is drawn as a revolved body from the
++//! very outline the collision laws read - the judged tool record's
++//! cutter and shank, and the band stack the fixture laws sweep above
++//! them. The mesh's meridian is exactly that outline, it follows a
++//! tilted tool axis, a degenerate outline draws nothing (never a panic),
++//! and the cached mesh is dropped with its tool, its operation or a
++//! change of outline. Our own tests.
++//!
++//! Gate map (M4.4): covers app::sim_tool_body, app::tool_body, app::tool_body_view.
++
++use std::sync::Arc;
++
++use camcraft_app::commands::{AddTool, CreateOperation, DeleteOperation, DeleteTool, History, SetStock, SetToolBody, ToolBodySpec};
++use camcraft_app::geometry::{Point3, Triangle};
++use camcraft_app::model;
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::sim_tool_body::{self as sim_body, JudgedOutline, OutlineError, SimToolCache};
++use camcraft_app::spun::SpunPoint;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tool_body;
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::world::new_world;
++use camcraft_tools::holder_profile::{HolderBand, HolderStack};
++use flecs_ecs::prelude::World;
++
++const TOOL: &str = "EM-0400-2FL";
++const OP: &str = "Face1";
++
++fn catalog_tool(name: &str) -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog entry")
++}
++
++fn shank_top() -> f64 {
++    let t = catalog_tool(TOOL);
++    t.flute_len + t.shank_len
++}
++
++/// A closed `n`-gon prism of circumradius `r` about model Z over `[z0, z1]`.
++fn prism(r: f64, z0: f64, z1: f64, n: usize) -> Vec<Triangle> {
++    let q = |k: usize, z: f64| {
++        let a = std::f64::consts::TAU * k as f64 / n as f64;
++        Point3::new(r * a.cos(), r * a.sin(), z)
++    };
++    let mut v = Vec::new();
++    for k in 0..n {
++        let (a0, a1, b0, b1) = (q(k, z0), q(k + 1, z0), q(k, z1), q(k + 1, z1));
++        v.push(Triangle::new(a0, a1, b1));
++        v.push(Triangle::new(a0, b1, b0));
++        v.push(Triangle::new(Point3::new(0.0, 0.0, z0), a1, a0));
++        v.push(Triangle::new(Point3::new(0.0, 0.0, z1), b0, b1));
++    }
++    v
++}
++
++fn face_world() -> (World, History) {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, Location::default()).expect("stock"),
++    );
++    history.execute(&world, AddTool::new(&world, TOOL, catalog_tool(TOOL)).expect("tool"));
++    let face = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(19.5),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    };
++    history.execute(&world, CreateOperation::new(&world, OP, TOOL, SrcRef::Stock, face).expect("op"));
++    (world, history)
++}
++
++fn tool_entity(world: &World) -> flecs_ecs::prelude::Entity {
++    model::find_by_name(world, TOOL).expect("tool")
++}
++
++/// The judged record and stack, read the way `fixture_struck` and
++/// `operation::generate` read them.
++fn judged_stack(world: &World) -> (Tool, HolderStack) {
++    let (judged, body) = tool_body::judged(world, &tool_entity(world), catalog_tool(TOOL)).expect("fits");
++    let stack = tool_body::stack(&judged.geom(), body.as_ref());
++    (judged, stack)
++}
++
++/// Every vertex of a tool-frame mesh as `(z, r)`.
++fn meridian_of(tris: &[Triangle]) -> Vec<(f64, f64)> {
++    tris.iter().flat_map(|t| [t.a, t.b, t.c]).map(|p| (p.z, p.x.hypot(p.y))).collect()
++}
++
++fn has(points: &[(f64, f64)], z: f64, r: f64) -> bool {
++    points.iter().any(|q| (q.0 - z).abs() < 1e-9 && (q.1 - r).abs() < 1e-9)
++}
++
++/// The mesh's meridian is exactly the outline: every mesh vertex sits on
++/// an outline vertex, and every outline vertex is in the mesh.
++fn assert_mesh_is_outline(outline: &JudgedOutline, tris: &[Triangle]) {
++    let mut want = outline.cutter.clone();
++    want.extend(outline.holder_meridian());
++    let got = meridian_of(tris);
++    assert!(!got.is_empty(), "a body is drawn");
++    for &(z, r) in &got {
++        assert!(has(&want, z, r), "mesh vertex (z {z}, r {r}) is not on the judged outline {want:?}");
++    }
++    for &(z, r) in &want {
++        assert!(has(&got, z, r), "outline vertex (z {z}, r {r}) is missing from the mesh");
++    }
++}
++
++#[test]
++fn the_bare_tool_is_spun_from_the_cylinder_the_laws_sweep() {
++    let (world, _history) = face_world();
++    let t = catalog_tool(TOOL);
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("a mill draws");
++    // The holder is the one cylinder `HolderStack::cylinder` hands the laws.
++    assert_eq!(outline.holder, HolderStack::cylinder(&t.geom()).bands);
++    assert_eq!(outline.holder, vec![HolderBand { above: shank_top(), len: t.holder_len, r: t.holder_d * 0.5 }]);
++    // The cutter and shank are the record's own profile up to the shank top.
++    assert!(has(&outline.cutter, 0.0, t.diameter * 0.5), "the cutter's rim at the tip");
++    assert!(has(&outline.cutter, t.flute_len, t.shank_d * 0.5), "the shank band starts at the flute top");
++    assert!(has(&outline.cutter, shank_top(), 0.0), "closed to the axis at the shank top");
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    let m = meridian_of(&tris);
++    let top = m.iter().fold(0.0f64, |a, q| a.max(q.0));
++    let wide = m.iter().fold(0.0f64, |a, q| a.max(q.1));
++    assert_eq!(top, shank_top() + t.holder_len, "tip to the holder's top");
++    assert!((wide - t.holder_d * 0.5).abs() < 1e-9, "the holder's radius is the widest");
++    assert_eq!(outline.top(), top);
++    assert!((outline.max_radius() - wide).abs() < 1e-9);
++}
++
++#[test]
++fn a_modelled_body_is_drawn_as_its_judged_envelope_not_its_facets() {
++    let (world, mut history) = face_world();
++    let z0 = shank_top();
++    // A hexagonal collar: its facets reach r = 20 only at six corners.
++    let spec = ToolBodySpec { source: "hex.stl".into(), facets: prism(20.0, z0, z0 + 30.0, 6), axis: [0.0, 0.0, 1.0], offset: 0.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    let (judged, stack) = judged_stack(&world);
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("draws");
++    assert_eq!(outline.holder, stack.bands, "the drawn holder is the stack the fixture laws sweep");
++    assert_eq!(outline, JudgedOutline::new(&judged, &stack).expect("sane"));
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    // Revolved: the body is at its envelope radius all the way round,
++    // not only at the hexagon's corners (its flats sit at r = 17.3).
++    let rim: Vec<f64> = meridian_of(&tris).into_iter().filter(|q| (q.0 - (z0 + 30.0)).abs() < 1e-9 && q.1 > 1.0).map(|q| q.1).collect();
++    assert!(rim.len() >= 32, "a full ring at the body's top: {}", rim.len());
++    let band_r = stack.bands.last().expect("a band").r;
++    assert!(rim.iter().all(|r| (r - band_r).abs() < 1e-9), "every rim vertex at the judged radius {band_r}");
++    assert!(band_r >= 20.0, "never smaller than the solid");
++}
++
++#[test]
++fn a_drawn_cone_is_drawn_as_the_stepped_bands_the_laws_judge() {
++    let (world, mut history) = face_world();
++    let z0 = shank_top();
++    // A cone from r = 10 to r = 30 over 20 mm: judged as one band at 30.
++    let cone = vec![SpunPoint::line(z0, 0.0), SpunPoint::line(z0, 10.0), SpunPoint::line(z0 + 20.0, 30.0), SpunPoint::line(z0 + 20.0, 0.0)];
++    history.execute(&world, SetToolBody::spun(&world, TOOL, Some(cone)).expect("a sane profile"));
++    let (_, stack) = judged_stack(&world);
++    assert_eq!(stack.bands, vec![HolderBand { above: z0, len: 20.0, r: 30.0 }], "the law's reading of the cone");
++    let outline = sim_body::for_operation(&world, OP).expect("no refusal").expect("draws");
++    assert_eq!(outline.holder, stack.bands);
++    let tris = outline.mesh();
++    assert_mesh_is_outline(&outline, &tris);
++    assert!(has(&meridian_of(&tris), z0, 30.0), "the foot is drawn at the judged 30, not the drawn 10");
++}
++
++#[test]
++fn the_body_follows_a_tilted_tool_axis() {
++    let (world, _history) = face_world();
++    let mut cache = SimToolCache::default();
++    let frame = cache.tool_frame(&world, OP).expect("a mesh");
++    let want = meridian_of(&frame);
++    let tip = [10.0, -20.0, 30.0];
++    let n = (0.3f64 * 0.3 + 0.2 * 0.2 + 0.9 * 0.9).sqrt();
++    for axis in [[0.3 / n, -0.2 / n, 0.9 / n], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 0.0, 1.0]] {
++        let posed = cache.posed(&world, OP, tip, axis).expect("posed");
++        assert_eq!(posed.len(), frame.len());
++        // Each vertex keeps its height along the axis and its distance from it.
++        let got: Vec<(f64, f64)> = posed
++            .iter()
++            .flat_map(|t| [t.a, t.b, t.c])
++            .map(|p| {
++                let d = [p.x - tip[0], p.y - tip[1], p.z - tip[2]];
++                let h = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
++                let off = [d[0] - h * axis[0], d[1] - h * axis[1], d[2] - h * axis[2]];
++                (h, (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt())
++            })
++            .collect();
++        for (g, w) in got.iter().zip(&want) {
++            assert!((g.0 - w.0).abs() < 1e-9 && (g.1 - w.1).abs() < 1e-9, "axis {axis:?}: {g:?} vs {w:?}");
++        }
++    }
++    // A prismatic frame is the tool frame moved to the tip.
++    let up = cache.posed(&world, OP, tip, [0.0, 0.0, 1.0]).expect("posed");
++    assert!((up[0].a.x - (frame[0].a.x + tip[0])).abs() < 1e-12 && (up[0].a.z - (frame[0].a.z + tip[2])).abs() < 1e-12);
++}
++
++#[test]
++fn a_degenerate_outline_draws_nothing_and_names_itself() {
++    let t = catalog_tool(TOOL);
++    let stack = HolderStack::cylinder(&t.geom());
++    assert!(JudgedOutline::new(&t, &stack).is_ok(), "the sane tool draws");
++    let band = |above: f64, len: f64, r: f64| HolderStack { bands: vec![HolderBand { above, len, r }], top: above + len };
++    assert_eq!(JudgedOutline::new(&Tool { diameter: f64::INFINITY, ..t.clone() }, &stack), Err(OutlineError::NonFinite));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, f64::NAN, 5.0)), Err(OutlineError::NonFinite));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, 10.0, -5.0)), Err(OutlineError::Negative));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, -10.0, 5.0)), Err(OutlineError::Negative));
++    // Bands that overlap along the axis: the outline would cross itself.
++    let crossing = HolderStack {
++        bands: vec![HolderBand { above: 50.0, len: 20.0, r: 10.0 }, HolderBand { above: 60.0, len: 20.0, r: 15.0 }],
++        top: 80.0,
++    };
++    assert_eq!(JudgedOutline::new(&t, &crossing), Err(OutlineError::RunsBack));
++    // No radius anywhere, and no length anywhere.
++    let none = HolderStack { bands: Vec::new(), top: 0.0 };
++    let thin = Tool { diameter: 0.0, shank_d: 0.0, ..t.clone() };
++    assert_eq!(JudgedOutline::new(&thin, &none), Err(OutlineError::NoRadius));
++    let flat = Tool { flute_len: 0.0, shank_len: 0.0, ..t.clone() };
++    assert_eq!(JudgedOutline::new(&flat, &none), Err(OutlineError::NoRadius));
++    assert_eq!(JudgedOutline::new(&t, &band(50.0, 10.0, 501.0)), Err(OutlineError::TooLarge));
++    assert_eq!(JudgedOutline::new(&t, &band(1995.0, 10.0, 5.0)), Err(OutlineError::TooLarge));
++    // A half-typed draft (NaN numbers) never panics: it draws short or not at all.
++    let draft = Tool { diameter: f64::NAN, flute_len: f64::NAN, ..t.clone() };
++    let _ = JudgedOutline::new(&draft, &stack).map(|o| o.mesh());
++    // An empty holder band is no holder, not an error.
++    let bare = JudgedOutline::new(&t, &band(50.0, 0.0, 22.0)).expect("the cutter still draws");
++    assert!(bare.holder.is_empty() && bare.holder_meridian().is_empty());
++    // Every catalog tool either draws a sane mesh or is a lathe kind.
++    for (name, tool) in catalog() {
++        let o = JudgedOutline::new(&tool, &HolderStack::cylinder(&tool.geom())).unwrap_or_else(|e| panic!("{name}: {e}"));
++        assert!(o.mesh().iter().all(|q| [q.a, q.b, q.c].iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite())), "{name}");
++    }
++}
++
++#[test]
++fn a_body_that_no_longer_fits_draws_nothing_and_says_why() {
++    let (world, _history) = face_world();
++    let mut cache = SimToolCache::default();
++    assert!(cache.tool_frame(&world, OP).is_some());
++    // Past the commands' own guard: a body standing over the flutes.
++    let low = tool_body::build("low.stl", [0.0, 0.0, 1.0], 0.0, prism(20.0, 1.0, 30.0, 12)).expect("an envelope");
++    tool_body::set_body(&world, &tool_entity(&world), Some(&low));
++    assert!(sim_body::for_operation(&world, OP).is_err());
++    assert!(cache.tool_frame(&world, OP).is_none(), "nothing is drawn");
++    assert!(cache.is_empty(), "and the stale mesh is dropped");
++    assert!(cache.refusal().is_some_and(|w| w.contains(TOOL) && w.contains("flutes")), "{:?}", cache.refusal());
++    assert!(cache.posed(&world, OP, [0.0; 3], [0.0, 0.0, 1.0]).is_none());
++    tool_body::set_body(&world, &tool_entity(&world), None);
++    assert!(cache.tool_frame(&world, OP).is_some(), "drawn again once it fits");
++    assert!(cache.refusal().is_none());
++}
++
++#[test]
++fn the_cached_mesh_is_reused_rebuilt_on_a_new_outline_and_freed_with_its_tool() {
++    let (world, mut history) = face_world();
++    let mut cache = SimToolCache::default();
++    assert!(cache.is_empty());
++    let first = cache.tool_frame(&world, OP).expect("a mesh");
++    let again = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(Arc::ptr_eq(&first, &again), "an unchanged outline reuses the mesh");
++    // A new body changes the judged outline: the old mesh is let go.
++    let z0 = shank_top();
++    let spec = ToolBodySpec { source: "c.stl".into(), facets: prism(20.0, z0, z0 + 30.0, 16), axis: [0.0, 0.0, 1.0], offset: 0.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    drop(again);
++    let weak = Arc::downgrade(&first);
++    drop(first);
++    let bodied = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(weak.upgrade().is_none(), "the replaced mesh is freed");
++    // Undo restores the old outline; the cache follows.
++    history.undo(&world);
++    let back = cache.tool_frame(&world, OP).expect("a mesh");
++    assert!(!Arc::ptr_eq(&bodied, &back));
++    let weak = Arc::downgrade(&back);
++    drop((bodied, back));
++    // Deleting the operation leaves nothing to draw and nothing held.
++    history.execute(&world, DeleteOperation::new(&world, OP).expect("delete op"));
++    assert!(cache.tool_frame(&world, OP).is_none());
++    assert!(cache.is_empty() && weak.upgrade().is_none(), "the op's mesh is freed");
++    history.undo(&world);
++    let held = Arc::downgrade(&cache.tool_frame(&world, OP).expect("drawn again"));
++    // Deleting the tool does the same.
++    history.execute(&world, DeleteTool::new(&world, TOOL).expect("delete tool"));
++    assert!(cache.tool_frame(&world, OP).is_none());
++    assert!(cache.is_empty() && held.upgrade().is_none(), "the tool's mesh is freed");
++    assert!(cache.refusal().is_none(), "a missing tool is not a refusal");
++    cache.clear();
++    assert!(cache.is_empty());
++}
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index 45b4655f..286e2a99 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -204,8 +204,19 @@ fn the_simulation_draws_the_tool_with_its_holder_cylinder_or_its_body() {
+     let (lo, hi) = zr(&verts);
+     assert!((lo - tip).abs() < 1e-3, "tip at {tip}: {lo}");
+     assert!((hi - (tip + top + 30.0)).abs() < 1e-3, "body top at tip + {top} + 30: {hi}");
++    // #743: what is drawn is the outline the laws judge, revolved - the
++    // 24-gon's envelope band all the way round - and its mesh is cached
++    // only while the transport is up.
++    let op = f.op.and_then(|i| sc.ops.get(i)).expect("an op at the playhead");
++    let outline = camcraft_app::sim_tool_body::for_operation(&st.world, op).expect("no refusal").expect("an outline");
++    let band = outline.holder.last().expect("the body's band");
++    assert_eq!(world::sim_tool_tris(st).map(|t| t.len()), Some(outline.mesh().len()), "the scene draws the judged outline's mesh");
++    let local: Vec<[f32; 3]> = verts.iter().map(|p| [p[0] - f.pos.x as f32, p[1] - f.pos.y as f32, p[2]]).collect();
++    assert!((r_at(&local, tip + top + 30.0) - band.r).abs() < 1e-3, "the judged band's radius at the body's top");
++    assert!(!st.sim_tool_cache.lock().unwrap().is_empty(), "the mesh is held while simulating");
+     st.sim = None;
+     assert_eq!(world::collect(st).parts.len(), parts_no_body - 1, "no transport, no tool drawn");
++    assert!(st.sim_tool_cache.lock().unwrap().is_empty(), "and the mesh is dropped with the transport");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
+ 
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 7ed42dfa..6075a831 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -300,15 +300,32 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+     parts
+ }
+ 
+-/// #371: the running tool's assembly at the playhead - cutter and shank
+-/// revolved from its numbers, then its modelled body, or without one the
+-/// holder cylinder from its own numbers (what the collision laws judge),
+-/// posed by the frame's tip and axis, world space. Only while the
+-/// transport is up and its timeline is this document's (`cached_script`
+-/// refreshes it before the next frame), any playhead including 0 and the
+-/// end, playing or paused, the op fresh or stale (display reads the
+-/// cached path). Lathe insert kinds yield nothing (marker only).
++/// #371, #743: the running tool at the playhead as a revolved body -
++/// the cutter and shank of the judged tool record and, above them, the
++/// very band stack the fixture laws sweep (the holder cylinder, a
++/// modelled body's revolved envelope, a drawn holder's bands), so what
++/// is drawn is what is checked - posed by the frame's tip and axis,
++/// world space. Only while the transport is up and its timeline is this
++/// document's (`cached_script` refreshes it before the next frame), any
++/// playhead including 0 and the end, playing or paused, the op fresh or
++/// stale (display reads the cached path). Lathe insert kinds yield
++/// nothing (marker only); a degenerate or misfitting tool yields nothing
++/// and is logged. The mesh lives in `State::sim_tool_cache` and is
++/// dropped as soon as there is no tool to draw.
+ pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry::Triangle>> {
++    // A poisoned lock only means a draw panicked mid-update: the cache
++    // is display data, rebuilt from the world, so it is safe to reuse.
++    let mut cache = state.sim_tool_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let Some((op, tip, axis)) = sim_tool_pose(state) else {
++        cache.clear();
++        return None;
++    };
++    cache.posed(&state.world, op, tip, axis)
++}
++
++/// The operation at the playhead with its tool tip and axis, when the
++/// transport is up on this document's timeline.
++fn sim_tool_pose(state: &State) -> Option<(&str, [f64; 3], [f64; 3])> {
+     let sim = state.sim?;
+     let (version, sc) = state.sim_script_cache.as_ref()?;
+     if *version != state.doc_version || sc.is_empty() {
+@@ -316,8 +333,7 @@ pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry:
+     }
+     let f = sc.at(sim.t);
+     let op = sc.ops.get(f.op?)?;
+-    let tris = camcraft_app::tool_body_view::assembly_for_operation(&state.world, op)?;
+-    Some(camcraft_app::tool_body_view::posed(&tris, [f.pos.x, f.pos.y, f.pos.z], f.axis))
++    Some((op.as_str(), [f.pos.x, f.pos.y, f.pos.z], f.axis))
+ }
+ 
+ /// [`sim_tool_tris`] as a model part (depth-tested, shaded).
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 7c6e922e..b4583b56 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1296,6 +1296,12 @@ pub struct State {
+     /// The transport's timeline, built once per `doc_version` (never
+     /// per frame: it walks every op's path) - see `shell::cached_script`.
+     pub sim_script_cache: Option<(u64, std::sync::Arc<camcraft_app::sim::Script>)>,
++    /// #743: the revolved mesh of the tool at the playhead, as the
++    /// collision laws read it - rebuilt only when its judged outline
++    /// changes, emptied when the tool, its operation or the transport
++    /// is gone. Display-only (a Mutex because the scene is collected
++    /// from `&State`).
++    pub sim_tool_cache: std::sync::Mutex<camcraft_app::sim_tool_body::SimToolCache>,
+     /// What `field_view` was walked for: (transport up, Deviate armed,
+     /// the document version a playback plan was frozen at). A change
+     /// retires the view and the playback - never a stale picture.
+@@ -1650,6 +1656,7 @@ impl State {
+             field_view: None,
+             field_play: None,
+             sim_script_cache: None,
++            sim_tool_cache: std::sync::Mutex::default(),
+             field_mode: None,
+             stock_mesh: camcraft_app::stock_export::MeshCache::default(),
+             ribbon_more: None,
+diff --git a/docs/decisions/743-sim-revolved-tool-body.md b/docs/decisions/743-sim-revolved-tool-body.md
+new file mode 100644
+index 00000000..5e896baf
+--- /dev/null
++++ b/docs/decisions/743-sim-revolved-tool-body.md
+@@ -0,0 +1,63 @@
++## #743 - the simulated tool is drawn as the revolved outline the laws judge (part 1)
++
++**What was decided.**
++
++1. *The simulation draws the judged outline, not the body's own facets.*
++   The tool at the playhead is one revolved body built from two reads the
++   collision laws already make: the judged tool record
++   (`tool_body::judged`) for the cutter and shank, and the band stack the
++   fixture laws sweep (`tool_body::stack`) for everything above the shank -
++   the holder cylinder, an imported body's revolved envelope (#368) or a
++   drawn holder's bands (#93). Before this, a tool with a body drew the
++   body's raw facets (an imported mesh with its flats and slots at a fixed
++   turn; a drawn profile with its cones and arcs).
++2. *A cone or an arc is therefore drawn stepped.* The laws read a drawn
++   cone as one cylinder at its larger end (`SpunProfile::bands`), so the
++   simulation now shows that cylinder. It looks coarser than the drawing,
++   and it is exactly what is checked. The tool editor's preview still
++   shows the drawn outline.
++3. *One mesh, cached, keyed by the outline itself.* `SimToolCache` holds
++   the mesh of the one tool at the playhead. The key is the judged
++   outline, so any edit that moves a judged number rebuilds it and nothing
++   else does; it empties when the tool or operation is gone, the tool is
++   refused, or the transport closes. It lives in `State` behind a `Mutex`
++   because the scene is collected from `&State`.
++4. *A tool that cannot be drawn draws nothing and is logged once.* A body
++   that no longer fits its tool, or a degenerate outline (non-finite,
++   negative, running back down the axis, no radius, past the body caps),
++   gives no body and one `tracing::warn!` per distinct reason. Before, a
++   misfitting body was still drawn.
++5. *No new command, no MCP tool.* Playback position is ephemeral; nothing
++   here writes the world.
++
++**Why.** The issue asks for "the same profile the collision laws judge, so
++what you see is what is checked". Calling the laws' own two functions is
++the only way the picture cannot drift from the verdict; a second
++derivation of the holder shape for display would be a second truth.
++
++**Considered and dropped.**
++
++- *Keep drawing the body's facets and add the envelope as a second,
++  translucent shell.* The viewport's model parts have no translucent
++  class, and two bodies on screen leave it unclear which one is judged.
++- *Draw the smooth drawn outline for a spun holder.* Prettier, but it
++  shows a cone where the law sweeps a cylinder - a tool that looks clear
++  of a clamp can be reported as striking it.
++- *A cache keyed by `doc_version`.* Every command bumps it, so the mesh
++  would be rebuilt after edits that do not touch the tool, and the app
++  layer could not test the cache without the UI.
++- *A per-tool map of meshes.* Only one tool is at the playhead; a map
++  would need its own eviction on tool/op deletion for no visible gain (a
++  rebuild is a few hundred triangles).
++- *Drawing the lathe insert kinds.* Their profile is a stand-in envelope;
++  they keep the axis marker, as before.
++
++**Known gap, filed not fixed.** The laws that read one holder cylinder
++(shank reach, gouge and the rest) judge the cylinder *enclosing* the body
++(`HolderProfile::enclose`), which is wider than the band stack drawn here
++wherever the body is stepped. This slice does not touch any law; the
++difference is filed as #835.
++
++**Cost to change later.** Small: `JudgedOutline::new` is the one place the
++drawn shape is assembled, and `world::sim_tool_tris` the one caller.
++Part 2 of #743 (STEP body to an editable DXF half-profile) is untouched.

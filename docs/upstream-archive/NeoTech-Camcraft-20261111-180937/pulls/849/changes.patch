@@ -1,0 +1,1574 @@
+From 6bd42c14f450af9bfcd36b605b1836e57d310fdd Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 15:29:25 +0100
+Subject: [PATCH 1/2] feat(kernel): heal seam op and solidcore native-format
+ importer corpus
+
+M12.1 stage 3 of the retirement gate. The Kernel seam gains heal():
+solidcore runs the port's api_heal_brep and the seam judges the result
+(empty and non-positive-tolerance input refused up front; integrity,
+closed manifold, positive measure and a vertex-edge gap under
+HEAL_GAP_LIMIT afterwards); truck answers Unsupported. New
+solidcore_import module: the port's native ASCII B-rep format as
+write_smb / read_smb / import_smb (read, heal, check).
+
+Bench: heal and the native round trip hold five fixtures to their
+closed forms; a vertex-gap fixture shows the port heals any gap by
+growing tolerance, so the seam caps it; a 21-file corrupt corpus, every
+case under a 60 s time bound, pins raw-reader and importer verdicts.
+Findings pinned: the raw reader returns Ok-empty for garbage files and
+Ok for a 1.0 vertex gap; the importer refuses all of them.
+
+No production path switched; truck keeps its kernel role.
+
+Refs #27
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/kernel/src/lib.rs               |  11 +-
+ crates/kernel/src/solidcore_impl.rs    |   4 +
+ crates/kernel/src/solidcore_import.rs  | 234 ++++++++++++++++++++++++
+ crates/kernel/src/truck_impl.rs        |  10 +-
+ crates/kernel/tests/heal_import.rs     | 207 +++++++++++++++++++++
+ crates/kernel/tests/import_corpus.rs   | 240 +++++++++++++++++++++++++
+ crates/kernel/tests/smb_util/mod.rs    |  85 +++++++++
+ docs/decisions/27-solidcore-healing.md |  59 ++++++
+ 8 files changed, 847 insertions(+), 3 deletions(-)
+ create mode 100644 crates/kernel/src/solidcore_import.rs
+ create mode 100644 crates/kernel/tests/heal_import.rs
+ create mode 100644 crates/kernel/tests/import_corpus.rs
+ create mode 100644 crates/kernel/tests/smb_util/mod.rs
+ create mode 100644 docs/decisions/27-solidcore-healing.md
+
+diff --git a/crates/kernel/src/lib.rs b/crates/kernel/src/lib.rs
+index 783f821d..3324dbb0 100644
+--- a/crates/kernel/src/lib.rs
++++ b/crates/kernel/src/lib.rs
+@@ -1,8 +1,8 @@
+-//! camcraft-kernel - the B-rep kernel seam of M12.1, stages 1-2 (evaluation +
++//! camcraft-kernel - the B-rep kernel seam of M12.1, stages 1-3 (evaluation +
+ //! agreement bench). A thin [`Kernel`] trait carries only the operations both
+ //! candidate engines can be asked for: primitive construction (box, Z
+ //! cylinder), the three booleans (subtract, union, intersect), whole-solid
+-//! offset, constant-radius edge blends (round, chamfer), and a [`Measure`]
++//! offset, constant-radius edge blends (round, chamfer), healing, and a [`Measure`]
+ //! (volume + bounding box) the bench compares. Nothing else in the workspace
+ //! depends on this crate yet; truck stays the live engine.
+ //!
+@@ -23,6 +23,7 @@ mod error;
+ mod measure;
+ mod solidcore_blend;
+ pub mod solidcore_impl;
++pub mod solidcore_import;
+ #[cfg(feature = "truck")]
+ pub mod truck_impl;
+ 
+@@ -87,6 +88,12 @@ pub trait Kernel {
+         kind: Blend,
+     ) -> Result<Self::Solid, KernelError>;
+ 
++    /// Repairs gaps between a solid's vertices, edges and faces (the fix-up
++    /// an imported model needs) and hands it back only if it is a closed
++    /// solid afterwards. Engines without healing return
++    /// [`KernelError::Unsupported`].
++    fn heal(&mut self, s: Self::Solid) -> Result<Self::Solid, KernelError>;
++
+     /// Volume and bounding box of a closed solid.
+     fn measure(&mut self, s: &mut Self::Solid) -> Result<Measure, KernelError>;
+ }
+diff --git a/crates/kernel/src/solidcore_impl.rs b/crates/kernel/src/solidcore_impl.rs
+index 71604880..74600a90 100644
+--- a/crates/kernel/src/solidcore_impl.rs
++++ b/crates/kernel/src/solidcore_impl.rs
+@@ -135,6 +135,10 @@ impl Kernel for SolidcoreKernel {
+         crate::solidcore_blend::blend_edges(self, s, picks, radius, kind)
+     }
+ 
++    fn heal(&mut self, s: Brep) -> Result<Brep, KernelError> {
++        crate::solidcore_import::heal(self, s)
++    }
++
+     /// Guards around the port's offset, each one answering a bench finding
+     /// (see tests/corrupt_input.rs `KNOWN_PORT_FINDINGS`):
+     /// - `merge_results: true` - with SMLib's default `false`, a plain box
+diff --git a/crates/kernel/src/solidcore_import.rs b/crates/kernel/src/solidcore_import.rs
+new file mode 100644
+index 00000000..f1d5080c
+--- /dev/null
++++ b/crates/kernel/src/solidcore_import.rs
+@@ -0,0 +1,234 @@
++//! The solidcore side of import (M12.1 stage 3): healing behind the seam,
++//! and the port's native B-rep text format (SMLib's ASCII `.smb`) as the
++//! importer the corrupt-input corpus drives. STEP stays on truck-stepio;
++//! this is the port's own reader, the one format it reads without truck.
++//! Provenance: calls solidcore 1.0.1's public API as documented in its
++//! rustdoc (`heal::heal_data::p1::api_heal_brep`, `topology::brep::p7::
++//! read_from_file`, `topology::brep_data_write`) and its `corpus` example's
++//! read/write calls; no SMLib/solidcore internals reimplemented here.
++
++use solidcore::EntityRef;
++use solidcore::geom::attribute::{AttributeStore, ObjectKey};
++use solidcore::geom::object::ObjectRef;
++use solidcore::heal::heal_data::p1::api_heal_brep;
++use solidcore::math::Point3;
++use solidcore::topology::brep::p7::read_from_file;
++use solidcore::topology::brep::p10::TopologyEnv;
++use solidcore::topology::brep_data::BrepData;
++use solidcore::topology::brep_data_write::FromBrepEnv;
++use solidcore::topology::database_io::FileType;
++use solidcore::topology::topology::NotifyRecords;
++use solidcore::topology::{Brep, EdgeId, EdgeuseId, FaceId};
++
++use crate::solidcore_impl::{SolidcoreKernel, checked, failed};
++use crate::{Kernel, KernelError};
++
++const NAME: &str = "solidcore";
++
++/// Largest native file the seam hands the reader (64 MiB). The reader holds
++/// the whole file and its parsed copy in memory; a larger input is refused
++/// by name rather than risked.
++pub const MAX_SMB_BYTES: usize = 64 << 20;
++
++/// Geometry copies the reader makes get identities from here up, clear of
++/// the topology identities [`key_of`] hands out (the corpus example's split).
++const GEOMETRY_KEYS: u64 = 1 << 62;
++
++/// A distinct identity per topology object of the one B-rep the seam reads
++/// or writes (the reader and writer key their records by it). The type codes
++/// are opaque tags here; only distinctness matters.
++fn key_of(e: EntityRef) -> ObjectRef {
++    let (type_code, kind, i) = match e {
++        EntityRef::Brep(x) => (16011, 0u64, x.index()),
++        EntityRef::Region(x) => (16012, 1, x.index()),
++        EntityRef::Shell(x) => (16013, 2, x.index()),
++        EntityRef::Faceuse(x) => (16022, 3, x.index()),
++        EntityRef::Face(x) => (16002, 4, x.index()),
++        EntityRef::Loopuse(x) => (16004, 5, x.index()),
++        EntityRef::Loop(x) => (16003, 6, x.index()),
++        EntityRef::Edgeuse(x) => (16005, 7, x.index()),
++        EntityRef::Edge(x) => (16016, 8, x.index()),
++        EntityRef::Vertexuse(x) => (16006, 9, x.index()),
++        EntityRef::Vertex(x) => (16021, 10, x.index()),
++    };
++    ObjectRef {
++        type_code,
++        key: ObjectKey((1u64 << 36) | ((kind + 1) << 32) | u64::from(i)),
++    }
++}
++
++/// The healing behind [`Kernel::heal`]. The port's heal reports success
++/// whatever its healer found (SMLib's `HealBrep` ignores every status but
++/// "unported"), so the seam judges the RESULT: it must pass the integrity
++/// and closed-manifold checks, and keep a positive finite volume.
++pub(crate) fn heal(k: &mut SolidcoreKernel, mut s: Brep) -> Result<Brep, KernelError> {
++    if s.faces().is_empty() {
++        return Err(KernelError::InvalidInput {
++            op: "heal",
++            detail: "empty B-rep (no faces)".into(),
++        });
++    }
++    // The port's stitch doubles its tolerance from a tenth of the B-rep's
++    // until gaps close; from zero or below it never would (upstream
++    // HANG-24, bounded in the port by MAX_TOL_DOUBLINGS). Refuse it here.
++    let tol = s.tolerance();
++    if !(tol.is_finite() && tol > 0.0) {
++        return Err(KernelError::InvalidInput {
++            op: "heal",
++            detail: format!("B-rep tolerance must be finite and > 0, got {tol}"),
++        });
++    }
++    api_heal_brep(&mut k.k, Some(&mut s)).map_err(|e| failed("heal", &e))?;
++    let mut s = checked("heal", s)?;
++    k.measure(&mut s)?;
++    // The port heals a vertex-edge gap by growing the vertex's tolerance to
++    // cover it, not by moving the vertex (bench reading, tests/heal_import.rs):
++    // any gap comes back "healed". The seam keeps only gaps under the limit.
++    let (gap, _) = vertex_gaps(k, &s)?;
++    if gap > HEAL_GAP_LIMIT {
++        return Err(KernelError::InvalidResult {
++            kernel: NAME,
++            op: "heal",
++            detail: format!(
++                "a vertex sits {gap:.3e} off its edges (limit {HEAL_GAP_LIMIT:e}): \
++                 the model is too far apart to heal"
++            ),
++        });
++    }
++    Ok(s)
++}
++
++/// The largest vertex-edge gap a healed solid may keep (model units, mm).
++/// The port closes a gap of any size by growing tolerances, so the seam caps
++/// it: a sub-micron gap is an export round-off; a gap past this is a model
++/// that is not closed (docs/decisions/27-solidcore-healing.md).
++pub const HEAL_GAP_LIMIT: f64 = 1e-3;
++
++/// The largest distance from a vertex to the nearer end of an edge curve it
++/// bounds, and the largest vertex tolerance, over the whole B-rep (edges
++/// without a 3D curve are skipped). A healed
++/// model whose vertices sit off their edges (or whose tolerances were grown
++/// to swallow the gap) is not a model a toolpath may trust.
++pub fn vertex_gaps(k: &SolidcoreKernel, s: &Brep) -> Result<(f64, f64), KernelError> {
++    let op = "vertex_gaps";
++    let dist = |a: Point3, b: Point3| {
++        ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
++    };
++    let mut gap = 0.0_f64;
++    let mut tol = 0.0_f64;
++    for (e, edge) in s.edges().iter() {
++        // A boolean's intersection edges may carry only UV trims, no 3D
++        // curve: there is no curve end to measure against, so the edge is
++        // skipped (the integrity check has already passed on it).
++        let Some(curve) = edge.curve.as_ref() else {
++            continue;
++        };
++        let p0 = curve
++            .evaluate_point(&k.k, edge.interval.min())
++            .map_err(|e| failed(op, &e))?;
++        let p1 = curve
++            .evaluate_point(&k.k, edge.interval.max())
++            .map_err(|e| failed(op, &e))?;
++        let (a, b) =
++            solidcore::topology::edge::start_end_vertices(s, e).map_err(|e| failed(op, &e))?;
++        for v in [a, b].into_iter().flatten() {
++            let vx = s.vertex(v).map_err(|e| failed(op, &e))?;
++            gap = gap.max(dist(vx.point, p0).min(dist(vx.point, p1)));
++            tol = tol.max(vx.tolerance);
++        }
++    }
++    if gap.is_finite() && tol.is_finite() {
++        Ok((gap, tol))
++    } else {
++        Err(KernelError::InvalidResult {
++            kernel: NAME,
++            op,
++            detail: format!("non-finite gap {gap} or tolerance {tol}"),
++        })
++    }
++}
++
++/// Writes `s` in the port's native ASCII B-rep format.
++pub fn write_smb(k: &SolidcoreKernel, s: &Brep) -> Result<Vec<u8>, KernelError> {
++    let store = AttributeStore::default();
++    let records = NotifyRecords::new();
++    // The writer keeps only the surfaces a face owns (SMLib's `GetSurfaces`),
++    // by comparing the surface's recorded owner with the face's identity; a
++    // B-rep the port built names its faces its own way, so a face's identity
++    // here IS its surface's recorded owner, else the seam's own key.
++    let face_key = |e: EntityRef| match e {
++        EntityRef::Face(f) => s
++            .face(f)
++            .ok()
++            .and_then(|x| x.surface.as_ref()?.owner())
++            .unwrap_or_else(|| key_of(e)),
++        _ => key_of(e),
++    };
++    let env = FromBrepEnv {
++        attributes: &store,
++        key_of: &face_key,
++        records: &records,
++        curve_key: &|_: EdgeId| ObjectKey(0),
++        uv_curve_key: &|_: EdgeuseId| ObjectKey(0),
++        surface_key: &|_: FaceId| ObjectKey(0),
++    };
++    let mut all = Vec::new();
++    let mut data = BrepData::from_brep(s, &env, &mut all).map_err(|e| failed("write_smb", &e))?;
++    data.write_to_file_with_nurbs(&k.k, FileType::Ascii)
++        .map_err(|e| failed("write_smb", &e))
++}
++
++/// Reads one B-rep from the port's native ASCII format, exactly as read: no
++/// healing, no solid check (the corpus measures the raw reader). Use
++/// [`import_smb`] for a model the rest of the program may trust.
++pub fn read_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Brep, KernelError> {
++    if bytes.is_empty() {
++        return Err(KernelError::InvalidInput {
++            op: "read_smb",
++            detail: "empty file".into(),
++        });
++    }
++    if bytes.len() > MAX_SMB_BYTES {
++        return Err(KernelError::InvalidInput {
++            op: "read_smb",
++            detail: format!(
++                "{} bytes is past the {MAX_SMB_BYTES}-byte limit",
++                bytes.len()
++            ),
++        });
++    }
++    let mut b = Brep::new_with_infinite_region().map_err(|e| failed("read_smb", &e))?;
++    let mut attributes = AttributeStore::default();
++    let mut records = NotifyRecords::new();
++    let mut env = TopologyEnv {
++        all_attributes: &[],
++        attributes: &mut attributes,
++        key_of: &key_of,
++        records: &mut records,
++        next_key: GEOMETRY_KEYS,
++    };
++    read_from_file(
++        &mut k.k,
++        &mut b,
++        bytes.to_vec(),
++        FileType::Ascii,
++        false,
++        &mut env,
++    )
++    .map_err(|e| failed("read_smb", &e))?;
++    Ok(b)
++}
++
++/// The importer: read, heal, and hand out only a closed solid with a
++/// positive finite measure. Every failure is a located `Err`.
++pub fn import_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Brep, KernelError> {
++    let b = read_smb(k, bytes)?;
++    heal(k, b).map_err(|e| match e {
++        KernelError::InvalidInput { detail, .. } => KernelError::InvalidResult {
++            kernel: NAME,
++            op: "import_smb",
++            detail,
++        },
++        other => other,
++    })
++}
+diff --git a/crates/kernel/src/truck_impl.rs b/crates/kernel/src/truck_impl.rs
+index c7325b2f..9200e0ce 100644
+--- a/crates/kernel/src/truck_impl.rs
++++ b/crates/kernel/src/truck_impl.rs
+@@ -1,7 +1,8 @@
+ //! The truck reference impl of the kernel seam (feature `truck`, bench only):
+ //! sweep-built primitives, booleans via truck-shapeops `and` / `or` (subtract
+ //! is `and` with the tool inverted), measure via truck-meshalgo tessellation.
+-//! truck has no solid offset and no edge blend: both are `Unsupported`.
++//! truck has no solid offset, no edge blend and no B-rep healing: all three
++//! are `Unsupported`.
+ //! Provenance: calls truck's public API as shown in its published examples
+ //! (truck-shapeops `punched-cube-shapeops`, truck-meshalgo rustdoc); no truck
+ //! internals reimplemented.
+@@ -136,6 +137,13 @@ impl Kernel for TruckKernel {
+         })
+     }
+ 
++    fn heal(&mut self, _s: Solid) -> Result<Solid, KernelError> {
++        Err(KernelError::Unsupported {
++            kernel: NAME,
++            op: "heal",
++        })
++    }
++
+     fn offset(&mut self, _s: &mut Solid, _distance: f64) -> Result<Solid, KernelError> {
+         Err(KernelError::Unsupported {
+             kernel: NAME,
+diff --git a/crates/kernel/tests/heal_import.rs b/crates/kernel/tests/heal_import.rs
+new file mode 100644
+index 00000000..9b4b583b
+--- /dev/null
++++ b/crates/kernel/tests/heal_import.rs
+@@ -0,0 +1,207 @@
++//! Healing and import bench of the kernel on trial (M12.1 stage 3): the
++//! seam's `heal` on solidcore against closed forms (truck has no B-rep
++//! healing - recorded as Unsupported, never as agreement), the port's native
++//! B-rep text reader (`.smb`) round-tripping the bench fixtures, and a
++//! vertex-gap fixture the healer must close. Every port call runs under a
++//! time bound (smb_util). STEP stays on truck-stepio and is not benched
++//! here; the corrupt-file corpus is import_corpus.rs.
++//! Provenance: our own bench design; closed forms are elementary solid
++//! geometry (box, cylinder, box minus a through-cylinder, the quarter-round
++//! section r^2 (1 - pi/4)).
++//!
++//! Gate map (M12.1): covers camcraft_kernel::solidcore_import and the
++//! `heal` arm of camcraft_kernel::{solidcore_impl, truck_impl}.
++
++mod common;
++mod smb_util;
++
++use std::f64::consts::PI;
++
++use camcraft_kernel::solidcore_impl::SolidcoreKernel;
++use camcraft_kernel::solidcore_import::{
++    HEAL_GAP_LIMIT, import_smb, read_smb, vertex_gaps, write_smb,
++};
++use camcraft_kernel::truck_impl::TruckKernel;
++use camcraft_kernel::{Blend, Kernel, KernelError, Measure};
++use common::{REL_FLOOR, Want, verdict};
++use smb_util::{bounded, gapped_box, port_verdict};
++use solidcore::topology::Brep;
++
++/// The bench fixtures, built through the seam on solidcore.
++fn fixture(k: &mut SolidcoreKernel, name: &str) -> Result<Brep, KernelError> {
++    match name {
++        "box 10" => k.make_box([0.0; 3], [10.0; 3]),
++        "cylinder r3 h10" => k.make_cylinder([0.0; 3], 3.0, 10.0),
++        "box - through cylinder r3" => {
++            let b = k.make_box([0.0; 3], [10.0; 3])?;
++            let c = k.make_cylinder([5.0, 5.0, -1.0], 3.0, 12.0)?;
++            k.boolean_subtract(b, c)
++        }
++        "box | box (L)" => {
++            let a = k.make_box([0.0; 3], [10.0, 5.0, 10.0])?;
++            let b = k.make_box([0.0; 3], [5.0, 10.0, 10.0])?;
++            k.boolean_union(a, b)
++        }
++        _ => {
++            let b = k.make_box([0.0; 3], [10.0; 3])?;
++            k.blend_edges(b, &[[5.0, 0.0, 0.0]], 2.0, Blend::Round)
++        }
++    }
++}
++
++fn wants() -> Vec<Want> {
++    let cube = ([0.0; 3], [10.0; 3]);
++    vec![
++        Want {
++            name: "box 10",
++            volume: 1000.0,
++            bbox: cube,
++        },
++        Want {
++            name: "cylinder r3 h10",
++            volume: 90.0 * PI,
++            bbox: ([-3.0, -3.0, 0.0], [3.0, 3.0, 10.0]),
++        },
++        Want {
++            name: "box - through cylinder r3",
++            volume: 1000.0 - 90.0 * PI,
++            bbox: cube,
++        },
++        Want {
++            name: "box | box (L)",
++            volume: 750.0,
++            bbox: cube,
++        },
++        Want {
++            name: "box, one edge round r2",
++            volume: 1000.0 - 40.0 * (1.0 - PI / 4.0),
++            bbox: cube,
++        },
++    ]
++}
++
++fn check(w: &Want, engine: &str, m: Result<Measure, KernelError>) -> Option<String> {
++    match m {
++        Ok(m) => verdict(engine, &m, w, REL_FLOOR * w.volume, 1e-6).err(),
++        Err(e) => Some(format!("{}: {engine} {e}", w.name)),
++    }
++}
++
++#[test]
++fn heal_keeps_every_fixture_at_its_closed_form() {
++    let mut fails = Vec::new();
++    for w in wants() {
++        let name = w.name;
++        let m = bounded(name, move || {
++            let mut k = SolidcoreKernel::default();
++            let s = fixture(&mut k, name)?;
++            k.heal(s).and_then(|mut h| k.measure(&mut h))
++        });
++        fails.extend(check(&w, "solidcore", m));
++    }
++    assert!(
++        fails.is_empty(),
++        "heal left the closed form:\n{}",
++        fails.join("\n")
++    );
++}
++
++/// truck has no B-rep healing: the seam says so by name. Recorded as a
++/// "not yet" on the truck side, never counted as agreement.
++#[test]
++fn truck_offers_no_heal() {
++    let mut t = TruckKernel::default();
++    let r = t.make_box([0.0; 3], [10.0; 3]).and_then(|b| t.heal(b));
++    println!("truck heal -> {:?}", r.as_ref().map(|_| "Ok"));
++    assert!(
++        matches!(
++            r,
++            Err(KernelError::Unsupported {
++                kernel: "truck",
++                op: "heal"
++            })
++        ),
++        "truck heal: {:?}",
++        r.map(|_| "Ok")
++    );
++}
++
++#[test]
++fn native_round_trip_matches_closed_form() {
++    let mut fails = Vec::new();
++    for w in wants() {
++        let name = w.name;
++        let m = bounded(name, move || {
++            let mut k = SolidcoreKernel::default();
++            let s = fixture(&mut k, name)?;
++            let bytes = write_smb(&k, &s)?;
++            import_smb(&mut k, &bytes).and_then(|mut b| k.measure(&mut b))
++        });
++        fails.extend(check(&w, "solidcore .smb", m));
++    }
++    assert!(
++        fails.is_empty(),
++        "round trip left the closed form:\n{}",
++        fails.join("\n")
++    );
++}
++
++/// Raw reader and importer on a vertex gap. The port's healer covers a gap
++/// by growing the vertex tolerance, not by moving the vertex, so the tight
++/// bounding box keeps the moved vertex. Under [`HEAL_GAP_LIMIT`] the import
++/// is a solid within the gap's reach of the closed form (|dV| <= gap x the
++/// box's surface area, bbox within the gap); past it, a clean refusal.
++#[test]
++fn vertex_gap_is_closed_by_the_importer() {
++    let mut fails = Vec::new();
++    let cube = Want {
++        name: "gapped box 10",
++        volume: 1000.0,
++        bbox: ([0.0; 3], [10.0; 3]),
++    };
++    for gap in [1e-6, 1e-4, 5e-4, 2e-3, 1e-2] {
++        let text = gapped_box(gap);
++        let r = bounded("vertex gap", move || {
++            let mut k = SolidcoreKernel::default();
++            let raw = read_smb(&mut k, text.as_bytes());
++            let raw = port_verdict(raw, &mut k);
++            let read = read_smb(&mut k, text.as_bytes())?;
++            let healed = k.heal(read);
++            let gaps = healed
++                .as_ref()
++                .map_err(Clone::clone)
++                .and_then(|h| vertex_gaps(&k, h));
++            let imp = import_smb(&mut k, text.as_bytes()).and_then(|mut b| k.measure(&mut b));
++            Ok::<_, KernelError>((raw, gaps, imp))
++        });
++        let Ok((raw, gaps, imported)) = r else {
++            fails.push(format!("gap {gap:e}: read {r:?}"));
++            continue;
++        };
++        println!(
++            "gap {gap:e}: read -> {raw}; healed (gap, vertex tol) {gaps:?}; import -> {imported:?}"
++        );
++        // within the limit: the healed vertex tolerance covers the gap
++        if gap <= HEAL_GAP_LIMIT {
++            match &gaps {
++                Ok((g, tol)) if *tol >= *g * (1.0 - 1e-9) && *g <= HEAL_GAP_LIMIT => {}
++                other => fails.push(format!("gap {gap:e}: healed gaps {other:?}")),
++            }
++            let tol = gap * 600.0 + REL_FLOOR * 1000.0;
++            match imported
++                .map_err(|e| e.to_string())
++                .and_then(|m| verdict("solidcore", &m, &cube, tol, gap * 1.01))
++            {
++                Ok(()) => {}
++                Err(e) => fails.push(format!("gap {gap:e}: {e}")),
++            }
++        } else if !matches!(imported, Err(KernelError::InvalidResult { op: "heal", .. })) {
++            fails.push(format!("gap {gap:e} past the limit: import {imported:?}"));
++        }
++    }
++    assert!(
++        fails.is_empty(),
++        "vertex gaps not healed:\n{}",
++        fails.join("\n")
++    );
++}
+diff --git a/crates/kernel/tests/import_corpus.rs b/crates/kernel/tests/import_corpus.rs
+new file mode 100644
+index 00000000..bd4120d5
+--- /dev/null
++++ b/crates/kernel/tests/import_corpus.rs
+@@ -0,0 +1,240 @@
++//! Corrupt-file corpus of the port's native B-rep reader (M12.1 stage 3):
++//! blank, foreign, truncated and field-corrupted `.smb` files through the
++//! raw reader and the seam's importer. Never a panic, never a hang (every
++//! case runs under a time bound); the importer hands out a model only when
++//! the edit left it whole, and then exactly the closed-form 10-box.
++//! Provenance: our own corpus, shaped after the Prime Directive's
++//! degenerate-input list; edits are made on the port's own writer output.
++//!
++//! Gate map (M12.1): covers camcraft_kernel::solidcore_import (read_smb,
++//! import_smb, the heal guards).
++
++mod smb_util;
++
++use camcraft_kernel::solidcore_impl::SolidcoreKernel;
++use camcraft_kernel::solidcore_import::{MAX_SMB_BYTES, import_smb, read_smb};
++use camcraft_kernel::{Kernel, KernelError};
++use smb_util::{bounded, box_text, edit_record, gapped_box, port_verdict};
++use solidcore::topology::Brep;
++
++/// Edits that leave the model itself whole: the reader may accept them, and
++/// the importer must then hand out the exact 10-box. A future format version
++/// number is read as the current one; a dropped final newline loses nothing;
++/// a zero or negative zone tolerance is replaced by the reader's default
++/// (the seam's heal guard sees a positive tolerance afterwards).
++const INTACT: &[&str] = &[
++    "future version",
++    "last byte dropped",
++    "zero zone tolerance",
++    "negative zone tolerance",
++];
++
++/// Corrupt native files: each name, the raw reader's verdict and the
++/// importer's verdict, pinned so a port bump that changes any of them fails
++/// here and gets looked at. Every importer verdict outside [`INTACT`] must
++/// be an `Err` - the importer never hands out a corrupt model.
++fn corpus() -> Vec<(&'static str, Vec<u8>)> {
++    let t = box_text();
++    let b = t.as_bytes();
++    let cut = |num: usize, den: usize| b.get(..b.len() * num / den).unwrap_or_default().to_vec();
++    let noise: Vec<u8> = (0u32..4096)
++        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
++        .collect();
++    vec![
++        ("empty file", Vec::new()),
++        ("one space", b" ".to_vec()),
++        (
++            "text, not a B-rep",
++            b"solid cube\nfacet normal 0 0 1\n".to_vec(),
++        ),
++        ("binary noise 4 KiB", noise),
++        ("header only", b"Version 42\nHealer Version 10\n".to_vec()),
++        (
++            "future version",
++            t.replacen("Version 42", "Version 9999", 1).into_bytes(),
++        ),
++        ("cut at 10%", cut(1, 10)),
++        ("cut at 50%", cut(1, 2)),
++        ("cut at 90%", cut(9, 10)),
++        (
++            "last byte dropped",
++            b.get(..b.len().saturating_sub(1))
++                .unwrap_or_default()
++                .to_vec(),
++        ),
++        (
++            "NaN vertex",
++            edit_record(&t, "8 Vertices In Brep", 5, |_| "nan".into()).into_bytes(),
++        ),
++        (
++            "inf vertex",
++            edit_record(&t, "8 Vertices In Brep", 5, |_| "inf".into()).into_bytes(),
++        ),
++        (
++            "zero zone tolerance",
++            t.replacen(
++                "0.0000100000000000 - Brep ZoneTol3d",
++                "0.0 - Brep ZoneTol3d",
++                1,
++            )
++            .into_bytes(),
++        ),
++        (
++            "negative zone tolerance",
++            t.replacen(
++                "0.0000100000000000 - Brep ZoneTol3d",
++                "-1.0 - Brep ZoneTol3d",
++                1,
++            )
++            .into_bytes(),
++        ),
++        (
++            "NaN zone tolerance",
++            t.replacen(
++                "0.0000100000000000 - Brep ZoneTol3d",
++                "nan - Brep ZoneTol3d",
++                1,
++            )
++            .into_bytes(),
++        ),
++        (
++            "face count 4294967295",
++            t.replacen("6 Faces In Brep", "4294967295 Faces In Brep", 1)
++                .into_bytes(),
++        ),
++        (
++            "face count -1",
++            t.replacen("6 Faces In Brep", "-1 Faces In Brep", 1)
++                .into_bytes(),
++        ),
++        (
++            "face surface index out of range",
++            edit_record(&t, "6 Faces In Brep", 5, |_| "77".into()).into_bytes(),
++        ),
++        (
++            "faceuse face index out of range",
++            edit_record(&t, "12 Faceuses In Brep", 4, |_| "99".into()).into_bytes(),
++        ),
++        ("vertex gap 1.0 (unhealable)", gapped_box(1.0).into_bytes()),
++        (
++            "one face dropped (open shell)",
++            t.replacen("6 Faces In Brep", "5 Faces In Brep", 1)
++                .into_bytes(),
++        ),
++    ]
++}
++
++/// What the raw reader and the importer do with each corpus file, pinned.
++/// FINDINGS against the port's reader: it returns `Ok` with an EMPTY B-rep
++/// (no faces) for a blank file, plain text, binary noise, a header with no
++/// body and a NaN zone tolerance; and `Ok` with a closed box whose vertex
++/// sits 1.0 off its edges. The importer refuses every one of them (the
++/// empty ones fail the heal guard's empty check -> `Err invalid`; the gap
++/// past `HEAL_GAP_LIMIT` -> `Err invalid`).
++const KNOWN_SMB_VERDICTS: &[(&str, &str, &str)] = &[
++    ("empty file", "Err refused", "Err refused"),
++    ("one space", "Ok faces=0 no measure", "Err invalid"),
++    ("text, not a B-rep", "Ok faces=0 no measure", "Err invalid"),
++    ("binary noise 4 KiB", "Ok faces=0 no measure", "Err invalid"),
++    ("header only", "Ok faces=0 no measure", "Err invalid"),
++    ("future version", "Ok V=1000.000", "Ok V=1000.000"),
++    ("cut at 10%", "Err failed", "Err failed"),
++    ("cut at 50%", "Err failed", "Err failed"),
++    ("cut at 90%", "Err failed", "Err failed"),
++    ("last byte dropped", "Ok V=1000.000", "Ok V=1000.000"),
++    ("NaN vertex", "Err failed", "Err failed"),
++    ("inf vertex", "Err failed", "Err failed"),
++    ("zero zone tolerance", "Ok V=1000.000", "Ok V=1000.000"),
++    ("negative zone tolerance", "Ok V=1000.000", "Ok V=1000.000"),
++    ("NaN zone tolerance", "Ok faces=0 no measure", "Err invalid"),
++    ("face count 4294967295", "Err failed", "Err failed"),
++    ("face count -1", "Err failed", "Err failed"),
++    (
++        "face surface index out of range",
++        "Err failed",
++        "Err failed",
++    ),
++    (
++        "faceuse face index out of range",
++        "Err failed",
++        "Err failed",
++    ),
++    (
++        "vertex gap 1.0 (unhealable)",
++        "Ok V=1000.000",
++        "Err invalid",
++    ),
++    ("one face dropped (open shell)", "Err failed", "Err failed"),
++];
++
++#[test]
++fn corrupt_native_files_never_panic_or_hang() {
++    let mut observed = Vec::new();
++    for (name, bytes) in corpus() {
++        let (raw, imp) = bounded(name, move || {
++            let mut k = SolidcoreKernel::default();
++            let raw = read_smb(&mut k, &bytes);
++            let raw = port_verdict(raw, &mut k);
++            let imp = import_smb(&mut k, &bytes);
++            let imp = port_verdict(imp, &mut k);
++            (raw, imp)
++        });
++        println!("{name:<34} read -> {raw:<22} import -> {imp}");
++        observed.push((name.to_string(), raw, imp));
++    }
++    let wrong: Vec<_> = observed
++        .iter()
++        .filter(|(n, _, i)| {
++            if INTACT.contains(&n.as_str()) {
++                i != "Ok V=1000.000"
++            } else {
++                i.starts_with("Ok")
++            }
++        })
++        .collect();
++    assert!(
++        wrong.is_empty(),
++        "importer verdict wrong (corrupt model handed out, or intact one lost): {wrong:?}"
++    );
++    let pinned: Vec<(String, String, String)> = KNOWN_SMB_VERDICTS
++        .iter()
++        .map(|(n, r, i)| ((*n).to_string(), (*r).to_string(), (*i).to_string()))
++        .collect();
++    assert_eq!(
++        observed, pinned,
++        "reader verdicts changed - re-triage the findings"
++    );
++}
++
++#[test]
++fn seam_refuses_degenerate_heal_and_oversized_files() {
++    let mut k = SolidcoreKernel::default();
++    let r = k.heal(Brep::new());
++    assert!(
++        matches!(r, Err(KernelError::InvalidInput { op: "heal", .. })),
++        "heal(empty): {:?}",
++        r.map(|_| "Ok")
++    );
++    // an open sheet is not a solid, before or after healing
++    let sheet = solidcore::primitive::api_primitives::create_plane(
++        &mut k.k,
++        solidcore::math::Point3::new(0.0, 0.0, 0.0),
++        10.0,
++        10.0,
++    );
++    if let Ok(sheet) = sheet {
++        let r = bounded("heal sheet", move || {
++            let mut k = SolidcoreKernel::default();
++            k.heal(sheet).map(|_| "Ok")
++        });
++        println!("heal(sheet) -> {r:?}");
++        assert!(r.is_err(), "heal(sheet) came back Ok");
++    }
++    let big = vec![b' '; MAX_SMB_BYTES + 1];
++    let r = read_smb(&mut k, &big);
++    assert!(
++        matches!(r, Err(KernelError::InvalidInput { op: "read_smb", .. })),
++        "oversized: {:?}",
++        r.map(|_| "Ok")
++    );
++}
+diff --git a/crates/kernel/tests/smb_util/mod.rs b/crates/kernel/tests/smb_util/mod.rs
+new file mode 100644
+index 00000000..11e9ea3f
+--- /dev/null
++++ b/crates/kernel/tests/smb_util/mod.rs
+@@ -0,0 +1,85 @@
++//! Shared helpers of the native-format benches (heal_import.rs,
++//! import_corpus.rs): a time bound per port call, the 10-box as the port
++//! writes it, record edits on that text, and a compact verdict.
++//! Provenance: our own bench design (M12.1 retirement gate).
++
++use std::sync::mpsc;
++use std::time::Duration;
++
++use camcraft_kernel::solidcore_impl::SolidcoreKernel;
++use camcraft_kernel::solidcore_import::write_smb;
++use camcraft_kernel::{Kernel, KernelError};
++use solidcore::topology::Brep;
++
++/// No single port call in this bench may take longer than this (release).
++pub const CASE_TIMEOUT: Duration = Duration::from_secs(60);
++
++/// Runs `f` on its own thread and fails the test if it does not answer in
++/// [`CASE_TIMEOUT`] (a hang is a finding, never a silent wait).
++pub fn bounded<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
++    let (tx, rx) = mpsc::channel();
++    std::thread::spawn(move || {
++        let _ = tx.send(f());
++    });
++    match rx.recv_timeout(CASE_TIMEOUT) {
++        Ok(v) => v,
++        Err(e) => panic!("{name}: no answer within {CASE_TIMEOUT:?} ({e}) - a hang or a panic"),
++    }
++}
++
++/// The text of the 10-box as the port writes it.
++pub fn box_text() -> String {
++    let mut k = SolidcoreKernel::default();
++    let s = k.make_box([0.0; 3], [10.0; 3]);
++    assert!(s.is_ok(), "fixture box: {:?}", s.as_ref().map(|_| "Ok"));
++    let bytes = s.and_then(|s| write_smb(&k, &s));
++    assert!(bytes.is_ok(), "write: {bytes:?}");
++    String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned()
++}
++
++/// `text` with token `col` of the first record after the line equal to
++/// `section` (skipping `//` comment and blank lines) replaced by `f(token)`.
++pub fn edit_record(text: &str, section: &str, col: usize, f: impl Fn(&str) -> String) -> String {
++    let mut out = Vec::new();
++    let mut armed = false;
++    let mut done = false;
++    for line in text.lines() {
++        if !done && armed && !line.starts_with("//") && !line.trim().is_empty() {
++            let mut toks: Vec<String> = line.split_whitespace().map(str::to_string).collect();
++            if let Some(t) = toks.get_mut(col) {
++                *t = f(t);
++            }
++            out.push(toks.join(" "));
++            done = true;
++            continue;
++        }
++        if line.trim() == section {
++            armed = true;
++        }
++        out.push(line.to_string());
++    }
++    out.join("\n") + "\n"
++}
++
++/// The first vertex's X moved by `gap` (vertex record: index, flags, two
++/// user ids, tolerance, X, Y, Z). The edge curves still end at the old
++/// corner, so the file carries a vertex-edge gap of `gap`.
++pub fn gapped_box(gap: f64) -> String {
++    edit_record(&box_text(), "8 Vertices In Brep", 5, |t| {
++        format!("{:.16}", t.parse::<f64>().unwrap_or(0.0) + gap)
++    })
++}
++
++/// Compact verdict of a reader / importer result.
++pub fn port_verdict(r: Result<Brep, KernelError>, k: &mut SolidcoreKernel) -> String {
++    match r {
++        Err(KernelError::InvalidInput { .. }) => "Err refused".into(),
++        Err(KernelError::Failed { .. }) => "Err failed".into(),
++        Err(KernelError::InvalidResult { .. }) => "Err invalid".into(),
++        Err(KernelError::Unsupported { .. }) => "Err unsupported".into(),
++        Ok(mut b) => match k.measure(&mut b) {
++            Ok(m) => format!("Ok V={:.3}", m.volume),
++            Err(_) => format!("Ok faces={} no measure", b.faces().len()),
++        },
++    }
++}
+diff --git a/docs/decisions/27-solidcore-healing.md b/docs/decisions/27-solidcore-healing.md
+new file mode 100644
+index 00000000..75b4eb88
+--- /dev/null
++++ b/docs/decisions/27-solidcore-healing.md
+@@ -0,0 +1,59 @@
++## #27 - M12.1 stage 3: healing seam op and the solidcore-side importer corpus
++
++**1. `heal` joins the seam; truck answers `Unsupported`.** The `Kernel` trait
++gains `heal(solid) -> solid`. solidcore runs the port's `api_heal_brep`
++(SMLib's whole heal sequence); truck has no B-rep healing in truck-modeling /
++truck-shapeops 0.4, so it returns `Unsupported` by name and the bench records
++it as "not yet", never as agreement. Dropped: a truck "heal" built from
++mesh welding (truck-meshalgo) - it would heal the tessellation, not the
++B-rep, and would make the two columns compare different things.
++
++**2. The seam judges the heal by its result.** The port's heal reports
++success whatever its healer found (SMLib's `HealBrep` ignores every status
++but "unported"). So the seam refuses an empty B-rep and a B-rep whose
++tolerance is not finite and > 0 up front (the port's stitch doubles its
++tolerance from a tenth of the B-rep's - upstream HANG-24 never ends from
++zero), and afterwards requires the integrity check, a closed manifold
++solid, a positive finite measure and a vertex-edge gap under the limit
++(next point).
++
++**3. `HEAL_GAP_LIMIT = 1e-3` model units.** Bench reading: the port heals a
++vertex-edge gap of ANY size (1e-6 up to 1.0 on a 10-box) by growing the
++vertex tolerance to cover it, never by moving the vertex. A healed model
++whose vertex sits 1 mm off its edges is not one a toolpath may trust, so the
++seam measures the largest vertex-to-curve-end distance after healing and
++refuses a gap past 1e-3 (one micron in mm). Why 1e-3: it passes the export round-off of
++CAD files (1e-6..1e-4 typical) and stays well under any machining tolerance
++CamCraft uses. Cost to change: one constant; making it a per-import
++parameter is a later step when a production importer exists. Edges with no
++3D curve (a boolean's intersection edges can carry only UV trims) are not
++gap-checked - the integrity check has passed on them.
++
++**4. The importer corpus uses the port's own native format (`.smb`).**
++solidcore 1.0.1 reads SMLib's ASCII B-rep files (`read_from_file`), the only
++format it reads without truck; STEP stays on truck-stepio as the issue
++says. The corpus is made from the port's own writer output (the 10-box),
++edited: blank, foreign text, noise, header only, truncations, NaN/inf
++vertex, zero/negative/NaN zone tolerance, nonsense counts and indices, a
++dropped face, an unhealable gap. Every case runs under a 60 s time bound on
++its own thread, so a hang fails the test instead of stalling the gate.
++Verdicts (raw reader and importer) are pinned in a table, like stages 1-2.
++Dropped: a corpus of third-party `.smb` files - none are in-tree and the
++port's upstream test files are not ours to vendor.
++
++**5. Whole edits may import.** A future version number, a dropped final
++newline, and a zero or negative zone tolerance (replaced by the reader's
++default) leave the model whole; the importer may hand those out, and then
++must hand out exactly the closed-form box. Everything else must be `Err`.
++
++**6. Writer identities.** The port's writer keeps only the surfaces whose
++recorded owner equals the face's identity; a B-rep the port built names its
++faces its own way, so the seam's writer uses each face's surface owner as
++the face identity. Without it the writer emitted "0 Surfaces" and the read
++back failed - found while building the round trip, not a port defect.
++
++**Findings against the port (pinned, not papered over):** the raw reader
++returns `Ok` with an EMPTY B-rep for a blank file, plain text, binary noise,
++a header with no body and a NaN zone tolerance; and `Ok` with a closed box
++whose vertex sits 1.0 off its edges. The importer refuses all of them. No
++panic and no hang on any corpus file.
+
+From ece27e290a7b19b1385aeca27b58f1f7bf71ad0a Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 16:38:52 +0100
+Subject: [PATCH 2/2] fix(kernel): review round on the heal/import seam (#27
+ stage 3)
+
+- heal_refuses_nonsense_brep_tolerance pins the heal tolerance guard
+  (0, -1, NaN, +inf) under the 60 s bound; the open-sheet check can no
+  longer skip.
+- import_smb returns Imported { brep, notes }: a zone tolerance the
+  reader replaced or clamped is an ImportNote, pinned in the corpus;
+  intact files are asserted against the exact 10-box (bbox too).
+- read_smb refuses a format version newer than the port's (42) and a
+  non-finite declared zone tolerance.
+- vertex_gaps returns VertexGaps and counts edges with no 3D curve; the
+  importer refuses any unjudged edge.
+- HEAL_GAP_LIMIT documented in mm as a chosen bench limit; provenance
+  names the .smb knowledge source; decision 5a records that the port
+  bounds allocations from declared counts (new corpus file: control
+  point count 1e15).
+
+Refs #27
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/kernel/src/solidcore_import.rs  | 153 +++++++++++++++++++++----
+ crates/kernel/tests/heal_import.rs     |  18 ++-
+ crates/kernel/tests/import_corpus.rs   | 122 +++++++++++++++-----
+ docs/decisions/27-solidcore-healing.md |  69 ++++++++---
+ 4 files changed, 297 insertions(+), 65 deletions(-)
+
+diff --git a/crates/kernel/src/solidcore_import.rs b/crates/kernel/src/solidcore_import.rs
+index f1d5080c..a6d3fdab 100644
+--- a/crates/kernel/src/solidcore_import.rs
++++ b/crates/kernel/src/solidcore_import.rs
+@@ -5,7 +5,12 @@
+ //! Provenance: calls solidcore 1.0.1's public API as documented in its
+ //! rustdoc (`heal::heal_data::p1::api_heal_brep`, `topology::brep::p7::
+ //! read_from_file`, `topology::brep_data_write`) and its `corpus` example's
+-//! read/write calls; no SMLib/solidcore internals reimplemented here.
++//! read/write calls. What the seam knows of the `.smb` text itself (the
++//! `Version <n>` first line, the `<tol> - Brep ZoneTol3d` header line, the
++//! reader's version and count handling) is read from the port's own writer
++//! output and the rustdoc of `topology::brep_data::BrepData::read_from_file`
++//! and `brep_data_write::DATABASE_VERSION`; no SMLib material consulted and
++//! no SMLib/solidcore internals reimplemented here.
+ 
+ use solidcore::EntityRef;
+ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
+@@ -15,7 +20,7 @@ use solidcore::math::Point3;
+ use solidcore::topology::brep::p7::read_from_file;
+ use solidcore::topology::brep::p10::TopologyEnv;
+ use solidcore::topology::brep_data::BrepData;
+-use solidcore::topology::brep_data_write::FromBrepEnv;
++use solidcore::topology::brep_data_write::{DATABASE_VERSION, FromBrepEnv};
+ use solidcore::topology::database_io::FileType;
+ use solidcore::topology::topology::NotifyRecords;
+ use solidcore::topology::{Brep, EdgeId, EdgeuseId, FaceId};
+@@ -84,7 +89,7 @@ pub(crate) fn heal(k: &mut SolidcoreKernel, mut s: Brep) -> Result<Brep, KernelE
+     // The port heals a vertex-edge gap by growing the vertex's tolerance to
+     // cover it, not by moving the vertex (bench reading, tests/heal_import.rs):
+     // any gap comes back "healed". The seam keeps only gaps under the limit.
+-    let (gap, _) = vertex_gaps(k, &s)?;
++    let gap = vertex_gaps(k, &s)?.gap;
+     if gap > HEAL_GAP_LIMIT {
+         return Err(KernelError::InvalidResult {
+             kernel: NAME,
+@@ -98,29 +103,44 @@ pub(crate) fn heal(k: &mut SolidcoreKernel, mut s: Brep) -> Result<Brep, KernelE
+     Ok(s)
+ }
+ 
+-/// The largest vertex-edge gap a healed solid may keep (model units, mm).
+-/// The port closes a gap of any size by growing tolerances, so the seam caps
+-/// it: a sub-micron gap is an export round-off; a gap past this is a model
+-/// that is not closed (docs/decisions/27-solidcore-healing.md).
++/// The largest vertex-edge gap a healed solid may keep, in mm (CamCraft's
++/// model unit), i.e. one micron. The port closes a gap of any size by
++/// growing tolerances, so the seam caps it. The value is a CHOSEN bench
++/// limit, not a sourced one: it passes the gaps the bench fixtures carry and
++/// sits under any machining tolerance in use; it is to be revisited against
++/// real-world models (#27's remaining list, item 4;
++/// docs/decisions/27-solidcore-healing.md).
+ pub const HEAL_GAP_LIMIT: f64 = 1e-3;
+ 
+-/// The largest distance from a vertex to the nearer end of an edge curve it
+-/// bounds, and the largest vertex tolerance, over the whole B-rep (edges
+-/// without a 3D curve are skipped). A healed
+-/// model whose vertices sit off their edges (or whose tolerances were grown
+-/// to swallow the gap) is not a model a toolpath may trust.
+-pub fn vertex_gaps(k: &SolidcoreKernel, s: &Brep) -> Result<(f64, f64), KernelError> {
++/// What [`vertex_gaps`] measured.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct VertexGaps {
++    /// Largest distance from a vertex to the nearer end of an edge curve it
++    /// bounds (model units).
++    pub gap: f64,
++    /// Largest vertex tolerance (a bench reading: how far the port's heal
++    /// grew tolerances; the seam's guard does not use it).
++    pub max_vertex_tolerance: f64,
++    /// Edges with no 3D curve, so no curve end to measure: not judged.
++    pub unjudged_edges: usize,
++}
++
++/// The vertex-edge gaps of a B-rep (see [`VertexGaps`]). A healed model whose
++/// vertices sit off their edges is not a model a toolpath may trust; edges
++/// without a 3D curve cannot be measured and are COUNTED, not passed over.
++pub fn vertex_gaps(k: &SolidcoreKernel, s: &Brep) -> Result<VertexGaps, KernelError> {
+     let op = "vertex_gaps";
+     let dist = |a: Point3, b: Point3| {
+         ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+     };
+     let mut gap = 0.0_f64;
+     let mut tol = 0.0_f64;
++    let mut unjudged_edges = 0usize;
+     for (e, edge) in s.edges().iter() {
+         // A boolean's intersection edges may carry only UV trims, no 3D
+-        // curve: there is no curve end to measure against, so the edge is
+-        // skipped (the integrity check has already passed on it).
++        // curve: there is no curve end to measure against.
+         let Some(curve) = edge.curve.as_ref() else {
++            unjudged_edges = unjudged_edges.saturating_add(1);
+             continue;
+         };
+         let p0 = curve
+@@ -138,7 +158,11 @@ pub fn vertex_gaps(k: &SolidcoreKernel, s: &Brep) -> Result<(f64, f64), KernelEr
+         }
+     }
+     if gap.is_finite() && tol.is_finite() {
+-        Ok((gap, tol))
++        Ok(VertexGaps {
++            gap,
++            max_vertex_tolerance: tol,
++            unjudged_edges,
++        })
+     } else {
+         Err(KernelError::InvalidResult {
+             kernel: NAME,
+@@ -197,6 +221,21 @@ pub fn read_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Brep, KernelErr
+             ),
+         });
+     }
++    let head = declared_header(bytes);
++    if let Some(v) = head.version.filter(|v| *v > DATABASE_VERSION) {
++        // The reader would parse a newer layout with this version's rules: a
++        // model that reads at all could be read wrong. Refused by name.
++        return Err(KernelError::InvalidInput {
++            op: "read_smb",
++            detail: format!("format version {v} is newer than the reader's {DATABASE_VERSION}"),
++        });
++    }
++    if let Some(t) = head.zone_tolerance.filter(|t| !t.is_finite()) {
++        return Err(KernelError::InvalidInput {
++            op: "read_smb",
++            detail: format!("zone tolerance {t} is not a finite number"),
++        });
++    }
+     let mut b = Brep::new_with_infinite_region().map_err(|e| failed("read_smb", &e))?;
+     let mut attributes = AttributeStore::default();
+     let mut records = NotifyRecords::new();
+@@ -219,16 +258,90 @@ pub fn read_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Brep, KernelErr
+     Ok(b)
+ }
+ 
++/// The header values a `.smb` file declares (ASCII; `None` when absent or
++/// unparsable - the reader then decides).
++#[derive(Debug, Clone, Copy, Default)]
++struct DeclaredHeader {
++    version: Option<u64>,
++    zone_tolerance: Option<f64>,
++}
++
++/// Reads `Version <n>` and `<tol> - Brep ZoneTol3d` from the first lines.
++fn declared_header(bytes: &[u8]) -> DeclaredHeader {
++    let prefix = bytes.get(..bytes.len().min(4096)).unwrap_or_default();
++    let text = String::from_utf8_lossy(prefix);
++    let mut h = DeclaredHeader::default();
++    for line in text.lines().take(16) {
++        if let Some(rest) = line.strip_prefix("Version ") {
++            h.version = rest.trim().parse().ok();
++        } else if line.trim_end().ends_with("- Brep ZoneTol3d") {
++            h.zone_tolerance = line.split_whitespace().next().and_then(|t| t.parse().ok());
++        }
++    }
++    h
++}
++
++/// A diagnostic the importer raises on a file it accepts: the model is
++/// whole, but the file said something the reader did not take as written.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum ImportNote {
++    /// The file's zone tolerance was replaced (zero or negative) or clamped
++    /// by the reader; the model carries `used`.
++    ZoneToleranceReplaced {
++        /// What the file declared.
++        declared: f64,
++        /// What the read model carries.
++        used: f64,
++    },
++}
++
++impl std::fmt::Display for ImportNote {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::ZoneToleranceReplaced { declared, used } => {
++                write!(f, "zone tolerance {declared:e} replaced by {used:e}")
++            }
++        }
++    }
++}
++
++/// An imported solid with the diagnostics raised on the way.
++#[derive(Debug)]
++pub struct Imported {
++    /// The healed, checked solid.
++    pub brep: Brep,
++    /// What the importer noticed but did not refuse.
++    pub notes: Vec<ImportNote>,
++}
++
+ /// The importer: read, heal, and hand out only a closed solid with a
+-/// positive finite measure. Every failure is a located `Err`.
+-pub fn import_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Brep, KernelError> {
++/// positive finite measure, every curved edge within [`HEAL_GAP_LIMIT`] of
++/// its vertices, and no edge left unjudged. Every failure is a located
++/// `Err`; every substitution the reader made is an [`ImportNote`].
++pub fn import_smb(k: &mut SolidcoreKernel, bytes: &[u8]) -> Result<Imported, KernelError> {
+     let b = read_smb(k, bytes)?;
+-    heal(k, b).map_err(|e| match e {
++    let mut notes = Vec::new();
++    if let Some(declared) = declared_header(bytes).zone_tolerance {
++        let used = b.tolerance();
++        if declared != used {
++            notes.push(ImportNote::ZoneToleranceReplaced { declared, used });
++        }
++    }
++    let brep = heal(k, b).map_err(|e| match e {
+         KernelError::InvalidInput { detail, .. } => KernelError::InvalidResult {
+             kernel: NAME,
+             op: "import_smb",
+             detail,
+         },
+         other => other,
+-    })
++    })?;
++    let unjudged = vertex_gaps(k, &brep)?.unjudged_edges;
++    if unjudged > 0 {
++        return Err(KernelError::InvalidResult {
++            kernel: NAME,
++            op: "import_smb",
++            detail: format!("{unjudged} edge(s) without a 3D curve: gaps cannot be judged"),
++        });
++    }
++    Ok(Imported { brep, notes })
+ }
+diff --git a/crates/kernel/tests/heal_import.rs b/crates/kernel/tests/heal_import.rs
+index 9b4b583b..5e032563 100644
+--- a/crates/kernel/tests/heal_import.rs
++++ b/crates/kernel/tests/heal_import.rs
+@@ -19,7 +19,7 @@ use std::f64::consts::PI;
+ 
+ use camcraft_kernel::solidcore_impl::SolidcoreKernel;
+ use camcraft_kernel::solidcore_import::{
+-    HEAL_GAP_LIMIT, import_smb, read_smb, vertex_gaps, write_smb,
++    HEAL_GAP_LIMIT, VertexGaps, import_smb, read_smb, vertex_gaps, write_smb,
+ };
+ use camcraft_kernel::truck_impl::TruckKernel;
+ use camcraft_kernel::{Blend, Kernel, KernelError, Measure};
+@@ -135,7 +135,10 @@ fn native_round_trip_matches_closed_form() {
+             let mut k = SolidcoreKernel::default();
+             let s = fixture(&mut k, name)?;
+             let bytes = write_smb(&k, &s)?;
+-            import_smb(&mut k, &bytes).and_then(|mut b| k.measure(&mut b))
++            let imp = import_smb(&mut k, &bytes)?;
++            assert!(imp.notes.is_empty(), "{name}: notes {:?}", imp.notes);
++            let mut b = imp.brep;
++            k.measure(&mut b)
+         });
+         fails.extend(check(&w, "solidcore .smb", m));
+     }
+@@ -171,7 +174,10 @@ fn vertex_gap_is_closed_by_the_importer() {
+                 .as_ref()
+                 .map_err(Clone::clone)
+                 .and_then(|h| vertex_gaps(&k, h));
+-            let imp = import_smb(&mut k, text.as_bytes()).and_then(|mut b| k.measure(&mut b));
++            let imp = import_smb(&mut k, text.as_bytes()).and_then(|i| {
++                let mut b = i.brep;
++                k.measure(&mut b)
++            });
+             Ok::<_, KernelError>((raw, gaps, imp))
+         });
+         let Ok((raw, gaps, imported)) = r else {
+@@ -184,7 +190,11 @@ fn vertex_gap_is_closed_by_the_importer() {
+         // within the limit: the healed vertex tolerance covers the gap
+         if gap <= HEAL_GAP_LIMIT {
+             match &gaps {
+-                Ok((g, tol)) if *tol >= *g * (1.0 - 1e-9) && *g <= HEAL_GAP_LIMIT => {}
++                Ok(VertexGaps {
++                    gap: g,
++                    max_vertex_tolerance: tol,
++                    unjudged_edges: 0,
++                }) if *tol >= *g * (1.0 - 1e-9) && *g <= HEAL_GAP_LIMIT => {}
+                 other => fails.push(format!("gap {gap:e}: healed gaps {other:?}")),
+             }
+             let tol = gap * 600.0 + REL_FLOOR * 1000.0;
+diff --git a/crates/kernel/tests/import_corpus.rs b/crates/kernel/tests/import_corpus.rs
+index bd4120d5..5d6a9014 100644
+--- a/crates/kernel/tests/import_corpus.rs
++++ b/crates/kernel/tests/import_corpus.rs
+@@ -13,17 +13,16 @@ mod smb_util;
+ 
+ use camcraft_kernel::solidcore_impl::SolidcoreKernel;
+ use camcraft_kernel::solidcore_import::{MAX_SMB_BYTES, import_smb, read_smb};
+-use camcraft_kernel::{Kernel, KernelError};
++use camcraft_kernel::{Kernel, KernelError, Measure};
+ use smb_util::{bounded, box_text, edit_record, gapped_box, port_verdict};
+ use solidcore::topology::Brep;
+ 
+-/// Edits that leave the model itself whole: the reader may accept them, and
+-/// the importer must then hand out the exact 10-box. A future format version
+-/// number is read as the current one; a dropped final newline loses nothing;
+-/// a zero or negative zone tolerance is replaced by the reader's default
+-/// (the seam's heal guard sees a positive tolerance afterwards).
++/// Edits that leave the model itself whole: the importer must hand out the
++/// exact 10-box (volume AND bounding box). A dropped final newline loses
++/// nothing; a zero or negative zone tolerance is replaced by the reader's
++/// default, and the importer says so in a pinned note. A future format
++/// version is NOT intact: the seam refuses it (decision 5).
+ const INTACT: &[&str] = &[
+-    "future version",
+     "last byte dropped",
+     "zero zone tolerance",
+     "negative zone tolerance",
+@@ -121,14 +120,26 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
+             t.replacen("6 Faces In Brep", "5 Faces In Brep", 1)
+                 .into_bytes(),
+         ),
++        (
++            "control point count 1e15",
++            t.replacen(
++                "1 Number of Control Points",
++                "1000000000000000 Number of Control Points",
++                1,
++            )
++            .into_bytes(),
++        ),
+     ]
+ }
+ 
+ /// What the raw reader and the importer do with each corpus file, pinned.
+ /// FINDINGS against the port's reader: it returns `Ok` with an EMPTY B-rep
+-/// (no faces) for a blank file, plain text, binary noise, a header with no
+-/// body and a NaN zone tolerance; and `Ok` with a closed box whose vertex
+-/// sits 1.0 off its edges. The importer refuses every one of them (the
++/// (no faces) for a blank file, plain text, binary noise and a header with
++/// no body (and for a NaN zone tolerance, which the seam now refuses before
++/// the reader runs); and `Ok` with a closed box whose vertex sits 1.0 off
++/// its edges. An absurd declared count (faces 2^32-1, control points 1e15)
++/// is refused by the port before it allocates (it checks counts against
++/// the bytes left). The importer refuses every one of them (the
+ /// empty ones fail the heal guard's empty check -> `Err invalid`; the gap
+ /// past `HEAL_GAP_LIMIT` -> `Err invalid`).
+ const KNOWN_SMB_VERDICTS: &[(&str, &str, &str)] = &[
+@@ -137,16 +148,24 @@ const KNOWN_SMB_VERDICTS: &[(&str, &str, &str)] = &[
+     ("text, not a B-rep", "Ok faces=0 no measure", "Err invalid"),
+     ("binary noise 4 KiB", "Ok faces=0 no measure", "Err invalid"),
+     ("header only", "Ok faces=0 no measure", "Err invalid"),
+-    ("future version", "Ok V=1000.000", "Ok V=1000.000"),
++    ("future version", "Err refused", "Err refused"),
+     ("cut at 10%", "Err failed", "Err failed"),
+     ("cut at 50%", "Err failed", "Err failed"),
+     ("cut at 90%", "Err failed", "Err failed"),
+     ("last byte dropped", "Ok V=1000.000", "Ok V=1000.000"),
+     ("NaN vertex", "Err failed", "Err failed"),
+     ("inf vertex", "Err failed", "Err failed"),
+-    ("zero zone tolerance", "Ok V=1000.000", "Ok V=1000.000"),
+-    ("negative zone tolerance", "Ok V=1000.000", "Ok V=1000.000"),
+-    ("NaN zone tolerance", "Ok faces=0 no measure", "Err invalid"),
++    (
++        "zero zone tolerance",
++        "Ok V=1000.000",
++        "Ok V=1000.000 [zone tolerance 0e0 replaced by 1e-4]",
++    ),
++    (
++        "negative zone tolerance",
++        "Ok V=1000.000",
++        "Ok V=1000.000 [zone tolerance -1e0 replaced by 1e-4]",
++    ),
++    ("NaN zone tolerance", "Err refused", "Err refused"),
+     ("face count 4294967295", "Err failed", "Err failed"),
+     ("face count -1", "Err failed", "Err failed"),
+     (
+@@ -165,28 +184,55 @@ const KNOWN_SMB_VERDICTS: &[(&str, &str, &str)] = &[
+         "Err invalid",
+     ),
+     ("one face dropped (open shell)", "Err failed", "Err failed"),
++    ("control point count 1e15", "Err failed", "Err failed"),
+ ];
+ 
+ #[test]
+ fn corrupt_native_files_never_panic_or_hang() {
+     let mut observed = Vec::new();
++    let mut bad_intact = Vec::new();
++    let cube = Measure {
++        volume: 1000.0,
++        min: [0.0; 3],
++        max: [10.0; 3],
++    };
+     for (name, bytes) in corpus() {
+-        let (raw, imp) = bounded(name, move || {
++        let (raw, imp, m) = bounded(name, move || {
+             let mut k = SolidcoreKernel::default();
+             let raw = read_smb(&mut k, &bytes);
+             let raw = port_verdict(raw, &mut k);
+             let imp = import_smb(&mut k, &bytes);
+-            let imp = port_verdict(imp, &mut k);
+-            (raw, imp)
++            let notes: Vec<String> = imp
++                .as_ref()
++                .map(|i| i.notes.iter().map(ToString::to_string).collect())
++                .unwrap_or_default();
++            let bbox = imp.as_ref().ok().map(|i| i.brep.clone());
++            let mut imp = port_verdict(imp.map(|i| i.brep), &mut k);
++            if !notes.is_empty() {
++                imp = format!("{imp} [{}]", notes.join("; "));
++            }
++            let bbox = bbox.and_then(|mut b| k.measure(&mut b).ok());
++            (raw, imp, bbox)
+         });
+         println!("{name:<34} read -> {raw:<22} import -> {imp}");
++        if INTACT.contains(&name) {
++            match m {
++                Some(m) if m.bbox_deviation(&cube) <= 1e-9 && (m.volume - 1000.0).abs() <= 1e-9 => {
++                }
++                other => bad_intact.push(format!("{name}: {other:?}")),
++            }
++        }
+         observed.push((name.to_string(), raw, imp));
+     }
++    assert!(
++        bad_intact.is_empty(),
++        "intact files not the exact 10-box: {bad_intact:?}"
++    );
+     let wrong: Vec<_> = observed
+         .iter()
+         .filter(|(n, _, i)| {
+             if INTACT.contains(&n.as_str()) {
+-                i != "Ok V=1000.000"
++                !i.starts_with("Ok V=1000.000")
+             } else {
+                 i.starts_with("Ok")
+             }
+@@ -222,14 +268,16 @@ fn seam_refuses_degenerate_heal_and_oversized_files() {
+         10.0,
+         10.0,
+     );
+-    if let Ok(sheet) = sheet {
+-        let r = bounded("heal sheet", move || {
+-            let mut k = SolidcoreKernel::default();
+-            k.heal(sheet).map(|_| "Ok")
+-        });
+-        println!("heal(sheet) -> {r:?}");
+-        assert!(r.is_err(), "heal(sheet) came back Ok");
+-    }
++    assert!(sheet.is_ok(), "fixture sheet not built: {sheet:?}");
++    let sheet = sheet.unwrap_or_default();
++    assert!(!sheet.faces().is_empty(), "fixture sheet has no face");
++    let (k, r) = bounded("heal sheet", move || {
++        let r = k.heal(sheet).map(|_| "Ok");
++        (k, r)
++    });
++    let mut k = k;
++    println!("heal(sheet) -> {r:?}");
++    assert!(r.is_err(), "heal(sheet) came back Ok");
+     let big = vec![b' '; MAX_SMB_BYTES + 1];
+     let r = read_smb(&mut k, &big);
+     assert!(
+@@ -238,3 +286,25 @@ fn seam_refuses_degenerate_heal_and_oversized_files() {
+         r.map(|_| "Ok")
+     );
+ }
++
++/// The heal guard on the B-rep tolerance, reached directly: a 10-box whose
++/// tolerance is zero, negative, NaN or infinite is refused by name before
++/// the port's heal runs (its stitch doubles the tolerance from a tenth of
++/// it and would never end from zero - upstream HANG-24). Every call runs
++/// under the time bound, since an unguarded port call could spin.
++#[test]
++fn heal_refuses_nonsense_brep_tolerance() {
++    for tol in [0.0, -1.0, f64::NAN, f64::INFINITY] {
++        let r = bounded("heal at nonsense tolerance", move || {
++            let mut k = SolidcoreKernel::default();
++            let mut b = k.make_box([0.0; 3], [10.0; 3])?;
++            b.set_tolerance(tol);
++            k.heal(b).map(|_| "Ok")
++        });
++        println!("heal at tolerance {tol} -> {r:?}");
++        assert!(
++            matches!(r, Err(KernelError::InvalidInput { op: "heal", .. })),
++            "heal at tolerance {tol}: {r:?}"
++        );
++    }
++}
+diff --git a/docs/decisions/27-solidcore-healing.md b/docs/decisions/27-solidcore-healing.md
+index 75b4eb88..800e5a5c 100644
+--- a/docs/decisions/27-solidcore-healing.md
++++ b/docs/decisions/27-solidcore-healing.md
+@@ -17,17 +17,30 @@ zero), and afterwards requires the integrity check, a closed manifold
+ solid, a positive finite measure and a vertex-edge gap under the limit
+ (next point).
+ 
+-**3. `HEAL_GAP_LIMIT = 1e-3` model units.** Bench reading: the port heals a
++**3. `HEAL_GAP_LIMIT = 1e-3` mm (one micron).** Bench reading: the port heals a
+ vertex-edge gap of ANY size (1e-6 up to 1.0 on a 10-box) by growing the
+ vertex tolerance to cover it, never by moving the vertex. A healed model
+ whose vertex sits 1 mm off its edges is not one a toolpath may trust, so the
+ seam measures the largest vertex-to-curve-end distance after healing and
+-refuses a gap past 1e-3 (one micron in mm). Why 1e-3: it passes the export round-off of
+-CAD files (1e-6..1e-4 typical) and stays well under any machining tolerance
+-CamCraft uses. Cost to change: one constant; making it a per-import
+-parameter is a later step when a production importer exists. Edges with no
+-3D curve (a boolean's intersection edges can carry only UV trims) are not
+-gap-checked - the integrity check has passed on them.
++refuses a gap past 1e-3 mm. The value is a CHOSEN bench limit, not a
++sourced one: it passes the sub-micron gaps of the bench fixtures and sits
++under any machining tolerance CamCraft uses. It is to be revisited against
++real-world models (#27 remaining list, item 4). Cost to change: one
++constant; making it a per-import parameter is a later step when a
++production importer exists.
++
++Edges with no 3D curve (a boolean's intersection edges can carry only UV
++trims) have no curve end to measure. `vertex_gaps` COUNTS them as
++`unjudged_edges` instead of passing over them. `import_smb` refuses a model
++with any unjudged edge: a file's edges carry 3D curves (the port's writer
++writes one per edge; all five round-trip fixtures, the L union included,
++read back with zero unjudged edges), so an unjudged edge in a file is
++itself a defect. The seam's `heal` on an in-memory solid still accepts
++them: the port's own boolean results (the L union) carry such edges, they
++were made by the port's intersector rather than read from a file, and the
++integrity and closed-manifold checks have passed on them. That is the
++remaining risk, recorded here: a gap on a curve-less edge of an in-memory
++solid is not measured.
+ 
+ **4. The importer corpus uses the port's own native format (`.smb`).**
+ solidcore 1.0.1 reads SMLib's ASCII B-rep files (`read_from_file`), the only
+@@ -41,10 +54,35 @@ Verdicts (raw reader and importer) are pinned in a table, like stages 1-2.
+ Dropped: a corpus of third-party `.smb` files - none are in-tree and the
+ port's upstream test files are not ours to vendor.
+ 
+-**5. Whole edits may import.** A future version number, a dropped final
+-newline, and a zero or negative zone tolerance (replaced by the reader's
+-default) leave the model whole; the importer may hand those out, and then
+-must hand out exactly the closed-form box. Everything else must be `Err`.
++**5. Whole edits import, with a note; a future version is refused.** A
++dropped final newline and a zero or negative zone tolerance leave the model
++whole: the importer hands out exactly the closed-form box (volume AND
++bounding box, asserted). The tolerance substitution is not silent (Prime
++Directive, "log diagnostics"): `import_smb` returns `Imported { brep,
++notes }`, and a declared zone tolerance the reader did not take as written
++(replaced, or clamped) becomes `ImportNote::ZoneToleranceReplaced {
++declared, used }`. The kernel crate carries no logging dependency, so the
++note is returned for the caller to show, and the corpus pins its text
++("zone tolerance 0e0 replaced by 1e-4"). A non-finite declared zone
++tolerance is refused by name before the reader runs.
++
++A file whose `Version` is newer than the port's writer version
++(`DATABASE_VERSION`, 42) is now REFUSED, not noted. Reason: the reader
++parses a newer layout with version-42 rules; the corpus file only read
++right because its body is a version-42 body under a changed number. A real
++newer file could read as a subtly different model - the silent wrong answer
++the Prime Directive forbids. Dropped: accepting with a note (output right
++today only by accident of the fixture).
++
++**5a. Allocation from declared counts.** Checked in the port (solidcore
++1.0.1): the reader bounds every declared record count against the bytes left
++in the input before it allocates (`topology::brep_data` `checked_count`, its
++module docs say so; NURBS curve and surface reads call `ensure_available`
++with the declared value count before sizing the arrays). With the seam's 64
++MiB cap on the input, an allocation is therefore bounded by the file size.
++The corpus pins two absurd counts refused that way, quickly and without a
++large allocation: face count 2^32-1 and a curve control-point count of
++1e15.
+ 
+ **6. Writer identities.** The port's writer keeps only the surfaces whose
+ recorded owner equals the face's identity; a B-rep the port built names its
+@@ -53,7 +91,8 @@ the face identity. Without it the writer emitted "0 Surfaces" and the read
+ back failed - found while building the round trip, not a port defect.
+ 
+ **Findings against the port (pinned, not papered over):** the raw reader
+-returns `Ok` with an EMPTY B-rep for a blank file, plain text, binary noise,
+-a header with no body and a NaN zone tolerance; and `Ok` with a closed box
+-whose vertex sits 1.0 off its edges. The importer refuses all of them. No
+-panic and no hang on any corpus file.
++returns `Ok` with an EMPTY B-rep for a blank file, plain text, binary noise
++and a header with no body (and for a NaN zone tolerance, which the seam now
++refuses before the reader runs); and `Ok` with a closed box whose vertex
++sits 1.0 off its edges. The importer refuses all of them. No panic and no
++hang on any corpus file.
