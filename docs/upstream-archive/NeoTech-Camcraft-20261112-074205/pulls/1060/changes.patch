@@ -1,0 +1,944 @@
+From c403f539f7926e39e66a64d5e929af62f7b27e08 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 11 Nov 2026 20:06:26 -0800
+Subject: [PATCH 1/2] feat(tools): tool library import modes - add, update in
+ place, replace
+
+ImportTools takes an ImportMode (Add default, unchanged). Update puts a
+same-named tool's imported definition in place (entity and controller
+number kept, operations go Stale); Replace also removes document tools the
+library lacks, refused by name when an operation uses one. One undo unit.
+GUI mode combo, cam.importTools / MCP import_tool_library mode parameter.
+
+Fixes #899
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/commands/mod.rs          |   2 +-
+ crates/app/src/commands/tool_import.rs  | 243 ++++++++++++++++++++----
+ crates/app/src/mcp/tools.rs             |  18 +-
+ crates/app/src/script/api.rs            |  19 +-
+ crates/app/src/script/mod.rs            |   2 +-
+ crates/app/tests/mcp.rs                 |  32 ++++
+ crates/app/tests/tool_import_modes.rs   | 198 +++++++++++++++++++
+ crates/ui/src/egui_app/pages.rs         |  22 ++-
+ crates/ui/src/state.rs                  |   4 +
+ crates/ui/src/state_tool_library.rs     |   2 +-
+ docs/decisions/899-tool-import-modes.md |  33 ++++
+ 11 files changed, 525 insertions(+), 50 deletions(-)
+ create mode 100644 crates/app/tests/tool_import_modes.rs
+ create mode 100644 docs/decisions/899-tool-import-modes.md
+
+diff --git a/crates/app/src/commands/mod.rs b/crates/app/src/commands/mod.rs
+index 198fc42fa..c095c205b 100644
+--- a/crates/app/src/commands/mod.rs
++++ b/crates/app/src/commands/mod.rs
+@@ -104,7 +104,7 @@ pub use set_wcs::SetWcsOrigin;
+ pub use tool::{AddTool, ChangeTool, DeleteTool, HolderPick};
+ pub use tool_body::{LatheBodySpec, SetToolBody, ToolBodySpec};
+ pub use tool_cutter::SetToolCutter;
+-pub use tool_import::{ImportReport, ImportTools};
++pub use tool_import::{ImportMode, ImportReport, ImportTools};
+ pub use tool_number::SetToolNumber;
+ pub use update_model::UpdateModel;
+ 
+diff --git a/crates/app/src/commands/tool_import.rs b/crates/app/src/commands/tool_import.rs
+index 303996fbe..906c3eb66 100644
+--- a/crates/app/src/commands/tool_import.rs
++++ b/crates/app/src/commands/tool_import.rs
+@@ -1,23 +1,65 @@
+-//! #300: import a tool library file as ONE undo unit. The library was
+-//! already checked whole by `tool_library::parse_tool_library`; here each
+-//! tool meets the document. The duplicate law: a name the document
+-//! already uses is never overwritten - an identical tool of that name is
+-//! skipped (it is already here), a different one comes in renamed with
+-//! the first free ` (2)`, ` (3)`... suffix, so an operation holding the
+-//! old tool keeps exactly the tool it had.
++//! #300 / #899: import a tool library file as ONE undo unit. The library
++//! was already checked whole by `tool_library::parse_tool_library`; here
++//! each tool meets the document, under an explicit [`ImportMode`] keyed by
++//! tool name (#898's part number is the intended future key):
+ //!
+-//! Provenance: our own command model (`AddTool`'s snapshot-free add and
+-//! remove-by-name inverse, batched); no vendor material consulted.
++//! - **Add** (default): a name the document already uses is never
++//!   overwritten - an identical tool of that name is skipped, a different
++//!   one comes in renamed with the first free ` (2)`, ` (3)`... suffix, so
++//!   an operation holding the old tool keeps exactly the tool it had.
++//! - **Update**: a same-named tool takes the imported definition in place
++//!   (same entity, same controller number, so operations keep pointing at
++//!   it and read Stale from the stamp); an identical one is skipped; a
++//!   name the document lacks is added.
++//! - **Replace**: Update, and the library becomes the document's whole tool
++//!   set: a document tool the library lacks is removed - unless an
++//!   operation uses it, which refuses the import by name, nothing applied.
++//!
++//! Provenance: our own command model (`AddTool` / `ChangeTool` /
++//! `DeleteTool`, batched into one undo unit); no vendor material consulted.
+ 
+ use flecs_ecs::prelude::World;
+ 
+ use crate::commands::tool::reserved;
+-use crate::commands::{Command, CommandError};
++use crate::commands::{Command, CommandError, DeleteTool};
+ use crate::model;
+ use crate::schema::ToolDef;
+ use crate::tool_library::LibraryTool;
+ use crate::tools::Tool;
+ 
++/// What an import does with a library tool whose name the document has.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ImportMode {
++    /// Skip an identical tool, rename a different one (the original law).
++    #[default]
++    Add,
++    /// Take the imported definition in place; add the unmatched.
++    Update,
++    /// Update, then remove document tools the library lacks (refused if used).
++    Replace,
++}
++
++impl ImportMode {
++    /// `add` / `update` / `replace`, case-blind, for scripts and MCP.
++    pub fn parse(text: &str) -> Result<Self, String> {
++        match text.trim().to_ascii_lowercase().as_str() {
++            "add" => Ok(Self::Add),
++            "update" => Ok(Self::Update),
++            "replace" => Ok(Self::Replace),
++            other => Err(format!("unknown import mode '{other}' (use add, update or replace)")),
++        }
++    }
++
++    #[must_use]
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::Add => "add",
++            Self::Update => "update",
++            Self::Replace => "replace",
++        }
++    }
++}
++
+ /// What an import did with each library tool, for the status line.
+ #[derive(Clone, Debug, Default, PartialEq)]
+ pub struct ImportReport {
+@@ -27,6 +69,16 @@ pub struct ImportReport {
+     pub renamed: Vec<(String, String)>,
+     /// Library names skipped: the document holds that exact tool already.
+     pub skipped: Vec<String>,
++    /// Update mode: tools that took the imported definition in place.
++    pub updated: Vec<String>,
++    /// Replace mode: tools that took the imported definition in place.
++    pub replaced: Vec<String>,
++    /// Replace mode: document tools the library lacked, removed.
++    pub removed: Vec<String>,
++}
++
++fn list(names: &[String]) -> String {
++    names.join(", ")
+ }
+ 
+ impl ImportReport {
+@@ -34,32 +86,79 @@ impl ImportReport {
+     #[must_use]
+     pub fn summary(&self) -> String {
+         let n = self.added.len().saturating_add(self.renamed.len());
+-        let mut s = format!("imported {n} tool{}", if n == 1 { "" } else { "s" });
++        let mut parts: Vec<String> = Vec::new();
++        let in_place = self.updated.len().saturating_add(self.replaced.len()).saturating_add(self.removed.len());
++        if n > 0 || in_place == 0 {
++            parts.push(format!("imported {n} tool{}", if n == 1 { "" } else { "s" }));
++        }
+         if !self.renamed.is_empty() {
+-            let list: Vec<String> = self.renamed.iter().map(|(a, b)| format!("{a} -> {b}")).collect();
+-            s.push_str(&format!("; {} renamed ({})", self.renamed.len(), list.join(", ")));
++            let l: Vec<String> = self.renamed.iter().map(|(a, b)| format!("{a} -> {b}")).collect();
++            parts.push(format!("{} renamed ({})", self.renamed.len(), l.join(", ")));
++        }
++        for (what, names) in [("updated", &self.updated), ("replaced", &self.replaced), ("removed", &self.removed)] {
++            if !names.is_empty() {
++                parts.push(format!("{} {what} ({})", names.len(), list(names)));
++            }
+         }
+         if !self.skipped.is_empty() {
+-            s.push_str(&format!("; {} already in the document ({})", self.skipped.len(), self.skipped.join(", ")));
++            parts.push(format!("{} already in the document ({})", self.skipped.len(), list(&self.skipped)));
+         }
+-        s
++        parts.join("; ")
+     }
+ }
+ 
+-/// Add every new tool of a library in one step; undo removes exactly
+-/// those tools and nothing else.
++/// One planned change of an import, applied in order, inverted in reverse.
++enum Step {
++    Add(String, Tool),
++    /// Same entity, new definition; the controller number stays.
++    Change { name: String, prev: Tool, next: Tool },
++    Remove(DeleteTool),
++}
++
++/// Import a library in one step; undo restores every changed tool exactly.
+ pub struct ImportTools {
+-    tools: Vec<(String, Tool)>,
++    steps: Vec<Step>,
+     report: ImportReport,
+ }
+ 
++/// Why `name` cannot take `next` in place (the `ChangeTool` gates), by name.
++fn change_refusal(world: &World, name: &str, prev: &Tool, next: &Tool) -> Option<String> {
++    if let Some(why) = next.torch_refusal() {
++        return Some(format!("tool '{name}': {why}"));
++    }
++    if let Some(msg) = crate::operation::tool_gate::retype_refusal(world, name, prev.kind, next.kind) {
++        return Some(msg);
++    }
++    let entity = model::find_by_name(world, name)?;
++    if let Some(body) = crate::tool_body::body_of(world, &entity) {
++        if let Err(e) = crate::tool_body::fits(next, &body) {
++            return Some(format!("tool '{name}': {e}"));
++        }
++    }
++    if let Some(c) = crate::tool_cutter::cutter_of(world, &entity) {
++        if let Err(e) = camcraft_tools::cutter_profile::agrees(next, &c) {
++            return Some(format!("tool '{name}': the drawn cutter profile no longer fits: {e}"));
++        }
++    }
++    None
++}
++
+ impl ImportTools {
+-    /// Plan the import against the document. Refuses (nothing applied)
+-    /// a library naming setup furniture, a tool `is_sane` refuses, or a
+-    /// library whose every tool is already in the document.
++    /// The original import: [`ImportMode::Add`].
+     pub fn new(world: &World, library: Vec<LibraryTool>) -> Result<Self, CommandError> {
+-        let mut tools: Vec<(String, Tool)> = Vec::with_capacity(library.len());
++        Self::with_mode(world, library, ImportMode::Add)
++    }
++
++    /// Plan the import against the document. Refuses (nothing applied)
++    /// a library naming setup furniture, a tool `is_sane` refuses, a
++    /// library that changes nothing, and - Update / Replace - a tool the
++    /// edit gates refuse or a name that belongs to a non-tool; Replace
++    /// also refuses to remove a tool an operation uses.
++    pub fn with_mode(world: &World, library: Vec<LibraryTool>, mode: ImportMode) -> Result<Self, CommandError> {
++        let mut steps: Vec<Step> = Vec::with_capacity(library.len());
++        let mut added: Vec<(String, Tool)> = Vec::new();
+         let mut report = ImportReport::default();
++        let names: Vec<String> = library.iter().map(|l| l.name.clone()).collect();
+         for LibraryTool { name, tool } in library {
+             if let Some(err) = reserved(world, &name) {
+                 return Err(err);
+@@ -69,31 +168,71 @@ impl ImportTools {
+                     "tool '{name}': parameters must be finite and positive"
+                 )));
+             }
+-            if tools.iter().any(|(n, _)| *n == name) {
++            if steps.iter().any(|s| matches!(s, Step::Add(n, _) if *n == name)) || report_has(&report, &name) {
+                 return Err(CommandError::Invalid(format!("tool '{name}' appears twice in the library")));
+             }
+-            let taken = |n: &str| model::find_by_name(world, n).is_some() || tools.iter().any(|(t, _)| t == n);
+-            match model::find_by_name(world, &name) {
+-                None if !taken(&name) => {
++            let taken = |n: &str| model::find_by_name(world, n).is_some() || added.iter().any(|(t, _)| t == n);
++            let existing = model::find_by_name(world, &name);
++            let current = existing.as_ref().and_then(|e| model::tool_of(world, e));
++            match (existing, current) {
++                (None, _) => {
+                     report.added.push(name.clone());
+-                    tools.push((name, tool));
++                    added.push((name.clone(), tool.clone()));
++                    steps.push(Step::Add(name, tool));
++                }
++                (Some(_), Some(prev)) if prev == tool => report.skipped.push(name),
++                (Some(_), Some(prev)) if mode != ImportMode::Add => {
++                    if let Some(why) = change_refusal(world, &name, &prev, &tool) {
++                        return Err(CommandError::Invalid(why));
++                    }
++                    match mode {
++                        ImportMode::Replace => report.replaced.push(name.clone()),
++                        _ => report.updated.push(name.clone()),
++                    }
++                    steps.push(Step::Change { name, prev, next: tool });
++                }
++                (Some(_), None) if mode != ImportMode::Add => {
++                    return Err(CommandError::Invalid(format!(
++                        "'{name}' in the library names something in the document that is not a tool; nothing imported"
++                    )));
+                 }
+-                Some(e) if model::tool_of(world, &e).as_ref() == Some(&tool) => report.skipped.push(name),
+                 _ => {
+                     let Some(free) = (2..=9999u32).map(|i| format!("{name} ({i})")).find(|c| !taken(c)) else {
+                         return Err(CommandError::NameConflict(name));
+                     };
+                     report.renamed.push((name, free.clone()));
+-                    tools.push((free, tool));
++                    added.push((free.clone(), tool.clone()));
++                    steps.push(Step::Add(free, tool));
++                }
++            }
++        }
++        if mode == ImportMode::Replace {
++            for (name, entity) in model::named_entities(world) {
++                if model::tool_of(world, &entity).is_none() || names.contains(&name) {
++                    continue;
++                }
++                let users: Vec<String> = model::named_entities(world)
++                    .into_iter()
++                    .filter(|(_, e)| model::operation_of(world, e).is_some_and(|op| op.tool == name))
++                    .map(|(n, _)| n)
++                    .collect();
++                if let Some(first) = users.first() {
++                    let more = users.len().saturating_sub(1);
++                    let more = if more == 0 { String::new() } else { format!(" (and {more} more)") };
++                    return Err(CommandError::Invalid(format!(
++                        "replace would remove tool '{name}', but operation {first}{more} uses it - keep it in the library or give the operation another tool; nothing imported"
++                    )));
+                 }
++                steps.push(Step::Remove(DeleteTool::new(world, &name)?));
++                report.removed.push(name);
+             }
+         }
+-        if tools.is_empty() {
++        if steps.is_empty() {
+             return Err(CommandError::Invalid(
+                 "nothing to import: every tool in the library is already in the document".into(),
+             ));
+         }
+-        Ok(ImportTools { tools, report })
++        Ok(ImportTools { steps, report })
+     }
+ 
+     #[must_use]
+@@ -102,21 +241,45 @@ impl ImportTools {
+     }
+ }
+ 
++fn report_has(report: &ImportReport, name: &str) -> bool {
++    [&report.skipped, &report.updated, &report.replaced].iter().any(|v| v.iter().any(|n| n == name))
++        || report.renamed.iter().any(|(from, _)| from == name)
++}
++
++fn put(world: &World, name: &str, tool: &Tool) {
++    if let Some(entity) = model::find_by_name(world, name) {
++        let number = model::tool_number_of(world, &entity);
++        entity.entity_view(world).set(ToolDef { tool: tool.clone(), number });
++    }
++}
++
+ impl Command for ImportTools {
+     fn apply(&self, world: &World) {
+-        for (name, tool) in &self.tools {
+-            let entity = match model::find_by_name(world, name) {
+-                Some(entity) => entity,
+-                None => model::spawn(world, name),
+-            };
+-            entity.entity_view(world).set(ToolDef { tool: tool.clone(), number: None });
++        for step in &self.steps {
++            match step {
++                Step::Add(name, tool) => {
++                    let entity = match model::find_by_name(world, name) {
++                        Some(entity) => entity,
++                        None => model::spawn(world, name),
++                    };
++                    entity.entity_view(world).set(ToolDef { tool: tool.clone(), number: None });
++                }
++                Step::Change { name, next, .. } => put(world, name, next),
++                Step::Remove(del) => del.apply(world),
++            }
+         }
+     }
+ 
+     fn invert(&self, world: &World) {
+-        for (name, _) in &self.tools {
+-            if let Some(entity) = model::find_by_name(world, name) {
+-                model::remove(world, &entity);
++        for step in self.steps.iter().rev() {
++            match step {
++                Step::Add(name, _) => {
++                    if let Some(entity) = model::find_by_name(world, name) {
++                        model::remove(world, &entity);
++                    }
++                }
++                Step::Change { name, prev, .. } => put(world, name, prev),
++                Step::Remove(del) => del.invert(world),
+             }
+         }
+     }
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 737cdd85c..25fd6bbb3 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -29,7 +29,7 @@ const TOOLS: &[Tool] = &[
+     Tool { name: "list_tool_catalog", description: "The built-in tool catalog: names and definitions add_tool can copy into the document.", schema: s_empty, run: job::list_tool_catalog },
+     Tool { name: "add_tool", description: "Add a tool to the document, from the catalog by name or from a full definition (the shape get_job shows). It starts with the machine's default holder unless \"holder\" says otherwise; one undo removes the tool and its holder.", schema: s_add_tool, run: edit::add_tool },
+     Tool { name: "export_tool_library", description: "Write the document's tools to a tool library file (.camtools), the same format the Tool library page's Export writes. Refuses a document with no tools or a path that cannot be written.", schema: s_library, run: export_tool_library },
+-    Tool { name: "import_tool_library", description: "Import a tool library file into the document as one undo step, through the same command as the Tool library page's Import: an identical tool is skipped, a clashing name arrives as \"Name (2)\", a malformed or insane file is refused naming the tool.", schema: s_library, run: import_tool_library },
++    Tool { name: "import_tool_library", description: "Import a tool library file into the document as one undo step, through the same command as the Tool library page's Import. mode add (default): an identical tool is skipped, a clashing name arrives as \"Name (2)\"; update: a same-named tool takes the file's definition in place (number kept, operations go Stale); replace: update, and tools the file lacks are removed unless an operation uses one (refused by name). A malformed or insane file is refused naming the tool.", schema: s_import_library, run: import_tool_library },
+     Tool { name: "set_stock", description: "Set the active setup's stock: a box, a cylinder, or a copy of a model.", schema: s_stock, run: edit::set_stock },
+     Tool { name: "add_operation", description: "Add an operation of a kind (see list_operation_types) with a tool, on the stock or a model, seeded with the kind's defaults and an optional params patch. Not generated until generate runs.", schema: s_add_op, run: edit::add_operation },
+     Tool { name: "edit_operation", description: "Patch an operation's parameters: the given fields replace the current ones (JSON merge patch over the kind's fields; null clears an optional field). One undo step.", schema: s_edit_op, run: edit::edit_operation },
+@@ -135,7 +135,11 @@ fn export_tool_library(env: &mut Env, a: &Map<String, Value>) -> Result<Value, S
+ }
+ 
+ fn import_tool_library(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
+-    api::v_import_tools(env, vec![json!(req_str(a, "path")?)])
++    let mut args = vec![json!(req_str(a, "path")?)];
++    if let Some(m) = opt_str(a, "mode")? {
++        args.push(json!(m));
++    }
++    api::v_import_tools(env, args)
+ }
+ 
+ fn generate(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
+@@ -181,6 +185,16 @@ fn s_library() -> Value {
+     obj(json!({ "path": { "type": "string", "description": "A tool library file (.camtools)." } }), &["path"])
+ }
+ 
++fn s_import_library() -> Value {
++    obj(
++        json!({
++            "path": { "type": "string", "description": "A tool library file (.camtools)." },
++            "mode": { "type": "string", "enum": ["add", "update", "replace"], "description": "What to do with a tool whose name the document has; default add." }
++        }),
++        &["path"],
++    )
++}
++
+ fn s_import() -> Value {
+     obj(
+         json!({
+diff --git a/crates/app/src/script/api.rs b/crates/app/src/script/api.rs
+index 989f49dd4..53f0e5bcb 100644
+--- a/crates/app/src/script/api.rs
++++ b/crates/app/src/script/api.rs
+@@ -7,7 +7,7 @@
+ 
+ use super::{arg_opt, arg_str, builtin_cps, inventory, only_keys, Env};
+ 
+-use crate::commands::{GenerateOperation, History, ImportModel, ImportTools, UpdateModel};
++use crate::commands::{GenerateOperation, History, ImportMode, ImportModel, ImportTools, UpdateModel};
+ use crate::model;
+ use crate::operation::OpStatus;
+ use crate::posting;
+@@ -84,16 +84,23 @@ pub(crate) fn v_export_tools(env: &mut Env, args: Vec<Value>) -> Result<Value, S
+     Ok(json!({ "path": path.display().to_string(), "tools": count }))
+ }
+ 
+-/// `cam.importTools(path)` - read a tool library file into the
++/// `cam.importTools(path, mode?)` - read a tool library file into the
+ /// document through `ImportTools`, the GUI's own command: the whole
+ /// file is checked first (a malformed or insane file refuses by name),
+ /// an identical tool is skipped, a clashing name arrives as "Name (2)",
+-/// and the import is one undo step.
++/// and the import is one undo step. #899: `mode` is `add` (default),
++/// `update` (same-named tools take the file's definition in place) or
++/// `replace` (update, and tools the file lacks are removed unless an
++/// operation uses them).
+ pub(crate) fn v_import_tools(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
+     let path = PathBuf::from(arg_str(&args, 0, "a tool library path")?);
+     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+     let library = crate::tool_library::parse_tool_library(&text)?;
+-    let cmd = ImportTools::new(&env.world, library).map_err(|e| e.to_string())?;
++    let mode = match args.get(1) {
++        None | Some(Value::Null) => ImportMode::Add,
++        Some(v) => ImportMode::parse(v.as_str().ok_or("import mode must be a string")?)?,
++    };
++    let cmd = ImportTools::with_mode(&env.world, library, mode).map_err(|e| e.to_string())?;
+     let report = cmd.report().clone();
+     env.history.execute(&env.world, cmd);
+     let renamed: Vec<Value> = report.renamed.iter().map(|(from, to)| json!({ "from": from, "to": to })).collect();
+@@ -102,6 +109,10 @@ pub(crate) fn v_import_tools(env: &mut Env, args: Vec<Value>) -> Result<Value, S
+         "added": report.added,
+         "renamed": renamed,
+         "skipped": report.skipped,
++        "updated": report.updated,
++        "replaced": report.replaced,
++        "removed": report.removed,
++        "mode": mode.label(),
+         "summary": report.summary(),
+     }))
+ }
+diff --git a/crates/app/src/script/mod.rs b/crates/app/src/script/mod.rs
+index 89a6a8128..7b2ffe396 100644
+--- a/crates/app/src/script/mod.rs
++++ b/crates/app/src/script/mod.rs
+@@ -84,7 +84,7 @@ pub(crate) const VERBS: &[Verb] = &[
+     Verb::new("save", -1, api::v_save, "save(path?: string): { path: string }"),
+     Verb::new("import", -1, api::v_import, "import(path: string, name?: string): { model: string; facets: number }"),
+     Verb::new("exportTools", 1, api::v_export_tools, "exportTools(path: string): { path: string; tools: number }"),
+-    Verb::new("importTools", 1, api::v_import_tools, "importTools(path: string): { path: string; added: string[]; renamed: { from: string; to: string }[]; skipped: string[]; summary: string }"),
++    Verb::new("importTools", -1, api::v_import_tools, "importTools(path: string, mode?: \"add\" | \"update\" | \"replace\"): { path: string; mode: string; added: string[]; renamed: { from: string; to: string }[]; skipped: string[]; updated: string[]; replaced: string[]; removed: string[]; summary: string }"),
+     Verb::new("operations", 0, api::v_operations, "operations(): OperationInfo[]"),
+     Verb::new("generate", -1, api::v_generate, "generate(...names: string[]): OperationInfo[]"),
+     Verb::new("verify", -1, api::v_verify, "verify(...names: string[]): VerifyReport"),
+diff --git a/crates/app/tests/mcp.rs b/crates/app/tests/mcp.rs
+index 06664a121..e9d5c63d2 100644
+--- a/crates/app/tests/mcp.rs
++++ b/crates/app/tests/mcp.rs
+@@ -323,6 +323,38 @@ fn tool_library_import_skips_duplicates_and_renames_clashes() {
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn tool_library_import_modes_update_and_replace_over_mcp() {
++    let dir = tmp_dir("toollib-modes");
++    let lib = dir.join("shop.camtools");
++    let mut src = Client::new();
++    let (a, b) = two_catalog_tools(&mut src);
++    src.ok("add_tool", json!({ "catalog": a }));
++    src.ok("add_tool", json!({ "catalog": b }));
++    src.ok("export_tool_library", json!({ "path": lib.display().to_string() }));
++
++    // The destination holds `a` under the same name but a different tool,
++    // plus `Extra`: update puts the file's `a` in place, replace also
++    // drops `Extra` (no operation uses it).
++    let mut dst = Client::new();
++    dst.ok("add_tool", json!({ "catalog": b, "name": a }));
++    dst.ok("add_tool", json!({ "catalog": a, "name": "Extra" }));
++    let imp = dst.ok("import_tool_library", json!({ "path": lib.display().to_string(), "mode": "update" }));
++    assert_eq!(imp["mode"], json!("update"), "{imp}");
++    assert_eq!(imp["updated"], json!([a]), "{imp}");
++    assert_eq!(imp["added"], json!([b]), "{imp}");
++    assert_eq!(imp["renamed"], json!([]));
++    let rep = dst.ok("import_tool_library", json!({ "path": lib.display().to_string(), "mode": "replace" }));
++    assert_eq!(rep["removed"], json!(["Extra"]), "{rep}");
++    let job = dst.ok("get_job", json!({}));
++    assert_eq!(job["tools"], src.ok("get_job", json!({}))["tools"], "the document now holds the file's set");
++    dst.ok("undo", json!({}));
++    assert!(job_tool_names(&mut dst).contains(&"Extra".to_owned()), "undo brings Extra back");
++    let msg = dst.refused("import_tool_library", json!({ "path": lib.display().to_string(), "mode": "merge" }));
++    assert!(msg.contains("unknown import mode"), "{msg}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn tool_library_malformed_files_are_refused_by_name() {
+     let dir = tmp_dir("toollib-bad");
+diff --git a/crates/app/tests/tool_import_modes.rs b/crates/app/tests/tool_import_modes.rs
+new file mode 100644
+index 000000000..2bdbdb1fe
+--- /dev/null
++++ b/crates/app/tests/tool_import_modes.rs
+@@ -0,0 +1,198 @@
++//! #899: the tool library import modes. Add keeps the duplicate law (see
++//! tool_library.rs); Update puts the file's definition into a same-named
++//! tool in place (same entity, same controller number, operations go
++//! Stale, undo restores exactly); Replace is Update plus removing the
++//! document tools the file lacks, refused by name when an operation uses
++//! one. Every mode is one undo unit.
++//! Provenance: our own tests over our own command model.
++//!
++//! Gate map (M4.4): covers app::commands (tool_import), app::script (importTools).
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, GenerateOperation, History, ImportMode, ImportTools, SetStock, SetToolNumber,
++};
++use camcraft_app::model;
++use camcraft_app::operation::{Height, OpParams, OpStatus, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tool_library::LibraryTool;
++use camcraft_app::tools::{Tool, catalog};
++use camcraft_app::world::new_world;
++use flecs_ecs::prelude::World;
++
++fn cat(name: &str) -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog tool")
++}
++
++fn lib(items: &[(&str, Tool)]) -> Vec<LibraryTool> {
++    items.iter().map(|(n, t)| LibraryTool { name: (*n).into(), tool: t.clone() }).collect()
++}
++
++fn tool_named(w: &World, n: &str) -> Option<Tool> {
++    model::find_by_name(w, n).and_then(|e| model::tool_of(w, &e))
++}
++
++fn number_of(w: &World, n: &str) -> Option<u32> {
++    model::find_by_name(w, n).and_then(|e| model::tool_number_of(w, &e))
++}
++
++fn do_import(w: &World, h: &mut History, items: &[(&str, Tool)], mode: ImportMode) -> Result<String, String> {
++    let cmd = ImportTools::with_mode(w, lib(items), mode).map_err(|e| e.to_string())?;
++    let s = cmd.report().summary();
++    h.execute(w, cmd);
++    Ok(s)
++}
++
++fn fatter(t: &Tool) -> Tool {
++    Tool { diameter: t.diameter + 1.0, ..t.clone() }
++}
++
++/// Stock, tools `T1` (end mill, number 7) and `T2`, one generated Face op on `T1`.
++fn world_with_op() -> (World, History) {
++    let w = new_world();
++    let mut h = History::default();
++    let stock = StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 };
++    h.execute(&w, SetStock::new(&w, stock, Location::default()).expect("stock"));
++    h.execute(&w, AddTool::new(&w, "T1", cat("EM-0400-2FL")).expect("T1"));
++    h.execute(&w, AddTool::new(&w, "T2", cat("EM-0600-4FL")).expect("T2"));
++    h.execute(&w, SetToolNumber::new(&w, "T1", Some(7)).expect("number"));
++    let params = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(19.5),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    };
++    h.execute(&w, CreateOperation::new(&w, "Face1", "T1", SrcRef::Stock, params).expect("op"));
++    h.execute(&w, GenerateOperation::new(&w, "Face1").expect("generate"));
++    (w, h)
++}
++
++fn status(w: &World, n: &str) -> OpStatus {
++    let e = model::find_by_name(w, n).expect("entity");
++    camcraft_app::operation::status_of(w, &e)
++}
++
++#[test]
++fn update_changes_in_place_keeps_identity_and_number_and_stales_ops() {
++    let (w, mut h) = world_with_op();
++    let before = model::find_by_name(&w, "T1").expect("T1");
++    let old = tool_named(&w, "T1").expect("tool");
++    assert_eq!(status(&w, "Face1"), OpStatus::Ok);
++    let next = fatter(&old);
++    let s = do_import(&w, &mut h, &[("T1", next.clone())], ImportMode::Update).expect("update");
++    assert!(s.contains("1 updated (T1)") && !s.contains("imported"), "{s}");
++    assert_eq!(model::find_by_name(&w, "T1"), Some(before), "same entity, not a rename");
++    assert_eq!(tool_named(&w, "T1"), Some(next));
++    assert_eq!(number_of(&w, "T1"), Some(7), "the controller number stays");
++    assert_eq!(status(&w, "Face1"), OpStatus::Stale, "the op reads the new numbers");
++    assert!(model::find_by_name(&w, "T1 (2)").is_none(), "Update never renames");
++    h.undo(&w);
++    assert_eq!(tool_named(&w, "T1"), Some(old), "undo restores the definition exactly");
++    assert_eq!(number_of(&w, "T1"), Some(7));
++    assert_eq!(status(&w, "Face1"), OpStatus::Ok, "and the op is fresh again");
++    h.redo(&w);
++    assert_eq!(number_of(&w, "T1"), Some(7));
++    assert_ne!(status(&w, "Face1"), OpStatus::Ok);
++}
++
++#[test]
++fn update_adds_unmatched_and_skips_identical_in_one_undo() {
++    let (w, mut h) = world_with_op();
++    let same = tool_named(&w, "T2").expect("T2");
++    let items = [("T2", same), ("New", cat("EM-0800-4FL")), ("T1", fatter(&cat("EM-0400-2FL")))];
++    let s = do_import(&w, &mut h, &items, ImportMode::Update).expect("update");
++    assert!(s.contains("imported 1 tool") && s.contains("1 updated (T1)") && s.contains("already in the document (T2)"), "{s}");
++    assert!(tool_named(&w, "New").is_some());
++    assert_eq!(number_of(&w, "New"), None);
++    h.undo(&w);
++    assert!(tool_named(&w, "New").is_none(), "one undo removes the add");
++    assert_eq!(tool_named(&w, "T1"), Some(cat("EM-0400-2FL")), "and reverts the update");
++}
++
++#[test]
++fn update_of_an_identical_library_has_nothing_to_do() {
++    let (w, _h) = world_with_op();
++    let same = tool_named(&w, "T1").expect("T1");
++    let err = ImportTools::with_mode(&w, lib(&[("T1", same)]), ImportMode::Update).err().expect("nothing").to_string();
++    assert!(err.contains("nothing to import"), "{err}");
++}
++
++#[test]
++fn update_refuses_a_name_that_is_not_a_tool() {
++    let (w, _h) = world_with_op();
++    let err = ImportTools::with_mode(&w, lib(&[("Face1", cat("EM-0400-2FL"))]), ImportMode::Update)
++        .err()
++        .expect("refused")
++        .to_string();
++    assert!(err.contains("Face1") && err.contains("not a tool"), "{err}");
++}
++
++#[test]
++fn update_refuses_a_retype_that_strands_an_operation() {
++    let (w, _h) = world_with_op();
++    let drill = catalog().into_iter().map(|(_, t)| t).find(|t| t.kind != cat("EM-0400-2FL").kind).expect("other kind");
++    let e = ImportTools::with_mode(&w, lib(&[("T1", drill)]), ImportMode::Update).err().expect("stranded").to_string();
++    assert!(e.contains("T1") && e.contains("Face1"), "{e}");
++}
++
++#[test]
++fn replace_removes_unmatched_unused_tools_and_undo_restores_them_exactly() {
++    let (w, mut h) = world_with_op();
++    let t2 = tool_named(&w, "T2").expect("T2");
++    h.execute(&w, SetToolNumber::new(&w, "T2", Some(9)).expect("number"));
++    let items = [("T1", fatter(&cat("EM-0400-2FL"))), ("Fresh", cat("EM-0800-4FL"))];
++    let s = do_import(&w, &mut h, &items, ImportMode::Replace).expect("replace");
++    assert!(s.contains("1 replaced (T1)") && s.contains("1 removed (T2)") && s.contains("imported 1 tool"), "{s}");
++    assert!(tool_named(&w, "T2").is_none(), "the library lacked T2");
++    assert!(tool_named(&w, "Fresh").is_some());
++    assert_eq!(number_of(&w, "T1"), Some(7));
++    h.undo(&w);
++    assert_eq!(tool_named(&w, "T2"), Some(t2), "T2 is back, exactly");
++    assert_eq!(number_of(&w, "T2"), Some(9), "with its number");
++    assert!(tool_named(&w, "Fresh").is_none());
++    assert_eq!(tool_named(&w, "T1"), Some(cat("EM-0400-2FL")));
++    h.redo(&w);
++    assert!(tool_named(&w, "T2").is_none());
++}
++
++#[test]
++fn replace_refuses_to_remove_a_tool_an_operation_uses() {
++    let (w, h) = world_with_op();
++    let before = tool_named(&w, "T2");
++    // The library lacks T1, which Face1 cuts with.
++    let err = ImportTools::with_mode(&w, lib(&[("T2", fatter(&cat("EM-0600-4FL")))]), ImportMode::Replace)
++        .err()
++        .expect("refused")
++        .to_string();
++    assert!(err.contains("T1") && err.contains("Face1") && err.contains("nothing imported"), "{err}");
++    assert_eq!(tool_named(&w, "T2"), before, "nothing applied");
++    assert!(tool_named(&w, "T1").is_some());
++    drop(h);
++}
++
++#[test]
++fn add_stays_the_default_and_renames_a_different_duplicate() {
++    assert_eq!(ImportMode::default(), ImportMode::Add);
++    let (w, mut h) = world_with_op();
++    let next = fatter(&cat("EM-0400-2FL"));
++    let s = do_import(&w, &mut h, &[("T1", next.clone())], ImportMode::Add).expect("add");
++    assert!(s.contains("T1 -> T1 (2)"), "{s}");
++    assert_eq!(tool_named(&w, "T1"), Some(cat("EM-0400-2FL")), "the original is untouched");
++    assert_eq!(tool_named(&w, "T1 (2)"), Some(next));
++    assert_eq!(status(&w, "Face1"), OpStatus::Ok);
++}
++
++#[test]
++fn modes_parse_by_name() {
++    assert_eq!(ImportMode::parse("Update"), Ok(ImportMode::Update));
++    assert_eq!(ImportMode::parse(" replace "), Ok(ImportMode::Replace));
++    assert_eq!(ImportMode::parse("add"), Ok(ImportMode::Add));
++    assert!(ImportMode::parse("merge").expect_err("unknown").contains("merge"));
++}
+diff --git a/crates/ui/src/egui_app/pages.rs b/crates/ui/src/egui_app/pages.rs
+index 916c6ac30..b93f80717 100644
+--- a/crates/ui/src/egui_app/pages.rs
++++ b/crates/ui/src/egui_app/pages.rs
+@@ -987,8 +987,9 @@ fn tool_page(ui: &mut Ui, state: &mut State, name: &str) {
+                 .clicked();
+             let import = ui
+                 .button("Import library…")
+-                .on_hover_text("add the tools of a CamCraft tool library file (one undo step; taken names are never overwritten)")
++                .on_hover_text("import the tools of a CamCraft tool library file (one undo step; the mode beside it says what happens to a name the document has)")
+                 .clicked();
++            tool_import_mode_combo(ui, &mut state.tool_import_mode);
+             (new, export, import)
+         })
+         .inner;
+@@ -1922,3 +1923,22 @@ mod turn_tests {
+         assert!(state.pending.is_empty());
+     }
+ }
++
++/// #899: the Import library mode picker (view state; the import is the command).
++fn tool_import_mode_combo(ui: &mut egui::Ui, mode: &mut camcraft_app::commands::ImportMode) {
++    use camcraft_app::commands::ImportMode;
++    egui::ComboBox::from_id_salt("tool_import_mode")
++        .selected_text(match mode {
++            ImportMode::Add => "Add (rename duplicates)",
++            ImportMode::Update => "Update same-named",
++            ImportMode::Replace => "Replace library",
++        })
++        .show_ui(ui, |ui| {
++            ui.selectable_value(mode, ImportMode::Add, "Add (rename duplicates)")
++                .on_hover_text("an identical tool is skipped, a different tool of a taken name comes in as \"Name (2)\"");
++            ui.selectable_value(mode, ImportMode::Update, "Update same-named")
++                .on_hover_text("a same-named tool takes the file's definition in place (number kept; operations using it go Stale); new names are added");
++            ui.selectable_value(mode, ImportMode::Replace, "Replace library")
++                .on_hover_text("update, and tools the file lacks are removed - refused if an operation uses one");
++        });
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 90d267106..075d4c898 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1305,6 +1305,9 @@ pub struct State {
+     /// #225: the Feeds tab shows the spindle speed as surface (cutting)
+     /// speed instead of rpm. View state - never a command, never saved.
+     pub spindle_as_vc: bool,
++    /// #899: how the Tool library page's Import treats a name the
++    /// document already has. View state - the import itself is the command.
++    pub tool_import_mode: camcraft_app::commands::ImportMode,
+     /// Bumped whenever documents changed; drives GPU re-upload of meshes.
+     pub doc_version: u64,
+     /// Bumped whenever selection changed; re-sends the vertex stream (the
+@@ -1745,6 +1748,7 @@ impl State {
+             debug_info_open: false,
+             gpu_line: None,
+             spindle_as_vc: false,
++            tool_import_mode: camcraft_app::commands::ImportMode::default(),
+             doc_version: 0,
+             selection_version: 0,
+             viewport_rect: ([0.0, 0.0], [0.0, 0.0]),
+diff --git a/crates/ui/src/state_tool_library.rs b/crates/ui/src/state_tool_library.rs
+index b7acd6cf6..49503185b 100644
+--- a/crates/ui/src/state_tool_library.rs
++++ b/crates/ui/src/state_tool_library.rs
+@@ -48,7 +48,7 @@ impl State {
+         let planned = std::fs::read_to_string(path)
+             .map_err(|e| e.to_string())
+             .and_then(|text| tool_library::parse_tool_library(&text))
+-            .and_then(|lib| ImportTools::new(&self.world, lib).map_err(|e| e.to_string()));
++            .and_then(|lib| ImportTools::with_mode(&self.world, lib, self.tool_import_mode).map_err(|e| e.to_string()));
+         match planned {
+             Ok(command) => {
+                 let summary = command.report().summary();
+diff --git a/docs/decisions/899-tool-import-modes.md b/docs/decisions/899-tool-import-modes.md
+new file mode 100644
+index 000000000..f0dec3f3e
+--- /dev/null
++++ b/docs/decisions/899-tool-import-modes.md
+@@ -0,0 +1,33 @@
++## #899 - tool library import modes (add / update / replace)
++
++**Decided.** `ImportTools` takes an `ImportMode`, default `Add` (today's
++behaviour, every existing test unchanged).
++- **Update**: a same-named tool takes the imported definition in place (same
++  entity, controller number kept, so operations keep pointing at it and read
++  Stale from the stamp mismatch). An identical tool is skipped. A name the
++  document lacks is added (upsert), so Update never loses a library tool.
++- **Replace**: Update, and the library becomes the document's whole tool
++  set: a document tool the file lacks is removed (`DeleteTool` snapshot, so
++  undo restores number, body and cutter). If any operation uses such a tool
++  the whole import is refused by tool and operation name, nothing applied.
++- Update/Replace run the same gates as `ChangeTool` (torch refusal, retype
++  that strands an operation, body/cutter fit); a library name that belongs
++  to a non-tool entity refuses. Add keeps its rename-on-clash law.
++- One undo unit: steps apply in order and invert in reverse. The report
++  gains `updated` / `replaced` / `removed`; GUI has a mode combo beside
++  "Import library..."; `cam.importTools(path, mode?)` and the MCP
++  `import_tool_library` take `mode`.
++
++**Why.** Re-importing an edited library otherwise piled up `Name (2)` copies
++that operations never pointed at. Upsert for Update is the least surprising;
++removal is confined to Replace and guarded by the use check (Prime Directive:
++never strand an operation silently).
++
++**Considered, dropped.** Replace that keeps unmatched tools (identical to
++Update, no point); Replace that reassigns operations of a removed tool (a
++hidden edit to operations); Update that resets the number (changes posted
++T-words).
++
++**Key.** The tool name, for now. #898's part number is the intended future
++key: matching would move to it with the name as fallback. Cost to change:
++the match in `ImportTools::with_mode`.
+
+From 075a9c6e8d17bdee38b713aac341e423ea257d81 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 11 Nov 2026 20:14:17 -0800
+Subject: [PATCH 2/2] fix(tools): cam.d.ts importTools mode; clippy let-chains
+
+Refs #899
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ assets/scripts/cam.d.ts                |  2 +-
+ crates/app/src/commands/tool_import.rs | 16 +++++------
+ crates/ui/src/egui_app/pages.rs        | 38 +++++++++++++-------------
+ 3 files changed, 28 insertions(+), 28 deletions(-)
+
+diff --git a/assets/scripts/cam.d.ts b/assets/scripts/cam.d.ts
+index 6802d9ede..eaa8c1d08 100644
+--- a/assets/scripts/cam.d.ts
++++ b/assets/scripts/cam.d.ts
+@@ -94,7 +94,7 @@ interface CamApi {
+   save(path?: string): { path: string };  // variadic
+   import(path: string, name?: string): { model: string; facets: number };  // variadic
+   exportTools(path: string): { path: string; tools: number };  // arity 1
+-  importTools(path: string): { path: string; added: string[]; renamed: { from: string; to: string }[]; skipped: string[]; summary: string };  // arity 1
++  importTools(path: string, mode?: "add" | "update" | "replace"): { path: string; mode: string; added: string[]; renamed: { from: string; to: string }[]; skipped: string[]; updated: string[]; replaced: string[]; removed: string[]; summary: string };  // variadic
+   operations(): OperationInfo[];  // arity 0
+   generate(...names: string[]): OperationInfo[];  // variadic
+   verify(...names: string[]): VerifyReport;  // variadic
+diff --git a/crates/app/src/commands/tool_import.rs b/crates/app/src/commands/tool_import.rs
+index 906c3eb66..b3e33d486 100644
+--- a/crates/app/src/commands/tool_import.rs
++++ b/crates/app/src/commands/tool_import.rs
+@@ -130,15 +130,15 @@ fn change_refusal(world: &World, name: &str, prev: &Tool, next: &Tool) -> Option
+         return Some(msg);
+     }
+     let entity = model::find_by_name(world, name)?;
+-    if let Some(body) = crate::tool_body::body_of(world, &entity) {
+-        if let Err(e) = crate::tool_body::fits(next, &body) {
+-            return Some(format!("tool '{name}': {e}"));
+-        }
++    if let Some(body) = crate::tool_body::body_of(world, &entity)
++        && let Err(e) = crate::tool_body::fits(next, &body)
++    {
++        return Some(format!("tool '{name}': {e}"));
+     }
+-    if let Some(c) = crate::tool_cutter::cutter_of(world, &entity) {
+-        if let Err(e) = camcraft_tools::cutter_profile::agrees(next, &c) {
+-            return Some(format!("tool '{name}': the drawn cutter profile no longer fits: {e}"));
+-        }
++    if let Some(c) = crate::tool_cutter::cutter_of(world, &entity)
++        && let Err(e) = camcraft_tools::cutter_profile::agrees(next, &c)
++    {
++        return Some(format!("tool '{name}': the drawn cutter profile no longer fits: {e}"));
+     }
+     None
+ }
+diff --git a/crates/ui/src/egui_app/pages.rs b/crates/ui/src/egui_app/pages.rs
+index b93f80717..af469cca5 100644
+--- a/crates/ui/src/egui_app/pages.rs
++++ b/crates/ui/src/egui_app/pages.rs
+@@ -1806,6 +1806,25 @@ fn model_page(ui: &mut Ui, state: &mut State, name: String) {
+     ui.label("Selected now: Del removes it (undo restores).");
+ }
+ 
++/// #899: the Import library mode picker (view state; the import is the command).
++fn tool_import_mode_combo(ui: &mut egui::Ui, mode: &mut camcraft_app::commands::ImportMode) {
++    use camcraft_app::commands::ImportMode;
++    egui::ComboBox::from_id_salt("tool_import_mode")
++        .selected_text(match mode {
++            ImportMode::Add => "Add (rename duplicates)",
++            ImportMode::Update => "Update same-named",
++            ImportMode::Replace => "Replace library",
++        })
++        .show_ui(ui, |ui| {
++            ui.selectable_value(mode, ImportMode::Add, "Add (rename duplicates)")
++                .on_hover_text("an identical tool is skipped, a different tool of a taken name comes in as \"Name (2)\"");
++            ui.selectable_value(mode, ImportMode::Update, "Update same-named")
++                .on_hover_text("a same-named tool takes the file's definition in place (number kept; operations using it go Stale); new names are added");
++            ui.selectable_value(mode, ImportMode::Replace, "Replace library")
++                .on_hover_text("update, and tools the file lacks are removed - refused if an operation uses one");
++        });
++}
++
+ #[cfg(test)]
+ mod turn_tests {
+     //! The turn/Level buttons are commands of their own now: the world -
+@@ -1923,22 +1942,3 @@ mod turn_tests {
+         assert!(state.pending.is_empty());
+     }
+ }
+-
+-/// #899: the Import library mode picker (view state; the import is the command).
+-fn tool_import_mode_combo(ui: &mut egui::Ui, mode: &mut camcraft_app::commands::ImportMode) {
+-    use camcraft_app::commands::ImportMode;
+-    egui::ComboBox::from_id_salt("tool_import_mode")
+-        .selected_text(match mode {
+-            ImportMode::Add => "Add (rename duplicates)",
+-            ImportMode::Update => "Update same-named",
+-            ImportMode::Replace => "Replace library",
+-        })
+-        .show_ui(ui, |ui| {
+-            ui.selectable_value(mode, ImportMode::Add, "Add (rename duplicates)")
+-                .on_hover_text("an identical tool is skipped, a different tool of a taken name comes in as \"Name (2)\"");
+-            ui.selectable_value(mode, ImportMode::Update, "Update same-named")
+-                .on_hover_text("a same-named tool takes the file's definition in place (number kept; operations using it go Stale); new names are added");
+-            ui.selectable_value(mode, ImportMode::Replace, "Replace library")
+-                .on_hover_text("update, and tools the file lacks are removed - refused if an operation uses one");
+-        });
+-}

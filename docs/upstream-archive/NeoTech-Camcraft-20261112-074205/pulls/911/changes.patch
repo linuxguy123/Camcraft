@@ -1,0 +1,3168 @@
+From 89f78683f25aec401f5840aef0f2aee6e8b20e7d Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 20:03:53 +0100
+Subject: [PATCH 1/4] fix(import): a STEP import reports the chord error of the
+ mesh it kept
+
+The refinement schedule moves to step_refine::refine, which returns the
+kept mesh with its own chord tolerance: a pass dropped for crossing the
+facet budget no longer leaves the halved tolerance on the coarser mesh
+(the log under-reported the error, and said nothing when the halved
+value hit the target). step::parse_with_chord returns the mesh and the
+coarsest kept tolerance in mm, refusing a non-finite or negative value;
+step::parse is unchanged (same schedule, same meshes). A thread-local
+test-only budget override forces a small fixture over budget.
+
+Held work: the UI/MCP flag and the law tightening are escalated to
+effort:max on the issue.
+
+Refs #864
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/geometry/import/mod.rs         |   1 +
+ crates/app/src/geometry/import/step.rs        | 102 ++++++++------
+ crates/app/src/geometry/import/step_refine.rs | 125 ++++++++++++++++++
+ crates/app/tests/step_fidelity.rs             |  40 ++++++
+ docs/decisions/864-reduced-fidelity.md        |  34 +++++
+ 5 files changed, 258 insertions(+), 44 deletions(-)
+ create mode 100644 crates/app/src/geometry/import/step_refine.rs
+ create mode 100644 crates/app/tests/step_fidelity.rs
+ create mode 100644 docs/decisions/864-reduced-fidelity.md
+
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index c1b253d2c..f02180c09 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -8,6 +8,7 @@
+ pub mod obj;
+ pub mod step;
+ pub mod step_csys;
++mod step_refine;
+ mod step_units;
+ pub mod stl;
+ 
+diff --git a/crates/app/src/geometry/import/step.rs b/crates/app/src/geometry/import/step.rs
+index 34ae18391..95502b149 100644
+--- a/crates/app/src/geometry/import/step.rs
++++ b/crates/app/src/geometry/import/step.rs
+@@ -31,7 +31,42 @@ const MIN_TOL: f64 = 1e-6;
+ /// wall stays inside what the gouge verdict already forgives (#689).
+ const MAX_CHORD: f64 = crate::stock_sim::DEV_TOL * 0.5;
+ 
++/// The finest chord tolerance the STEP importer promises (mm); a model
++/// tessellated coarser than this is "reduced fidelity" (#864).
++pub const CHORD_CAP: f64 = MAX_CHORD;
++
++thread_local! {
++    /// Test-only override of the facet budget (#864's pins force a small
++    /// STEP fixture over budget instead of committing a huge model).
++    static BUDGET_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
++}
++
++/// Run `f` with the STEP facet budget lowered to `budget` on this thread.
++/// Never raises it past [`MAX_FACETS`]. For tests; the override is
++/// cleared on return.
++#[doc(hidden)]
++pub fn with_facet_budget<R>(budget: usize, f: impl FnOnce() -> R) -> R {
++    BUDGET_OVERRIDE.with(|b| b.set(Some(budget)));
++    let out = f();
++    BUDGET_OVERRIDE.with(|b| b.set(None));
++    out
++}
++
++fn facet_budget() -> usize {
++    BUDGET_OVERRIDE
++        .with(std::cell::Cell::get)
++        .map_or(MAX_FACETS, |b| b.min(MAX_FACETS))
++}
++
+ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
++    parse_with_chord(data).map(|(mesh, _)| mesh)
++}
++
++/// [`parse`], and the chord error the kept mesh was actually made at, in
++/// millimetres: the coarsest kept tolerance over all shells, scaled by the
++/// file's length unit (#864). Never NaN, infinite or negative - such a
++/// value is refused as a corrupt import, not carried into a verdict.
++pub fn parse_with_chord(data: &[u8]) -> Result<(Mesh, f64), ImportError> {
+     if data.is_empty() {
+         return Err(ImportError::Empty);
+     }
+@@ -54,12 +89,14 @@ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
+         return Err(ImportError::Step("no shells found".into()));
+     }
+ 
++    let max_facets = facet_budget();
+     let mut facets: Vec<Triangle> = Vec::new();
++    let mut chord = 0.0f64;
+     for shell in table.shell.values() {
+-        if facets.len() >= MAX_FACETS {
++        if facets.len() >= max_facets {
+             return Err(ImportError::TooLarge);
+         }
+-        let budget = MAX_FACETS - facets.len();
++        let budget = max_facets - facets.len();
+         // The whole per-shell kernel sequence runs inside one guarded call.
+         // Everything it touches is shared-immutable or thread-local, so
+         // AssertUnwindSafe holds for our purposes: on a panic we discard all
+@@ -67,7 +104,7 @@ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
+         let per_shell = std::panic::catch_unwind(AssertUnwindSafe(|| {
+             shell_facets(&table, shell, budget)
+         }));
+-        let tris = match per_shell {
++        let (tris, tol) = match per_shell {
+             Err(_) => {
+                 eprintln!("step: truck kernel panicked on a shell; import aborted");
+                 return Err(ImportError::Step(
+@@ -75,8 +112,9 @@ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
+                 ));
+             }
+             Ok(Err(err)) => return Err(err),
+-            Ok(Ok(tris)) => tris,
++            Ok(Ok(kept)) => kept,
+         };
++        chord = chord.max(tol);
+         facets.extend(tris);
+     }
+     if facets.is_empty() {
+@@ -90,8 +128,12 @@ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
+         for t in &mut facets {
+             *t = Triangle::new(mm(t.a), mm(t.b), mm(t.c));
+         }
++        chord *= k.abs();
+     }
+-    Ok(Mesh::from_facets(facets))
++    if !(chord.is_finite() && chord >= 0.0) {
++        return Err(ImportError::Step(format!("tessellation reported a chord error of {chord} mm")));
++    }
++    Ok((Mesh::from_facets(facets), chord))
+ }
+ 
+ /// Tessellate one STEP shell into triangles, staying inside `budget` facets.
+@@ -100,7 +142,7 @@ fn shell_facets(
+     table: &Table,
+     shell: &truck_stepio::r#in::ShellHolder,
+     budget: usize,
+-) -> Result<Vec<Triangle>, ImportError> {
++) -> Result<(Vec<Triangle>, f64), ImportError> {
+     let cshell = table
+         .to_compressed_shell(shell)
+         .map_err(|e| ImportError::Step(format!("shell conversion failed: {e}")))?;
+@@ -165,45 +207,17 @@ fn shell_facets(
+     let tol_target = (extent * 1e-3).min(MAX_CHORD).max(MIN_TOL);
+     // Start 250x coarser than the target - the first pass then costs a few
+     // dozen triangles per face no matter how big the model, so no shell can
+-    // silently allocate a monster mesh before we have measured it.
+-    let mut tol = (extent * 0.25).max(tol_target);
+-    let mut refined = loop {
+-        match triangulate(tol) {
+-            Ok(tris) => break tris,
+-            // Face count alone can overflow the budget; coarsen up to a
+-            // bounded cap. tol grows strictly each retry, so this ends.
+-            Err(ImportError::TooLarge) => {
+-                if tol >= extent * 16.0 {
+-                    return Err(ImportError::TooLarge);
+-                }
+-                tol = (tol * 4.0).min(extent * 16.0);
+-            }
+-            Err(err) => return Err(err),
+-        }
+-    };
+-    // Refine toward the target: halving the tolerance at most quadruples the
+-    // count, so a pass is taken only while the projected mesh stays within
+-    // budget/2. The loop ends at the target, at the budget, or at the pass
+-    // cap - never on a panicking or unbounded path.
+-    for _ in 0..24 {
+-        if tol <= tol_target || refined.len() > budget / 8 {
+-            break;
+-        }
+-        tol = (tol * 0.5).max(tol_target);
+-        match triangulate(tol) {
+-            Ok(tris) => refined = tris,
+-            // Should not happen (the projection bounds it); if truck's
+-            // density does not follow the tol^-2 law, keep the last mesh
+-            // that fit rather than failing the import.
+-            Err(ImportError::TooLarge) => break,
+-            Err(err) => return Err(err),
+-        }
+-    }
+-    if tol > tol_target {
++    // silently allocate a monster mesh before we have measured it. The
++    // schedule (coarse start, halving toward the target inside the budget)
++    // lives in `step_refine`, which also keeps the tolerance of the mesh
++    // it actually kept (#864).
++    let kept = super::step_refine::refine(extent, tol_target, budget, triangulate)?;
++    if kept.tol > tol_target {
+         eprintln!(
+-            "step: tessellated at reduced fidelity (tol {tol:e}, target {tol_target:e}, {} facets) to bound memory",
+-            refined.len()
++            "step: tessellated at reduced fidelity (tol {:e}, target {tol_target:e}, {} facets) to bound memory",
++            kept.tol,
++            kept.facets.len()
+         );
+     }
+-    Ok(refined)
++    Ok((kept.facets, kept.tol))
+ }
+diff --git a/crates/app/src/geometry/import/step_refine.rs b/crates/app/src/geometry/import/step_refine.rs
+new file mode 100644
+index 000000000..63d83ac58
+--- /dev/null
++++ b/crates/app/src/geometry/import/step_refine.rs
+@@ -0,0 +1,125 @@
++//! The STEP importer's tessellation schedule: coarse first, then halve the
++//! chord tolerance toward the target while the facet budget allows, and
++//! report the tolerance of the mesh it KEPT (#864).
++//!
++//! Provenance: our own design (bounded refinement under a memory budget);
++//! the chord-tolerance meaning is the tessellator's (truck, Apache-2.0).
++//! Nothing from any CAM vendor.
++//!
++//! Split out of `step.rs` so the bookkeeping is testable without a STEP
++//! kernel: `triangulate` is any pass at a tolerance that either returns
++//! the facets or reports the budget was crossed.
++
++use super::ImportError;
++
++/// The facets of the last pass that fit, and the chord tolerance that pass
++/// ran at - never a tolerance whose pass was thrown away.
++#[derive(Debug)]
++pub(super) struct Kept<T> {
++    pub facets: Vec<T>,
++    pub tol: f64,
++}
++
++/// Run the schedule. `extent` is the shell's half-size (its largest
++/// absolute coordinate), `tol_target` the quality target, `budget` the
++/// facet cap for this shell.
++///
++/// - Coarse start at `max(extent / 4, target)`; a first pass over budget
++///   coarsens up to `16 * extent`, then refuses with `TooLarge`.
++/// - Refinement halves `tol` (never below the target) while the kept mesh
++///   is at most `budget / 8`, for at most 24 passes.
++/// - A refinement pass that crosses the budget is dropped and the PREVIOUS
++///   mesh is kept, with the previous tolerance. Before #864 the halved
++///   tolerance was reported for the coarser mesh, under-reporting its
++///   chord error (and saying nothing when the halved value hit the target).
++pub(super) fn refine<T>(
++    extent: f64,
++    tol_target: f64,
++    budget: usize,
++    mut triangulate: impl FnMut(f64) -> Result<Vec<T>, ImportError>,
++) -> Result<Kept<T>, ImportError> {
++    let mut tol = (extent * 0.25).max(tol_target);
++    let mut kept = loop {
++        match triangulate(tol) {
++            Ok(facets) => break Kept { facets, tol },
++            // Face count alone can overflow the budget; coarsen up to a
++            // bounded cap. tol grows strictly each retry, so this ends.
++            Err(ImportError::TooLarge) => {
++                if tol >= extent * 16.0 {
++                    return Err(ImportError::TooLarge);
++                }
++                tol = (tol * 4.0).min(extent * 16.0);
++            }
++            Err(err) => return Err(err),
++        }
++    };
++    // Halving the tolerance at most quadruples the count, so a pass is
++    // taken only while the projected mesh stays within budget/2. The loop
++    // ends at the target, at the budget, or at the pass cap.
++    for _ in 0..24 {
++        if kept.tol <= tol_target || kept.facets.len() > budget / 8 {
++            break;
++        }
++        let next = (kept.tol * 0.5).max(tol_target);
++        match triangulate(next) {
++            Ok(facets) => kept = Kept { facets, tol: next },
++            // Should not happen (the projection bounds it); if the
++            // tessellator's density does not follow the tol^-2 law, keep
++            // the last mesh that fit - with ITS tolerance (#864).
++            Err(ImportError::TooLarge) => break,
++            Err(err) => return Err(err),
++        }
++    }
++    Ok(kept)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A fake pass: `n(tol)` facets, or `TooLarge` at or below `wall`.
++    fn pass(tol: f64, wall: f64, n: impl Fn(f64) -> usize) -> Result<Vec<u8>, ImportError> {
++        if tol <= wall {
++            return Err(ImportError::TooLarge);
++        }
++        Ok(vec![0; n(tol)])
++    }
++
++    #[test]
++    fn a_dropped_pass_keeps_the_tolerance_of_the_mesh_it_kept() {
++        // extent 4: start tol 1.0, then 0.5, 0.25 ... ; the pass at 0.125
++        // crosses the budget, so the 0.25 mesh is kept AND reported.
++        let mut seen = Vec::new();
++        let kept = refine(4.0, 0.001, 1_000_000, |t| {
++            seen.push(t);
++            pass(t, 0.2, |t| (1.0 / t) as usize)
++        })
++        .unwrap();
++        assert_eq!(kept.tol, 0.25, "the kept mesh's own tolerance, not the halved one");
++        assert_eq!(kept.facets.len(), 4);
++        assert_eq!(seen, vec![1.0, 0.5, 0.25, 0.125]);
++    }
++
++    #[test]
++    fn a_dropped_pass_whose_halved_tolerance_is_the_target_still_reports_the_kept_one() {
++        // The halved tolerance reaches the target exactly; the old code then
++        // logged nothing although the mesh kept was twice as coarse.
++        let kept = refine(4.0, 0.5, 1_000_000, |t| pass(t, 0.5, |_| 10)).unwrap();
++        assert_eq!(kept.tol, 1.0);
++        assert!(kept.tol > 0.5, "the kept mesh misses the target and must say so");
++    }
++
++    #[test]
++    fn a_mesh_that_reaches_the_target_reports_the_target() {
++        let kept = refine(4.0, 0.25, 1_000_000, |t| pass(t, 0.0, |_| 10)).unwrap();
++        assert_eq!(kept.tol, 0.25);
++    }
++
++    #[test]
++    fn the_budget_stop_reports_the_tolerance_of_the_last_pass() {
++        // 100 facets at every pass, budget 400: 100 > 400/8 stops after the
++        // first pass, at the coarse start.
++        let kept = refine(4.0, 0.001, 400, |t| pass(t, 0.0, |_| 100)).unwrap();
++        assert_eq!(kept.tol, 1.0);
++    }
++}
+diff --git a/crates/app/tests/step_fidelity.rs b/crates/app/tests/step_fidelity.rs
+new file mode 100644
+index 000000000..1e01dcf70
+--- /dev/null
++++ b/crates/app/tests/step_fidelity.rs
+@@ -0,0 +1,40 @@
++//! #864: a STEP import reports the chord error of the mesh it KEPT. A model
++//! that fits the facet budget reaches the 0.005 mm cap and its mesh is the
++//! one `parse` always made; a model forced over budget keeps a coarser mesh
++//! and says by how much.
++//!
++//! Gate map: covers app::geometry::import::step and step_refine.
++//!
++//! Provenance: our own pins over the importer's tessellation schedule.
++
++use camcraft_app::geometry::import::step;
++
++fn milling_test() -> Vec<u8> {
++    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/Milling-test.step");
++    std::fs::read(p).expect("the Milling-test fixture is in testdata")
++}
++
++#[test]
++fn a_model_that_fits_the_budget_reaches_the_cap_and_keeps_its_mesh() {
++    let data = milling_test();
++    let (mesh, chord) = step::parse_with_chord(&data).expect("imports");
++    assert!(chord > 0.0 && chord <= step::CHORD_CAP, "full fidelity: {chord}");
++    let plain = step::parse(&data).expect("imports");
++    assert_eq!(mesh.facets.len(), plain.facets.len());
++    assert!(mesh.facets.iter().zip(plain.facets.iter()).all(|(a, b)| a == b), "same mesh as before #864");
++}
++
++#[test]
++fn a_model_forced_over_budget_reports_the_coarser_chord_it_kept() {
++    let data = milling_test();
++    let (full, _) = step::parse_with_chord(&data).expect("imports");
++    let budget = 2_000;
++    let (mesh, chord) = step::with_facet_budget(budget, || step::parse_with_chord(&data)).expect("imports at reduced fidelity");
++    assert!(chord > step::CHORD_CAP, "reduced fidelity is reported: {chord}");
++    assert!(chord.is_finite());
++    assert!(mesh.facets.len() <= budget, "{} facets within the {budget} budget", mesh.facets.len());
++    assert!(mesh.facets.len() < full.facets.len());
++    // The override is gone once the closure returns.
++    let (_, again) = step::parse_with_chord(&data).expect("imports");
++    assert!(again <= step::CHORD_CAP);
++}
+diff --git a/docs/decisions/864-reduced-fidelity.md b/docs/decisions/864-reduced-fidelity.md
+new file mode 100644
+index 000000000..753b42650
+--- /dev/null
++++ b/docs/decisions/864-reduced-fidelity.md
+@@ -0,0 +1,34 @@
++## #864 - an over-budget STEP mesh: report the chord error it kept (held work, escalated)
++
++**What was decided.** The STEP importer's refinement schedule moved into
++`app::geometry::import::step_refine::refine`, which returns the mesh it kept
++together with the chord tolerance of that mesh. A refinement pass that
++crosses the facet budget is dropped, and the previous mesh is kept with its
++own tolerance. Before this change, the halved tolerance was reported for the
++coarser mesh. `step::parse_with_chord` returns the mesh and the coarsest kept
++tolerance over all shells, in millimetres (scaled by the file's length unit).
++A non-finite or negative value is refused as a corrupt import. `step::parse`
++is unchanged for callers: same schedule, same meshes. `step::CHORD_CAP` names
++the 0.005 mm cap. `step::with_facet_budget` is a test-only, thread-local
++override that lets a small fixture be forced over budget.
++
++**Why.** Every part of #864 (the UI flag, the MCP facts, the tightened laws)
++needs the true chord error of the kept mesh. The `TooLarge` bookkeeping bug
++made the logged value wrong exactly in the over-budget case.
++
++**Escalated, not finished.** Tightening "every gouge law that judges
++tool-against-model distance" by the excess reaches about 15 law sites in
++four crates. It also has an open design question: once the excess is larger
++than the 0.01 mm verdict tolerance, a uniform tighter floor convicts every
++exactly finished planar face, because planar facets carry no chord error.
++That makes such a model unpostable under a misleading "gouge" verdict. The
++options are a named refusal, curvature-aware excess, or an outward offset of
++the mesh. This is effort:max work. The inventory is on #864.
++
++**Considered and dropped.**
++- Logging only: this is the status quo the issue rejects.
++- Recording the error on every STEP model: models that fit the budget would
++  gain a project-file field and change saved bytes. The plan on #864 records
++  it only above the cap.
++
++**Cost to change later.** Low: `refine` is a pure function with unit pins.
+
+From e7d4f80785711b32690605cc24dd8e94595a59e6 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 21:29:00 +0100
+Subject: [PATCH 2/4] fix(sim,app): flag a STEP model imported coarser than
+ promised; tighten its gouge verdicts, refuse past that
+
+A STEP model whose kept mesh is coarser than the importer's 0.005 mm
+promise used to import with only a stderr line. Its facets stand inside
+the true surface on a convex wall, so a real gouge up to the mesh's error
+could pass every verdict.
+
+- Flag: the import's achieved error lands on the model as
+  schema::ReducedFidelity (only above the cap), through ImportModel,
+  UpdateModel, ImportFixture and AddFixtureModel; kept by a repair,
+  restored by undo; saved as `coarse_mm` on that entity only. Shown on the
+  model page and the import status line, and by MCP import_model/get_job.
+- Tighten: VerifyContext::model_excess (achieved error less the cap),
+  apart from gouge_tol. Laws (b), (b2) and (f), contain_into, the lathe
+  axial hole verdict and the program sim's deviation tolerance subtract it
+  while a positive tolerance is left.
+- Refuse: past that the laws read untightened and the program gate refuses
+  the operation by name; the program sim does not judge. Kinds whose gouge
+  laws do not read the excess yet are refused on any reduced model.
+- A reduced-fidelity fixture is judged by its box grown by its error and
+  never acquitted by its mesh.
+
+With no flag every law, golden and saved byte is unchanged. A metre-unit
+STEP file (0.01 mm at the kernel's floor since #839) gets the same flag and
+treatment. Owed work is #904.
+
+Fixes #864
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/commands/delete_entity.rs      |   5 +
+ crates/app/src/commands/fixture.rs            |   8 +-
+ crates/app/src/commands/import_fixture.rs     |   2 +-
+ crates/app/src/commands/import_model.rs       |  22 +-
+ crates/app/src/commands/repair_model.rs       |   2 +-
+ crates/app/src/commands/update_model.rs       |  25 ++
+ crates/app/src/fixture.rs                     |  26 +-
+ crates/app/src/geometry/import/mod.rs         |  43 ++-
+ crates/app/src/geometry/import/step.rs        |   9 +
+ crates/app/src/lib.rs                         |   2 +
+ crates/app/src/mcp/job.rs                     |   9 +-
+ crates/app/src/mcp/tools.rs                   |   4 +-
+ crates/app/src/model_fidelity.rs              | 188 ++++++++++
+ crates/app/src/operation/fidelity_law.rs      |  95 +++++
+ crates/app/src/operation/generate.rs          |  68 +---
+ crates/app/src/operation/material.rs          |  13 +-
+ crates/app/src/operation/material_region.rs   |   1 +
+ crates/app/src/operation/mod.rs               |   2 +
+ crates/app/src/posting.rs                     |   6 +
+ crates/app/src/project/apply.rs               |   3 +
+ crates/app/src/project/entity.rs              |   7 +
+ crates/app/src/project/wire.rs                |   1 +
+ crates/app/src/schema.rs                      |  13 +
+ crates/app/src/script/api.rs                  |  19 +-
+ crates/app/src/stock_sim.rs                   |   7 +-
+ crates/app/src/stock_sim_carry.rs             |   6 +-
+ crates/app/tests/blind_floor.rs               |   1 +
+ crates/app/tests/boundary_walls.rs            |   1 +
+ crates/app/tests/corner_blend.rs              |   1 +
+ crates/app/tests/drilling_cross_rapids.rs     |   1 +
+ crates/app/tests/fixtures.rs                  |   1 +
+ crates/app/tests/model_fidelity.rs            | 336 ++++++++++++++++++
+ crates/app/tests/posed_contact.rs             |   1 +
+ crates/app/tests/real_tip_contour.rs          |   1 +
+ crates/app/tests/slot_caps.rs                 |   1 +
+ crates/app/tests/solid_law.rs                 |   1 +
+ crates/app/tests/solid_law_goldens.rs         |   1 +
+ crates/app/tests/verify.rs                    |   2 +
+ crates/app/tests/verify_arc_reading.rs        |   1 +
+ crates/app/tests/vertical_arc_entry.rs        |   1 +
+ crates/app/tests/wall_arc_entry.rs            |   1 +
+ crates/app/tests/warned_moves.rs              |   1 +
+ crates/app/tests/whole_model_pocket.rs        |   1 +
+ crates/motion/tests/adaptive_hsm.rs           |   1 +
+ crates/motion/tests/blind_floor.rs            |   1 +
+ crates/motion/tests/center_cut_law.rs         |   1 +
+ crates/motion/tests/entry_approach.rs         |   1 +
+ crates/motion/tests/entry_arc_3d.rs           |   1 +
+ crates/motion/tests/finish3d.rs               |   1 +
+ crates/motion/tests/level_links.rs            |   1 +
+ crates/motion/tests/machining3d.rs            |   1 +
+ crates/motion/tests/offset_shells.rs          |   1 +
+ crates/motion/tests/one_descent.rs            |   1 +
+ crates/motion/tests/overhang_2d.rs            |   1 +
+ crates/motion/tests/pocket3d_hsm.rs           |   1 +
+ crates/motion/tests/real_tip.rs               |   1 +
+ crates/motion/tests/solid_law.rs              |   1 +
+ crates/motion/tests/trochoid_slot.rs          |   1 +
+ crates/motion/tests/xy_arc_entry.rs           |   1 +
+ crates/sim/src/verify/finish.rs               |   8 +-
+ crates/sim/src/verify/mod.rs                  |   2 +-
+ crates/sim/src/verify/section.rs              |   8 +-
+ crates/sim/src/verify/types.rs                |  77 ++++
+ crates/sim/tests/model_excess.rs              | 158 ++++++++
+ crates/sim/tests/overhang_laws.rs             |   4 +
+ crates/sim/tests/posed_rapids.rs              |   1 +
+ crates/sim/tests/radial_rapids.rs             |   1 +
+ crates/sim/tests/sideways_rapids.rs           |   1 +
+ crates/sim/tests/vertical_rapids.rs           |   1 +
+ crates/ui/src/egui_app/pages.rs               |  11 +
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ .../ui/src/egui_app/tests/model_fidelity.rs   |  43 +++
+ crates/ui/src/state.rs                        |  11 +-
+ docs/decisions/864-reduced-fidelity.md        | 123 +++++--
+ 74 files changed, 1283 insertions(+), 123 deletions(-)
+ create mode 100644 crates/app/src/model_fidelity.rs
+ create mode 100644 crates/app/src/operation/fidelity_law.rs
+ create mode 100644 crates/app/tests/model_fidelity.rs
+ create mode 100644 crates/sim/tests/model_excess.rs
+ create mode 100644 crates/ui/src/egui_app/tests/model_fidelity.rs
+
+diff --git a/crates/app/src/commands/delete_entity.rs b/crates/app/src/commands/delete_entity.rs
+index baca39ec4..68ce972df 100644
+--- a/crates/app/src/commands/delete_entity.rs
++++ b/crates/app/src/commands/delete_entity.rs
+@@ -14,6 +14,9 @@ pub struct DeleteEntity {
+     name: String,
+     location: Location,
+     facets: Option<std::sync::Arc<[Triangle]>>,
++    /// #864: a reduced-fidelity model comes back flagged - an undo that
++    /// dropped the flag would loosen every verdict against it.
++    coarse_mm: Option<f64>,
+     /// Non-`None` restores the `StockDef` component; `wcs` restores the
+     /// `Wcs` tag. Together with the CAM components below they keep every
+     /// kind of named entity undoable with its kind intact.
+@@ -54,6 +57,7 @@ impl DeleteEntity {
+             name: name.to_string(),
+             location: model::transform_of(world, &entity).unwrap_or_default(),
+             facets: model::facets_of(world, &entity),
++            coarse_mm: crate::model_fidelity::chord_of(world, &entity),
+             stock: model::stock_def_of(world, &entity),
+             wcs: model::is_wcs(world, &entity),
+             tool: model::tool_of(world, &entity),
+@@ -88,6 +92,7 @@ impl Command for DeleteEntity {
+         if let Some(tris) = &self.facets {
+             model::set_facets(world, &entity, tris.clone());
+         }
++        crate::model_fidelity::set(world, &entity, self.coarse_mm);
+         if let Some(shape) = &self.stock {
+             entity
+                 .entity_view(world)
+diff --git a/crates/app/src/commands/fixture.rs b/crates/app/src/commands/fixture.rs
+index 760022ca2..167ce65e5 100644
+--- a/crates/app/src/commands/fixture.rs
++++ b/crates/app/src/commands/fixture.rs
+@@ -360,6 +360,8 @@ impl Command for DeleteFixture {
+ pub struct AddFixtureModel {
+     name: String,
+     facets: std::sync::Arc<[Triangle]>,
++    /// #864: the chord error of a mesh imported coarser than promised.
++    coarse_mm: Option<f64>,
+ }
+ 
+ impl AddFixtureModel {
+@@ -381,10 +383,11 @@ impl AddFixtureModel {
+         if model::find_by_name(world, name).is_some() {
+             return Err(CommandError::NameConflict(name.to_string()));
+         }
+-        let mesh = crate::geometry::import::load_model(path)?;
++        let graded = crate::geometry::import::load_model_graded(path)?;
+         Ok(AddFixtureModel {
+             name: name.to_string(),
+-            facets: mesh.facets,
++            facets: graded.mesh.facets,
++            coarse_mm: graded.coarse_mm,
+         })
+     }
+ }
+@@ -402,6 +405,7 @@ impl Command for AddFixtureModel {
+         let entity = model::spawn(world, &self.name);
+         model::set_facets(world, &entity, self.facets.clone());
+         model::set_rev(world, &entity, 1);
++        crate::model_fidelity::set(world, &entity, self.coarse_mm);
+         entity.entity_view(world).set(FixtureDef::default());
+     }
+ 
+diff --git a/crates/app/src/commands/import_fixture.rs b/crates/app/src/commands/import_fixture.rs
+index 6486fd1de..95a1bea15 100644
+--- a/crates/app/src/commands/import_fixture.rs
++++ b/crates/app/src/commands/import_fixture.rs
+@@ -60,7 +60,7 @@ impl ImportFixture {
+             crate::plate::mount::Unmounts::default()
+         };
+         let landing = match existing {
+-            Some(_) => Landing::Update(UpdateModel::new(world, &name, import.mesh)?),
++            Some(_) => Landing::Update(UpdateModel::new(world, &name, import.mesh)?.with_fidelity(import.coarse_mm)),
+             None => Landing::Fresh(import),
+         };
+         Ok(ImportFixture {
+diff --git a/crates/app/src/commands/import_model.rs b/crates/app/src/commands/import_model.rs
+index 75df6bb58..3d1bdb23f 100644
+--- a/crates/app/src/commands/import_model.rs
++++ b/crates/app/src/commands/import_model.rs
+@@ -12,6 +12,9 @@ use crate::model;
+ pub struct ImportModel {
+     pub name: String,
+     pub mesh: Mesh,
++    /// The chord error of a mesh imported coarser than the STEP importer
++    /// promises (#864); `None` at full fidelity. It lands with the mesh.
++    pub coarse_mm: Option<f64>,
+ }
+ 
+ impl ImportModel {
+@@ -27,21 +30,35 @@ impl ImportModel {
+             }
+             _ => {}
+         }
+-        let mesh = import::load_model(path)?;
++        let graded = import::load_model_graded(path)?;
+         let name = path
+             .file_stem()
+             .and_then(|s| s.to_str())
+             .unwrap_or("model")
+             .to_string();
+-        Ok(Self::from_mesh(&name, mesh))
++        Ok(Self::from_mesh(&name, graded.mesh).with_fidelity(graded.coarse_mm))
+     }
+ 
+     pub fn from_mesh(name: &str, mesh: Mesh) -> Self {
+         ImportModel {
+             name: name.to_string(),
+             mesh,
++            coarse_mm: None,
+         }
+     }
++
++    /// The same import under another name - mesh and fidelity together.
++    #[must_use]
++    pub fn renamed(self, name: &str) -> Self {
++        ImportModel { name: name.to_string(), ..self }
++    }
++
++    /// State the fidelity the mesh was imported at (#864).
++    #[must_use]
++    pub fn with_fidelity(mut self, coarse_mm: Option<f64>) -> Self {
++        self.coarse_mm = coarse_mm;
++        self
++    }
+ }
+ 
+ impl Command for ImportModel {
+@@ -59,6 +76,7 @@ impl Command for ImportModel {
+         // counts from there. ImportModel only ever spawns - a same-named
+         // re-import is routed to UpdateModel by the caller, never here.
+         model::set_rev(world, &entity, 1);
++        crate::model_fidelity::set(world, &entity, self.coarse_mm);
+     }
+ 
+     fn invert(&self, world: &World) {
+diff --git a/crates/app/src/commands/repair_model.rs b/crates/app/src/commands/repair_model.rs
+index babebd5c7..ad173bc7f 100644
+--- a/crates/app/src/commands/repair_model.rs
++++ b/crates/app/src/commands/repair_model.rs
+@@ -71,7 +71,7 @@ impl RepairModel {
+                 report.vertices_after, report.triangles_after
+             )));
+         }
+-        let inner = UpdateModel::new(world, name, report.mesh.clone())?;
++        let inner = UpdateModel::new(world, name, report.mesh.clone())?.keeping_fidelity();
+         Ok(RepairModel {
+             name: name.to_string(),
+             weld_tol,
+diff --git a/crates/app/src/commands/update_model.rs b/crates/app/src/commands/update_model.rs
+index c05a0bd76..5225cb92a 100644
+--- a/crates/app/src/commands/update_model.rs
++++ b/crates/app/src/commands/update_model.rs
+@@ -54,6 +54,10 @@ pub struct UpdateModel {
+     /// model at construction (`Some`) - the propagation law's side of the
+     /// snapshot, so undo trades model and material back together.
+     prev_stock: Option<std::sync::Arc<[crate::geometry::Triangle]>>,
++    /// The fidelity of the new mesh and of the one it replaces (#864): the
++    /// flag describes the facets, so it is traded with them, both ways.
++    coarse_mm: Option<f64>,
++    prev_coarse_mm: Option<f64>,
+ }
+ 
+ impl UpdateModel {
+@@ -86,9 +90,28 @@ impl UpdateModel {
+             prev_facets: model::facets_of(world, &entity),
+             prev_rev: model::rev_of(world, &entity),
+             prev_stock,
++            coarse_mm: None,
++            prev_coarse_mm: crate::model_fidelity::chord_of(world, &entity),
+         })
+     }
+ 
++    /// State the fidelity the new mesh was imported at (#864). Unstated,
++    /// the update lands at full fidelity - a generated or STL mesh.
++    #[must_use]
++    pub fn with_fidelity(mut self, coarse_mm: Option<f64>) -> Self {
++        self.coarse_mm = coarse_mm;
++        self
++    }
++
++    /// Keep the fidelity the model already carries (#864): for an update
++    /// that reshapes the same facets (a repair), which makes them no
++    /// truer to the surface they were imported from.
++    #[must_use]
++    pub fn keeping_fidelity(mut self) -> Self {
++        self.coarse_mm = self.prev_coarse_mm;
++        self
++    }
++
+     /// What moved between the two revisions this command trades. Computed
+     /// on demand (the message wants it once, at import); cached Features
+     /// make both sides cheap after the first call anywhere.
+@@ -110,6 +133,7 @@ impl Command for UpdateModel {
+             .unwrap_or_else(|| model::spawn(world, &self.name));
+         model::set_facets(world, &entity, self.mesh.facets.clone());
+         model::set_rev(world, &entity, self.prev_rev + 1);
++        crate::model_fidelity::set(world, &entity, self.coarse_mm);
+         // Propagation (M3.1 B): the derived stock's copy is local-frame
+         // facets - the very mesh above (SetStock's copy law) - and the
+         // stock's own placement is never touched: re-importing a model
+@@ -134,6 +158,7 @@ impl Command for UpdateModel {
+                 }
+             }
+             model::set_rev(world, &entity, self.prev_rev);
++            crate::model_fidelity::set(world, &entity, self.prev_coarse_mm);
+         }
+         if let Some(tris) = &self.prev_stock {
+             for stock in stock_copies(world, &self.name) {
+diff --git a/crates/app/src/fixture.rs b/crates/app/src/fixture.rs
+index f3d380291..0560e8999 100644
+--- a/crates/app/src/fixture.rs
++++ b/crates/app/src/fixture.rs
+@@ -148,14 +148,28 @@ pub fn boxes_for(world: &World, declared: Option<&str>) -> Vec<FixtureBox> {
+ pub fn named_boxes_for(world: &World, declared: Option<&str>) -> Vec<(String, FixtureBox)> {
+     let mut out: Vec<(String, FixtureBox)> = tagged(world, declared)
+         .into_iter()
+-        .filter_map(|(name, e)| {
+-            model::entity_world_aabb(world, &e).map(|b| (name, FixtureBox { min: b.min, max: b.max }))
+-        })
++        .filter_map(|(name, e)| steel_box(world, &e).map(|b| (name, b)))
+         .collect();
+     out.extend(table_box(world, declared).map(|b| (MACHINE_TABLE.to_string(), b)));
+     out
+ }
+ 
++/// One tagged model's collision box: its world AABB - grown on every
++/// side by its chord error when it was imported coarser than the STEP
++/// importer promises (#864). The mesh's vertices lie on the true steel,
++/// so a curved face can stand that far outside the box of its facets.
++fn steel_box(world: &World, e: &Entity) -> Option<FixtureBox> {
++    let b = model::entity_world_aabb(world, e)?;
++    // Full fidelity: the box itself, bit for bit (no `+ 0.0`).
++    let Some(g) = crate::model_fidelity::chord_of(world, e) else {
++        return Some(FixtureBox { min: b.min, max: b.max });
++    };
++    Some(FixtureBox {
++        min: Point3::new(b.min.x - g, b.min.y - g, b.min.z - g),
++        max: Point3::new(b.max.x + g, b.max.y + g, b.max.z + g),
++    })
++}
++
+ /// [`boxes_for`] split by whether the steel turns with the part (M13.8
+ /// (2)): `.0` the tagged models riding the rotary (the default), `.1`
+ /// those declared fixed, then the machine table - a table never turns.
+@@ -164,8 +178,7 @@ pub fn named_boxes_for(world: &World, declared: Option<&str>) -> Vec<(String, Fi
+ pub fn workholding_for(world: &World, declared: Option<&str>) -> (Vec<FixtureBox>, Vec<FixtureBox>) {
+     let (mut turning, mut fixed) = (Vec::new(), Vec::new());
+     for (_, e) in tagged(world, declared) {
+-        let Some(b) = model::entity_world_aabb(world, &e) else { continue };
+-        let b = FixtureBox { min: b.min, max: b.max };
++        let Some(b) = steel_box(world, &e) else { continue };
+         if def_of(world, &e).is_some_and(|d| d.fixed) {
+             fixed.push(b);
+         } else {
+@@ -184,6 +197,9 @@ pub fn workholding_for(world: &World, declared: Option<&str>) -> (Vec<FixtureBox
+ pub fn meshes_for(world: &World, declared: Option<&str>) -> Vec<MeshedFixture> {
+     tagged(world, declared)
+         .into_iter()
++        // #864: a fixture imported coarser than promised is judged by its
++        // (grown) box alone - its mesh is never trusted to acquit a hit.
++        .filter(|(_, e)| crate::model_fidelity::chord_of(world, e).is_none())
+         .filter_map(|(name, e)| {
+             let b = model::entity_world_aabb(world, &e)?;
+             let tris = model::world_facets(world, &e)?;
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index f02180c09..25be2719f 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -61,24 +61,51 @@ pub enum Format {
+ /// streams: `metadata` feeds the size law, so a 10M-facet file costs its
+ /// facet buffer plus one window, never the whole disk image twice over.
+ pub fn load_model(path: &Path) -> Result<Mesh, ImportError> {
++    load_model_graded(path).map(|m| m.mesh)
++}
++
++pub fn parse_model(data: &[u8], format: Format) -> Result<Mesh, ImportError> {
++    parse_model_graded(data, format).map(|m| m.mesh)
++}
++
++/// An imported mesh and how faithfully it stands for the surfaces it was
++/// made from (#864).
++#[derive(Debug)]
++pub struct Graded {
++    pub mesh: Mesh,
++    /// `Some(mm)` when the mesh approximates its curved surfaces more
++    /// coarsely than the importer promises ([`step::CHORD_CAP`]): the
++    /// chord error it was actually made at. `None` for a mesh that met
++    /// the promise, and for STL and OBJ - those files ARE the mesh, with
++    /// no surface behind them to measure against.
++    pub coarse_mm: Option<f64>,
++}
++
++/// [`load_model`], with the fidelity the import achieved.
++pub fn load_model_graded(path: &Path) -> Result<Graded, ImportError> {
+     let format = format_from_path(path)?;
+     let meta = std::fs::metadata(path)?;
+     if meta.len() > MAX_FILE_BYTES {
+         return Err(ImportError::TooLarge);
+     }
+     if format == Format::Stl {
+-        return gate(stl::parse_file(path)?);
++        return Ok(Graded { mesh: gate(stl::parse_file(path)?)?, coarse_mm: None });
+     }
+     let data = std::fs::read(path)?;
+-    parse_model(&data, format)
++    parse_model_graded(&data, format)
+ }
+ 
+-pub fn parse_model(data: &[u8], format: Format) -> Result<Mesh, ImportError> {
+-    gate(match format {
+-        Format::Stl => stl::parse(data)?,
+-        Format::Obj => obj::parse(data)?,
+-        Format::Step => step::parse(data)?,
+-    })
++/// [`parse_model`], with the fidelity the import achieved.
++pub fn parse_model_graded(data: &[u8], format: Format) -> Result<Graded, ImportError> {
++    let (mesh, coarse_mm) = match format {
++        Format::Stl => (stl::parse(data)?, None),
++        Format::Obj => (obj::parse(data)?, None),
++        Format::Step => {
++            let (mesh, chord) = step::parse_with_chord(data)?;
++            (mesh, step::coarse(chord))
++        }
++    };
++    Ok(Graded { mesh: gate(mesh)?, coarse_mm })
+ }
+ 
+ /// Belt-and-gate: each importer checks finiteness at the parse site, and
+diff --git a/crates/app/src/geometry/import/step.rs b/crates/app/src/geometry/import/step.rs
+index a038d63a0..3da34c19c 100644
+--- a/crates/app/src/geometry/import/step.rs
++++ b/crates/app/src/geometry/import/step.rs
+@@ -43,6 +43,15 @@ const MAX_CHORD: f64 = crate::stock_sim::DEV_TOL * 0.5;
+ /// tessellated coarser than this is "reduced fidelity" (#864).
+ pub const CHORD_CAP: f64 = MAX_CHORD;
+ 
++/// The chord error of a kept mesh when it is coarser than the importer
++/// promises, else `None` (#864). A nanometre of slack: an inch or metre
++/// file's cap is divided into the file's unit and multiplied back, and
++/// that round trip must not flag a mesh that met the promise.
++#[must_use]
++pub fn coarse(chord_mm: f64) -> Option<f64> {
++    (chord_mm.is_finite() && chord_mm > CHORD_CAP + 1e-9).then_some(chord_mm)
++}
++
+ thread_local! {
+     /// Test-only override of the facet budget (#864's pins force a small
+     /// STEP fixture over budget instead of committing a huge model).
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 4240926b7..055a0f031 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -38,6 +38,8 @@ pub mod machine;
+ pub mod machined_classes;
+ pub mod mcp;
+ pub mod model;
++// #864: models imported coarser than the importer promises.
++pub mod model_fidelity;
+ pub mod operation;
+ pub mod pick;
+ pub use camcraft_post::post;
+diff --git a/crates/app/src/mcp/job.rs b/crates/app/src/mcp/job.rs
+index 184b07774..be0755a50 100644
+--- a/crates/app/src/mcp/job.rs
++++ b/crates/app/src/mcp/job.rs
+@@ -90,12 +90,17 @@ pub(super) fn get_job(env: &mut Env, _a: &Map<String, Value>) -> Result<Value, S
+         .iter()
+         .filter(|(_, e)| !model::is_stock(w, e))
+         .map(|(n, e)| {
+-            json!({
++            let mut m = json!({
+                 "name": n,
+                 "facets": model::facets_of(w, e).map_or(0, |f| f.len()),
+                 "bounds": model::entity_world_aabb(w, e).as_ref().map(aabb),
+                 "fixture": model::is_fixture(w, e),
+-            })
++            });
++            // #864: only a model imported coarser than promised says so.
++            if let Some(chord) = crate::model_fidelity::chord_of(w, e) {
++                m["reduced_fidelity"] = crate::model_fidelity::facts(w, chord);
++            }
++            m
+         })
+         .collect();
+     let tools: Vec<Value> = model::named_entities(w)
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 6070eb1ed..6f57a42c5 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -23,8 +23,8 @@ pub(super) struct Tool {
+ const TOOLS: &[Tool] = &[
+     Tool { name: "open_project", description: "Open a .camproj project file, replacing the current document and clearing undo history.", schema: s_path, run: open_project },
+     Tool { name: "save_project", description: "Save the document as a .camproj file. Without a path, saves over the file last opened or saved.", schema: s_opt_path, run: save_project },
+-    Tool { name: "import_model", description: "Import a mesh model (STL, STEP or OBJ) through the app's importers. A name already used by a model updates that model.", schema: s_import, run: import_model },
+-    Tool { name: "get_job", description: "The whole document as JSON: setups, stock, work offsets, models, tools, and operations with their parameters and status.", schema: s_empty, run: job::get_job },
++    Tool { name: "import_model", description: "Import a mesh model (STL, STEP or OBJ) through the app's importers. A name already used by a model updates that model. A STEP model too large to import at full detail answers with reduced_fidelity: how closely its surfaces are approximated, in mm - gouge checks against it are stricter, and its operations are refused at the post when it is too coarse to check.", schema: s_import, run: import_model },
++    Tool { name: "get_job", description: "The whole document as JSON: setups, stock, work offsets, models (one imported at reduced fidelity carries reduced_fidelity), tools, and operations with their parameters and status.", schema: s_empty, run: job::get_job },
+     Tool { name: "list_operation_types", description: "Every operation kind with its parameter fields, JSON types and default values, and the tool kinds it accepts.", schema: s_empty, run: job::list_operation_types },
+     Tool { name: "list_tool_catalog", description: "The built-in tool catalog: names and definitions add_tool can copy into the document.", schema: s_empty, run: job::list_tool_catalog },
+     Tool { name: "add_tool", description: "Add a tool to the document, from the catalog by name or from a full definition (the shape get_job shows).", schema: s_add_tool, run: edit::add_tool },
+diff --git a/crates/app/src/model_fidelity.rs b/crates/app/src/model_fidelity.rs
+new file mode 100644
+index 000000000..193d550fe
+--- /dev/null
++++ b/crates/app/src/model_fidelity.rs
+@@ -0,0 +1,188 @@
++//! Reduced-fidelity models (#864): a STEP model whose kept mesh is coarser
++//! than the importer promises - the flag, what the gouge verdicts do about
++//! it, and the program gate's refusal once they cannot be honest.
++//!
++//! Provenance: our own design (maintainer decision on #864). A facet of a
++//! curved wall is a chord of the true surface and stands inside it by its
++//! sagitta (elementary geometry), so against the mesh a convex wall looks
++//! farther from the tool than the real one is. No vendor material consulted.
++//!
++//! ## The law here
++//!
++//! - A model carries [`ReducedFidelity`] exactly when its import kept a
++//!   chord error above `step::CHORD_CAP`. Its EXCESS is that error less
++//!   the cap: how much more a verdict against the mesh can forgive than
++//!   the same verdict against a model that met the promise.
++//! - While a verdict tolerance less the excess stays positive, the gouge
++//!   laws judge with that smaller tolerance (`VerifyContext::model_excess`
++//!   at generation, [`verdict_tol`] for the program sim): stricter, never
++//!   looser. False gouges on a concave wall are the safe side.
++//! - Once the excess uses a whole tolerance, a tightened law would convict
++//!   every exactly finished flat face - a misleading verdict. The laws
++//!   then read untightened and [`gate_problems`] refuses the operation by
++//!   name at the post; the program sim does not judge at all.
++//! - A kind whose own gouge laws do not read the excess yet
++//!   (`operation::fidelity_law::excess_aware`) is refused on any reduced
++//!   model: a refusal is the only verdict that cannot be looser.
++
++use flecs_ecs::core::EntityViewGet;
++use flecs_ecs::prelude::{Entity, World};
++
++use crate::geometry::import::step;
++use crate::model;
++use crate::operation::{fidelity_law, SrcRef};
++use crate::schema::{Operation, ReducedFidelity};
++use crate::stock::StockShape;
++use crate::stock_sim::DEV_TOL;
++use crate::verify::excess_floor;
++
++/// What every refusal here says, in the user's words.
++pub const TOO_COARSE: &str = "imported too coarsely to verify; re-import with a larger budget";
++
++/// The chord error a reduced-fidelity model was imported at, mm; `None`
++/// for a model at full fidelity. A stored value that is not a coarse
++/// chord (a hand-edited file) reads as none.
++#[must_use]
++pub fn chord_of(world: &World, entity: &Entity) -> Option<f64> {
++    entity.entity_view(world).try_get::<&ReducedFidelity>(|r| r.chord_mm).and_then(step::coarse)
++}
++
++/// Write or clear the flag. For the import/update commands, their undo
++/// and the project loader only - it describes the facets it lands with.
++pub fn set(world: &World, entity: &Entity, coarse_mm: Option<f64>) {
++    let view = entity.entity_view(world);
++    match coarse_mm.and_then(step::coarse) {
++        Some(chord_mm) => {
++            view.set(ReducedFidelity { chord_mm });
++        }
++        None => {
++            view.remove(world.component::<ReducedFidelity>());
++        }
++    }
++}
++
++/// The reduced-fidelity model behind the entity `name`: itself, or - for
++/// a stock that is a copy of a model - the model it copies (same facets).
++fn coarse_source(world: &World, name: &str) -> Option<(String, f64)> {
++    let entity = model::find_by_name(world, name)?;
++    if let Some(c) = chord_of(world, &entity) {
++        return Some((name.to_string(), c));
++    }
++    let Some(StockShape::FromModel { source }) = model::stock_def_of(world, &entity) else {
++        return None;
++    };
++    let src = model::find_by_name(world, &source)?;
++    chord_of(world, &src).map(|c| (source, c))
++}
++
++/// How much of a verdict tolerance the named entity's mesh has used up,
++/// mm: its chord error less the cap, 0 at full fidelity.
++#[must_use]
++pub fn excess_of(world: &World, name: &str) -> f64 {
++    coarse_source(world, name).map_or(0.0, |(_, c)| excess(c))
++}
++
++/// A coarse chord error's excess over the importer's promise.
++#[must_use]
++pub fn excess(chord_mm: f64) -> f64 {
++    (chord_mm - step::CHORD_CAP).max(0.0)
++}
++
++/// The plain-words line the model page and the import report show.
++#[must_use]
++pub fn summary(world: &World, chord_mm: f64) -> String {
++    format!("Reduced fidelity: surfaces are approximated to within {}", within(world, chord_mm))
++}
++
++/// The same facts for MCP and the script API: the achieved error in mm,
++/// the importer's promise, and the sentence a person would be shown.
++#[must_use]
++pub fn facts(world: &World, chord_mm: f64) -> serde_json::Value {
++    serde_json::json!({
++        "approximation_mm": chord_mm,
++        "promised_mm": step::CHORD_CAP,
++        "note": format!(
++            "{}. Gouge checks against this model are stricter; if it is too coarse to check, its operations are refused at the post. Re-import with a larger budget to clear this.",
++            summary(world, chord_mm)
++        ),
++    })
++}
++
++/// "0.012 mm" in the document's unit.
++fn within(world: &World, chord_mm: f64) -> String {
++    let u = crate::units::of(world);
++    format!("{} {}", crate::units::len(chord_mm, u, 3), u.suffix())
++}
++
++/// The coarsest model an operation is judged against, by name: the
++/// entities its source names (the setup's stock, one entity, or every
++/// entity of a selection).
++fn op_coarse(world: &World, op: &Operation) -> Option<(String, f64)> {
++    let names: Vec<String> = match &op.src {
++        SrcRef::Stock => vec![crate::setup::stock_entity_name(world, op.setup.as_deref())],
++        SrcRef::Entity(n) => vec![n.clone()],
++        SrcRef::Selection(items) => items.iter().map(|g| g.entity.clone()).collect(),
++    };
++    names
++        .iter()
++        .filter_map(|n| coarse_source(world, n))
++        .max_by(|a, b| a.1.total_cmp(&b.1))
++}
++
++/// Why `op` cannot be verified against the model it is judged on, or
++/// `None` when it can (full fidelity, or tightened verdicts).
++#[must_use]
++pub fn op_problem(world: &World, name: &str, op: &Operation) -> Option<String> {
++    let (model, chord) = op_coarse(world, op)?;
++    let said = format!("surfaces are approximated to within {}", within(world, chord));
++    if !fidelity_law::excess_aware(&op.params) {
++        return Some(format!(
++            "{name}: model '{model}' was imported at reduced fidelity ({said}) and this kind of operation cannot be verified against it; re-import with a larger budget"
++        ));
++    }
++    excess_floor(fidelity_law::floor_of(&op.params), excess(chord))
++        .is_none()
++        .then(|| format!("{name}: model '{model}' was {TOO_COARSE} ({said})"))
++}
++
++/// The program gate's clause: one line per operation of the program that
++/// cannot be verified against its model, else one for the program when a
++/// part is too coarse for the program verdict. A program the post would
++/// refuse anyway (a stale op) is that refusal's to name.
++#[must_use]
++pub fn gate_problems(world: &World) -> Vec<String> {
++    let Ok(ops) = crate::posting::program_ops(world) else {
++        return Vec::new();
++    };
++    let mut out: Vec<String> = ops
++        .iter()
++        .filter_map(|(name, e)| op_problem(world, name, &model::operation_of(world, e)?))
++        .collect();
++    // A part no operation names is still what the program verdict is read
++    // against: when it is too coarse for that verdict, the program is
++    // refused rather than posted without it.
++    if out.is_empty()
++        && let Err(why) = verdict_tol(world)
++    {
++        out.push(why);
++    }
++    out
++}
++
++/// The program sim's verdict tolerance for this document: `DEV_TOL`, less
++/// the worst excess among the parts the verdict is read against. `Err`
++/// names the model once nothing honest is left - the sim then judges
++/// nothing rather than paint a misleading map.
++pub fn verdict_tol(world: &World) -> Result<f64, String> {
++    let worst = model::model_entities(world)
++        .into_iter()
++        .filter(|(_, e)| !model::is_fixture(world, e))
++        .filter_map(|(n, e)| chord_of(world, &e).map(|c| (n, c)))
++        .max_by(|a, b| a.1.total_cmp(&b.1));
++    let Some((name, chord)) = worst else {
++        return Ok(DEV_TOL);
++    };
++    excess_floor(DEV_TOL, excess(chord)).ok_or_else(|| {
++        format!("model '{name}' was {TOO_COARSE} (surfaces are approximated to within {})", within(world, chord))
++    })
++}
+diff --git a/crates/app/src/operation/fidelity_law.rs b/crates/app/src/operation/fidelity_law.rs
+new file mode 100644
+index 000000000..6a0759c70
+--- /dev/null
++++ b/crates/app/src/operation/fidelity_law.rs
+@@ -0,0 +1,95 @@
++//! What an operation kind's gouge verdicts need of its model's fidelity
++//! (#864): the tolerance its envelope law is judged at, the smallest
++//! tolerance any of its gouge laws holds, and whether those laws read a
++//! coarse model's excess at all.
++//!
++//! Provenance: our own registry of our own verify laws; `finish_tol_of`
++//! is the envelope budget `generate` always handed to `verify`, moved
++//! here unchanged so the program gate reads the same number.
++
++use super::material::GOUGE_TOL;
++use super::{OpParams, Section};
++use crate::verify::Mode;
++
++/// The envelope law's budget for `params`: the op's own tolerance for the
++/// kinds that law judges, `None` for every other kind.
++pub(crate) fn finish_tol_of(params: &OpParams) -> Option<f64> {
++    match params {
++        OpParams::Finish3D { tolerance, .. }
++        | OpParams::Contour5D { tolerance, .. }
++        | OpParams::Parallel5D { tolerance, .. }
++        | OpParams::Swarf { tolerance, .. }
++        | OpParams::AdvancedSwarf { tolerance, .. }
++        | OpParams::RotaryContour { tolerance, .. }
++        | OpParams::RotaryParallel { tolerance, .. }
++        // The rough ladder's tolerance is exactly this
++        // law's budget - its only reading (E2), and
++        // the stamped ladder reads it the same way
++        // (E3): the positions are the pocket's, the
++        // verdict measures them under the pose.
++        | OpParams::RotaryOffset { tolerance, .. }
++        | OpParams::MultiAxisRough { tolerance, .. }
++        // Flow is the finish's law on turning lines:
++        // the tolerance is the envelope budget, as
++        // always in this group (M5.1 I). The
++        // drive-curve contour reads it the same way -
++        // its ONLY reading, the path itself comes from
++        // the picks (M5.1 J).
++        | OpParams::Flow5D { tolerance, .. }
++        | OpParams::MultiAxisContour { tolerance, .. }
++        // Facing reads it the same way - its ONLY
++        // reading: the stations come from the
++        // profile, the budget judges them (M5.2 A).
++        // The profile kinds read it TWICE (the
++        // kernel chords its ride at it) and stand
++        // before this same budget (M5.2 B).
++        | OpParams::Facing { tolerance, .. }
++        | OpParams::ProfileRough { tolerance, .. }
++        | OpParams::ProfileFinish { tolerance, .. }
++        // The contour rides read it the same way the
++        // profile kinds do - TWICE: the kernel chords
++        // the ride at it, the door judges the promised
++        // line at it, and the envelope scan measures
++        // the same skin under this budget (M5.2 E).
++        // Without it the verdict cannot measure, and
++        // an unmeasurable Envelope op refuses.
++        | OpParams::Chamfering { tolerance, .. }
++        | OpParams::TaperTurning { tolerance, .. }
++        // The boring bar reads it the contour twins'
++        // way - TWICE, and from the inside: the
++        // kernel chords the wall and the center curve
++        // at quarters of it, and the envelope scan
++        // measures the ride against the same
++        // promise (M5.2 F).
++        | OpParams::BoringTurning { tolerance, .. }
++        | OpParams::MultiPassTurning { tolerance, .. } => Some(*tolerance),
++        _ => None,
++    }
++}
++
++/// The smallest tolerance a gouge law of this kind is held at: the
++/// section and solid laws' `GOUGE_TOL`, and the envelope law's own budget
++/// where the kind carries one. A coarse model's excess must leave all of
++/// them positive, or the operation is refused instead of judged.
++pub(crate) fn floor_of(params: &OpParams) -> f64 {
++    finish_tol_of(params).map_or(GOUGE_TOL, |t| t.min(GOUGE_TOL))
++}
++
++/// Whether every gouge law that judges this kind reads a coarse model's
++/// excess: the upright mill kinds, whose verdict is `verify`'s section
++/// law (b), solid law (b2 - `generate::contain_into` for the containment
++/// kinds) and envelope law (f), plus the lathe's axial hole verdict.
++///
++/// Not yet: the cone and engrave rides (their verdict is the generator's
++/// own construction law), the cross drill (`cross_part`), the multi-axis
++/// and rotary kinds (the stamp, lean and radial field laws), turning
++/// (the meridian scans) and plasma. On a reduced-fidelity model those are
++/// refused at the program gate rather than judged loosely.
++pub(crate) fn excess_aware(params: &OpParams) -> bool {
++    let info = params.kind().info();
++    let upright_mill = matches!(info.section, Section::Mill2D | Section::Mill3D | Section::Drilling);
++    let judged = matches!(info.mode, Mode::Area | Mode::Boundary)
++        || (info.mode == Mode::Envelope && info.section == Section::Mill3D);
++    let cross_drill = matches!(params, OpParams::Drill { cross, .. } if !cross.is_empty());
++    upright_mill && judged && !cross_drill
++}
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 6b3ffe233..2a9df9e03 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -196,6 +196,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+         facets: f.local_facets(&material.facets),
+         top: material.top - oz,
+         bodies: material.bodies.clone(),
++        excess: material.excess,
+     });
+     let m_gen = material_local.as_ref().unwrap_or(&material);
+ 
+@@ -2794,61 +2795,13 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     // shank, so they carry their tolerance the same way
+                     // (the ball's path is identical; the envelope scan
+                     // never sees the difference).
+-                    finish_tol: match &params {
+-                        OpParams::Finish3D { tolerance, .. }
+-                        | OpParams::Contour5D { tolerance, .. }
+-                        | OpParams::Parallel5D { tolerance, .. }
+-                        | OpParams::Swarf { tolerance, .. }
+-                        | OpParams::AdvancedSwarf { tolerance, .. }
+-                        | OpParams::RotaryContour { tolerance, .. }
+-                        | OpParams::RotaryParallel { tolerance, .. }
+-                        // The rough ladder's tolerance is exactly this
+-                        // law's budget - its only reading (E2), and
+-                        // the stamped ladder reads it the same way
+-                        // (E3): the positions are the pocket's, the
+-                        // verdict measures them under the pose.
+-                        | OpParams::RotaryOffset { tolerance, .. }
+-                        | OpParams::MultiAxisRough { tolerance, .. }
+-                        // Flow is the finish's law on turning lines:
+-                        // the tolerance is the envelope budget, as
+-                        // always in this group (M5.1 I). The
+-                        // drive-curve contour reads it the same way -
+-                        // its ONLY reading, the path itself comes from
+-                        // the picks (M5.1 J).
+-                        | OpParams::Flow5D { tolerance, .. }
+-                        | OpParams::MultiAxisContour { tolerance, .. }
+-                        // Facing reads it the same way - its ONLY
+-                        // reading: the stations come from the
+-                        // profile, the budget judges them (M5.2 A).
+-                        // The profile kinds read it TWICE (the
+-                        // kernel chords its ride at it) and stand
+-                        // before this same budget (M5.2 B).
+-                        | OpParams::Facing { tolerance, .. }
+-                        | OpParams::ProfileRough { tolerance, .. }
+-                        | OpParams::ProfileFinish { tolerance, .. }
+-                        // The contour rides read it the same way the
+-                        // profile kinds do - TWICE: the kernel chords
+-                        // the ride at it, the door judges the promised
+-                        // line at it, and the envelope scan measures
+-                        // the same skin under this budget (M5.2 E).
+-                        // Without it the verdict cannot measure, and
+-                        // an unmeasurable Envelope op refuses.
+-                        | OpParams::Chamfering { tolerance, .. }
+-                        | OpParams::TaperTurning { tolerance, .. }
+-                        // The boring bar reads it the contour twins'
+-                        // way - TWICE, and from the inside: the
+-                        // kernel chords the wall and the center curve
+-                        // at quarters of it, and the envelope scan
+-                        // measures the ride against the same
+-                        // promise (M5.2 F).
+-                        | OpParams::BoringTurning { tolerance, .. }
+-                        | OpParams::MultiPassTurning { tolerance, .. } => Some(*tolerance),
+-                        _ => None,
+-                    },
++                    finish_tol: super::fidelity_law::finish_tol_of(&params),
+                     // Steel runs against the path below, under the
+                     // post gate's workholding laws (M13.8 owed).
+                     fixtures: &[],
+                     spindle: None,
++                    // #864: a source imported coarser than promised.
++                    model_excess: material.excess,
+                 },
+                 // The picks' touching bodies, read as their union
+                 // (M13.11); empty for one body.
+@@ -2988,14 +2941,15 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // own recognized bore - width, floor and existence, by
+             // name at the cycle's first move.
+             if lathe_axial {
+-                warns.extend(drilling::axial_warnings(&material.facets, &path, d, GOUGE_TOL));
++                let tol = verify::excess_floor(GOUGE_TOL, material.excess).unwrap_or(GOUGE_TOL);
++                warns.extend(drilling::axial_warnings(&material.facets, &path, d, tol));
+             }
+             // The containment kinds' solid law (their verify runs without
+             // the model - exact rims): the tool's own tip and stack swept
+             // along every move against the part solid. The Section kinds
+             // answer the same law inside `verify` (b2), real tip (M13.7).
+             if depth_law == DepthLaw::Contain {
+-                contain_into(&mut warns, &path, &material.facets, &tool, depth_law, stl);
++                contain_into(&mut warns, &path, &material.facets, &tool, depth_law, stl, material.excess);
+             }
+             // The rotary kinds' bands and rapids (M13): `Mode::Rotary`
+             // stood the vertical-column laws down; the radial field
+@@ -3098,6 +3052,8 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     // Steel runs against the world path below.
+                     fixtures: &[],
+                     spindle: None,
++                    // #864: a source imported coarser than promised.
++                    model_excess: material.excess,
+                 },
+                 &m_gen.bodies,
+             );
+@@ -3106,7 +3062,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // along every move against the part solid. The Section kinds
+             // answer the same law inside `verify` (b2), real tip (M13.7).
+             if depth_law == DepthLaw::Contain {
+-                contain_into(&mut warns, &path, &m_gen.facets, &tool, depth_law, stl);
++                contain_into(&mut warns, &path, &m_gen.facets, &tool, depth_law, stl, material.excess);
+             }
+             warns.extend(workholding_warnings(
+                 &path_world,
+@@ -3239,10 +3195,12 @@ fn contain_into(
+     tool: &crate::tools::Tool,
+     law: DepthLaw,
+     stl: f64,
++    excess: f64,
+ ) {
+     let law = verify::SolidLaw {
+         step: CONTAIN_STEP,
+-        allow: GOUGE_TOL + (-stl).max(0.0),
++        // #864: less a coarse model's excess, while that is honest.
++        allow: verify::excess_floor(GOUGE_TOL, excess).unwrap_or(GOUGE_TOL) + (-stl).max(0.0),
+         hole_walls: law == DepthLaw::Contain,
+     };
+     for w in verify::solid_hits(path, facets, &verify::Cutter::of(tool), &law) {
+diff --git a/crates/app/src/operation/material.rs b/crates/app/src/operation/material.rs
+index 4d20cb87c..3a7925652 100644
+--- a/crates/app/src/operation/material.rs
++++ b/crates/app/src/operation/material.rs
+@@ -49,6 +49,10 @@ pub(super) struct Material {
+     /// so two models butted face to face are one solid, not a
+     /// non-manifold refusal. Empty for one body - the plain read.
+     pub(super) bodies: Vec<std::ops::Range<usize>>,
++    /// How much coarser than the importer's promise the source mesh is,
++    /// mm (#864, `model_fidelity`): the worst of the entities read. 0 for
++    /// every model that met it - the gouge laws then read as always.
++    pub(super) excess: f64,
+ }
+ 
+ /// The world facets an operation's generator stands in - exactly
+@@ -78,6 +82,7 @@ pub(super) fn material_of(
+             let mut top = f64::NEG_INFINITY;
+             let mut seen: Vec<&str> = Vec::new();
+             let mut bodies = Vec::new();
++            let mut excess = 0.0f64;
+             for g in items {
+                 if seen.contains(&g.entity.as_str()) {
+                     continue;
+@@ -89,6 +94,7 @@ pub(super) fn material_of(
+                     &g.entity,
+                     &format!("the selection names '{}', which is gone", g.entity),
+                 )?;
++                excess = excess.max(m.excess);
+                 let start = facets.len();
+                 facets.extend(m.facets);
+                 if facets.len() > start {
+@@ -97,6 +103,7 @@ pub(super) fn material_of(
+                 top = top.max(m.top);
+             }
+             let mut m = usable(facets, top, "the selection")?;
++            m.excess = excess;
+             // Two or more bodies: each is read as its own solid and the
+             // planes are united; one body keeps the plain read.
+             if bodies.len() > 1 {
+@@ -188,7 +195,9 @@ pub(super) fn named_material(world: &World, setup: Option<&str>, name: &str, gon
+     let top = crate::setup_align::entity_aabb_in(world, &entity, setup)
+         .map(|b| b.max.z)
+         .unwrap_or(f64::NAN);
+-    usable(facets, top, name)
++    let mut m = usable(facets, top, name)?;
++    m.excess = crate::model_fidelity::excess_of(world, name);
++    Ok(m)
+ }
+ 
+ /// The shared sanity gate: every vertex finite, a real top.
+@@ -202,7 +211,7 @@ pub(super) fn usable(facets: Vec<Triangle>, top: f64, label: &str) -> Result<Mat
+             "'{label}' has no usable geometry to machine"
+         )));
+     }
+-    Ok(Material { facets, top, bodies: Vec::new() })
++    Ok(Material { facets, top, bodies: Vec::new(), excess: 0.0 })
+ }
+ 
+ pub(super) fn from_slice(e: SliceError) -> GenError {
+diff --git a/crates/app/src/operation/material_region.rs b/crates/app/src/operation/material_region.rs
+index d107cc931..33a4e2c81 100644
+--- a/crates/app/src/operation/material_region.rs
++++ b/crates/app/src/operation/material_region.rs
+@@ -145,6 +145,7 @@ fn region_turn_core(
+         .map(|(r, t)| (r, t, None)),
+         Some(f) => {
+             let local = Material {
++                excess: material.excess,
+                 facets: f.local_facets(&material.facets),
+                 top: material.top - f.origin.z,
+                 bodies: material.bodies.clone(),
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 413436f3b..66024c8f2 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -149,6 +149,8 @@ pub(crate) mod spindle_law;
+ pub use spindle_law::{spindle_reading, SpindleReading, SPINDLE_TOL};
+ mod rotary_gate;
+ mod air_law;
++// #864: what a kind's gouge laws need of its model's fidelity.
++pub(crate) mod fidelity_law;
+ mod top_stock;
+ pub use top_stock::TOP_STOCK_WARNING;
+ mod turning_credit;
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index 6eb2f3ebf..eca5702b6 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -625,6 +625,12 @@ pub fn verification_gate(world: &World) -> Vec<String> {
+ pub fn verification_report(world: &World) -> GateReport {
+     let mut problems = Vec::new();
+ 
++    // The fidelity clause (#864), first: an operation judged against a
++    // model imported too coarsely to verify is refused by name - the sim
++    // below then refuses to judge it too, so no gouge verdict is read off
++    // a mesh that cannot carry one.
++    problems.extend(crate::model_fidelity::gate_problems(world));
++
+     let sim = sim_clause(world);
+     problems.extend(sim.problem);
+     // The plasma clause (#672): the 3D stock sim carves nothing for a
+diff --git a/crates/app/src/project/apply.rs b/crates/app/src/project/apply.rs
+index b0f628fb1..5c2d1c219 100644
+--- a/crates/app/src/project/apply.rs
++++ b/crates/app/src/project/apply.rs
+@@ -660,6 +660,9 @@ pub(super) fn check_and_apply(world: &World, mut file: ProjectFile) -> Result<Ve
+                 // not the file's whole history. Staleness never reads
+                 // it; the stamp's signature does the work.
+                 model::set_rev(world, &entity, dto.rev);
++                // #864: the flag lands with the facets it describes; an
++                // absent key, or a value that is no coarse chord, is none.
++                crate::model_fidelity::set(world, &entity, dto.coarse_mm);
+             }
+             EntityKind::Stock => {
+                 // validate_kind already refused these; Result, never unwrap.
+diff --git a/crates/app/src/project/entity.rs b/crates/app/src/project/entity.rs
+index 0c2b5a1a4..092e6b2d2 100644
+--- a/crates/app/src/project/entity.rs
++++ b/crates/app/src/project/entity.rs
+@@ -558,6 +558,13 @@ pub struct EntityDto {
+     /// identical to its v19 save.
+     #[serde(default, skip_serializing_if = "is_unrevised")]
+     pub rev: u64,
++    /// The chord error (mm) of a model imported coarser than the STEP
++    /// importer promises (#864, `schema::ReducedFidelity`). Absent on
++    /// every other entity, so a document without such a model - and every
++    /// file from before the key existed - saves byte for byte as it did
++    /// and loads as full fidelity.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub coarse_mm: Option<f64>,
+     /// Absent means Model; only non-model entities carry the tag.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub kind: Option<EntityKind>,
+diff --git a/crates/app/src/project/wire.rs b/crates/app/src/project/wire.rs
+index bb6a61f41..339a40c84 100644
+--- a/crates/app/src/project/wire.rs
++++ b/crates/app/src/project/wire.rs
+@@ -158,6 +158,7 @@ pub fn collect(world: &World) -> ProjectFile {
+                 // The counter moves on models and stocks (every facet
+                 // landing); everywhere else it reads 0 and omits itself.
+                 rev: model::rev_of(world, &entity),
++                coarse_mm: crate::model_fidelity::chord_of(world, &entity),
+                 kind,
+                 stock,
+                 tool,
+diff --git a/crates/app/src/schema.rs b/crates/app/src/schema.rs
+index 7e10507fa..44a2bc63b 100644
+--- a/crates/app/src/schema.rs
++++ b/crates/app/src/schema.rs
+@@ -78,6 +78,18 @@ pub struct GeoSig {
+     pub sig: u64,
+ }
+ 
++/// A model whose mesh stands for its curved surfaces more coarsely than
++/// the STEP importer promises (#864): `chord_mm` is the chord error the
++/// import actually kept, always above `step::CHORD_CAP`. Present ONLY on
++/// such a model - one that met the promise, an STL or OBJ mesh, and
++/// every model of a project saved before this existed carry no component
++/// and read as full fidelity. Written by the import and update commands
++/// and the project loader, through `model_fidelity::set`.
++#[derive(Component, Debug, Clone, Copy, PartialEq)]
++pub struct ReducedFidelity {
++    pub chord_mm: f64,
++}
++
+ /// Selection marker (tag). Only `SelectEntity` writes it (AGENTS.md: changes
+ /// go through commands); the tree and viewport read it to highlight.
+ #[derive(Component, Debug)]
+@@ -524,6 +536,7 @@ pub fn register_schema(world: &World) {
+     world.component::<Facets>();
+     world.component::<Revision>();
+     world.component::<GeoSig>();
++    world.component::<ReducedFidelity>();
+     world.component::<Selected>();
+     world.component::<StockDef>();
+     world.component::<Wcs>();
+diff --git a/crates/app/src/script/api.rs b/crates/app/src/script/api.rs
+index 840b0cd15..1de789aac 100644
+--- a/crates/app/src/script/api.rs
++++ b/crates/app/src/script/api.rs
+@@ -54,17 +54,22 @@ pub(crate) fn v_import(env: &mut Env, args: Vec<Value>) -> Result<Value, String>
+     // extension refusals (IGES needs a kernel we do not have) are
+     // ImportModel's law, not a second copy here.
+     let imp = ImportModel::new(&path).map_err(|e| e.to_string())?;
+-    let name = arg_opt(&args, 1, "a model name")?.unwrap_or(imp.name);
++    let name = arg_opt(&args, 1, "a model name")?.unwrap_or_else(|| imp.name.clone());
+     if model::find_by_name(&env.world, &name).is_some() {
+-        let cmd = UpdateModel::new(&env.world, &name, imp.mesh).map_err(|e| e.to_string())?;
++        let cmd = UpdateModel::new(&env.world, &name, imp.mesh).map_err(|e| e.to_string())?.with_fidelity(imp.coarse_mm);
+         env.history.execute(&env.world, cmd);
+     } else {
+-        env.history.execute(&env.world, ImportModel::from_mesh(&name, imp.mesh));
++        env.history.execute(&env.world, imp.renamed(&name));
+     }
+-    let facets = model::find_by_name(&env.world, &name)
+-        .and_then(|e| model::facets_of(&env.world, &e))
+-        .map_or(0, |a| a.len());
+-    Ok(json!({ "model": name, "facets": facets }))
++    let entity = model::find_by_name(&env.world, &name);
++    let facets = entity.and_then(|e| model::facets_of(&env.world, &e)).map_or(0, |a| a.len());
++    let mut out = json!({ "model": name, "facets": facets });
++    // #864: a mesh imported coarser than the importer promises says so,
++    // with the error it carries; a full-fidelity import adds nothing.
++    if let Some(chord) = entity.and_then(|e| crate::model_fidelity::chord_of(&env.world, &e)) {
++        out["reduced_fidelity"] = crate::model_fidelity::facts(&env.world, chord);
++    }
++    Ok(out)
+ }
+ 
+ /// `cam.exportTools(path)` - write the document's tools as a tool
+diff --git a/crates/app/src/stock_sim.rs b/crates/app/src/stock_sim.rs
+index 297335c3a..f81356a22 100644
+--- a/crates/app/src/stock_sim.rs
++++ b/crates/app/src/stock_sim.rs
+@@ -135,6 +135,9 @@ pub fn simulate_document(
+ ) -> Result<ProgramSim, String> {
+     let planned = plan_program(world)?;
+     refuse_unjudged(&planned)?;
++    // #864: a part imported coarser than promised tightens the verdict by
++    // its excess; one too coarse for that is refused by name, not judged.
++    let tol = crate::model_fidelity::verdict_tol(world)?;
+ 
+     // Setup changes (#317): a setup that holds the part differently, or
+     // is placed relative to the one before it, starts from the body the
+@@ -148,8 +151,8 @@ pub fn simulate_document(
+         part_facets(world)?
+     };
+     let (mut dev, display) = match walked.held {
+-        carry::Held::Plain(dex) => (deviate(&dex, &model_facets, DEV_TOL).map_err(|e| e.to_string())?, dex),
+-        carry::Held::Carried(body) => (body.deviate(&model_facets, DEV_TOL).map_err(|e| e.to_string())?, body.display()),
++        carry::Held::Plain(dex) => (deviate(&dex, &model_facets, tol).map_err(|e| e.to_string())?, dex),
++        carry::Held::Carried(body) => (body.deviate(&model_facets, tol).map_err(|e| e.to_string())?, body.display()),
+     };
+     // #303: the op owns its break - a chamfer's or deburr's declared
+     // bevel is part of the finished part, judged by its own depth.
+diff --git a/crates/app/src/stock_sim_carry.rs b/crates/app/src/stock_sim_carry.rs
+index cc1fb66be..0d5d12e3a 100644
+--- a/crates/app/src/stock_sim_carry.rs
++++ b/crates/app/src/stock_sim_carry.rs
+@@ -265,9 +265,11 @@ pub(crate) fn walk(
+ /// The verdict of the stock as held, against the parts in `frame`.
+ pub(crate) fn judge(world: &flecs_ecs::prelude::World, held: &Held, frame: Option<&str>) -> Result<Deviation, String> {
+     let facets = crate::setup_align::parts_facets_in(world, frame);
++    // #864: the same tightened tolerance the final verdict is read at.
++    let tol = crate::model_fidelity::verdict_tol(world)?;
+     match held {
+-        Held::Plain(d) => crate::stock_sim::deviate(d, &facets, crate::stock_sim::DEV_TOL),
+-        Held::Carried(b) => b.deviate(&facets, crate::stock_sim::DEV_TOL),
++        Held::Plain(d) => crate::stock_sim::deviate(d, &facets, tol),
++        Held::Carried(b) => b.deviate(&facets, tol),
+     }
+     .map_err(|e| e.to_string())
+ }
+diff --git a/crates/app/tests/blind_floor.rs b/crates/app/tests/blind_floor.rs
+index 37bbb73b2..9643686f8 100644
+--- a/crates/app/tests/blind_floor.rs
++++ b/crates/app/tests/blind_floor.rs
+@@ -213,6 +213,7 @@ fn depth_verify(t: &Toolpath, region: &Region, model: Option<&[Triangle]>, leave
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/app/tests/boundary_walls.rs b/crates/app/tests/boundary_walls.rs
+index 3ecc6537a..13368df43 100644
+--- a/crates/app/tests/boundary_walls.rs
++++ b/crates/app/tests/boundary_walls.rs
+@@ -66,6 +66,7 @@ fn judge(t: &Toolpath, model: Option<&[Triangle]>) -> Vec<Warning> {
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/app/tests/corner_blend.rs b/crates/app/tests/corner_blend.rs
+index 692cdb215..4dadbcf54 100644
+--- a/crates/app/tests/corner_blend.rs
++++ b/crates/app/tests/corner_blend.rs
+@@ -66,6 +66,7 @@ fn ctx<'a>(region: &'a Region, stock: Option<&'a Region>, tool: &'a ToolGeom, mo
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/drilling_cross_rapids.rs b/crates/app/tests/drilling_cross_rapids.rs
+index c4d2330b1..317334034 100644
+--- a/crates/app/tests/drilling_cross_rapids.rs
++++ b/crates/app/tests/drilling_cross_rapids.rs
+@@ -77,6 +77,7 @@ fn judge_on_bar_stock(t: &Toolpath) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/app/tests/fixtures.rs b/crates/app/tests/fixtures.rs
+index c1ddcd6d9..de6a3dd4f 100644
+--- a/crates/app/tests/fixtures.rs
++++ b/crates/app/tests/fixtures.rs
+@@ -136,6 +136,7 @@ fn ctx<'a>(
+         finish_tol: None,
+         fixtures,
+         spindle,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/model_fidelity.rs b/crates/app/tests/model_fidelity.rs
+new file mode 100644
+index 000000000..ffc67bea7
+--- /dev/null
++++ b/crates/app/tests/model_fidelity.rs
+@@ -0,0 +1,336 @@
++//! #864: a STEP model imported coarser than the importer promises is
++//! flagged (component, project file, MCP), its program verdict is
++//! tightened by the excess while that leaves a positive tolerance, and
++//! past that the program gate refuses its operations by name instead of
++//! emitting gouge verdicts. A model that met the promise - and a project
++//! saved before the flag existed - reads exactly as before.
++//!
++//! Gate map (#864): covers app::model_fidelity, app::operation::fidelity_law,
++//! app::geometry::import (graded imports), app::commands (import_model,
++//! update_model, repair_model, delete_entity), app::project (the
++//! `coarse_mm` key), app::posting (verification_report), app::stock_sim
++//! (simulate_document), app::mcp (import_model, get_job).
++//!
++//! Provenance: our own pins over our own laws; no vendor material.
++
++use camcraft_app::commands::{AddTool, CreateOperation, DeleteEntity, GenerateOperation, History, ImportModel, SetStock, UpdateModel};
++use camcraft_app::geometry::import::step;
++use camcraft_app::geometry::{cube, Mesh, Point3};
++use camcraft_app::mcp::Server;
++use camcraft_app::operation::{Height, HeightReference, OpParams, SrcRef};
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_sim::DEV_TOL;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++use camcraft_app::{model, model_fidelity, posting, project};
++use flecs_ecs::prelude::World;
++use serde_json::{json, Value};
++
++const MILL: &str = "EM-1000-4FL";
++/// A chord error that leaves a positive tolerance (excess 0.007 of 0.01),
++/// and one that leaves none.
++const TIGHT: f64 = 0.012;
++const TOO_COARSE: f64 = 0.03;
++
++fn step_path() -> std::path::PathBuf {
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/Milling-test.step")
++}
++
++fn brick() -> Mesh {
++    cube(Point3::new(-20.0, -10.0, 0.0), Point3::new(20.0, 10.0, 10.0))
++}
++
++fn face() -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover: 3.0,
++        clearance_z: Height::of(HeightReference::TopOfStock, 25.0),
++        cut_z: Height::of(HeightReference::TopOfStock, 0.0),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        blend_turns: false,
++    }
++}
++
++/// The brick imported at `coarse_mm`, its own stock, and a Face op that
++/// finishes its flat top exactly.
++fn faced_brick(coarse_mm: Option<f64>) -> World {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("brick", brick()).with_fidelity(coarse_mm));
++    h.execute(&world, SetStock::new(&world, StockShape::FromModel { source: "brick".into() }, Default::default()).expect("stock"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == MILL).map(|(_, t)| t).expect("catalog mill");
++    h.execute(&world, AddTool::new(&world, MILL, tool).expect("tool"));
++    h.execute(&world, CreateOperation::new(&world, "OP", MILL, SrcRef::Entity("brick".into()), face()).expect("create"));
++    h.execute(&world, GenerateOperation::new(&world, "OP").expect("generate"));
++    world
++}
++
++/// Lower every cached move by `dz` (what a generator bug would post).
++fn sink(world: &World, dz: f64) {
++    let e = model::find_by_name(world, "OP").expect("op");
++    let mut t = model::toolpath_of(world, &e).expect("cached");
++    for m in &mut t.path.moves {
++        m.from.z -= dz;
++        m.to.z -= dz;
++    }
++    e.entity_view(world).set(camcraft_app::schema::Toolpath::new(t.path, t.warnings));
++}
++
++fn gouge_line(gate: &[String]) -> Option<&String> {
++    gate.iter().find(|l| l.starts_with("gouge:"))
++}
++
++#[test]
++fn an_over_budget_step_import_is_flagged_and_one_that_fits_is_not() {
++    let path = step_path();
++    let world = new_world();
++    let mut h = History::default();
++    let full = ImportModel::new(&path).expect("imports");
++    assert_eq!(full.coarse_mm, None, "a model that fits the budget carries no flag");
++    h.execute(&world, full.renamed("full"));
++    let e = model::find_by_name(&world, "full").expect("landed");
++    assert_eq!(model_fidelity::chord_of(&world, &e), None);
++    assert_eq!(model_fidelity::excess_of(&world, "full"), 0.0);
++
++    let coarse = step::with_facet_budget(2_000, || ImportModel::new(&path)).expect("imports at reduced fidelity");
++    let chord = coarse.coarse_mm.expect("the kept mesh's own chord error rides the command");
++    assert!(chord > step::CHORD_CAP && chord.is_finite(), "{chord}");
++    h.execute(&world, coarse.renamed("coarse"));
++    let e = model::find_by_name(&world, "coarse").expect("landed");
++    assert_eq!(model_fidelity::chord_of(&world, &e), Some(chord), "the flag carries the achieved error");
++    assert!((model_fidelity::excess_of(&world, "coarse") - (chord - step::CHORD_CAP)).abs() < 1e-12);
++
++    // The flag follows the facets through every command that trades them.
++    h.undo(&world);
++    assert!(model::find_by_name(&world, "coarse").is_none());
++    h.redo(&world);
++    let flagged = |w: &World| model::find_by_name(w, "coarse").and_then(|e| model_fidelity::chord_of(w, &e));
++    assert_eq!(flagged(&world), Some(chord));
++    // An update to a full-fidelity mesh clears it; undo brings it back.
++    h.execute(&world, UpdateModel::new(&world, "coarse", brick()).expect("update"));
++    assert_eq!(flagged(&world), None);
++    h.undo(&world);
++    assert_eq!(flagged(&world), Some(chord));
++    // A reshaping update (a repair's) keeps it.
++    h.execute(&world, UpdateModel::new(&world, "coarse", brick()).expect("update").keeping_fidelity());
++    assert_eq!(flagged(&world), Some(chord));
++    // Delete and undo: the model comes back flagged.
++    h.execute(&world, DeleteEntity::new(&world, "coarse").expect("delete"));
++    assert_eq!(flagged(&world), None);
++    h.undo(&world);
++    assert_eq!(flagged(&world), Some(chord));
++    // A stock copied from it is judged as coarse as the model it copies.
++    h.execute(&world, SetStock::new(&world, StockShape::FromModel { source: "coarse".into() }, Default::default()).expect("stock"));
++    assert!(model_fidelity::excess_of(&world, "Stock") > 0.0);
++}
++
++#[test]
++fn the_round_trip_of_a_unit_scaled_cap_is_not_a_reduced_fidelity_flag() {
++    // An inch file's cap is divided into inches and multiplied back: the
++    // result may sit a float's dust above 0.005 and must not be flagged.
++    assert_eq!(step::coarse(step::CHORD_CAP), None);
++    assert_eq!(step::coarse((step::CHORD_CAP / 25.4) * 25.4), None);
++    assert_eq!(step::coarse(step::CHORD_CAP * (1.0 + 1e-12)), None);
++    assert_eq!(step::coarse(0.01), Some(0.01), "a metre file stopped at the kernel's 0.01 mm floor");
++    assert_eq!(step::coarse(f64::NAN), None);
++}
++
++#[test]
++fn an_inch_step_is_full_fidelity_and_a_metre_step_is_flagged_at_the_kernels_floor() {
++    let model = |n: &str| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models").join(n);
++    // The inch twin of the fixture meets the promise: no flag (#839's cap
++    // is unit-correct, and the unit round trip is not an excess).
++    let inch = ImportModel::new(&model("Milling-test-inch.step")).expect("the inch part imports");
++    assert_eq!(inch.coarse_mm, None);
++    // A metre file stops at the kernel's least tolerance, 1e-5 m: 0.01 mm,
++    // twice the promise. Before #864 that was a log line; now it is the
++    // same flag an over-budget model gets - with a tolerance left, so its
++    // verdicts are tightened, not refused.
++    let metre = ImportModel::new(&model("sample_ap214.step")).expect("the metre sample imports");
++    let chord = metre.coarse_mm.expect("flagged");
++    assert!((chord - 0.01).abs() < 1e-9, "{chord}");
++    let left = camcraft_app::verify::excess_floor(DEV_TOL, model_fidelity::excess(chord)).expect("a tolerance is left");
++    assert!((left - 0.005).abs() < 1e-9, "{left}");
++}
++
++#[test]
++fn a_project_keeps_the_flag_and_one_without_it_saves_back_unchanged() {
++    let dir = std::env::temp_dir();
++    let file = |tag: &str| dir.join(format!("camcraft-864-{tag}-{}.camproj", std::process::id()));
++    // A document with no reduced-fidelity model: the key never appears,
++    // so its bytes are what they were before the key existed - and a load
++    // and a second save give them back unchanged.
++    let (a, b) = (file("plain-a"), file("plain-b"));
++    project::save(&faced_brick(None), &a).expect("save");
++    let first = std::fs::read_to_string(&a).expect("read");
++    assert!(!first.contains("coarse_mm"), "a full-fidelity document writes no fidelity key");
++    let loaded = new_world();
++    project::load(&loaded, &a).expect("an older-shaped project loads");
++    let e = model::find_by_name(&loaded, "brick").expect("model");
++    assert_eq!(model_fidelity::chord_of(&loaded, &e), None, "and loads as full fidelity");
++    project::save(&loaded, &b).expect("save again");
++    assert_eq!(first, std::fs::read_to_string(&b).expect("read"), "saved back unchanged");
++
++    // A flagged model keeps its flag and its number through the file.
++    let (c, d) = (file("coarse-a"), file("coarse-b"));
++    project::save(&faced_brick(Some(TIGHT)), &c).expect("save");
++    let text = std::fs::read_to_string(&c).expect("read");
++    assert!(text.contains("\"coarse_mm\""), "the flag is in the file");
++    let loaded = new_world();
++    project::load(&loaded, &c).expect("load");
++    let e = model::find_by_name(&loaded, "brick").expect("model");
++    assert_eq!(model_fidelity::chord_of(&loaded, &e), Some(TIGHT));
++    project::save(&loaded, &d).expect("save again");
++    assert_eq!(text, std::fs::read_to_string(&d).expect("read"));
++    for p in [a, b, c, d] {
++        let _ = std::fs::remove_file(p);
++    }
++}
++
++#[test]
++fn the_program_verdict_tightens_by_the_excess_while_a_tolerance_is_left() {
++    // Full fidelity: today's verdict. A floor cut 0.006 mm too deep is
++    // inside the 0.01 mm verdict tolerance; 0.05 mm is a gouge.
++    let full = faced_brick(None);
++    assert_eq!(model_fidelity::verdict_tol(&full), Ok(DEV_TOL));
++    assert!(posting::verification_gate(&full).is_empty(), "{:?}", posting::verification_gate(&full));
++    sink(&full, 0.006);
++    assert!(posting::verification_gate(&full).is_empty(), "0.006 mm passes at full fidelity");
++    sink(&full, 0.044);
++    assert!(gouge_line(&posting::verification_gate(&full)).is_some(), "0.05 mm is a gouge at full fidelity");
++
++    // Reduced fidelity with a tolerance left: an exactly finished flat
++    // face still posts clean - and the same 0.006 mm is now convicted.
++    let tight = faced_brick(Some(TIGHT));
++    let tol = model_fidelity::verdict_tol(&tight).expect("a positive tolerance is left");
++    assert!((tol - (DEV_TOL - (TIGHT - step::CHORD_CAP))).abs() < 1e-12 && tol > 0.0, "{tol}");
++    let e = model::find_by_name(&tight, "OP").expect("op");
++    let cached = model::toolpath_of(&tight, &e).expect("cached");
++    assert!(cached.warnings.iter().all(|w| !w.blocks_post()), "the generator's tightened laws pass a flat face: {:?}", cached.warnings);
++    assert!(posting::verification_gate(&tight).is_empty(), "an exact flat face is no gouge: {:?}", posting::verification_gate(&tight));
++    sink(&tight, 0.006);
++    let gate = posting::verification_gate(&tight);
++    assert!(gouge_line(&gate).is_some(), "the tightened verdict convicts 0.006 mm: {gate:?}");
++    assert!(gate.iter().all(|l| !l.contains("too coarsely")), "no refusal while a tolerance is left: {gate:?}");
++}
++
++#[test]
++fn a_model_too_coarse_to_verify_is_refused_by_name_with_no_gouge_verdict() {
++    let world = faced_brick(Some(TOO_COARSE));
++    assert!(model_fidelity::verdict_tol(&world).is_err());
++    let refusal = "OP: model 'brick' was imported too coarsely to verify; re-import with a larger budget (surfaces are approximated to within 0.030 mm)";
++    // The exactly finished flat face: refused by name, not called a gouge.
++    let report = posting::verification_report(&world);
++    assert_eq!(report.problems, vec![refusal.to_string()], "{:?}", report.problems);
++    let said = report.not_judged.expect("the sim says it did not judge");
++    assert!(said.contains("model 'brick' was imported too coarsely to verify"), "{said}");
++    // The generator's laws read untightened there: no gouge on a flat face.
++    let e = model::find_by_name(&world, "OP").expect("op");
++    let cached = model::toolpath_of(&world, &e).expect("cached");
++    assert!(cached.warnings.iter().all(|w| !w.blocks_post()), "{:?}", cached.warnings);
++    // A path that does cut deep: still the refusal, still no gouge line.
++    sink(&world, 1.0);
++    let gate = posting::verification_gate(&world);
++    assert!(gate.contains(&refusal.to_string()), "{gate:?}");
++    assert!(gouge_line(&gate).is_none(), "no gouge verdict is read off a mesh that cannot carry one: {gate:?}");
++    // And nothing posts.
++    let out = std::env::temp_dir().join(format!("camcraft-864-{}.nc", std::process::id()));
++    let posted = posting::post_setup(&world, &out);
++    let _ = std::fs::remove_file(&out);
++    let Err(err) = posted else { panic!("the post went out past the refusal") };
++    assert!(err.contains("imported too coarsely to verify"), "{err}");
++}
++
++#[test]
++fn a_kind_whose_laws_do_not_read_the_excess_is_refused_on_any_reduced_model() {
++    // A 2D chamfer's verdict is its generator's own construction law, not
++    // yet excess-aware: on a reduced-fidelity model it is refused even
++    // where a tolerance would be left; at full fidelity it is untouched.
++    let op = |coarse: Option<f64>| {
++        let world = new_world();
++        let mut h = History::default();
++        h.execute(&world, ImportModel::from_mesh("brick", brick()).with_fidelity(coarse));
++        let chamfer = camcraft_app::operation::retype_params(&face(), camcraft_app::operation::OpType::Chamfer2D.ordinal());
++        let created = camcraft_app::schema::Operation {
++            tool: MILL.into(),
++            src: SrcRef::Entity("brick".into()),
++            params: chamfer,
++            ..model::operation_of(&faced_brick(None), &model::find_by_name(&faced_brick(None), "OP").expect("op")).expect("an op to copy")
++        };
++        model_fidelity::op_problem(&world, "CH", &created)
++    };
++    assert_eq!(op(None), None);
++    let why = op(Some(TIGHT)).expect("refused");
++    assert!(why.starts_with("CH: model 'brick' was imported at reduced fidelity (surfaces are approximated to within 0.012 mm)"), "{why}");
++    assert!(why.ends_with("re-import with a larger budget"), "{why}");
++}
++
++#[test]
++fn a_coarse_fixture_is_judged_by_a_grown_box_and_never_acquitted_by_its_mesh() {
++    use camcraft_app::fixture;
++    let steel = |coarse: Option<f64>| {
++        let world = new_world();
++        let mut h = History::default();
++        h.execute(&world, ImportModel::from_mesh("vise", brick()).with_fidelity(coarse));
++        let e = model::find_by_name(&world, "vise").expect("landed");
++        e.entity_view(&world).set(camcraft_app::schema::FixtureDef::default());
++        (fixture::boxes_for(&world, None), fixture::meshes_for(&world, None).len())
++    };
++    // Full fidelity: the mesh's own box, and the mesh may acquit.
++    let (boxes, meshes) = steel(None);
++    assert_eq!((boxes[0].min, boxes[0].max), (Point3::new(-20.0, -10.0, 0.0), Point3::new(20.0, 10.0, 10.0)));
++    assert_eq!(meshes, 1);
++    // Reduced fidelity: the box grows by the error on every side (a
++    // curved face can stand that far outside its facets) and the mesh is
++    // not offered to the law that only ever acquits.
++    let (boxes, meshes) = steel(Some(0.5));
++    assert_eq!((boxes[0].min, boxes[0].max), (Point3::new(-20.5, -10.5, -0.5), Point3::new(20.5, 10.5, 10.5)));
++    assert_eq!(meshes, 0);
++}
++
++// ---- MCP ----------------------------------------------------------------
++
++struct Client {
++    server: Server,
++    next: i64,
++}
++
++impl Client {
++    fn ok(&mut self, name: &str, args: Value) -> Value {
++        let id = self.next;
++        self.next += 1;
++        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
++        let reply = self.server.handle(&msg).expect("a request gets a response");
++        let result = &reply["result"];
++        assert!(result["isError"] != json!(true), "{name} refused: {result}");
++        result["structuredContent"].clone()
++    }
++}
++
++#[test]
++fn mcp_reports_a_reduced_fidelity_import_and_says_nothing_of_a_normal_one() {
++    let path = step_path().to_string_lossy().into_owned();
++    let mut c = Client { server: Server::new(), next: 1 };
++    let full = c.ok("import_model", json!({ "path": path, "name": "full" }));
++    assert!(full.get("reduced_fidelity").is_none(), "{full}");
++    let coarse = step::with_facet_budget(2_000, || c.ok("import_model", json!({ "path": path, "name": "coarse" })));
++    let facts = &coarse["reduced_fidelity"];
++    let mm = facts["approximation_mm"].as_f64().expect("the achieved error, in mm");
++    assert!(mm > step::CHORD_CAP, "{coarse}");
++    assert_eq!(facts["promised_mm"], json!(step::CHORD_CAP));
++    let note = facts["note"].as_str().expect("a sentence");
++    assert!(note.starts_with("Reduced fidelity: surfaces are approximated to within "), "{note}");
++    assert!(!note.contains("chord") && !note.contains("sagitta"), "plain words: {note}");
++
++    // The model read tool carries the same facts, on that model only.
++    let job = c.ok("get_job", json!({}));
++    let models = job["models"].as_array().expect("models");
++    let named = |n: &str| models.iter().find(|m| m["name"] == json!(n)).expect("listed");
++    assert!(named("full").get("reduced_fidelity").is_none());
++    assert_eq!(named("coarse")["reduced_fidelity"]["approximation_mm"], json!(mm));
++}
+diff --git a/crates/app/tests/posed_contact.rs b/crates/app/tests/posed_contact.rs
+index de986676b..338d1bcb8 100644
+--- a/crates/app/tests/posed_contact.rs
++++ b/crates/app/tests/posed_contact.rs
+@@ -119,6 +119,7 @@ fn ctx<'a>(region: &'a Region, facets: &'a [Triangle], tool: &'a ToolGeom) -> Ve
+         finish_tol: Some(TOL),
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/real_tip_contour.rs b/crates/app/tests/real_tip_contour.rs
+index 1da2e9263..b93bedc63 100644
+--- a/crates/app/tests/real_tip_contour.rs
++++ b/crates/app/tests/real_tip_contour.rs
+@@ -221,6 +221,7 @@ fn judge(path: &Toolpath, cutter: Option<Cutter>, leave: f64) -> Vec<Warning> {
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/app/tests/slot_caps.rs b/crates/app/tests/slot_caps.rs
+index 617a91f6e..23f69e252 100644
+--- a/crates/app/tests/slot_caps.rs
++++ b/crates/app/tests/slot_caps.rs
+@@ -184,6 +184,7 @@ fn judge(world: &World, path: &Toolpath) -> Vec<Warning> {
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/app/tests/solid_law.rs b/crates/app/tests/solid_law.rs
+index ab4f0091b..c964c14cd 100644
+--- a/crates/app/tests/solid_law.rs
++++ b/crates/app/tests/solid_law.rs
+@@ -288,6 +288,7 @@ fn the_solid_law_on_the_users_part_is_silent_and_cheap() {
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     );
+     let whole = t1.elapsed();
+diff --git a/crates/app/tests/solid_law_goldens.rs b/crates/app/tests/solid_law_goldens.rs
+index 75ed07e6d..498eca399 100644
+--- a/crates/app/tests/solid_law_goldens.rs
++++ b/crates/app/tests/solid_law_goldens.rs
+@@ -188,6 +188,7 @@ fn cx<'a>(region: &'a Region, model: Option<&'a [Triangle]>, tool: &'a ToolGeom,
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/verify.rs b/crates/app/tests/verify.rs
+index 92a0e9f02..c2dc223d8 100644
+--- a/crates/app/tests/verify.rs
++++ b/crates/app/tests/verify.rs
+@@ -85,6 +85,7 @@ fn ctx<'a>(region: &'a Region, stock: Option<&'a Region>, tool: &'a ToolGeom, mo
+         // what it was before the stage existed.
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+@@ -657,6 +658,7 @@ fn env_ctx<'a>(
+         finish_tol,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/verify_arc_reading.rs b/crates/app/tests/verify_arc_reading.rs
+index 409529dfd..b869eff68 100644
+--- a/crates/app/tests/verify_arc_reading.rs
++++ b/crates/app/tests/verify_arc_reading.rs
+@@ -68,6 +68,7 @@ fn ctx<'a>(region: &'a Region, tool: &'a ToolGeom) -> VerifyContext<'a> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/app/tests/vertical_arc_entry.rs b/crates/app/tests/vertical_arc_entry.rs
+index 1ba32278b..cad38999c 100644
+--- a/crates/app/tests/vertical_arc_entry.rs
++++ b/crates/app/tests/vertical_arc_entry.rs
+@@ -149,6 +149,7 @@ fn verify_bore(t: &Toolpath, region: &Region) -> Vec<camcraft_app::verify::Warni
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/app/tests/wall_arc_entry.rs b/crates/app/tests/wall_arc_entry.rs
+index f94c10686..2c8e9322f 100644
+--- a/crates/app/tests/wall_arc_entry.rs
++++ b/crates/app/tests/wall_arc_entry.rs
+@@ -319,6 +319,7 @@ fn verify_wall(t: &Toolpath, region: &Region) -> Vec<camcraft_app::verify::Warni
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/app/tests/warned_moves.rs b/crates/app/tests/warned_moves.rs
+index 919ae4a31..85be3b550 100644
+--- a/crates/app/tests/warned_moves.rs
++++ b/crates/app/tests/warned_moves.rs
+@@ -59,6 +59,7 @@ fn judge(t: &Toolpath, region: &Region, tool: &ToolGeom) -> Vec<camcraft_app::ve
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/app/tests/whole_model_pocket.rs b/crates/app/tests/whole_model_pocket.rs
+index e502d4e84..21b470f66 100644
+--- a/crates/app/tests/whole_model_pocket.rs
++++ b/crates/app/tests/whole_model_pocket.rs
+@@ -165,6 +165,7 @@ fn a_feed_chorded_across_the_parts_corner_reads_a_gouge() {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     let gouges = |t: &Toolpath| -> Vec<usize> {
+         verify(t, &cx).into_iter().filter_map(|w| if let Warning::Gouge { at } = w { Some(at) } else { None }).collect()
+diff --git a/crates/motion/tests/adaptive_hsm.rs b/crates/motion/tests/adaptive_hsm.rs
+index f7fa52384..3d0b03e4f 100644
+--- a/crates/motion/tests/adaptive_hsm.rs
++++ b/crates/motion/tests/adaptive_hsm.rs
+@@ -166,6 +166,7 @@ fn verified(path: &Toolpath, reg: &Region, tool_d: f64) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/blind_floor.rs b/crates/motion/tests/blind_floor.rs
+index b781e46f8..3ecd397d6 100644
+--- a/crates/motion/tests/blind_floor.rs
++++ b/crates/motion/tests/blind_floor.rs
+@@ -144,6 +144,7 @@ fn silent(facets: &[Triangle], region: &Region, t: &camcraft_motion::cl::Toolpat
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/motion/tests/center_cut_law.rs b/crates/motion/tests/center_cut_law.rs
+index af171e5be..e15ce6db8 100644
+--- a/crates/motion/tests/center_cut_law.rs
++++ b/crates/motion/tests/center_cut_law.rs
+@@ -151,6 +151,7 @@ fn check(t: &Toolpath, r: &Region) {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     assert_eq!(verify(t, &cx), Vec::new(), "{:?}", t.notes);
+ }
+diff --git a/crates/motion/tests/entry_approach.rs b/crates/motion/tests/entry_approach.rs
+index f2edaaa39..6f648e1d5 100644
+--- a/crates/motion/tests/entry_approach.rs
++++ b/crates/motion/tests/entry_approach.rs
+@@ -95,6 +95,7 @@ fn check(t: &Toolpath, r: &Region) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/motion/tests/entry_arc_3d.rs b/crates/motion/tests/entry_arc_3d.rs
+index f37404063..29b576c6e 100644
+--- a/crates/motion/tests/entry_arc_3d.rs
++++ b/crates/motion/tests/entry_arc_3d.rs
+@@ -99,6 +99,7 @@ fn verify_against(facets: &[Triangle], region: &Region, path: &Toolpath) -> Vec<
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/finish3d.rs b/crates/motion/tests/finish3d.rs
+index acc7f5840..0556464a8 100644
+--- a/crates/motion/tests/finish3d.rs
++++ b/crates/motion/tests/finish3d.rs
+@@ -313,6 +313,7 @@ fn verify_finish(
+         finish_tol: Some(TOL),
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/motion/tests/level_links.rs b/crates/motion/tests/level_links.rs
+index 1fda23438..d057251a6 100644
+--- a/crates/motion/tests/level_links.rs
++++ b/crates/motion/tests/level_links.rs
+@@ -95,6 +95,7 @@ fn check(path: &Toolpath, region: &Region, model: Option<&[Triangle]>, mode: Mod
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/machining3d.rs b/crates/motion/tests/machining3d.rs
+index 8a3487c7f..dea12b57f 100644
+--- a/crates/motion/tests/machining3d.rs
++++ b/crates/motion/tests/machining3d.rs
+@@ -136,6 +136,7 @@ fn verify_against(facets: &[Triangle], region: &Region, path: &Toolpath) -> Vec<
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/offset_shells.rs b/crates/motion/tests/offset_shells.rs
+index f4267f8fe..c49b591a3 100644
+--- a/crates/motion/tests/offset_shells.rs
++++ b/crates/motion/tests/offset_shells.rs
+@@ -168,6 +168,7 @@ fn verify_against(facets: &[Triangle], region: &Region, path: &Toolpath) -> Vec<
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/one_descent.rs b/crates/motion/tests/one_descent.rs
+index f6c20b144..0d45ddbee 100644
+--- a/crates/motion/tests/one_descent.rs
++++ b/crates/motion/tests/one_descent.rs
+@@ -78,6 +78,7 @@ fn check(t: &Toolpath, region: &Region, model: Option<&[Triangle]>, mode: Mode,
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/motion/tests/overhang_2d.rs b/crates/motion/tests/overhang_2d.rs
+index d9d531e25..ba7eb3941 100644
+--- a/crates/motion/tests/overhang_2d.rs
++++ b/crates/motion/tests/overhang_2d.rs
+@@ -183,6 +183,7 @@ fn depth_verify(t: &camcraft_motion::cl::Toolpath, region: &Region, f: &[Triangl
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/motion/tests/pocket3d_hsm.rs b/crates/motion/tests/pocket3d_hsm.rs
+index 1ce69bd2a..006851d17 100644
+--- a/crates/motion/tests/pocket3d_hsm.rs
++++ b/crates/motion/tests/pocket3d_hsm.rs
+@@ -136,6 +136,7 @@ fn verified(facets: &[Triangle], region: &Region, path: &Toolpath) -> Vec<Warnin
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/real_tip.rs b/crates/motion/tests/real_tip.rs
+index 062429920..b5bfa0ee9 100644
+--- a/crates/motion/tests/real_tip.rs
++++ b/crates/motion/tests/real_tip.rs
+@@ -108,6 +108,7 @@ fn judge(t: &Toolpath, cutter: Option<Cutter>) -> Vec<Warning> {
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/motion/tests/solid_law.rs b/crates/motion/tests/solid_law.rs
+index 44a6d0a93..2358d8604 100644
+--- a/crates/motion/tests/solid_law.rs
++++ b/crates/motion/tests/solid_law.rs
+@@ -184,6 +184,7 @@ fn law_verify(t: &Toolpath, region: &Region, f: &[Triangle], mode: Mode, top: f6
+             finish_tol: None,
+             fixtures: &[],
+             spindle: None,
++            ..Default::default()
+         },
+     )
+ }
+diff --git a/crates/motion/tests/trochoid_slot.rs b/crates/motion/tests/trochoid_slot.rs
+index cff582b93..f5f149440 100644
+--- a/crates/motion/tests/trochoid_slot.rs
++++ b/crates/motion/tests/trochoid_slot.rs
+@@ -85,6 +85,7 @@ fn verified(path: &Toolpath, w: f64) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(path, &cx)
+ }
+diff --git a/crates/motion/tests/xy_arc_entry.rs b/crates/motion/tests/xy_arc_entry.rs
+index 40d315f37..1a4f95d04 100644
+--- a/crates/motion/tests/xy_arc_entry.rs
++++ b/crates/motion/tests/xy_arc_entry.rs
+@@ -87,6 +87,7 @@ fn check(t: &Toolpath, r: &Region) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(t, &cx)
+ }
+diff --git a/crates/sim/src/verify/finish.rs b/crates/sim/src/verify/finish.rs
+index 356f56a0b..0aca760fa 100644
+--- a/crates/sim/src/verify/finish.rs
++++ b/crates/sim/src/verify/finish.rs
+@@ -96,7 +96,13 @@ pub(super) fn finish_envelope(
+                             gate_mm: gate,
+                         });
+                     }
+-                    if rep.gouge_mm > gate || rep.rest_mm > gate {
++                    // #864: the gouge half answers to the tolerance
++                    // less a coarse model's excess chord error (its true
++                    // convex surface stands that far outside the facets
++                    // the scan measured); the rest half and the scan's
++                    // own band keep the op's tolerance.
++                    let gouge_gate = gate - (tol - cx.tightened(tol));
++                    if rep.gouge_mm > gouge_gate || rep.rest_mm > gate {
+                         Some(Warning::Envelope {
+                             at: nearest(rep.at),
+                             gouge_mm: rep.gouge_mm.clamp(0.0, 1e9),
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index f4cc5ab21..e8e5a220f 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -185,7 +185,7 @@ mod swept;
+ mod types;
+ mod workholding;
+ 
+-pub use types::{FixturePart, Mode, VerifyContext, Warning};
++pub use types::{excess_floor, FixturePart, Mode, VerifyContext, Warning};
+ #[doc(hidden)]
+ pub use crossing::{crossed_pairs, crossed_pairs_all};
+ pub use engine::{verify, verify_bodies};
+diff --git a/crates/sim/src/verify/section.rs b/crates/sim/src/verify/section.rs
+index 9f236846f..785c578e3 100644
+--- a/crates/sim/src/verify/section.rs
++++ b/crates/sim/src/verify/section.rs
+@@ -97,7 +97,10 @@ pub(super) fn tangency(
+         // deliberate overcut) - b2's own allowance. A positive leave
+         // never licenses cutting into the finished wall: the old
+         // `r - leave` let a 0.5 mm leave sink 0.5 mm unconvicted.
+-        let floor = (r - (-cx.stock_to_leave).max(0.0) - cx.gouge_tol).max(0.0);
++        // #864: a model coarser than the importer promises gives its
++        // excess chord error back out of the tolerance - the true wall
++        // of a convex feature stands that far outside these loops.
++        let floor = (r - (-cx.stock_to_leave).max(0.0) - cx.tightened(cx.gouge_tol)).max(0.0);
+         let mut loops = cx.region.loops().iter().chain(section.iter().flat_map(|s| s.loops().iter()));
+         let gouged = loops.any(|l| {
+             let pts = l.points();
+@@ -260,7 +263,8 @@ pub(super) fn solid(
+     if let Some(f) = cx.model {
+         let law = super::SolidLaw {
+             step: SOLID_STEP,
+-            allow: cx.gouge_tol + (-cx.stock_to_leave).max(0.0),
++            // #864: tightened by a coarse model's excess, as (b) is.
++            allow: cx.tightened(cx.gouge_tol) + (-cx.stock_to_leave).max(0.0),
+             hole_walls: false,
+         };
+         for w in super::solid_hits(path, f, cutter, &law) {
+diff --git a/crates/sim/src/verify/types.rs b/crates/sim/src/verify/types.rs
+index 2158af634..d3f20fbd9 100644
+--- a/crates/sim/src/verify/types.rs
++++ b/crates/sim/src/verify/types.rs
+@@ -134,6 +134,83 @@ pub struct VerifyContext<'a> {
+     /// law only: against stock the housing still stands down by the
+     /// same kerf reasoning as the holder band.
+     pub spindle: Option<(f64, f64)>,
++    /// How much coarser than the importer's promise the judged model's
++    /// mesh is, mm (#864): the chord error the import actually kept less
++    /// the cap it promises. A facet of a curved wall stands inside the
++    /// true surface by up to its chord error, so on a convex wall a cut
++    /// that deep into the real part reads as clean against the mesh; the
++    /// gouge laws (b), (b2) and (f) give that much of their tolerance
++    /// back ([`VerifyContext::tightened`]). `0.0` - every model that met
++    /// the promise, and every context that never names a model - reads
++    /// each law exactly as it always did. Kept apart from `gouge_tol`,
++    /// which is also the budget moves are read into chords at and must
++    /// not shrink with the model.
++    pub model_excess: f64,
++}
++
++/// The inert tool of [`VerifyContext::default`].
++static NO_TOOL: ToolGeom = ToolGeom {
++    radius: 0.0,
++    nose_radius: 0.0,
++    flute_len: 0.0,
++    shank_radius: 0.0,
++    shank_len: 0.0,
++    holder_radius: 0.0,
++    holder_len: 0.0,
++};
++/// The empty region of [`VerifyContext::default`].
++static NO_REGION: std::sync::LazyLock<Region> = std::sync::LazyLock::new(Region::default);
++
++/// The base a context is written over (`..Default::default()`), so a new
++/// field with an inert reading (#864's `model_excess`) is not spelled out
++/// at every construction site. On its own it judges nothing.
++impl Default for VerifyContext<'_> {
++    fn default() -> Self {
++        VerifyContext {
++            region: &NO_REGION,
++            stock: None,
++            model: None,
++            tool: &NO_TOOL,
++            cutter: None,
++            mode: Mode::Area,
++            stock_top_z: 0.0,
++            clearance_z: 0.0,
++            stock_to_leave: 0.0,
++            gouge_tol: 0.0,
++            z_tol: 0.0,
++            finish_tol: None,
++            fixtures: &[],
++            spindle: None,
++            model_excess: 0.0,
++        }
++    }
++}
++
++impl VerifyContext<'_> {
++    /// A gouge tolerance, tightened for a model coarser than the
++    /// importer promises (#864): `tol` less [`Self::model_excess`], while
++    /// that stays positive. At or below zero it would convict every
++    /// exactly finished flat face - a misleading verdict - so `tol` comes
++    /// back unchanged and the program gate refuses the operation by name
++    /// ([`excess_floor`] is the one test both sides read).
++    #[must_use]
++    pub fn tightened(&self, tol: f64) -> f64 {
++        excess_floor(tol, self.model_excess).unwrap_or(tol)
++    }
++}
++
++/// `tol` less a model's `excess` chord error, while that is an honest
++/// tolerance (#864): `Some(tol)` untouched when there is no excess,
++/// `Some(tol - excess)` while it stays positive, `None` once the excess
++/// has used the whole tolerance - where the caller must refuse rather
++/// than judge. A non-finite or negative excess is no excess.
++#[must_use]
++pub fn excess_floor(tol: f64, excess: f64) -> Option<f64> {
++    if !(excess.is_finite() && excess > 0.0) {
++        return Some(tol);
++    }
++    let left = tol - excess;
++    (left.is_finite() && left > 0.0).then_some(left)
+ }
+ 
+ /// Which machine element struck a fixture (M3.2 stage B). Serde on it
+diff --git a/crates/sim/tests/model_excess.rs b/crates/sim/tests/model_excess.rs
+new file mode 100644
+index 000000000..be859c5fa
+--- /dev/null
++++ b/crates/sim/tests/model_excess.rs
+@@ -0,0 +1,158 @@
++//! #864: the gouge law on a model coarser than the importer promises. A
++//! facet of a convex wall stands INSIDE the true surface by its chord
++//! error, so a cut that deep into the real part reads as clean against
++//! the mesh. `VerifyContext::model_excess` gives that much of the
++//! tolerance back - while a positive tolerance is left; past that the law
++//! reads untightened (the program gate refuses instead) so an exactly
++//! finished flat face is never called a gouge.
++//!
++//! Provenance: our own fixtures; the sagitta `R * (1 - cos(pi / n))` of an
++//! inscribed n-gon is elementary geometry. No vendor material.
++//!
++//! Gate map (#864): covers camcraft_sim::verify (types, section).
++
++use camcraft_sim::cl::{Move, MoveKind, Toolpath};
++use camcraft_sim::geo2d::{Loop, Point2, Region};
++use camcraft_sim::geometry::Point3;
++use camcraft_sim::verify::{excess_floor, verify, Mode, ToolGeom, VerifyContext, Warning};
++
++/// The importer's promise and the verdict tolerance, mm.
++const CAP: f64 = 0.005;
++const TOL: f64 = 0.01;
++/// The true boss, the cutter, and the mesh's side count: a 90-gon of a
++/// 20 mm circle stands 0.0122 mm inside it at each facet's middle.
++const BOSS_R: f64 = 20.0;
++const TOOL_R: f64 = 6.0;
++const SIDES: usize = 90;
++
++fn region(pts: Vec<Point2>) -> Region {
++    match Loop::new(pts).and_then(|l| Region::new(vec![l])) {
++        Ok(r) => r,
++        Err(e) => panic!("region: {e:?}"),
++    }
++}
++
++/// The boss as its coarse mesh shows it: the inscribed polygon.
++fn coarse_boss() -> Region {
++    region(ring(BOSS_R, SIDES).collect())
++}
++
++fn ring(r: f64, n: usize) -> impl Iterator<Item = Point2> {
++    (0..n).map(move |k| {
++        let a = std::f64::consts::TAU * k as f64 / n as f64;
++        Point2::new(r * a.cos(), r * a.sin())
++    })
++}
++
++/// The chord error of the coarse boss.
++fn chord() -> f64 {
++    BOSS_R * (1.0 - (std::f64::consts::PI / SIDES as f64).cos())
++}
++
++fn tool() -> ToolGeom {
++    ToolGeom {
++        radius: TOOL_R,
++        nose_radius: 0.0,
++        flute_len: 20.0,
++        shank_radius: TOOL_R,
++        shank_len: 20.0,
++        holder_radius: TOOL_R,
++        holder_len: 10.0,
++    }
++}
++
++fn feeds(pts: &[Point2], z: f64) -> Toolpath {
++    let at = |p: Point2| Point3::new(p.x, p.y, z);
++    let moves = pts
++        .iter()
++        .zip(pts.iter().cycle().skip(1))
++        .take(pts.len())
++        .map(|(a, b)| Move::new(MoveKind::Feed, at(*a), at(*b), Some(600.0)))
++        .collect();
++    Toolpath { moves, cycles: Vec::new(), notes: Vec::new(), comps: Vec::new(), threads: Vec::new(), probes: Vec::new(), breaks: Vec::new(), plasma: None }
++}
++
++/// The gouge verdicts of `path` round `wall` with a model `excess`.
++fn gouges(path: &Toolpath, wall: &Region, excess: f64) -> usize {
++    let tool = tool();
++    let cx = VerifyContext {
++        region: wall,
++        tool: &tool,
++        mode: Mode::Boundary,
++        stock_top_z: 10.0,
++        clearance_z: 20.0,
++        gouge_tol: TOL,
++        z_tol: 1e-6,
++        model_excess: excess,
++        ..Default::default()
++    };
++    verify(path, &cx).iter().filter(|w| matches!(w, Warning::Gouge { .. })).count()
++}
++
++/// A ring round the boss whose cutter stands `into` mm inside the TRUE
++/// circle: 720 short feeds, so the path's own chords add under a micron.
++fn ring_cut(into: f64) -> Toolpath {
++    let pts: Vec<Point2> = ring(BOSS_R + TOOL_R - into, 720).collect();
++    feeds(&pts, 5.0)
++}
++
++#[test]
++fn a_cut_into_a_convex_wall_shallower_than_the_mesh_error_is_convicted_on_a_coarse_model() {
++    let (c, wall) = (chord(), coarse_boss());
++    assert!(c > 0.012 && c < 0.0125, "the fixture's chord error: {c}");
++    let excess = c - CAP;
++    assert!(excess_floor(TOL, excess).is_some_and(|t| t > 0.0), "a positive tolerance is left");
++    // 0.006 mm into the real boss: less than the mesh's chord error, and -
++    // measured against the mesh's vertices - inside the 0.01 mm verdict.
++    let path = ring_cut(0.006);
++    assert_eq!(gouges(&path, &wall, 0.0), 0, "the full-fidelity reading keeps today's verdict");
++    assert!(gouges(&path, &wall, excess) > 0, "the coarse model's excess convicts it");
++    // A nominal ring - the cutter on the true circle - is clean both ways.
++    let nominal = ring_cut(0.0);
++    assert_eq!(gouges(&nominal, &wall, 0.0), 0);
++    assert_eq!(gouges(&nominal, &wall, excess), 0, "tightening is not a blanket conviction");
++}
++
++#[test]
++fn an_exactly_finished_flat_face_is_never_a_gouge_on_a_coarse_model() {
++    // A square boss: flat walls carry no chord error. The cutter runs
++    // exactly its radius off the X = 20 wall.
++    let wall = region(vec![Point2::new(-20.0, -20.0), Point2::new(20.0, -20.0), Point2::new(20.0, 20.0), Point2::new(-20.0, 20.0)]);
++    let x = 20.0 + TOOL_R;
++    let m = Move::new(MoveKind::Feed, Point3::new(x, -20.0, 5.0), Point3::new(x, 20.0, 5.0), Some(600.0));
++    let path = Toolpath { moves: vec![m], cycles: Vec::new(), notes: Vec::new(), comps: Vec::new(), threads: Vec::new(), probes: Vec::new(), breaks: Vec::new(), plasma: None };
++    for excess in [0.0, 0.004, 0.007, 0.009_999, 0.01, 0.02, 0.5] {
++        assert_eq!(gouges(&path, &wall, excess), 0, "excess {excess}");
++    }
++}
++
++#[test]
++fn past_the_tolerance_the_law_reads_untightened_and_leaves_the_refusal_to_the_gate() {
++    let wall = coarse_boss();
++    // An excess that uses the whole tolerance: nothing honest is left.
++    for excess in [TOL, 0.02, 0.5] {
++        assert_eq!(excess_floor(TOL, excess), None, "excess {excess}");
++        // Every path reads exactly as it does at full fidelity.
++        for into in [0.0, 0.006, 0.05] {
++            let path = ring_cut(into);
++            assert_eq!(gouges(&path, &wall, excess), gouges(&path, &wall, 0.0), "excess {excess}, {into} mm in");
++        }
++    }
++    // ...and a real gouge is still one there.
++    assert!(gouges(&ring_cut(0.05), &wall, 0.5) > 0);
++}
++
++#[test]
++fn the_excess_floor_only_ever_tightens() {
++    assert_eq!(excess_floor(TOL, 0.0), Some(TOL), "no excess: the tolerance itself");
++    assert_eq!(excess_floor(TOL, -1.0), Some(TOL), "a negative excess is none");
++    assert_eq!(excess_floor(TOL, f64::NAN), Some(TOL), "a NaN excess is none");
++    assert_eq!(excess_floor(TOL, f64::INFINITY), Some(TOL), "an infinite excess is none");
++    let t = excess_floor(TOL, 0.004).expect("positive");
++    assert!((t - 0.006).abs() < 1e-12 && t < TOL);
++    assert_eq!(excess_floor(TOL, TOL), None, "zero left is a refusal, not a tolerance");
++    // The default context carries no excess: every law reads as before.
++    let cx = VerifyContext::default();
++    assert_eq!(cx.model_excess, 0.0);
++    assert_eq!(cx.tightened(TOL), TOL);
++}
+diff --git a/crates/sim/tests/overhang_laws.rs b/crates/sim/tests/overhang_laws.rs
+index 95e60569f..7f8a0309c 100644
+--- a/crates/sim/tests/overhang_laws.rs
++++ b/crates/sim/tests/overhang_laws.rs
+@@ -79,6 +79,7 @@ fn judge(p: &Toolpath, facets: &[Triangle], tool: &ToolGeom) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(p, &cx)
+ }
+@@ -238,6 +239,7 @@ fn a_2d_path_without_a_model_is_unchanged() {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     let w = verify(&rapid_cleared(5.0), &cx);
+     assert!(w.is_empty(), "{w:?}");
+@@ -263,6 +265,7 @@ fn judge_2d(p: &Toolpath, tool: &ToolGeom) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(p, &cx)
+ }
+@@ -358,6 +361,7 @@ fn judge_ball(p: &Toolpath, facets: &[Triangle]) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(p, &cx)
+ }
+diff --git a/crates/sim/tests/posed_rapids.rs b/crates/sim/tests/posed_rapids.rs
+index 649a14a35..add1fff74 100644
+--- a/crates/sim/tests/posed_rapids.rs
++++ b/crates/sim/tests/posed_rapids.rs
+@@ -79,6 +79,7 @@ fn judge(p: &Toolpath, top: f64, x1: f64) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(p, &cx)
+ }
+diff --git a/crates/sim/tests/radial_rapids.rs b/crates/sim/tests/radial_rapids.rs
+index e35722c2d..d316b2272 100644
+--- a/crates/sim/tests/radial_rapids.rs
++++ b/crates/sim/tests/radial_rapids.rs
+@@ -71,6 +71,7 @@ fn judge_with(p: &Toolpath, mode: Mode, tool: &ToolGeom, stock_top_z: f64, z_tol
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(p, &cx)
+ }
+diff --git a/crates/sim/tests/sideways_rapids.rs b/crates/sim/tests/sideways_rapids.rs
+index 857c37ab6..ea8ce74b9 100644
+--- a/crates/sim/tests/sideways_rapids.rs
++++ b/crates/sim/tests/sideways_rapids.rs
+@@ -100,6 +100,7 @@ fn judge(moves: Vec<Move>) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(&p, &cx)
+ }
+diff --git a/crates/sim/tests/vertical_rapids.rs b/crates/sim/tests/vertical_rapids.rs
+index cd6669893..fd8958b5c 100644
+--- a/crates/sim/tests/vertical_rapids.rs
++++ b/crates/sim/tests/vertical_rapids.rs
+@@ -87,6 +87,7 @@ fn judge_tip(moves: Vec<Move>, r: f64, corner: Option<f64>) -> Vec<Warning> {
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     };
+     verify(&p, &cx)
+ }
+diff --git a/crates/ui/src/egui_app/pages.rs b/crates/ui/src/egui_app/pages.rs
+index 2567b6674..8cf9fb159 100644
+--- a/crates/ui/src/egui_app/pages.rs
++++ b/crates/ui/src/egui_app/pages.rs
+@@ -1676,6 +1676,17 @@ fn model_page(ui: &mut Ui, state: &mut State, name: String) {
+     };
+     let tris = model::facets_of(&state.world, &entity).map_or(0, |f| f.len());
+     ui.label(format!("{tris} triangle(s)"));
++    // #864: a model imported coarser than the importer promises says so,
++    // with the error it carries and what that does to the checks.
++    if let Some(chord) = camcraft_app::model_fidelity::chord_of(&state.world, &entity) {
++        ui.label(camcraft_app::model_fidelity::summary(&state.world, chord));
++        hint(
++            ui,
++            "This model was too large to import at full detail. Gouge checks against it are \
++             stricter to make up for that; when it is too coarse to check at all, its operations \
++             are refused at the post. Re-import with a larger budget to clear this.",
++        );
++    }
+     if let Some(a) = model::entity_world_aabb(&state.world, &entity) {
+         ui.label(format!(
+             "{} x {} x {} {}",
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 46e2681cf..2cf728bf1 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -119,6 +119,8 @@ mod theme_door;
+ mod recent_door;
+ // #509: the Fixtures page rows fit the pane.
+ mod fixture_rows;
++// #864: a reduced-fidelity model says so on its page.
++mod model_fidelity;
+ // #709 hand check: both points of a two-point axis stay marked.
+ mod two_point_marks;
+ 
+diff --git a/crates/ui/src/egui_app/tests/model_fidelity.rs b/crates/ui/src/egui_app/tests/model_fidelity.rs
+new file mode 100644
+index 000000000..d72bca4c1
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/model_fidelity.rs
+@@ -0,0 +1,43 @@
++//! #864: a model imported coarser than the STEP importer promises says
++//! so on its page, with the error it carries; a full-fidelity one does not.
++//! Provenance: our own page law; no HSMWorks material.
++//!
++//! Gate map (M4.4): covers ui::egui_app::pages (model_page),
++//! app::model_fidelity.
++
++use super::*;
++
++#[test]
++fn a_reduced_fidelity_model_says_so_on_its_page_and_a_normal_one_does_not() {
++    let mut h = shell_harness();
++    {
++        let st = &mut h.state_mut().state;
++        let block = model::find_by_name(&st.world, "Block").expect("the seeded block");
++        let facets = model::facets_of(&st.world, &block).expect("it has geometry");
++        let coarse = camcraft_app::commands::ImportModel::from_mesh("Coarse", camcraft_app::geometry::Mesh::from_shared(facets))
++            .with_fidelity(Some(0.012));
++        st.history.execute(&st.world, coarse);
++        st.ui_target = UiTarget::Model("Coarse".into());
++    }
++    h.run();
++    assert!(
++        h.query_by_label("Reduced fidelity: surfaces are approximated to within 0.012 mm").is_some(),
++        "the flag and the achieved error are on the model page"
++    );
++    h.state_mut().state.ui_target = UiTarget::Model("Block".into());
++    h.run();
++    assert!(h.query_by_label("Model: Block").is_some(), "the block's page is open");
++    assert!(
++        h.query_by_label_contains("Reduced fidelity").is_none(),
++        "a full-fidelity model carries no flag"
++    );
++    // Undo takes the coarse model - and its flag - away; redo brings both back.
++    {
++        let st = &mut h.state_mut().state;
++        st.history.undo(&st.world);
++        assert!(model::find_by_name(&st.world, "Coarse").is_none());
++        st.history.redo(&st.world);
++        let e = model::find_by_name(&st.world, "Coarse").expect("redone");
++        assert_eq!(camcraft_app::model_fidelity::chord_of(&st.world, &e), Some(0.012));
++    }
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 5b453edd2..bac897801 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -3732,7 +3732,8 @@ impl State {
+                     return;
+                 }
+                 if model::find_by_name(&self.world, &name).is_some() {
+-                    match UpdateModel::new(&self.world, &name, command.mesh) {
++                    let coarse = command.coarse_mm;
++                    match UpdateModel::new(&self.world, &name, command.mesh).map(|u| u.with_fidelity(coarse)) {
+                         Ok(upd) => {
+                             let summary = upd.changes().describe();
+                             self.history.execute(&self.world, upd);
+@@ -3749,6 +3750,14 @@ impl State {
+                     self.note_recent_model(file.as_deref());
+                     self.status = timed("imported", "");
+                 }
++                // #864: an import kept coarser than promised is said, not
++                // only logged.
++                if let Some(chord) = model::find_by_name(&self.world, &name)
++                    .and_then(|e| camcraft_app::model_fidelity::chord_of(&self.world, &e))
++                {
++                    let said = camcraft_app::model_fidelity::summary(&self.world, chord);
++                    self.status = format!("{} - {said}", self.status);
++                }
+             }
+             Err(err) => {
+                 // A refused import-as-fixture must not tag the NEXT import.
+diff --git a/docs/decisions/864-reduced-fidelity.md b/docs/decisions/864-reduced-fidelity.md
+index 753b42650..6982f0538 100644
+--- a/docs/decisions/864-reduced-fidelity.md
++++ b/docs/decisions/864-reduced-fidelity.md
+@@ -1,34 +1,103 @@
+-## #864 - an over-budget STEP mesh: report the chord error it kept (held work, escalated)
++## #864 - a STEP model imported coarser than promised: flag it, tighten its gouge verdicts, refuse past that
+ 
+-**What was decided.** The STEP importer's refinement schedule moved into
+-`app::geometry::import::step_refine::refine`, which returns the mesh it kept
+-together with the chord tolerance of that mesh. A refinement pass that
+-crosses the facet budget is dropped, and the previous mesh is kept with its
+-own tolerance. Before this change, the halved tolerance was reported for the
+-coarser mesh. `step::parse_with_chord` returns the mesh and the coarsest kept
+-tolerance over all shells, in millimetres (scaled by the file's length unit).
+-A non-finite or negative value is refused as a corrupt import. `step::parse`
+-is unchanged for callers: same schedule, same meshes. `step::CHORD_CAP` names
+-the 0.005 mm cap. `step::with_facet_budget` is a test-only, thread-local
+-override that lets a small fixture be forced over budget.
++**What was decided.** The maintainer's three-part decision on #864, built as
++follows.
+ 
+-**Why.** Every part of #864 (the UI flag, the MCP facts, the tightened laws)
+-needs the true chord error of the kept mesh. The `TooLarge` bookkeeping bug
+-made the logged value wrong exactly in the over-budget case.
++1. *Flag.* The STEP importer reports the chord error of the mesh it kept
++   (`step::parse_with_chord`; the refinement schedule lives in
++   `step_refine`, which keeps the tolerance of the pass it kept, not of a
++   pass it threw away). A value above the 0.005 mm cap lands on the model as
++   the component `schema::ReducedFidelity { chord_mm }`, through
++   `ImportModel`, `UpdateModel`, `AddFixtureModel` and `ImportFixture`.
++   It is written to the project file as `coarse_mm` on that entity only.
++   The model page, the import status line, MCP `import_model` and MCP
++   `get_job` show it. Models that met the promise, STL and OBJ meshes, and
++   every model of an older project carry nothing and read as full fidelity.
++2. *Tighten while honest.* `VerifyContext::model_excess` (achieved error
++   less the cap) is a separate field, never mixed into `gouge_tol`, which is
++   also the budget moves are read into chords at. The gouge laws subtract it
++   from their tolerance while a positive tolerance is left: the section law
++   (b), the solid law (b2), the envelope law's gouge half (f),
++   `generate::contain_into`, the lathe's axial hole verdict, and the program
++   sim's `deviate` tolerance (`model_fidelity::verdict_tol`).
++3. *Refuse past that.* Once the excess uses a whole tolerance the laws read
++   untightened and the program gate (`posting::verification_report`,
++   `model_fidelity::gate_problems`) refuses each operation judged against
++   that model by name: "OP: model 'part' was imported too coarsely to
++   verify; re-import with a larger budget (surfaces are approximated to
++   within 0.030 mm)". The program sim refuses to judge too, so no gouge line
++   is read off such a mesh.
+ 
+-**Escalated, not finished.** Tightening "every gouge law that judges
+-tool-against-model distance" by the excess reaches about 15 law sites in
+-four crates. It also has an open design question: once the excess is larger
+-than the 0.01 mm verdict tolerance, a uniform tighter floor convicts every
+-exactly finished planar face, because planar facets carry no chord error.
+-That makes such a model unpostable under a misleading "gouge" verdict. The
+-options are a named refusal, curvature-aware excess, or an outward offset of
+-the mesh. This is effort:max work. The inventory is on #864.
++**Why.** A facet of a curved wall is a chord of the true surface. On a convex
++wall it stands inside the part, so a cut up to the chord error deep into the
++real wall reads as clean. Subtracting the excess makes the worst case on a
++coarse model equal to the worst case on a model that met the promise. A
++tolerance at or below zero would convict every exactly finished flat face,
++which carries no chord error at all; that is a misleading verdict, so the
++honest answer there is a refusal that says what to do.
++
++**Decisions taken unattended.**
++
++- *The refusal threshold is "nothing positive left", per law.* An operation's
++  floor is the smaller of the 0.01 mm gouge tolerance and its own envelope
++  tolerance (`fidelity_law::floor_of`). With the fixed 0.01 mm laws this
++  means a mesh at 0.015 mm or coarser is refused. A margin above zero (to
++  spare a model at 0.0149 mm from near-certain false gouges on concave
++  walls) was considered and dropped: the decision text says "while the floor
++  stays positive", and false gouges are the safe side.
++- *Kinds whose gouge laws do not read the excess yet are refused on any
++  reduced-fidelity model* (`fidelity_law::excess_aware`): the cone and
++  engrave rides (2D chamfer, deburr, trace, engrave), probe, the cross drill,
++  every multi-axis and rotary kind, turning, and plasma. Their verdicts live
++  in generator construction laws and in the motion crate's meridian, stamp
++  and radial-field scans. A refusal is the only verdict that cannot be
++  looser; tightening those laws is owed and filed as a follow-up.
++- *Collision laws are not gouge laws and are not tightened*: shank and holder
++  reach (c, c3), rapids in stock (d), the turning rapid, bar and holder
++  scans. They judge clearance against rest material at millimetre scale.
++  While an operation still posts, the excess is under 0.01 mm. Filed with
++  the follow-up, said in the PR.
++- *Fixtures that came through the same importer.* A reduced-fidelity fixture
++  is judged by its bounding box grown by its chord error on every side, and
++  its mesh is not offered to the mesh law, which only ever acquits a box hit
++  (`fixture::steel_box`, `fixture::meshes_for`). Stricter only; a
++  full-fidelity fixture is untouched.
++- *A stock copied from a model* reads the excess of the model it copies
++  (same facets). A box or cylinder stock has none.
++- *A repair keeps the flag* (`UpdateModel::keeping_fidelity`): welding and
++  hole filling make the facets no truer to the surface. Any other update
++  replaces the flag with the new mesh's. Undo restores it; deleting and
++  undoing a model brings it back flagged.
++- *A metre-unit STEP file* stops at the kernel's least tolerance, 1e-5 m =
++  0.01 mm (#839). It now gets the same flag as an over-budget model, with
++  0.005 mm of tolerance left, so its mill verdicts are tightened and it
++  still posts. Scaling the geometry to millimetres before meshing would fix
++  it at the root; it means transforming the kernel's shell before
++  tessellation and was not small or clearly safe, so it is owed.
++- *The flag threshold has a nanometre of slack* (`step::coarse`). An inch
++  file's cap is divided into inches and multiplied back; that round trip
++  must not flag a mesh that met the promise.
++- *`VerifyContext` gained `Default`* as a struct-update base, so the new
++  field is not spelled out at the 40-odd test construction sites and the
++  next one will not touch them. The two production sites in `generate.rs`
++  state `model_excess` explicitly.
++- *"Re-import with a larger budget" is the maintainer's wording, but the
++  budget is not yet a user setting* (`MAX_FACETS` is a constant). The
++  refusal is still true and actionable in part (a smaller or simpler export,
++  millimetre units). A user-facing budget is filed with the follow-up.
+ 
+ **Considered and dropped.**
+-- Logging only: this is the status quo the issue rejects.
++- Logging only: the status quo the issue rejects.
+ - Recording the error on every STEP model: models that fit the budget would
+-  gain a project-file field and change saved bytes. The plan on #864 records
+-  it only above the cap.
++  gain a project-file key and change saved bytes.
++- Folding the excess into `gouge_tol`: it is also the chord-reading budget,
++  and the reading must not get finer or coarser with the model.
++- Curvature-aware excess, or offsetting the mesh outward: geometry
++  algorithms, beyond the decision; the refusal covers the case they would.
++- Refusing every reduced-fidelity model outright: simpler and safe, but it
++  would make every metre-unit STEP file unpostable.
+ 
+-**Cost to change later.** Low: `refine` is a pure function with unit pins.
++**Cost to change later.** Low. The law is one function
++(`verify::excess_floor`) read by both the laws and the gate; the per-kind
++table is `operation::fidelity_law`; making a kind excess-aware is threading
++`material.excess` into its law and adding it to `excess_aware`.
+
+From f7124d38b51c798b2648e3a0c3b89a7cb8409df3 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 11 Nov 2026 23:32:19 +0100
+Subject: [PATCH 3/4] test(verify): the union arc joints are judged against the
+ tightened floor
+
+With a positive model_excess, a sharp vertex on an old arc joint (one no
+quarter joint stands near, #689 review B1) is convicted between the plain
+and the tightened floor in Boundary mode, clean outside it, and reads as
+full fidelity once the excess uses the whole tolerance.
+
+Refs #864
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/verify_arc_reading.rs | 58 ++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/crates/app/tests/verify_arc_reading.rs b/crates/app/tests/verify_arc_reading.rs
+index 9021c6e58..ad8c2ef1b 100644
+--- a/crates/app/tests/verify_arc_reading.rs
++++ b/crates/app/tests/verify_arc_reading.rs
+@@ -283,3 +283,61 @@ fn boundary_mode_keeps_the_old_joints_so_a_sharp_vertex_on_one_stays_convicted()
+         assert_eq!(boundary(&region_at(d)), Vec::new(), "clearance {d}");
+     }
+ }
++
++/// #864 with #689 review B1: a model coarser than the importer promises
++/// tightens the FLOOR (`model_excess`), never the reading - an arc is
++/// still read at the union of the old and the quarter joints, at the
++/// plain `gouge_tol`. So a sharp vertex on an OLD joint (which no quarter
++/// joint stands near) is judged against the tightened floor: inside it is
++/// convicted, though the untightened floor passes it, and outside it stays
++/// clean.
++#[test]
++fn boundary_mode_judges_the_union_joints_against_the_tightened_floor() {
++    // The B1 case: r 200 sweeping 0.048 rad, the old joint at 0.016 rad.
++    let (rad, sweep) = (200.0, 0.048);
++    let t = arc(p2(0.0, 0.0), rad, 0.0, sweep);
++    let a = sweep / 3.0;
++    let joint = p2(rad * a.cos(), rad * a.sin());
++    let (ux, uy) = (a.cos(), a.sin());
++    let (tx, ty) = (-uy, ux);
++    let region_at = |d: f64| {
++        let v = p2(joint.x + ux * d, joint.y + uy * d);
++        let side = |s: f64| p2(v.x + ux * 20.0 + tx * 5.0 * s, v.y + uy * 20.0 + ty * 5.0 * s);
++        let island = Loop::new(vec![v, side(1.0), side(-1.0)]).expect("island");
++        Region::new(vec![rect(150.0, -50.0, 260.0, 60.0), island]).expect("region")
++    };
++    let g = tool();
++    let boundary = |region: &Region, excess: f64| {
++        let mut c = ctx(region, &g);
++        c.mode = Mode::Boundary;
++        c.model_excess = excess;
++        verify(&t, &c)
++    };
++    // 6 um of excess leaves 4 um of tolerance: the floor rises from 3.990
++    // to 3.996 mm.
++    let excess = 0.006;
++    let tight = R - (TOL - excess);
++    assert!(floor() < tight && tight < R);
++    // Between the two floors: clean at full fidelity, convicted with the
++    // excess - at the old joint, so the union reading is what found it.
++    for d in [3.991, 3.993, 3.995] {
++        assert!(d >= floor() && d < tight);
++        assert_eq!(boundary(&region_at(d), 0.0), Vec::new(), "full fidelity, clearance {d}");
++        assert_eq!(boundary(&region_at(d), excess), vec![Warning::Gouge { at: 0 }], "coarse model, clearance {d}");
++    }
++    // Inside the plain floor: convicted either way (the #689 verdict).
++    assert_eq!(boundary(&region_at(3.98), 0.0), vec![Warning::Gouge { at: 0 }]);
++    assert_eq!(boundary(&region_at(3.98), excess), vec![Warning::Gouge { at: 0 }]);
++    // Outside the tightened floor: clean either way - the tightening is
++    // not a blanket conviction, and the reading added no false gouge.
++    for d in [3.997, 4.0] {
++        assert!(d >= tight);
++        assert_eq!(boundary(&region_at(d), 0.0), Vec::new(), "clearance {d}");
++        assert_eq!(boundary(&region_at(d), excess), Vec::new(), "coarse model, clearance {d}");
++    }
++    // An excess that uses the whole tolerance reads untightened (the
++    // program gate refuses instead): the full-fidelity verdicts exactly.
++    for d in [3.98, 3.993, 4.0] {
++        assert_eq!(boundary(&region_at(d), 0.02), boundary(&region_at(d), 0.0), "clearance {d}");
++    }
++}
+
+From 6a40e3b60ed70f06c1a51a645036e20316b886d7 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 03:33:55 +0100
+Subject: [PATCH 4/4] test(verify): the whole-arc wall reading answers to the
+ tightened floor
+
+After the merge of main (#942): law (b)'s whole-arc reading takes the same
+floor as the joints, so a reduced-fidelity model's excess tightens it too.
+Pinned beside boundary_arc_walls: a corner between an arc's joints is
+convicted between the plain and the tightened floor on a coarse model,
+clean at full fidelity and outside the tightened floor. The suite's
+context (new on main) takes the struct-update base for model_excess, which
+the merge commit alone lacks.
+
+Refs #864
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/boundary_arc_walls.rs | 52 ++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/crates/app/tests/boundary_arc_walls.rs b/crates/app/tests/boundary_arc_walls.rs
+index 783bcd093..26feb54e7 100644
+--- a/crates/app/tests/boundary_arc_walls.rs
++++ b/crates/app/tests/boundary_arc_walls.rs
+@@ -63,6 +63,7 @@ fn ctx<'a>(region: &'a Region, tool: &'a ToolGeom, mode: Mode) -> VerifyContext<
+         finish_tol: None,
+         fixtures: &[],
+         spindle: None,
++        ..Default::default()
+     }
+ }
+ 
+@@ -156,3 +157,54 @@ fn area_mode_verdicts_on_the_corner_are_unchanged() {
+     let (clear, _) = region_at(4.0, true);
+     assert_eq!(verify(&t, &ctx(&clear, &g, Mode::Area)), Vec::new());
+ }
++
++/// #864 with #905: a model coarser than the importer promises tightens
++/// every part-facing floor of law (b) - the whole-arc wall reading too,
++/// not only the joints. A corner BETWEEN the joints, where only the
++/// whole-arc reading measures, is convicted between the plain and the
++/// tightened floor on such a model; at full fidelity, and outside the
++/// tightened floor, the verdicts above stand unchanged.
++#[test]
++fn the_whole_arc_reading_answers_to_a_coarse_models_tightened_floor() {
++    let g = tool();
++    let judge = |t: &Toolpath, region: &Region, excess: f64| {
++        let mut c = ctx(region, &g, Mode::Boundary);
++        c.model_excess = excess;
++        verify(t, &c)
++    };
++    // 7 um of excess leaves 3 um of tolerance: the floor rises from
++    // 3.990 to 3.997 mm. The whole-arc reading pads the arc's radius by
++    // the centre's 1 um lattice (it never reads farther than the truth),
++    // so the clearances below stand 3 um or more off whichever floor they
++    // must read clear of.
++    let excess = 0.007;
++    let tight = R - (TOL - excess);
++    assert!(floor() < tight && tight < R);
++    for outward in [true, false] {
++        for ccw in [true, false] {
++            let t = arc(ccw);
++            // Between the two floors.
++            for d in [3.994, 3.995, 3.996] {
++                assert!(d >= floor() + 0.003 && d < tight);
++                let (region, v) = region_at(d, outward);
++                // No joint comes near: only the whole-arc reading sees it.
++                assert!(joint_clearance(&t.moves[0], v) >= tight, "the joints read it clear of the tightened floor too");
++                assert_eq!(judge(&t, &region, 0.0), Vec::new(), "full fidelity, d {d}, outward {outward}, ccw {ccw}");
++                assert_eq!(judge(&t, &region, excess), vec![Warning::Gouge { at: 0 }], "coarse model, d {d}, outward {outward}, ccw {ccw}");
++                // An excess that uses the whole tolerance reads untightened
++                // (the program gate refuses instead).
++                assert_eq!(judge(&t, &region, 0.02), Vec::new(), "past the tolerance, d {d}");
++            }
++            // Outside the tightened floor: clean either way.
++            for d in [4.001, 4.01, 4.5] {
++                assert!(d >= tight + 0.003);
++                let (region, _) = region_at(d, outward);
++                assert_eq!(judge(&t, &region, excess), Vec::new(), "coarse model, d {d}, outward {outward}, ccw {ccw}");
++            }
++            // Inside the plain floor: a gouge either way.
++            let (region, _) = region_at(3.98, outward);
++            assert_eq!(judge(&t, &region, excess), judge(&t, &region, 0.0));
++            assert_eq!(judge(&t, &region, excess), vec![Warning::Gouge { at: 0 }]);
++        }
++    }
++}
