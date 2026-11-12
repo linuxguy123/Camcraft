@@ -1,0 +1,1616 @@
+From 81e4cb015d0ae9e6daf4c549726fcf3001e1359e Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 12:54:12 +0100
+Subject: [PATCH 1/4] fix(turning): the workholding rpm limit judges the work
+ spindle, not a live tool's speed
+
+The chuck / collet limit (#1031) used spindle_law::turns, which also
+counts the cross drill (a driven radial tool, the work held still), so
+a 10000 rpm cross drill was refused under a 100 rpm chuck with the
+false text "turns the work at 10000 rpm". The program gate now sorts
+each section by which spindle its S drives, as the lathe post does:
+turning and the lathe's axial drill turn the work at the stated rpm
+(G97 refused above the limit; the G96 clamp unchanged); a C-axis
+live-tool section (moves state C) turns the work only on C, judged by
+the machine's C rate (refused by name when that is over the limit or
+unstated while a limit is stated); a cross drill is not judged.
+
+Fixes #1174
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/setup_workholding.rs           | 110 +++++++++--
+ crates/app/tests/lathe_workholding_live.rs    | 177 ++++++++++++++++++
+ crates/app/tests/lathe_workholding_rpm.rs     |  10 +
+ .../1174-chuck-limit-work-spindle-only.md     |  40 ++++
+ 4 files changed, 317 insertions(+), 20 deletions(-)
+ create mode 100644 crates/app/tests/lathe_workholding_live.rs
+ create mode 100644 docs/decisions/1174-chuck-limit-work-spindle-only.md
+
+diff --git a/crates/app/src/setup_workholding.rs b/crates/app/src/setup_workholding.rs
+index 3469b61f1..b109ca593 100644
+--- a/crates/app/src/setup_workholding.rs
++++ b/crates/app/src/setup_workholding.rs
+@@ -65,9 +65,61 @@ pub fn css_of(world: &World, declared: Option<&str>, css: Option<Css>) -> Option
+     Some(c)
+ }
+ 
+-/// The program-level clause: every unsuppressed operation that turns the
+-/// work at a constant rpm (no CSS) faster than its setup's workholding
+-/// maximum, named with its setup. Empty when no setup states a limit.
++/// Which spindle an operation's stated speed drives, so what the
++/// workholding limit judges in its section (#1174). Read from what the
++/// lathe post does with the section, not from the kind's name:
++/// `fanuc-lathe.cps` opens a plain section with `G97 S<rpm> M03` (or
++/// `G96`) - the WORK spindle - and a `PARAM LiveTool` section (a path
++/// stating C angles) with the machine's live-spindle word and `S<rpm>`
++/// while the work spindle is put in C mode and fed as an axis.
++enum WorkSpeed {
++    /// The work turns at the section's stated speed: the turning family
++    /// and the lathe's axial (on-centre) drill.
++    Stated,
++    /// A C-axis live-tool section: the stated rpm is the driven tool's;
++    /// the work turns only on C, at most at the machine's C rate.
++    OnC,
++    /// Nothing the limit judges: a cross (radial) drill - a driven tool
++    /// plunging toward a work held still (its moves state no C, its
++    /// pose is fixed) - or a kind that does not turn the work.
++    Not,
++}
++
++fn work_speed(world: &World, declared: Option<&str>, op: &crate::schema::Operation, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
++    use flecs_ecs::prelude::*;
++    // The post's own test: any move stating a C angle makes the section
++    // live-tool work (the stream's PARAM LiveTool, `post::post`).
++    let on_c = e
++        .entity_view(world)
++        .try_get::<&crate::schema::Toolpath>(|t| t.path.moves.iter().any(|m| m.rotary.is_some()))
++        .unwrap_or(false);
++    if on_c {
++        return WorkSpeed::OnC;
++    }
++    if matches!(&op.params, crate::operation::OpParams::Drill { cross, .. } if !cross.is_empty()) {
++        return WorkSpeed::Not;
++    }
++    if crate::operation::spindle_law::turns(world, declared, &op.params) {
++        WorkSpeed::Stated
++    } else {
++        WorkSpeed::Not
++    }
++}
++
++/// The fastest the machine states its C axis turns, deg/min: the larger
++/// of its feed and rapid rates (the post positions C at the rapid and
++/// caps a cut by the feed). `None` when the machine states neither.
++fn c_rate(world: &World, declared: Option<&str>) -> Option<f64> {
++    let (_, machine) = crate::machine::of_setup(world, declared);
++    let c = machine?.axes.into_iter().find(|a| a.rotary && a.name.eq_ignore_ascii_case("C"))?;
++    [c.feed, c.rapid].into_iter().flatten().filter(|r| r.is_finite() && *r > 0.0).reduce(f64::max)
++}
++
++/// The program-level clause: every unsuppressed operation during which
++/// the WORK spindle turns faster than its setup's workholding maximum,
++/// named with its setup - a constant-rpm (G97) section at its stated
++/// rpm, a C-axis live-tool section at its machine's C rate (never the
++/// live tool's own rpm). Empty when no setup states a limit.
+ #[must_use]
+ pub fn program_problems(world: &World) -> Vec<String> {
+     let mut out = Vec::new();
+@@ -82,23 +134,41 @@ pub fn program_problems(world: &World) -> Vec<String> {
+         let Some(hold) = of(world, declared) else {
+             continue;
+         };
+-        if !crate::operation::spindle_law::turns(world, declared, &op.params) {
+-            continue;
+-        }
+-        let Some(tool) = model::find_by_name(world, &op.tool).and_then(|t| model::tool_of(world, &t)) else {
+-            continue; // the tool gate names a missing tool
+-        };
+-        if crate::cutting_turn::css_of(&op.params, &tool).is_some() {
+-            continue; // G96: clamped by css_of above
+-        }
+-        let rpm = crate::posting::posted_rpm(&tool);
+-        if rpm > hold {
+-            let setup_name = setup::effective(world, declared).unwrap_or_default();
+-            let label = model::operation_label(world, &name, &e);
+-            out.push(format!(
+-                "{label}: turns the work at {rpm:.0} rpm (G97), over setup '{setup_name}''s workholding maximum of {hold:.0} rpm - lower tool {}'s rpm or state the chuck's real rating",
+-                op.tool
+-            ));
++        let setup_name = || setup::effective(world, declared).unwrap_or_default();
++        match work_speed(world, declared, &op, &e) {
++            WorkSpeed::Not => {}
++            WorkSpeed::OnC => {
++                let label = model::operation_label(world, &name, &e);
++                match c_rate(world, declared) {
++                    Some(rate) if rate / 360.0 > hold => out.push(format!(
++                        "{label}: turns the work on the C axis at up to {:.0} rpm (the machine's C rate of {rate:.0} degrees per minute), over setup '{}''s workholding maximum of {hold:.0} rpm - state the chuck's real rating or a slower C rate",
++                        rate / 360.0,
++                        setup_name()
++                    )),
++                    Some(_) => {}
++                    None => out.push(format!(
++                        "{label}: turns the work on the C axis, but the machine states no C rate, so how fast the work turns cannot be held to setup '{}''s workholding maximum of {hold:.0} rpm - state the C axis's speeds in the machine file",
++                        setup_name()
++                    )),
++                }
++            }
++            WorkSpeed::Stated => {
++                let Some(tool) = model::find_by_name(world, &op.tool).and_then(|t| model::tool_of(world, &t)) else {
++                    continue; // the tool gate names a missing tool
++                };
++                if crate::cutting_turn::css_of(&op.params, &tool).is_some() {
++                    continue; // G96: clamped by css_of above
++                }
++                let rpm = crate::posting::posted_rpm(&tool);
++                if rpm > hold {
++                    let label = model::operation_label(world, &name, &e);
++                    out.push(format!(
++                        "{label}: turns the work at {rpm:.0} rpm (G97), over setup '{}''s workholding maximum of {hold:.0} rpm - lower tool {}'s rpm or state the chuck's real rating",
++                        setup_name(),
++                        op.tool
++                    ));
++                }
++            }
+         }
+     }
+     out
+diff --git a/crates/app/tests/lathe_workholding_live.rs b/crates/app/tests/lathe_workholding_live.rs
+new file mode 100644
+index 000000000..892ea177c
+--- /dev/null
++++ b/crates/app/tests/lathe_workholding_live.rs
+@@ -0,0 +1,177 @@
++//! The workholding rpm limit judges the WORK spindle, never a live
++//! tool's (#1174). A setup's chuck or collet rating (#1031) holds the
++//! spindle that turns the work: a constant-rpm turning section at its
++//! stated rpm (`lathe_workholding_rpm` pins those), and a C-axis
++//! live-tool section at the most its machine's C axis turns - the
++//! lathe post puts the work spindle in C mode there and gives the
++//! section's S to the live spindle, so the tool's rpm is not the
++//! work's. A cross (radial) drill is a driven tool plunging toward a
++//! work held still: the limit does not judge it at all. A C section on
++//! a machine stating no C rate cannot be held to the limit, and is
++//! refused by name while a limit is stated.
++//!
++//! Gate map (M4.4): covers app::setup_workholding (the program gate's
++//! work-speed split), app::posting (verification_gate).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++mod cross_support;
++
++use cross_support::*;
++
++use camcraft_app::commands::{CreateSetup, SetSetupWorkholdingRpm};
++use camcraft_app::machine::{AxisLimits, LiveToolCodes};
++use camcraft_app::posting;
++
++fn chuck_lines(world: &World) -> Vec<String> {
++    posting::verification_gate(world).into_iter().filter(|p| p.contains("workholding")).collect()
++}
++
++/// The cross-drill bar on a mill-turn, Setup1 stating `chuck` rpm, the
++/// drill at 10000 rpm, cross drill CD1 generated.
++fn cross_drilled(chuck: Option<f64>) -> World {
++    let (world, mut h) = bar_stock_world("mill-turn");
++    let fast = Tool { rpm: 10_000.0, flute_len: 50.0, ..catalog_tool("DR-0400") };
++    h.execute(&world, camcraft_app::commands::ChangeTool::new(&world, "DR-0400", fast).expect("10000 rpm drill"));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("Setup1"));
++    if chuck.is_some() {
++        h.execute(&world, SetSetupWorkholdingRpm::new(&world, "Setup1", chuck).expect("chuck limit"));
++    }
++    create(&world, &mut h, "CD1", cross_params(typed(), None));
++    assert_eq!(status(&world, "CD1"), OpStatus::Ok);
++    world
++}
++
++#[test]
++fn a_10000_rpm_cross_drill_is_not_judged_by_a_100_rpm_chuck() {
++    let held = cross_drilled(Some(100.0));
++    assert!(chuck_lines(&held).is_empty(), "the drill's spindle is not the chuck's: {:?}", chuck_lines(&held));
++    // The limit adds nothing to the gate: the same verdicts as no limit.
++    assert_eq!(posting::verification_gate(&held), posting::verification_gate(&cross_drilled(None)));
++}
++
++/// The test bench's live-tool words - placeholders, no builder's codes.
++fn codes() -> LiveToolCodes {
++    LiveToolCodes {
++        c_axis_on: "M1001".into(),
++        c_axis_off: "M1002".into(),
++        spindle_on: "M1003".into(),
++        spindle_off: "M1004".into(),
++    }
++}
++
++/// A mill-turn whose C turns at `c` = (feed, rapid) deg/min.
++fn mill_turn(c: (Option<f64>, Option<f64>)) -> Machine {
++    Machine {
++        model: "TestBench mill-turn".into(),
++        kind: Some("mill-turn".into()),
++        spindle_max: Some(6000.0),
++        axes: vec![
++            AxisLimits { name: "X".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits { name: "Y".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits { name: "Z".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits {
++                name: "C".into(),
++                rotary: true,
++                axis: Some([0.0, 0.0, 1.0]),
++                feed: c.0,
++                rapid: c.1,
++                ..Default::default()
++            },
++        ],
++        live_tool: Some(codes()),
++        ..Default::default()
++    }
++}
++
++/// The turned bar standing on the spindle: wall r6, shoulder, neck r5.
++fn bar() -> Vec<Triangle> {
++    const MERIDIAN: [(f64, f64); 6] = [(0.0, -16.0), (6.0, -16.0), (6.0, -2.0), (5.0, 2.0), (5.0, 16.0), (0.0, 16.0)];
++    let pt = |rho: f64, s: f64, j: usize| {
++        let th = TAU * j as f64 / 16.0;
++        Point3::new(rho * th.cos(), rho * th.sin(), s)
++    };
++    let mut f = Vec::new();
++    for w in MERIDIAN.windows(2) {
++        let ((ra, za), (rb, zb)) = (w[0], w[1]);
++        for j in 0..16 {
++            let k = (j + 1) % 16;
++            let (a1, a2, b1, b2) = (pt(ra, za, j), pt(ra, za, k), pt(rb, zb, j), pt(rb, zb, k));
++            if ra <= 1e-12 {
++                f.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                f.push(Triangle::new(a1, a2, b2));
++            } else {
++                f.push(Triangle::new(a1, a2, b2));
++                f.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    f
++}
++
++/// A C-axis rotary contour W1 by a 10000 rpm live ball on machine `m`,
++/// Setup1 stating `chuck` rpm - generated.
++fn wrapped(m: Machine, chuck: Option<f64>) -> World {
++    let world = new_world();
++    let mut h = History::default();
++    let ball = Tool { rpm: 10_000.0, ..catalog_tool("BN-0600") };
++    h.execute(&world, AddTool::new(&world, "BN-0600", ball).expect("tool"));
++    let stock = SetStock::new(&world, StockShape::Box { dx: 14.0, dy: 14.0, dz: 34.0 }, Location::default());
++    h.execute(&world, stock.expect("stock"));
++    h.execute(&world, ImportModel::from_mesh("bar", Mesh::from_facets(bar())));
++    h.execute(&world, LoadMachine::new(&world, "millturn.mch".into(), Some(m)).expect("machine"));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("Setup1"));
++    if chuck.is_some() {
++        h.execute(&world, SetSetupWorkholdingRpm::new(&world, "Setup1", chuck).expect("chuck limit"));
++    }
++    let params = OpParams::RotaryContour {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(25.0),
++        retract_z: None,
++        top_z: Height::fixed(6.0),
++        bottom_z: Height::fixed(-8.0),
++        feed: 500.0,
++        plunge_feed: 100.0,
++        climb: true,
++        lead_deg: 0.0,
++        lag_deg: 0.0,
++        max_tilt_deg: 60.0,
++    };
++    let op = CreateOperation::new(&world, "W1", "BN-0600", SrcRef::Entity("bar".into()), params);
++    h.execute(&world, op.expect("create"));
++    h.execute(&world, GenerateOperation::new(&world, "W1").expect("generate"));
++    assert_eq!(status(&world, "W1"), OpStatus::Ok);
++    let path = cache(&world, "W1").expect("a cached path");
++    assert!(path.path.moves.iter().any(|m| m.rotary.is_some()), "a C section: its moves state C");
++    world
++}
++
++/// C at 6000 deg/min feed, 12000 deg/min rapid: the work turns at most
++/// 12000 / 360 = 33.3 rpm.
++const RATED: (Option<f64>, Option<f64>) = (Some(6000.0), Some(12_000.0));
++
++#[test]
++fn a_c_section_is_judged_by_its_c_rate_never_by_the_live_tools_rpm() {
++    // 10000 rpm live tool, 100 rpm chuck, C at most 33 rpm: allowed.
++    let held = wrapped(mill_turn(RATED), Some(100.0));
++    assert!(chuck_lines(&held).is_empty(), "{:?}", chuck_lines(&held));
++    assert_eq!(posting::verification_gate(&held), posting::verification_gate(&wrapped(mill_turn(RATED), None)));
++    // A 20 rpm collet under a C that turns the work at 33 rpm: refused by name.
++    let slow = wrapped(mill_turn(RATED), Some(20.0));
++    let lines = chuck_lines(&slow);
++    assert_eq!(lines.len(), 1, "{lines:?}");
++    let l = &lines[0];
++    assert!(l.contains("W1") && l.contains("C axis") && l.contains("33 rpm"), "names the op and the work's speed: {l}");
++    assert!(l.contains("12000 degrees per minute"), "names the C rate it read: {l}");
++    assert!(l.contains("setup 'Setup1'") && l.contains("workholding maximum of 20 rpm"), "names the setup: {l}");
++    assert!(!l.contains("10000"), "never the live tool's rpm: {l}");
++}
++
++#[test]
++fn a_c_section_on_an_unrated_c_is_refused_only_under_a_stated_limit() {
++    let lines = chuck_lines(&wrapped(mill_turn((None, None)), Some(2000.0)));
++    assert_eq!(lines.len(), 1, "{lines:?}");
++    assert!(lines[0].contains("W1") && lines[0].contains("states no C rate"), "{}", lines[0]);
++    assert!(lines[0].contains("setup 'Setup1'") && lines[0].contains("2000 rpm"), "{}", lines[0]);
++    assert!(chuck_lines(&wrapped(mill_turn((None, None)), None)).is_empty(), "no limit stated: nothing to hold");
++}
+diff --git a/crates/app/tests/lathe_workholding_rpm.rs b/crates/app/tests/lathe_workholding_rpm.rs
+index 264469d86..72b08c1ac 100644
+--- a/crates/app/tests/lathe_workholding_rpm.rs
++++ b/crates/app/tests/lathe_workholding_rpm.rs
+@@ -189,6 +189,16 @@ fn a_g97_op_over_the_chuck_is_refused_by_name_never_capped() {
+     assert!(post(FANUC, &free).program.contains("G97 S2500 M03\n"));
+ }
+ 
++#[test]
++fn a_3000_rpm_g97_turning_op_under_a_2000_rpm_chuck_is_still_refused_by_name() {
++    // #1174 narrowed the limit to the work spindle; turning is that spindle.
++    let (world, _h) = faced(Tool { rpm: 3000.0, ..insert() }, Some(2000.0));
++    let lines = chuck_lines(&world);
++    assert_eq!(lines.len(), 1, "{lines:?}");
++    assert!(lines[0].contains("F1: turns the work at 3000 rpm (G97)"), "{}", lines[0]);
++    assert!(lines[0].contains("setup 'Setup1''s workholding maximum of 2000 rpm"), "{}", lines[0]);
++}
++
+ #[test]
+ fn the_limit_is_one_validated_undoable_command() {
+     let (world, mut h) = faced(insert(), None);
+diff --git a/docs/decisions/1174-chuck-limit-work-spindle-only.md b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+new file mode 100644
+index 000000000..30ea71b62
+--- /dev/null
++++ b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+@@ -0,0 +1,40 @@
++## #1174 - The workholding rpm limit judges the work spindle, not a live tool's speed
++
++**What was decided.** `setup_workholding::program_problems` sorts each
++operation by which spindle its section's stated speed drives, read from
++what the lathe post does with the section (not from kind names):
++
++| Section | What `fanuc-lathe.cps` writes | Spindle the S word drives | What the chuck limit judges |
++|---|---|---|---|
++| Turning family (turn, face, groove, part, thread, ...) | `G97 S<rpm> M03` / `G50 S` + `G96` | the WORK spindle | G97: the stated rpm (refused above the limit); G96: the clamp, min(machine, tool, chuck) - unchanged |
++| Lathe Drill, axial holes (on centre) | `G97 S<rpm> M03` + G83 face drilling | the WORK spindle (drill held still in the turret) | the stated rpm, as before |
++| Any section whose moves state a C angle (`PARAM LiveTool`: the C-axis rotary kinds on a mill-turn) | `G98`, the machine's C-on word, the live-spindle word `S<rpm>`; no `M03` | the LIVE tool; the work is in C mode, fed as an axis | the machine's C rate: the larger of its stated C feed and C rapid (deg/min) / 360, the most the work can turn in the section. A machine stating no C rate is refused by name while a limit is stated |
++| Drill with cross (radial) holes, lathe or mill-turn | a posed section (B 90, C fixed); no shipped lathe post voices it (`fanuc-lathe.cps` refuses posed moves) | the driven radial tool; the work is held in place (no C move, fixed pose) | nothing |
++| Everything else (`spindle_law::turns` false, no C) | not judged before, not judged now | - | nothing |
++
++**Why.** A chuck's rating limits the spindle that holds it. The old check
++used `spindle_law::turns` ("works about the spindle axis", the axis law's
++question), which also counts the cross drill, so a 10000 rpm live drill
++was refused under a 100 rpm chuck with the false text "turns the work at
++10000 rpm". The C-axis rotary kinds were not judged at all, although the
++work does turn (slowly) during them; judging them by the C rate closes
++that without touching the post scripts.
++
++**Considered and dropped.**
++- Judging a C section by the speed C actually reaches per move (chord,
++  feed, cap): exact, but it repeats the post's composite-feed arithmetic
++  in the app. The machine's stated C rate is the ceiling the post and the
++  control hold C to (G01 capped by it, G00 C at the rapid), so it is the
++  stricter reading and needs no second copy of the post's math.
++- Letting an unrated C pass: its speed cannot be held to the limit, and
++  a limit that is skipped is a hazard; refused by name instead (only
++  while a limit is stated - `None` posts exactly as before).
++- Changing any post script: not needed; the rule is a program-gate rule.
++
++**Open.** A Mill-family operation on a mill-turn whose path states no C
++(no `LiveTool` param) would be opened by the lathe post with `G97 S M03`,
++the work spindle. It was not judged before and is not judged now; it is
++filed as #1190.
++
++**Cost to change later.** One function (`work_speed`) and its pins in
++`lathe_workholding_live`.
+
+From b0434952bc6b67459f09118ccbbdbb0d79ef9723 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 13:20:44 +0100
+Subject: [PATCH 2/4] fix(turning): the workholding limit reads the post's own
+ section derivation; no kind fails open
+
+Review of PR #1191: the gate fell back to spindle_law::turns, which
+counts an on-centre Drill only on a pure lathe, so a mill-turn's
+on-centre drill at 8000 rpm posted G97 S8000 M03 under a 2000 rpm chuck.
+The lathe post opens every section without PARAM LiveTool on the work
+spindle, whatever its kind. post::section_spindle::of(path) is now the
+one derivation: post::dump writes PARAM LiveTool and the A/B pose words
+from it, and setup_workholding::work_speed reads it - on a lathe or
+mill-turn a Work section is judged at its stated rpm, a LiveTool
+section by the machine's C rate, a Posed section is the post's refusal.
+lathe_workholding_kinds proves it for every kind a lathe or mill-turn
+admits.
+
+Refs #1174
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/setup_workholding.rs           |  57 ++--
+ crates/app/tests/lathe_workholding_kinds.rs   | 260 ++++++++++++++++++
+ crates/post/src/post/mod.rs                   |   5 +-
+ crates/post/src/post/section_spindle.rs       |  48 ++++
+ .../1174-chuck-limit-work-spindle-only.md     |  80 +++---
+ 5 files changed, 383 insertions(+), 67 deletions(-)
+ create mode 100644 crates/app/tests/lathe_workholding_kinds.rs
+ create mode 100644 crates/post/src/post/section_spindle.rs
+
+diff --git a/crates/app/src/setup_workholding.rs b/crates/app/src/setup_workholding.rs
+index b109ca593..ed78b4c9b 100644
+--- a/crates/app/src/setup_workholding.rs
++++ b/crates/app/src/setup_workholding.rs
+@@ -12,10 +12,13 @@
+ //!   Tormach `G96 D`), becomes the lower of the tool's own and the
+ //!   workholding's ([`css_of`]); the posts take the lower of that and
+ //!   the machine's, so the clamp is min(machine, tool, workholding).
+-//! - **Constant rpm (G97).** An operation that turns the work at an rpm
+-//!   over its setup's limit is refused by name at the program gate
++//! - **Constant rpm (G97).** An operation whose section the lathe post
++//!   opens on the work spindle (any kind, #1174) at an rpm over its
++//!   setup's limit is refused by name at the program gate
+ //!   ([`program_problems`]), never silently capped: the cut was planned
+ //!   at that rpm, so the fix is the user's to choose.
++//! - **C-axis live tooling.** The section's S is the live tool's; the
++//!   work turns only on C, judged by the machine's C rate (#1174).
+ //!
+ //! Provenance: our own design (#1031); the hazard (jaw grip force falls
+ //! with speed, so chucks carry a rated maximum rpm) is general machining
+@@ -65,44 +68,38 @@ pub fn css_of(world: &World, declared: Option<&str>, css: Option<Css>) -> Option
+     Some(c)
+ }
+ 
+-/// Which spindle an operation's stated speed drives, so what the
+-/// workholding limit judges in its section (#1174). Read from what the
+-/// lathe post does with the section, not from the kind's name:
+-/// `fanuc-lathe.cps` opens a plain section with `G97 S<rpm> M03` (or
+-/// `G96`) - the WORK spindle - and a `PARAM LiveTool` section (a path
+-/// stating C angles) with the machine's live-spindle word and `S<rpm>`
+-/// while the work spindle is put in C mode and fed as an axis.
++/// What the workholding limit judges in an operation's section (#1174),
++/// read from what the lathe post will do with it - the one derivation
++/// the stream itself takes (`post::section_spindle`), never a list of
++/// operation kinds: on a lathe or mill-turn a section with no C and no
++/// lean is opened `G97 S<rpm> M03` (or `G96`) on the WORK spindle,
++/// whatever its kind; a C section gives S to the live spindle while the
++/// work is fed on C; a leaning (A/B) section is refused by the lathe
++/// posts. A mill's spindle turns the tool, never the work.
+ enum WorkSpeed {
+-    /// The work turns at the section's stated speed: the turning family
+-    /// and the lathe's axial (on-centre) drill.
++    /// The work turns at the section's stated speed.
+     Stated,
+     /// A C-axis live-tool section: the stated rpm is the driven tool's;
+     /// the work turns only on C, at most at the machine's C rate.
+     OnC,
+-    /// Nothing the limit judges: a cross (radial) drill - a driven tool
+-    /// plunging toward a work held still (its moves state no C, its
+-    /// pose is fixed) - or a kind that does not turn the work.
++    /// Nothing the limit judges: no path yet (the post refuses an
++    /// ungenerated op), a posed section the lathe posts refuse (the
++    /// cross drill's radial plunges), or a machine whose spindle turns
++    /// the tool.
+     Not,
+ }
+ 
+-fn work_speed(world: &World, declared: Option<&str>, op: &crate::schema::Operation, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
++fn work_speed(world: &World, declared: Option<&str>, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
++    use crate::post::section_spindle::{self, SectionSpindle};
+     use flecs_ecs::prelude::*;
+-    // The post's own test: any move stating a C angle makes the section
+-    // live-tool work (the stream's PARAM LiveTool, `post::post`).
+-    let on_c = e
+-        .entity_view(world)
+-        .try_get::<&crate::schema::Toolpath>(|t| t.path.moves.iter().any(|m| m.rotary.is_some()))
+-        .unwrap_or(false);
+-    if on_c {
+-        return WorkSpeed::OnC;
+-    }
+-    if matches!(&op.params, crate::operation::OpParams::Drill { cross, .. } if !cross.is_empty()) {
++    use crate::machine::Kind;
++    if !matches!(crate::machine::kind_of_setup(world, declared), Kind::Lathe | Kind::MillTurn) {
+         return WorkSpeed::Not;
+     }
+-    if crate::operation::spindle_law::turns(world, declared, &op.params) {
+-        WorkSpeed::Stated
+-    } else {
+-        WorkSpeed::Not
++    match e.entity_view(world).try_get::<&crate::schema::Toolpath>(|t| section_spindle::of(&t.path)) {
++        Some(SectionSpindle::Work) => WorkSpeed::Stated,
++        Some(SectionSpindle::LiveTool) => WorkSpeed::OnC,
++        Some(SectionSpindle::Posed) | None => WorkSpeed::Not,
+     }
+ }
+ 
+@@ -135,7 +132,7 @@ pub fn program_problems(world: &World) -> Vec<String> {
+             continue;
+         };
+         let setup_name = || setup::effective(world, declared).unwrap_or_default();
+-        match work_speed(world, declared, &op, &e) {
++        match work_speed(world, declared, &e) {
+             WorkSpeed::Not => {}
+             WorkSpeed::OnC => {
+                 let label = model::operation_label(world, &name, &e);
+diff --git a/crates/app/tests/lathe_workholding_kinds.rs b/crates/app/tests/lathe_workholding_kinds.rs
+new file mode 100644
+index 000000000..8737c1a2d
+--- /dev/null
++++ b/crates/app/tests/lathe_workholding_kinds.rs
+@@ -0,0 +1,260 @@
++//! The workholding rpm limit fails closed for EVERY operation kind a
++//! lathe or mill-turn setup can hold (#1174 review): the program gate
++//! reads the same derivation the stream does (`post::section_spindle`),
++//! so a section the lathe post opens on the work spindle (`G97 S M03`,
++//! whatever its kind) is judged at its stated rpm, a C section by the
++//! machine's C rate, and nothing posts with the work spindle above the
++//! chuck's rating. Before the fix a mill-turn's on-centre Drill at 8000
++//! rpm posted `G97 S8000 M03` under a 2000 rpm chuck: the gate only
++//! judged what `spindle_law::turns` named.
++//!
++//! Gate map (M4.4): covers app::setup_workholding (the program gate),
++//! post::post (section_spindle), app::posting (post_script).
++//! Lane shape (M4.4): the default tests run in seconds each; the slow
++//! kinds' rows are one heavy-lane test (`SLOW`).
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, CreateSetup, GenerateOperation, History, ImportModel, LoadMachine, SetSetupWorkholdingRpm,
++    SetStock,
++};
++use camcraft_app::drilling::Hole;
++use camcraft_app::geo2d::Point2;
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::machine::{AxisLimits, Coolant, LiveToolCodes, Machine};
++use camcraft_app::operation::{seed_params, KindInfo, OpParams, OpType, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::world::new_world;
++use camcraft_app::posting;
++
++const TAU: f64 = std::f64::consts::TAU;
++const FANUC: &str = include_str!("../../../assets/posts/fanuc-lathe.cps");
++const CHUCK: f64 = 2000.0;
++const FAST: f64 = 8000.0;
++/// A bar r6, z -16..16, with a blind r2.2 centre hole down to z 6.
++const BORED: [(f64, f64); 6] = [(0.0, -16.0), (6.0, -16.0), (6.0, 16.0), (2.2, 16.0), (2.2, 6.0), (0.0, 6.0)];
++
++fn revolve(meridian: &[(f64, f64)], segs: usize) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / segs as f64;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..segs {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++fn machine(kind: &str) -> Machine {
++    let lin = |n: &str| AxisLimits { name: n.into(), feed: Some(4000.0), ..Default::default() };
++    let c = AxisLimits {
++        name: "C".into(),
++        rotary: true,
++        axis: Some([0.0, 0.0, 1.0]),
++        feed: Some(6000.0),
++        rapid: Some(12_000.0),
++        ..Default::default()
++    };
++    Machine {
++        model: format!("TestBench {kind}"),
++        kind: Some(kind.into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12_000.0),
++        coolants: vec![Coolant { name: "Flood".into(), m_code: "M8".into() }],
++        axes: vec![lin("X"), lin("Y"), lin("Z"), c],
++        live_tool: Some(LiveToolCodes {
++            c_axis_on: "M1001".into(),
++            c_axis_off: "M1002".into(),
++            spindle_on: "M1003".into(),
++            spindle_off: "M1004".into(),
++        }),
++        ..Default::default()
++    }
++}
++
++/// The bored bar in its own stock on a `kind` machine, Setup1 stating
++/// `chuck` rpm, every catalog tool at `rpm`.
++fn doc(kind: &str, chuck: f64, rpm: f64) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
++    let stock = SetStock::new(&world, StockShape::Cylinder { diameter: 12.0, height: 32.0 }, at);
++    h.execute(&world, stock.expect("bar stock"));
++    h.execute(&world, LoadMachine::new(&world, "bench.mch".into(), Some(machine(kind))).expect("machine"));
++    for (name, t) in catalog() {
++        let flute_len = t.flute_len.max(20.0);
++        if let Ok(cmd) = AddTool::new(&world, name, Tool { rpm, flute_len, ..t }) {
++            h.execute(&world, cmd);
++        }
++    }
++    h.execute(&world, ImportModel::from_mesh("bar", revolve(&BORED, 24)));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("Setup1"));
++    h.execute(&world, SetSetupWorkholdingRpm::new(&world, "Setup1", Some(chuck)).expect("chuck limit"));
++    (world, h)
++}
++
++/// The centre hole, for the kinds that take a hole list.
++fn on_centre(p: &mut OpParams) {
++    let hole = Hole { xy: Point2::new(0.0, 0.0), radius: 2.2, entry_z: 16.0, floor_z: 6.0, through: false, stepped: false };
++    match p {
++        OpParams::Drill { holes, .. } | OpParams::Bore { holes, .. } | OpParams::Thread { holes, .. } => *holes = vec![hole],
++        _ => {}
++    }
++}
++
++/// Create kind `i` as "K" with the first catalog tool its door takes,
++/// and generate it. `false` when no tool fits or generation is refused.
++fn add_kind(world: &World, h: &mut History, i: usize) -> bool {
++    let mut p = seed_params(i);
++    on_centre(&mut p);
++    let made = catalog().into_iter().find_map(|(tool, _)| CreateOperation::new(world, "K", tool, SrcRef::Entity("bar".into()), p.clone()).ok());
++    let Some(cmd) = made else { return false };
++    h.execute(world, cmd);
++    match GenerateOperation::new(world, "K") {
++        Ok(g) => {
++            h.execute(world, g);
++            true
++        }
++        Err(_) => false,
++    }
++}
++
++fn chuck_lines(world: &World) -> Vec<String> {
++    posting::verification_gate(world).into_iter().filter(|p| p.contains("workholding")).collect()
++}
++
++/// Every work-spindle start in `program` held to `limit`: a G97's S
++/// itself, a G96's G50 clamp in force. A live spindle's S is the tool's.
++fn work_spindle_within(program: &str, limit: f64) -> Result<(), String> {
++    let s_of = |l: &str| l.split(' ').find_map(|w| w.strip_prefix('S').and_then(|v| v.parse::<f64>().ok()));
++    let mut clamp = f64::INFINITY;
++    for l in program.lines() {
++        if l.starts_with("G50") {
++            clamp = s_of(l).unwrap_or(f64::INFINITY);
++        }
++        let starts = l.contains("M03") || l.contains("M04");
++        if starts && l.contains("G97") && s_of(l).is_none_or(|s| s > limit) {
++            return Err(format!("work spindle over the chuck: {l}"));
++        }
++        if starts && l.contains("G96") && clamp > limit {
++            return Err(format!("G96 clamped at {clamp} over the chuck: {l}"));
++        }
++    }
++    Ok(())
++}
++
++enum Outcome {
++    Limit,
++    Posted,
++    Refused(String),
++    NotBuilt,
++}
++
++fn judge(kind: &str, i: usize, chuck: f64, rpm: f64) -> Outcome {
++    let (world, mut h) = doc(kind, chuck, rpm);
++    if !add_kind(&world, &mut h, i) {
++        return Outcome::NotBuilt;
++    }
++    if !chuck_lines(&world).is_empty() {
++        return Outcome::Limit;
++    }
++    let out = std::env::temp_dir().join(format!("camcraft-1174-{}-{kind}-{i}.nc", std::process::id()));
++    let posted = posting::post_script(&world, &out, FANUC);
++    let program = std::fs::read_to_string(&out).unwrap_or_default();
++    let _ = std::fs::remove_file(&out);
++    match posted {
++        Err(e) => Outcome::Refused(e),
++        Ok(_) => {
++            if let Err(why) = work_spindle_within(&program, chuck) {
++                panic!("{kind} kind {} posted with the work spindle over the {chuck} rpm chuck - {why}\n{program}", KindInfo::ALL[i].label);
++            }
++            Outcome::Posted
++        }
++    }
++}
++
++/// Every kind `mk` admits whose registry index falls in `range`, judged
++/// on a `kind` machine with the tools at 8000 rpm under a 2000 rpm chuck:
++/// refused by the limit, posted with the work spindle within it (a C
++/// section, judged by the C rate), refused for another named reason, or
++/// not buildable on the fixture - never posted over the chuck (`judge`
++/// panics on that). Split in slices so no one test runs past a minute.
++fn table(kind: &str, mk: camcraft_app::machine::Kind, range: std::ops::Range<usize>, slow: bool) {
++    let mut rows = Vec::new();
++    let picked = |i: &usize, k: &KindInfo| range.contains(i) && k.admits(mk) && SLOW.contains(&k.ty) == slow;
++    for (i, k) in KindInfo::ALL.iter().enumerate().filter(|(i, k)| picked(i, k)) {
++        let t = std::time::Instant::now();
++        let o = match judge(kind, i, CHUCK, FAST) {
++            Outcome::Limit => "refused by the chuck limit".to_string(),
++            Outcome::Posted => "posted, work spindle within the chuck".to_string(),
++            Outcome::Refused(e) => format!("refused: {}", e.chars().take(110).collect::<String>()),
++            Outcome::NotBuilt => "not built (no tool / generation refused)".to_string(),
++        };
++        rows.push(format!("{kind:9} {:24} {:5.1}s {o}", k.label, t.elapsed().as_secs_f64()));
++    }
++    println!("{}", rows.join("
++"));
++}
++
++const N: usize = KindInfo::ALL.len();
++
++/// The kinds whose generation on the bar takes 15-65 s in debug: their
++/// rows run in the heavy lane (`every_slow_kind_...`). The C-rate rule
++/// they reach is pinned in the default lane by `lathe_workholding_live`.
++const SLOW: [OpType; 5] = [OpType::Contour5D, OpType::Parallel5D, OpType::Flow5D, OpType::RotaryContour, OpType::TrochoidalSlot];
++
++#[test]
++fn no_lathe_kind_posts_the_work_spindle_over_the_chuck() {
++    table("lathe", camcraft_app::machine::Kind::Lathe, 0..N, false);
++}
++
++#[test]
++fn no_mill_turn_kind_posts_the_work_spindle_over_the_chuck_first_third() {
++    table("mill-turn", camcraft_app::machine::Kind::MillTurn, 0..N / 3, false);
++}
++
++#[test]
++fn no_mill_turn_kind_posts_the_work_spindle_over_the_chuck_second_third() {
++    table("mill-turn", camcraft_app::machine::Kind::MillTurn, N / 3..2 * N / 3, false);
++}
++
++#[test]
++fn no_mill_turn_kind_posts_the_work_spindle_over_the_chuck_last_third() {
++    table("mill-turn", camcraft_app::machine::Kind::MillTurn, 2 * N / 3..N, false);
++}
++
++#[test]
++#[ignore = "heavy lane (#1174 per-kind workholding table): the 5-axis, rotary-contour and trochoidal kinds on a mill-turn, ~2 min debug - run at the cut with -- --ignored"]
++fn every_slow_kind_on_a_mill_turn_keeps_the_work_spindle_within_the_chuck() {
++    table("mill-turn", camcraft_app::machine::Kind::MillTurn, 0..N, true);
++}
++
++#[test]
++fn a_mill_turn_on_centre_drill_bore_is_judged_like_the_lathes() {
++    use camcraft_app::machine::Kind;
++    for (kind, mk) in [("lathe", Kind::Lathe), ("mill-turn", Kind::MillTurn)] {
++        for ty in [OpType::Drill, OpType::Bore] {
++            let i = KindInfo::ALL.iter().position(|k| k.ty == ty).expect("kind");
++            if !KindInfo::ALL[i].admits(mk) {
++                continue;
++            }
++            assert!(matches!(judge(kind, i, CHUCK, FAST), Outcome::Limit), "{kind} {ty:?} at 8000 under 2000 is refused by the limit");
++            assert!(!matches!(judge(kind, i, CHUCK, CHUCK), Outcome::Limit), "{kind} {ty:?} exactly at the limit is allowed");
++        }
++    }
++}
+diff --git a/crates/post/src/post/mod.rs b/crates/post/src/post/mod.rs
+index f8bce5ca5..84490ff54 100644
+--- a/crates/post/src/post/mod.rs
++++ b/crates/post/src/post/mod.rs
+@@ -38,6 +38,7 @@ pub mod machine;
+ pub mod nose_tip;
+ pub mod probe_rec;
+ mod program;
++pub mod section_spindle;
+ 
+ pub use after_op::AfterOperation;
+ pub use coolant::CoolantMode;
+@@ -258,7 +259,7 @@ pub fn dump(t: &Toolpath, d: &Dump) -> Vec<Record> {
+     // a C turn: the section says so before it opens, so a script can
+     // engage C and the live spindle in its preamble - and the engine
+     // refuses, by name, a script that does not declare `liveTooling`.
+-    if t.moves.iter().any(|m| m.rotary.is_some()) {
++    if section_spindle::of(t) == section_spindle::SectionSpindle::LiveTool {
+         out.push(Record::Param { name: "LiveTool".into(), value: json!("radial") });
+     }
+     // A thread whose passes need the spindle reversed (#629): the
+@@ -442,7 +443,7 @@ pub fn dump(t: &Toolpath, d: &Dump) -> Vec<Record> {
+                 tilted = false;
+                 Some([0.0, 0.0, c])
+             }
+-            (None, Some(a)) if !crate::cl::is_vertical(&a) => {
++            (None, Some(a)) if section_spindle::leans(m) => {
+                 tilted = true;
+                 Some(crate::cl::axis_to_angles(a))
+             }
+diff --git a/crates/post/src/post/section_spindle.rs b/crates/post/src/post/section_spindle.rs
+new file mode 100644
+index 000000000..50c1d0675
+--- /dev/null
++++ b/crates/post/src/post/section_spindle.rs
+@@ -0,0 +1,48 @@
++//! Which spindle a path's section drives (#1174): the one reading the
++//! stream ([`super::dump`]'s `PARAM LiveTool`) and the program gate's
++//! workholding rule (`app::setup_workholding`) both take, so the two
++//! can never disagree about whether the work turns at the section's S.
++//!
++//! - A path stating a C angle on any move is C-axis live-tool work
++//!   (issue #33): the stream says `PARAM LiveTool`, and a lathe post
++//!   gives the section's S to the live spindle with the work on C.
++//! - A path stating a leaning tool axis on a non-C move commands A/B
++//!   words; the lathe posts refuse those sections ("posed move").
++//! - Anything else a lathe post opens on the WORK spindle
++//!   (`G97 S M03` / `G96`), whatever the operation's kind.
++//!
++//! Provenance: our own stream grammar (issue #33, M5.1 stage A); a
++//! lathe's main spindle turns the work and a live-tool spindle the
++//! cutter (any turning handbook's mill-turn chapter). No vendor
++//! material consulted.
++
++use crate::cl::{Move, Toolpath};
++
++/// What a lathe post does with a path's section, by its moves.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SectionSpindle {
++    /// No C, no lean: the work spindle turns at the section's S.
++    Work,
++    /// C stated: live-tool work, the work positioned and fed on C.
++    LiveTool,
++    /// A leaning axis on a non-C move: A/B words a lathe post refuses.
++    Posed,
++}
++
++/// A non-C move stating a leaning tool axis - one that commands A/B.
++#[must_use]
++pub fn leans(m: &Move) -> bool {
++    m.rotary.is_none() && m.axis.is_some_and(|a| !crate::cl::is_vertical(&a))
++}
++
++/// The section spindle of `t` (C first: a C move commands no A/B).
++#[must_use]
++pub fn of(t: &Toolpath) -> SectionSpindle {
++    if t.moves.iter().any(|m| m.rotary.is_some()) {
++        SectionSpindle::LiveTool
++    } else if t.moves.iter().any(leans) {
++        SectionSpindle::Posed
++    } else {
++        SectionSpindle::Work
++    }
++}
+diff --git a/docs/decisions/1174-chuck-limit-work-spindle-only.md b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+index 30ea71b62..72477d78e 100644
+--- a/docs/decisions/1174-chuck-limit-work-spindle-only.md
++++ b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+@@ -1,40 +1,50 @@
+-## #1174 - The workholding rpm limit judges the work spindle, not a live tool's speed
++## #1174 - The workholding rpm limit judges the work spindle, from the post's own derivation
+ 
+-**What was decided.** `setup_workholding::program_problems` sorts each
+-operation by which spindle its section's stated speed drives, read from
+-what the lathe post does with the section (not from kind names):
++**What was decided.** `setup_workholding::program_problems` judges each
++operation by what the lathe post will do with its section, read through
++one function the stream itself uses: `post::section_spindle::of(path)`.
++`post::dump` writes `PARAM LiveTool` (and the A/B pose words) from the
++same function, so the gate and the stream can never disagree. No list of
++operation kinds is consulted (the first version of this PR fell back to
++`spindle_law::turns`, which counts an on-centre Drill only on a pure
++lathe - a mill-turn's on-centre drill at 8000 rpm posted `G97 S8000 M03`
++under a 2000 rpm chuck; the review caught it).
+ 
+-| Section | What `fanuc-lathe.cps` writes | Spindle the S word drives | What the chuck limit judges |
++On a setup whose machine is a lathe or a mill-turn:
++
++| `section_spindle::of` | What `fanuc-lathe.cps` writes | Spindle the S word drives | What the chuck limit judges |
+ |---|---|---|---|
+-| Turning family (turn, face, groove, part, thread, ...) | `G97 S<rpm> M03` / `G50 S` + `G96` | the WORK spindle | G97: the stated rpm (refused above the limit); G96: the clamp, min(machine, tool, chuck) - unchanged |
+-| Lathe Drill, axial holes (on centre) | `G97 S<rpm> M03` + G83 face drilling | the WORK spindle (drill held still in the turret) | the stated rpm, as before |
+-| Any section whose moves state a C angle (`PARAM LiveTool`: the C-axis rotary kinds on a mill-turn) | `G98`, the machine's C-on word, the live-spindle word `S<rpm>`; no `M03` | the LIVE tool; the work is in C mode, fed as an axis | the machine's C rate: the larger of its stated C feed and C rapid (deg/min) / 360, the most the work can turn in the section. A machine stating no C rate is refused by name while a limit is stated |
+-| Drill with cross (radial) holes, lathe or mill-turn | a posed section (B 90, C fixed); no shipped lathe post voices it (`fanuc-lathe.cps` refuses posed moves) | the driven radial tool; the work is held in place (no C move, fixed pose) | nothing |
+-| Everything else (`spindle_law::turns` false, no C) | not judged before, not judged now | - | nothing |
+-
+-**Why.** A chuck's rating limits the spindle that holds it. The old check
+-used `spindle_law::turns` ("works about the spindle axis", the axis law's
+-question), which also counts the cross drill, so a 10000 rpm live drill
+-was refused under a 100 rpm chuck with the false text "turns the work at
+-10000 rpm". The C-axis rotary kinds were not judged at all, although the
+-work does turn (slowly) during them; judging them by the C rate closes
+-that without touching the post scripts.
++| `Work` - no move states C or a leaning axis (every turning kind, the on-centre Drill / Bore / Thread / tapping cycles, Probe, any mill path on the meridian) | `G97 S<rpm> M03` / `G50 S` + `G96` - whatever the kind | the WORK spindle | G97: the stated rpm, refused by name above the limit (at it is allowed); G96: the clamp, min(machine, tool, chuck) - unchanged |
++| `LiveTool` - a move states C (`PARAM LiveTool`: the C-axis rotary kinds) | `G98`, the C-on word, the live-spindle word `S<rpm>`; no `M03` | the LIVE tool; the work is in C mode, fed as an axis | the machine's C rate: the larger of its stated C feed and C rapid (deg/min) / 360. No C rate stated -> refused by name while a limit is stated |
++| `Posed` - a non-C move states a leaning tool axis (the cross drill's radial plunges, the 5-axis kinds) | A/B words, refused by both lathe posts ("posed move ... no rotary to command") | - (the post refuses it) | nothing - the post's refusal is the guard |
++
++On a mill (or any other machine kind) the spindle turns the tool: the
++limit judges nothing there.
++
++**Why.** A chuck's rating limits the spindle that holds the work, and
++which spindle that is in a section is decided by the post, not by the
++operation's kind: the lathe post opens every non-live section on the
++work spindle. Judging from the same derivation the stream uses closes
++both directions - the false refusal of #1174 (a 10000 rpm live cross
++drill under a 100 rpm chuck) and the fail-open the review found (any
++kind `turns()` did not name posted the chuck over its rating).
+ 
+ **Considered and dropped.**
+-- Judging a C section by the speed C actually reaches per move (chord,
+-  feed, cap): exact, but it repeats the post's composite-feed arithmetic
+-  in the app. The machine's stated C rate is the ceiling the post and the
+-  control hold C to (G01 capped by it, G00 C at the rapid), so it is the
+-  stricter reading and needs no second copy of the post's math.
+-- Letting an unrated C pass: its speed cannot be held to the limit, and
+-  a limit that is skipped is a hazard; refused by name instead (only
+-  while a limit is stated - `None` posts exactly as before).
+-- Changing any post script: not needed; the rule is a program-gate rule.
+-
+-**Open.** A Mill-family operation on a mill-turn whose path states no C
+-(no `LiveTool` param) would be opened by the lathe post with `G97 S M03`,
+-the work spindle. It was not judged before and is not judged now; it is
+-filed as #1190.
+-
+-**Cost to change later.** One function (`work_speed`) and its pins in
+-`lathe_workholding_live`.
++- A second list of kinds (extend `turns()` with Bore, Thread, ...): it
++  can drift from the post again; the moves are what the post reads.
++- Judging a C section by the speed C actually reaches per move: exact,
++  but a second copy of the post's composite-feed arithmetic. The stated C
++  rate is the ceiling the post and the control hold C to, so it is the
++  stricter reading.
++- Letting an unrated C pass: a limit that is skipped is a hazard.
++- Judging a `Posed` section at its rpm: the cross drill's S is a driven
++  radial tool's (the work is held still); no shipped lathe post voices a
++  posed section at all. If a post ever does, this row needs re-reading.
++- Changing any post script: not needed (and #1190 owns the post side).
++
++**Known over-reach.** A mill-turn posted through a MILL post (which
++gives S to the tool spindle) is judged as if the lathe post ran: a
++refusal that is too wide, never a skipped limit.
++
++**Cost to change later.** `post::section_spindle` and `work_speed`; pins
++in `lathe_workholding_live` and `lathe_workholding_kinds`.
+
+From f4bb9985698f21759fa534ab4eb87ea9eb0955f9 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 13:47:27 +0100
+Subject: [PATCH 3/4] wip(turning): key the workholding rule on the post
+ dialect (pre-merge of #1202)
+
+Refs #1174
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/posting.rs               | 18 +++++-
+ crates/app/src/posting_mounts.rs        | 10 +++-
+ crates/app/src/posting_per_op.rs        | 13 ++++-
+ crates/app/src/setup_workholding.rs     | 76 ++++++++++++++++++-------
+ crates/post/src/post/section_spindle.rs | 67 ++++++++++++++++++++++
+ 5 files changed, 156 insertions(+), 28 deletions(-)
+
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index 154b4a2b3..b0dae88ed 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -458,7 +458,9 @@ fn post_script_body(world: &World, out_path: &Path, cps: &str) -> Result<Posted,
+     // computed here and now - never a cached verdict carried in from
+     // the viewer (the PostView law: a verdict about an older world
+     // must not release this one's metal).
+-    let mut report = verification_report(world);
++    // #1174: the workholding clause reads the dialect of THIS script.
++    let voice = post::section_spindle::work_voice(cps);
++    let mut report = verification_report_by(world, &|_| voice);
+     // One file, one register per word (#196): two setups posting the same
+     // word from different placements refuse here - per-op files are exempt.
+     report.problems.extend(wcs_slot::shared_word_problems(world));
+@@ -629,6 +631,15 @@ pub fn verification_gate(world: &World) -> Vec<String> {
+ /// read, so the visible line and the binding gate are one run.
+ #[must_use]
+ pub fn verification_report(world: &World) -> GateReport {
++    verification_report_by(world, &|declared| crate::setup_workholding::mounted_voice(world, declared))
++}
++
++/// [`verification_report`] with the workholding clause (#1174) judged
++/// for the post scripts that will actually run: `voice` names the
++/// dialect of the script each operation's setup context posts through
++/// (an explicit script: the same for every op).
++#[must_use]
++pub fn verification_report_by(world: &World, voice: &dyn Fn(Option<&str>) -> post::section_spindle::WorkVoice) -> GateReport {
+     let mut problems = Vec::new();
+ 
+     // The fidelity clause (#864), first: an operation judged against a
+@@ -656,8 +667,9 @@ pub fn verification_report(world: &World) -> GateReport {
+     // program (the Output and the thread output) - never posted half one
+     // way. Judged program-wide, ahead of #388's per-mount split.
+     problems.extend(crate::setup_post_options::program_problems(world));
+-    // #1031: a G97 rpm over a setup's workholding maximum, by name.
+-    problems.extend(crate::setup_workholding::program_problems(world));
++    // #1031/#1174: the work spindle over a setup's workholding maximum,
++    // by name - judged for the post dialect each op runs through.
++    problems.extend(crate::setup_workholding::program_problems_by(world, voice));
+     // The carried-stock clause (#319): a feed move into carried material
+     // outside a setup's declared stock is engagement nothing verified.
+     problems.extend(crate::operation::carried_problems(world));
+diff --git a/crates/app/src/posting_mounts.rs b/crates/app/src/posting_mounts.rs
+index 98bf5536f..0111d686c 100644
+--- a/crates/app/src/posting_mounts.rs
++++ b/crates/app/src/posting_mounts.rs
+@@ -201,7 +201,15 @@ fn post_each(world: &World, out_path: &Path, cps: Option<&str>, mounts: Vec<Moun
+         });
+     }
+     let streams = op_streams(world)?;
+-    let mut report = verification_report(world);
++    // #1174: an explicit script is the dialect every op posts through;
++    // otherwise each op's own mount's post (the scripts read above).
++    let mut report = match cps {
++        Some(c) => {
++            let voice = crate::post::section_spindle::work_voice(c);
++            crate::posting::verification_report_by(world, &|_| voice)
++        }
++        None => verification_report(world),
++    };
+     for m in &mounts {
+         report.problems.extend(wcs_slot::shared_word_problems_in(world, Some(&m.setups)));
+     }
+diff --git a/crates/app/src/posting_per_op.rs b/crates/app/src/posting_per_op.rs
+index a79f1a3cc..bef0a8e2c 100644
+--- a/crates/app/src/posting_per_op.rs
++++ b/crates/app/src/posting_per_op.rs
+@@ -16,7 +16,7 @@
+ //! writes nothing: never a folder with ops 1 and 3 but not 2.
+ 
+ use super::{
+-    machine_value_of, op_streams, options_value, post_options, script_of, script_source, verification_report, viewer_map,
++    machine_value_of, op_streams, options_value, post_options, script_of, script_source, viewer_map,
+     Posted,
+ };
+ use crate::post::{cnc, engine};
+@@ -111,7 +111,16 @@ fn post_per_op_with(
+         return Err(format!("{} is not a folder", dir.display()));
+     }
+     let streams = op_streams(world)?;
+-    let report = verification_report(world);
++    // #1174: the workholding clause reads each op's own script's dialect
++    // (keyed by effective setup name, as `script` is); unreadable reads
++    // as undeclared - the stricter reading.
++    let voice = |declared: Option<&str>| {
++        let setup = crate::setup::effective(world, declared).unwrap_or_default();
++        script(&setup).map_or(crate::post::section_spindle::WorkVoice::Undeclared, |c| {
++            crate::post::section_spindle::work_voice(&c)
++        })
++    };
++    let report = crate::posting::verification_report_by(world, &voice);
+     if !report.problems.is_empty() {
+         return Err(format!("post blocked - {}", report.problems.join("; ")));
+     }
+diff --git a/crates/app/src/setup_workholding.rs b/crates/app/src/setup_workholding.rs
+index ed78b4c9b..b7b758f64 100644
+--- a/crates/app/src/setup_workholding.rs
++++ b/crates/app/src/setup_workholding.rs
+@@ -28,6 +28,7 @@
+ use flecs_ecs::prelude::World;
+ 
+ use crate::model;
++use crate::post::section_spindle::{self, WorkVoice};
+ use crate::post::Css;
+ use crate::setup;
+ 
+@@ -69,13 +70,13 @@ pub fn css_of(world: &World, declared: Option<&str>, css: Option<Css>) -> Option
+ }
+ 
+ /// What the workholding limit judges in an operation's section (#1174),
+-/// read from what the lathe post will do with it - the one derivation
+-/// the stream itself takes (`post::section_spindle`), never a list of
+-/// operation kinds: on a lathe or mill-turn a section with no C and no
+-/// lean is opened `G97 S<rpm> M03` (or `G96`) on the WORK spindle,
+-/// whatever its kind; a C section gives S to the live spindle while the
+-/// work is fed on C; a leaning (A/B) section is refused by the lathe
+-/// posts. A mill's spindle turns the tool, never the work.
++/// read from what the post will do with it - the derivations the stream
++/// and the posts themselves take (`post::section_spindle`), never a list
++/// of operation kinds nor the machine's kind: a section with no C and no
++/// lean is opened `G97 S<rpm> M03` (or `G96`) on the WORK spindle by a
++/// turning post, whatever its kind and whatever machine is (or is not)
++/// mounted; a C section gives S to the live spindle while the work is
++/// fed on C; a leaning (A/B) section is refused by the lathe posts.
+ enum WorkSpeed {
+     /// The work turns at the section's stated speed.
+     Stated,
+@@ -84,25 +85,45 @@ enum WorkSpeed {
+     OnC,
+     /// Nothing the limit judges: no path yet (the post refuses an
+     /// ungenerated op), a posed section the lathe posts refuse (the
+-    /// cross drill's radial plunges), or a machine whose spindle turns
+-    /// the tool.
++    /// cross drill's radial plunges), or a Work section through a
++    /// milling post (its S drives the tool spindle, not the chuck).
+     Not,
+ }
+ 
+-fn work_speed(world: &World, declared: Option<&str>, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
++fn work_speed(world: &World, voice: WorkVoice, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
+     use crate::post::section_spindle::{self, SectionSpindle};
+     use flecs_ecs::prelude::*;
+-    use crate::machine::Kind;
+-    if !matches!(crate::machine::kind_of_setup(world, declared), Kind::Lathe | Kind::MillTurn) {
+-        return WorkSpeed::Not;
+-    }
+     match e.entity_view(world).try_get::<&crate::schema::Toolpath>(|t| section_spindle::of(&t.path)) {
+-        Some(SectionSpindle::Work) => WorkSpeed::Stated,
++        Some(SectionSpindle::Work) => match voice {
++            WorkVoice::WorkSpindle => WorkSpeed::Stated,
++            WorkVoice::ToolSpindle => WorkSpeed::Not,
++            // A script that states no dialect (#1199): the stricter
++            // reading - judged as a turning post while a limit is
++            // stated. Whoever settles #1199 changes this arm together
++            // with the lathe door that reads the same mask (#1190).
++            WorkVoice::Undeclared => WorkSpeed::Stated,
++        },
+         Some(SectionSpindle::LiveTool) => WorkSpeed::OnC,
+         Some(SectionSpindle::Posed) | None => WorkSpeed::Not,
+     }
+ }
+ 
++/// The dialect of the post a declared setup context runs (its own, else
++/// the document's): a script that cannot be read is `Undeclared` - the
++/// stricter reading; the post itself refuses it by name.
++#[must_use]
++pub fn mounted_voice(world: &World, declared: Option<&str>) -> WorkVoice {
++    let post = crate::setup_mount::post_of(world, declared);
++    crate::posting::script_of(&post).map_or(WorkVoice::Undeclared, |(_, cps)| section_spindle::work_voice(&cps))
++}
++
++/// `rpm` and `limit` as the refusal prints them: whole rpm, or one
++/// decimal when whole rpm would print the two the same (2000.4 over 2000).
++fn shown(rpm: f64, limit: f64) -> (String, String) {
++    let (a, b) = (format!("{rpm:.0}"), format!("{limit:.0}"));
++    if a == b { (format!("{rpm:.1}"), format!("{limit:.1}")) } else { (a, b) }
++}
++
+ /// The fastest the machine states its C axis turns, deg/min: the larger
+ /// of its feed and rapid rates (the post positions C at the rapid and
+ /// caps a cut by the feed). `None` when the machine states neither.
+@@ -119,6 +140,14 @@ fn c_rate(world: &World, declared: Option<&str>) -> Option<f64> {
+ /// live tool's own rpm). Empty when no setup states a limit.
+ #[must_use]
+ pub fn program_problems(world: &World) -> Vec<String> {
++    program_problems_by(world, &|declared| mounted_voice(world, declared))
++}
++
++/// [`program_problems`] with each operation's post dialect read by
++/// `voice` from its declared setup context - what a post of an explicit
++/// script (every op through that script) or of per-setup scripts passes.
++#[must_use]
++pub fn program_problems_by(world: &World, voice: &dyn Fn(Option<&str>) -> WorkVoice) -> Vec<String> {
+     let mut out = Vec::new();
+     for (name, e) in setup::operation_order(world) {
+         let Some(op) = model::operation_of(world, &e) else {
+@@ -132,16 +161,18 @@ pub fn program_problems(world: &World) -> Vec<String> {
+             continue;
+         };
+         let setup_name = || setup::effective(world, declared).unwrap_or_default();
+-        match work_speed(world, declared, &e) {
++        match work_speed(world, voice(declared), &e) {
+             WorkSpeed::Not => {}
+             WorkSpeed::OnC => {
+                 let label = model::operation_label(world, &name, &e);
+                 match c_rate(world, declared) {
+-                    Some(rate) if rate / 360.0 > hold => out.push(format!(
+-                        "{label}: turns the work on the C axis at up to {:.0} rpm (the machine's C rate of {rate:.0} degrees per minute), over setup '{}''s workholding maximum of {hold:.0} rpm - state the chuck's real rating or a slower C rate",
+-                        rate / 360.0,
+-                        setup_name()
+-                    )),
++                    Some(rate) if rate / 360.0 > hold => {
++                        let (c, h) = shown(rate / 360.0, hold);
++                        out.push(format!(
++                            "{label}: turns the work on the C axis at up to {c} rpm (the machine's C rate of {rate:.0} degrees per minute), over setup '{}''s workholding maximum of {h} rpm - state the chuck's real rating or a slower C rate",
++                            setup_name()
++                        ));
++                    }
+                     Some(_) => {}
+                     None => out.push(format!(
+                         "{label}: turns the work on the C axis, but the machine states no C rate, so how fast the work turns cannot be held to setup '{}''s workholding maximum of {hold:.0} rpm - state the C axis's speeds in the machine file",
+@@ -159,8 +190,9 @@ pub fn program_problems(world: &World) -> Vec<String> {
+                 let rpm = crate::posting::posted_rpm(&tool);
+                 if rpm > hold {
+                     let label = model::operation_label(world, &name, &e);
++                    let (r, h) = shown(rpm, hold);
+                     out.push(format!(
+-                        "{label}: turns the work at {rpm:.0} rpm (G97), over setup '{}''s workholding maximum of {hold:.0} rpm - lower tool {}'s rpm or state the chuck's real rating",
++                        "{label}: turns the work at {r} rpm (G97), over setup '{}''s workholding maximum of {h} rpm - lower tool {}'s rpm or state the chuck's real rating",
+                         setup_name(),
+                         op.tool
+                     ));
+diff --git a/crates/post/src/post/section_spindle.rs b/crates/post/src/post/section_spindle.rs
+index 50c1d0675..febed8c2f 100644
+--- a/crates/post/src/post/section_spindle.rs
++++ b/crates/post/src/post/section_spindle.rs
+@@ -46,3 +46,70 @@ pub fn of(t: &Toolpath) -> SectionSpindle {
+         SectionSpindle::Work
+     }
+ }
++
++/// Which spindle a post script gives a [`SectionSpindle::Work`]
++/// section's S to (#1174), from the dialect its manifest declares
++/// (`capabilities`: bit 2 = turning, bit 1 = milling). A turning post
++/// opens such a section `G97 S M03` / `G96` on the WORK spindle (both
++/// shipped lathe posts); a milling post's S drives the TOOL spindle.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum WorkVoice {
++    /// A turning dialect: a Work section turns the work at its S.
++    WorkSpindle,
++    /// A milling dialect only: the S word drives the tool.
++    ToolSpindle,
++    /// No dialect stated (a user's own script without the manifest
++    /// line), or one this reading cannot settle: the caller takes the
++    /// stricter reading (#1199 decides undeclared scripts for good).
++    Undeclared,
++}
++
++/// The [`WorkVoice`] of post script `cps`.
++#[must_use]
++pub fn work_voice(cps: &str) -> WorkVoice {
++    match manifest_mask(cps) {
++        Some(m) if m & 2 != 0 => WorkVoice::WorkSpindle,
++        Some(m) if m & 1 != 0 => WorkVoice::ToolSpindle,
++        _ => WorkVoice::Undeclared,
++    }
++}
++
++/// The script's top-level `capabilities = <integer>;` mask: a line at
++/// column 0 (a manifest line, never one inside a function body), its
++/// `//` comment set aside. Two lines that disagree, or a value that is
++/// not a plain integer, read as `None` - never guessed.
++fn manifest_mask(cps: &str) -> Option<u32> {
++    let mut found: Option<u32> = None;
++    for line in cps.lines() {
++        let code = line.split("//").next().unwrap_or("");
++        let Some(rest) = code.strip_prefix("capabilities") else { continue };
++        let Some(value) = rest.trim_start().strip_prefix('=') else { continue };
++        let value = value.trim().trim_end_matches(';').trim();
++        let m = value.parse::<u32>().ok()?;
++        if found.is_some_and(|f| f != m) {
++            return None;
++        }
++        found = Some(m);
++    }
++    found
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{work_voice, WorkVoice};
++
++    #[test]
++    fn the_manifest_mask_names_the_spindle_a_work_section_drives() {
++        assert_eq!(work_voice("capabilities = 2; // turning\n"), WorkVoice::WorkSpindle);
++        assert_eq!(work_voice("capabilities = 3;\n"), WorkVoice::WorkSpindle, "turning wins: the stricter reading");
++        assert_eq!(work_voice("capabilities = 1; // milling\n"), WorkVoice::ToolSpindle);
++        assert_eq!(work_voice("function onOpen() {}\n"), WorkVoice::Undeclared);
++        assert_eq!(work_voice("// capabilities = 1;\n"), WorkVoice::Undeclared, "a comment declares nothing");
++        assert_eq!(work_voice("function f() {\n  capabilities = 1;\n}\n"), WorkVoice::Undeclared, "only a top-level line");
++        assert_eq!(work_voice("capabilities = 1;\ncapabilities = 2;\n"), WorkVoice::Undeclared, "disagreeing lines");
++        assert_eq!(work_voice("capabilities = CAP;\n"), WorkVoice::Undeclared, "not a plain integer");
++        assert_eq!(work_voice(include_str!("../../../../assets/posts/fanuc-lathe.cps")), WorkVoice::WorkSpindle);
++        assert_eq!(work_voice(include_str!("../../../../assets/posts/tormach-lathe.cps")), WorkVoice::WorkSpindle);
++        assert_eq!(work_voice(include_str!("../../../../assets/posts/fanuc.cps")), WorkVoice::ToolSpindle);
++    }
++}
+
+From 30e350fd3cdadaa48c9c5bc58581908f6e295323 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 14:35:14 +0100
+Subject: [PATCH 4/4] fix(turning): a work-spindle section through a milling
+ post on a mill-turn is held to the chuck
+
+Third review of PR #1191: the milling-post arm of work_speed spared every
+section on a mill-turn, so a facing op at 3000 rpm under a 2000 rpm chuck
+posted S3000 M3 through fanuc.cps and haas.cps (main refused it). On a
+lathe or mill-turn a work-spindle section only cuts if the work turns, so
+it is judged at its rpm whatever the post calls itself; a mill-turn's
+milling section through a milling post stays unjudged; a C section on a
+chucked machine is judged by the C rate under any post. Pinned by
+lathe_workholding_mill_post, with a walk over every machine kind x post
+dialect x section.
+
+Refs #1174
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/setup_workholding.rs           |  36 ++--
+ .../app/tests/lathe_workholding_mill_post.rs  | 194 ++++++++++++++++++
+ .../1174-chuck-limit-work-spindle-only.md     |  13 +-
+ 3 files changed, 228 insertions(+), 15 deletions(-)
+ create mode 100644 crates/app/tests/lathe_workholding_mill_post.rs
+
+diff --git a/crates/app/src/setup_workholding.rs b/crates/app/src/setup_workholding.rs
+index 266b28eed..121df0d41 100644
+--- a/crates/app/src/setup_workholding.rs
++++ b/crates/app/src/setup_workholding.rs
+@@ -92,22 +92,20 @@ enum WorkSpeed {
+ 
+ fn work_speed(world: &World, declared: Option<&str>, voice: WorkVoice, e: &flecs_ecs::prelude::Entity) -> WorkSpeed {
+     use crate::lathe_voice::LatheVoice;
++    use crate::machine::Kind;
+     let section = crate::lathe_voice::voice_of(world, e);
+-    // A plain lathe has one spindle, and it holds the chuck: a milling
+-    // script's S turns the work there too, and the lathe door does not
+-    // fire for a milling script - so every plain section is judged, as
+-    // for an undeclared one. Only widens what is judged (the safe
+-    // direction); a mill-turn through a milling post drives the tool
+-    // spindle and is not judged.
+-    let voice = match (voice, crate::machine::kind_of_setup(world, declared)) {
+-        (WorkVoice::ToolSpindle, crate::machine::Kind::Lathe) => WorkVoice::Undeclared,
+-        (v, _) => v,
+-    };
++    let kind = crate::machine::kind_of_setup(world, declared);
++    // A lathe or mill-turn has a work spindle holding the chuck.
++    let chucked = matches!(kind, Kind::Lathe | Kind::MillTurn);
+     match (voice, section) {
+-        (_, None) | (WorkVoice::ToolSpindle, _) => WorkSpeed::Not,
++        (_, None) => WorkSpeed::Not,
++        // A C section turns the work on C; only a milling post on a
++        // machine with no work spindle (a mill, or none) is spared -
++        // the engine refuses a live section there anyway.
++        (WorkVoice::ToolSpindle, Some(LatheVoice::LiveTool)) if !chucked => WorkSpeed::Not,
+         (_, Some(LatheVoice::LiveTool)) => WorkSpeed::OnC,
+         (WorkVoice::WorkSpindle, Some(LatheVoice::WorkSpindle)) => WorkSpeed::Stated,
+-        // The door refuses it by name before a line is posted.
++        // The lathe door refuses it by name before a line is posted.
+         (WorkVoice::WorkSpindle, Some(LatheVoice::Refused(_))) => WorkSpeed::Not,
+         // A script that states no dialect (#1199): the lathe door does
+         // not fire for it, so every plain section may reach the work
+@@ -115,6 +113,20 @@ fn work_speed(world: &World, declared: Option<&str>, voice: WorkVoice, e: &flecs
+         // stated. Whoever settles #1199 changes this arm together with
+         // `lathe_voice::at_post`, which reads the same mask.
+         (WorkVoice::Undeclared, Some(_)) => WorkSpeed::Stated,
++        // A milling post: its S drives the tool spindle - on a mill. On a
++        // lathe or mill-turn a work-spindle section (a turning kind, an
++        // on-centre drill) only cuts if the work turns, so it is judged
++        // at its rpm whatever the post calls itself (#1174 third review:
++        // a mill-turn's facing op through fanuc.cps posted `S3000 M3`
++        // under a 2000 rpm chuck). Judging only ever adds a refusal.
++        (WorkVoice::ToolSpindle, Some(LatheVoice::WorkSpindle)) if chucked => WorkSpeed::Stated,
++        // A plain lathe's one spindle holds the chuck, and the lathe
++        // door does not fire for a milling script: every plain section
++        // is judged there, as for an undeclared script.
++        (WorkVoice::ToolSpindle, Some(LatheVoice::Refused(_))) if kind == Kind::Lathe => WorkSpeed::Stated,
++        // A milling section (a mill-turn's live milling on the tool
++        // spindle) or any section on a mill: no chuck turns at that S.
++        (WorkVoice::ToolSpindle, Some(_)) => WorkSpeed::Not,
+     }
+ }
+ 
+diff --git a/crates/app/tests/lathe_workholding_mill_post.rs b/crates/app/tests/lathe_workholding_mill_post.rs
+new file mode 100644
+index 000000000..17ed629cb
+--- /dev/null
++++ b/crates/app/tests/lathe_workholding_mill_post.rs
+@@ -0,0 +1,194 @@
++//! The workholding rpm limit through a MILLING post (#1174, third
++//! review): on a lathe or mill-turn a work-spindle section - a turning
++//! kind, an on-centre drill - only cuts if the work turns, so it is
++//! judged against the chuck whatever the post calls itself. Before the
++//! fix a mill-turn's facing op at 3000 rpm under a 2000 rpm chuck posted
++//! `S3000 M3` through `fanuc.cps` and `haas.cps` (main refused it). A
++//! real milling section on a mill-turn through a milling post drives the
++//! tool spindle and stays unjudged. The walk below covers every machine
++//! kind x post dialect x section the limit can meet (C sections are
++//! pinned in `lathe_workholding_live`).
++//!
++//! Gate map (M4.4): covers app::setup_workholding (work_speed's
++//! milling-post arms), app::posting (post_script).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, CreateSetup, GenerateOperation, History, ImportModel, LoadMachine, SetSetupWorkholdingRpm,
++    SetStock,
++};
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::machine::Machine;
++use camcraft_app::operation::{seed_params, Height, KindInfo, OpParams, OpType, SrcRef};
++use camcraft_app::posting;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::world::new_world;
++
++const TAU: f64 = std::f64::consts::TAU;
++const LATHE: &str = include_str!("../../../assets/posts/fanuc-lathe.cps");
++const FANUC: &str = include_str!("../../../assets/posts/fanuc.cps");
++const HAAS: &str = include_str!("../../../assets/posts/haas.cps");
++const CHUCK: f64 = 2000.0;
++/// The finished bar r6, z -16..14, in a stock to z 16 (facing takes the 2 mm).
++const BAR: [(f64, f64); 4] = [(0.0, -16.0), (6.0, -16.0), (6.0, 14.0), (0.0, 14.0)];
++
++fn revolve(meridian: &[(f64, f64)], segs: usize) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / segs as f64;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..segs {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++fn machine(kind: &str) -> Option<Machine> {
++    (kind != "none").then(|| Machine {
++        model: format!("TestBench {kind}"),
++        kind: Some(kind.into()),
++        spindle_max: Some(12_000.0),
++        ..Default::default()
++    })
++}
++
++/// Which section the op cuts: a turning facing pass (the work spindle)
++/// or a mill Face pass (the tool spindle).
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Section {
++    Work,
++    Tool,
++}
++
++/// The bar on machine `kind` ("none" mounts nothing), Setup1 stating a
++/// 2000 rpm chuck, op K of `section` with its tool at `rpm` - generated.
++/// `None` when the kind's door refuses the op on that machine.
++fn doc(kind: &str, section: Section, rpm: f64) -> Option<World> {
++    let world = new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
++    h.execute(&world, SetStock::new(&world, StockShape::Cylinder { diameter: 12.0, height: 32.0 }, at).expect("stock"));
++    if let Some(m) = machine(kind) {
++        h.execute(&world, LoadMachine::new(&world, "bench.mch".into(), Some(m)).expect("machine"));
++    }
++    h.execute(&world, ImportModel::from_mesh("bar", revolve(&BAR, 24)));
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("Setup1"));
++    h.execute(&world, SetSetupWorkholdingRpm::new(&world, "Setup1", Some(CHUCK)).expect("chuck limit"));
++    let (tool, params) = match section {
++        Section::Work => (
++            "TN-1600-0R8",
++            OpParams::Facing {
++                tolerance: 0.05,
++                clearance_z: Height::fixed(25.0),
++                top_z: Height::fixed(16.0),
++                bottom_z: Height::fixed(14.0),
++                stepdown: 0.5,
++                feed: 150.0,
++                plunge_feed: 80.0,
++            },
++        ),
++        Section::Tool => {
++            let i = KindInfo::ALL.iter().position(|k| k.ty == OpType::Face).expect("mill Face");
++            ("EM-1000-4FL", seed_params(i))
++        }
++    };
++    let t = catalog().into_iter().find(|(n, _)| *n == tool).map(|(_, t)| t).expect("catalog tool");
++    h.execute(&world, AddTool::new(&world, tool, Tool { rpm, ..t }).expect("tool"));
++    h.execute(&world, CreateOperation::new(&world, "K", tool, SrcRef::Entity("bar".into()), params).ok()?);
++    h.execute(&world, GenerateOperation::new(&world, "K").ok()?);
++    Some(world)
++}
++
++fn post(world: &World, cps: &str, tag: &str) -> Result<String, String> {
++    let out = std::env::temp_dir().join(format!("camcraft-1174c-{}-{tag}.nc", std::process::id()));
++    let posted = posting::post_script(world, &out, cps).map(|p| p.program);
++    let _ = std::fs::remove_file(&out);
++    posted
++}
++
++#[test]
++fn a_mill_turn_facing_op_through_a_milling_post_is_held_to_the_chuck() {
++    for (name, cps) in [("fanuc", FANUC), ("haas", HAAS)] {
++        let over = doc("mill-turn", Section::Work, 3000.0).expect("facing on a mill-turn");
++        let why = post(&over, cps, name).err().unwrap_or_default();
++        assert!(
++            why.contains("K: turns the work at 3000 rpm (G97)") && why.contains("workholding maximum of 2000 rpm"),
++            "{name}: facing at 3000 under a 2000 chuck is refused by name: {why}"
++        );
++        let at = doc("mill-turn", Section::Work, CHUCK).expect("facing on a mill-turn");
++        let posted = post(&at, cps, name);
++        assert!(posted.is_ok(), "{name}: exactly at the limit posts: {:?}", posted.err());
++    }
++}
++
++#[test]
++fn a_mill_turn_milling_section_through_a_milling_post_is_not_judged() {
++    for (name, cps) in [("fanuc", FANUC), ("haas", HAAS)] {
++        let w = doc("mill-turn", Section::Tool, 8000.0).expect("mill Face on a mill-turn");
++        let program = post(&w, cps, name).unwrap_or_else(|e| panic!("{name}: the milling section posts: {e}"));
++        assert!(program.contains("S8000"), "{name}: the tool spindle at the cutter's rpm: {program}");
++    }
++}
++
++/// The verdict a cell must give: judged by the chuck limit (refused by
++/// name over it), or not judged (anything else - posted, or refused for
++/// another named reason).
++fn judged(kind: &str, dialect: &str, section: Section) -> bool {
++    let chucked = kind == "lathe" || kind == "mill-turn";
++    match (dialect, section) {
++        // A turning post opens a work section on the work spindle; the
++        // lathe door (#1190) refuses a milling section by name first.
++        ("turning", Section::Work) => true,
++        ("turning", Section::Tool) => false,
++        // An undeclared script (#1199): the stricter reading.
++        ("undeclared", _) => true,
++        // A milling post: a work section on a chucked machine cuts only
++        // if the work turns; a milling section turns the tool - except
++        // on a plain lathe, whose one spindle holds the chuck.
++        ("milling", Section::Work) => chucked,
++        ("milling", Section::Tool) => kind == "lathe",
++        _ => unreachable!("{dialect}"),
++    }
++}
++
++#[test]
++fn every_machine_dialect_and_section_cell_gives_its_verdict() {
++    let undeclared = LATHE.replacen("capabilities = 2;", "", 1);
++    let mut rows = Vec::new();
++    for kind in ["none", "mill", "mill-turn", "lathe"] {
++        for (dialect, cps) in [("turning", LATHE), ("milling", FANUC), ("undeclared", undeclared.as_str())] {
++            for section in [Section::Work, Section::Tool] {
++                let rpm = if section == Section::Work { 3000.0 } else { 8000.0 };
++                let Some(w) = doc(kind, section, rpm) else {
++                    rows.push(format!("{kind:9} {dialect:10} {section:?}: not creatable on this machine"));
++                    continue;
++                };
++                let got = post(&w, cps, &format!("{kind}-{dialect}-{section:?}"));
++                let by_limit = got.as_ref().err().is_some_and(|e| e.contains("workholding maximum"));
++                let want = judged(kind, dialect, section);
++                rows.push(format!("{kind:9} {dialect:10} {section:?}: {}", if by_limit { "judged" } else { "not judged" }));
++                assert_eq!(by_limit, want, "{kind} / {dialect} / {section:?}: {got:?}");
++                if let Ok(program) = &got {
++                    assert!(!(section == Section::Work && program.contains("G97 S3000")), "work spindle over the chuck: {program}");
++                }
++            }
++        }
++    }
++    println!("{}", rows.join("\n"));
++}
+diff --git a/docs/decisions/1174-chuck-limit-work-spindle-only.md b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+index 773d26f34..54df08e62 100644
+--- a/docs/decisions/1174-chuck-limit-work-spindle-only.md
++++ b/docs/decisions/1174-chuck-limit-work-spindle-only.md
+@@ -19,7 +19,10 @@ two shared readings and no list of kinds of its own:
+ | turning (`fanuc-lathe.cps`, `tormach-lathe.cps`) | `WorkSpindle` (turning kinds, on-centre Drill) | the stated rpm: G97 refused by name above the limit, at it allowed; the G96 clamp min(machine, tool, chuck) untouched |
+ | turning | `LiveTool` (moves state C) | the machine's C rate, max(C feed, C rapid) / 360; no C rate -> refused by name |
+ | turning | `Refused` (milling kinds, off-centre or tilted drill, probe) | nothing - the lathe door refuses it by name before a line posts |
+-| milling (`capabilities = 1`), on a mill or mill-turn | any | nothing: the S word drives the TOOL spindle, which no chuck holds. A workholding limit stated on such a setup has no effect on what that post writes |
++| milling (`capabilities = 1`), on a mill or no machine | any | nothing: the S word drives the TOOL spindle, which no chuck holds (turning kinds cannot be created there). A workholding limit stated on such a setup has no effect on what that post writes |
++| milling, on a MILL-TURN | `WorkSpindle` (turning kinds, on-centre Drill) | the stated rpm (third review: a facing op through `fanuc.cps` / `haas.cps` posted `S3000 M3` under a 2000 rpm chuck - main refused it). A turning pass only cuts if the work turns, so whatever the post calls itself its S turns the chuck |
++| milling, on a mill-turn | `LiveTool` | the C rate (the engine refuses a live section through a milling post anyway) |
++| milling, on a mill-turn | `Refused` (a milling section) | nothing - the tool spindle cuts; no chuck turns at that S |
+ | milling, on a plain LATHE | any plain section | judged as undeclared (next row): a lathe's one spindle holds the chuck, so whatever the script calls itself its S turns the work, and the lathe door does not fire for a milling script |
+ | undeclared (no mask; #1199) | `WorkSpindle` or `Refused` | the stated rpm - the stricter reading while a limit is stated (the door does not fire for it). Whoever settles #1199 changes this arm and `lathe_voice::at_post` together |
+ | undeclared | `LiveTool` | the C rate, as above |
+@@ -27,8 +30,12 @@ two shared readings and no list of kinds of its own:
+ The dialect is the one of the script that RUNS: `post_script` /
+ `post_mounts` with an explicit script judge every op by it; the gate and
+ per-mount / per-op posts judge each op by its own setup's post. The
+-machine's kind is no part of it except the plain-lathe row (which only
+-widens). No machine mounted (or a mill) under a lathe post is judged like
++machine's kind enters only through the milling-post rows, and only to
++widen what is judged. Judging was chosen over a door that refuses turning
++kinds through a milling post: judging adds a refusal only when the speed
++is over the limit, while a door would refuse every turning op through a
++mill post on a mill-turn, limit stated or not - changing programs that
++post today. No machine mounted (or a mill) under a lathe post is judged like
+ a lathe - the second review's fail-open.
+ 
+ Refusal text prints whole rpm, or one decimal when the two numbers would

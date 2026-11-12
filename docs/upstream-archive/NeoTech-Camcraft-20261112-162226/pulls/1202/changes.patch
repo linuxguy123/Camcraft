@@ -1,0 +1,1231 @@
+From ee8423cdebe7b4a53b1ec9507c849e036405fce6 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 12 Nov 2026 13:36:08 +0100
+Subject: [PATCH] fix(post): a milling operation is never posted on a lathe's
+ work spindle
+
+A lathe post opens every section that states no C angle with the WORK
+spindle (G97 S M03). The stream names no operation family, so a milling
+pass that stays on one meridian - a Face pass with an end mill along
+Y = 0 - read to fanuc-lathe.cps and tormach-lathe.cps like a facing pass
+and posted the work spindle at the cutter's rpm with the cutter standing
+still.
+
+The program gate now decides it before a line is written, from what it
+already holds (the operation's kind, its cached path, its work offset):
+through a turning dialect a section passes only as live-tool work (its
+path states C), a turning-family kind, or a Drill whose every cutting
+move and cycle is on the spindle axis with the tool along +Z (how a
+lathe drills and taps on centre). Every other operation is refused by
+name. `app::lathe_voice::voice` is the one derivation; `at_post` is the
+door, called by the single-file, per-mount and per-operation posts, so
+the GUI, the script verb and the MCP tool all take it. A mill post is
+untouched.
+
+The dialect is read from the script's own manifest (`capabilities`, the
+mask every shipped post already states) by `post::dialect::speaks_turning`;
+`post::dialect::states_live_tool` is the one "does the path state C?"
+test, and the stream's PARAM LiveTool is written from it. No change to
+the stream format, the CL spec or any post script; goldens unchanged.
+
+Pinned by lathe_voice's unit table over every operation kind and by the
+lathe_work_spindle suite (both reproductions, every post entry point).
+
+Fixes #1190
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/lathe_voice.rs                | 176 +++++++++
+ crates/app/src/lathe_voice_tests.rs          | 274 +++++++++++++
+ crates/app/src/lib.rs                        |   3 +
+ crates/app/src/posting.rs                    |   5 +-
+ crates/app/src/posting_mounts.rs             |   8 +
+ crates/app/src/posting_per_op.rs             |  20 +-
+ crates/app/tests/lathe_work_spindle.rs       | 387 +++++++++++++++++++
+ crates/post/src/post/dialect.rs              |  86 +++++
+ crates/post/src/post/js.rs                   |   7 +
+ crates/post/src/post/mod.rs                  |   3 +-
+ docs/decisions/1190-mill-op-on-lathe-post.md |  96 +++++
+ 11 files changed, 1057 insertions(+), 8 deletions(-)
+ create mode 100644 crates/app/src/lathe_voice.rs
+ create mode 100644 crates/app/src/lathe_voice_tests.rs
+ create mode 100644 crates/app/tests/lathe_work_spindle.rs
+ create mode 100644 crates/post/src/post/dialect.rs
+ create mode 100644 docs/decisions/1190-mill-op-on-lathe-post.md
+
+diff --git a/crates/app/src/lathe_voice.rs b/crates/app/src/lathe_voice.rs
+new file mode 100644
+index 000000000..357ce1105
+--- /dev/null
++++ b/crates/app/src/lathe_voice.rs
+@@ -0,0 +1,176 @@
++//! Which spindle a lathe post turns for a section (#1190), and the door
++//! that keeps a milling operation off the work spindle.
++//!
++//! A turning dialect (`fanuc-lathe.cps`, `tormach-lathe.cps`) opens a
++//! section one of two ways: a section whose moves state a C angle
++//! (`PARAM LiveTool`) starts the live tool and holds the work on C;
++//! every other section starts the WORK spindle at the section's speed
++//! (`G97 S M03`, or `G96`) and the tool stands still. The stream names
++//! no operation family, so a milling path that happens to stay on one
++//! meridian (a face pass along Y = 0) reads to the post exactly like a
++//! turning pass - and would turn the work at the cutter's rpm while the
++//! cutter stands still.
++//!
++//! The law, stated on what the program gate already holds (the
++//! operation's kind, its cached path, its work offset): a section may
++//! reach a turning dialect only as
++//!
++//! 1. live-tool work - its path states C ([`LatheVoice::LiveTool`]);
++//! 2. a turning-family kind ([`LatheVoice::WorkSpindle`]);
++//! 3. a Drill whose every cutting move and cycle stands on the spindle
++//!    axis with the tool along +Z (drill, centre drill, tap, reamer on
++//!    centre). There - and only there - it makes no difference to the
++//!    cut whether the tool turns or the work does: the two share one
++//!    axis, so the relative rotation is the same. That is how a lathe
++//!    drills and taps on centre ([`LatheVoice::WorkSpindle`]).
++//!
++//! Everything else is refused by name before a line is posted: a cutter
++//! that moves off the axis must itself turn (every milling kind, the
++//! helical Bore, the thread mill), and a probe has no spindle at all.
++//!
++//! One derivation: [`voice`] is the only place that decides which
++//! spindle a lathe post turns for an operation. The post door below and
++//! any rule that asks "does this section turn the work?" (the
++//! workholding rpm limit) read it - never a second copy.
++//!
++//! Provenance: our own rule. That a lathe drills and taps on centre
++//! with the work turning and the tool held still, and that a milling
++//! cutter must itself rotate, is general machining knowledge from the
++//! machine-tool handbooks. No vendor material consulted.
++
++use flecs_ecs::prelude::*;
++
++use crate::cl::{MoveKind, Toolpath};
++use crate::model;
++use crate::operation::spindle_law::SPINDLE_TOL;
++use crate::operation::{Family, OpParams};
++
++/// What a turning dialect does with one operation's section.
++#[derive(Clone, Debug, PartialEq)]
++pub enum LatheVoice {
++    /// The work spindle turns at the section's stated speed and the
++    /// tool stands still: the turning family and the on-centre Drill.
++    WorkSpindle,
++    /// The path states C: the live tool turns, the work is held on C.
++    LiveTool,
++    /// Not a section a lathe post may open; the reason, in the words
++    /// the refusal says after the operation's name.
++    Refused(String),
++}
++
++/// What every refusal ends with: the two acts that fix it.
++const FIX: &str = "move it to a setup that posts through a mill post, or suppress the operation";
++
++/// The one derivation (#1190): what a turning dialect does with an
++/// operation of these `params` whose cached path is `path`, posted
++/// about the work offset at `origin` (world mm - the spindle axis is
++/// world Z through it, the lathe posts' own frame).
++#[must_use]
++pub fn voice(params: &OpParams, path: &Toolpath, origin: [f64; 3]) -> LatheVoice {
++    // The post's own order: a section stating C is live-tool work,
++    // whatever its kind.
++    if crate::post::dialect::states_live_tool(path) {
++        return LatheVoice::LiveTool;
++    }
++    let kind = params.kind();
++    if kind.info().family() == Family::Turn {
++        return LatheVoice::WorkSpindle;
++    }
++    match params {
++        OpParams::Drill { .. } => match off_centre(path, origin) {
++            None => LatheVoice::WorkSpindle,
++            Some(what) => LatheVoice::Refused(format!(
++                "a Drill operation would be posted on the work spindle with {what} - a lathe post drills with the work \
++                 turning and the drill standing still, which is only right for a hole on the spindle axis; keep the \
++                 on-centre holes in an operation of their own and {FIX}"
++            )),
++        },
++        OpParams::Probe { .. } => LatheVoice::Refused(format!(
++            "a Probe operation cannot be posted through a lathe post - it would open the section on the work spindle \
++             and writes no probing; {FIX}"
++        )),
++        OpParams::PlasmaProfile(_) => LatheVoice::Refused(
++            "a Plasma Profile operation cannot be posted through a lathe post - it would open the section on the work \
++             spindle, and a torch has none; post it through a plasma post, or suppress the operation"
++                .to_owned(),
++        ),
++        _ => LatheVoice::Refused(format!(
++            "a {kind} operation would be posted on the work spindle - a lathe post turns the work at the tool's speed \
++             while the cutter stands still, so nothing is milled; cut it as C-axis live tooling (a rotary operation), \
++             or {FIX}"
++        )),
++    }
++}
++
++/// Why a drilling path is not an on-centre hole along Z, or `None`
++/// when it is: every cutting move and every cycle on the spindle axis
++/// (within the posts' own lattice, [`SPINDLE_TOL`]) and no tilted
++/// tool. Rapids are free - the tool may come in from the side in air.
++fn off_centre(path: &Toolpath, origin: [f64; 3]) -> Option<String> {
++    // A NaN is never on the axis: the comparison refuses it.
++    let off = |x: f64, y: f64| !((x - origin[0]).abs() <= SPINDLE_TOL && (y - origin[1]).abs() <= SPINDLE_TOL);
++    // A pose that is not along +Z (a NaN included) is a tilted tool.
++    let upright = |a: [f64; 3]| a[2] >= 1.0 - 1e-9;
++    if path.moves.iter().any(|m| m.axis.is_some_and(|a| !upright(a))) {
++        return Some("a tilted drill (a cross hole, not along the spindle axis)".to_owned());
++    }
++    let at = |x: f64, y: f64| {
++        format!("a hole off the spindle axis (X{:.3} Y{:.3} from the work offset)", x - origin[0], y - origin[1])
++    };
++    if let Some(c) = path.cycles.iter().find(|c| off(c.xy.x, c.xy.y)) {
++        return Some(at(c.xy.x, c.xy.y));
++    }
++    path.moves
++        .iter()
++        .filter(|m| m.kind != MoveKind::Rapid)
++        .flat_map(|m| [m.from, m.to])
++        .find(|p| off(p.x, p.y))
++        .map(|p| at(p.x, p.y))
++}
++
++/// [`voice`] for operation entity `e`, read from the document: its
++/// kind, its cached path and its own setup's work offset. `None` for an
++/// entity that is no operation or has no path yet (the program gate
++/// names those).
++#[must_use]
++pub fn voice_of(world: &World, e: &Entity) -> Option<LatheVoice> {
++    let op = model::operation_of(world, e)?;
++    let cache = model::toolpath_of(world, e)?;
++    let (_slot, origin) = crate::posting::wcs_context(world, op.setup.as_deref());
++    Some(voice(&op.params, &cache.path, origin))
++}
++
++/// The shared predicate: is this operation's section voiced on the
++/// WORK spindle by a turning dialect (the work turns at the section's
++/// stated speed)? What the workholding rpm limit judges.
++#[must_use]
++pub fn on_work_spindle(world: &World, e: &Entity) -> bool {
++    voice_of(world, e) == Some(LatheVoice::WorkSpindle)
++}
++
++/// The door at post: when `cps` is a turning dialect, refuse by name
++/// the first of `ops` (operation entity names, program order) that a
++/// lathe post may not open. A milling dialect passes untouched - there
++/// `M03` is the tool's own spindle.
++///
++/// # Errors
++/// `"<op>: a <kind> operation would be posted on the work spindle - ..."`,
++/// or the script's own load failure.
++pub(crate) fn at_post<'a>(world: &World, ops: impl IntoIterator<Item = &'a str>, cps: &str) -> Result<(), String> {
++    if !crate::post::dialect::speaks_turning(cps).map_err(|e| format!("post engine: {e}"))? {
++        return Ok(());
++    }
++    for name in ops {
++        let Some(e) = model::find_by_name(world, name) else {
++            continue;
++        };
++        if let Some(LatheVoice::Refused(why)) = voice_of(world, &e) {
++            return Err(format!("{}: {why}", model::operation_label(world, name, &e)));
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++#[path = "lathe_voice_tests.rs"]
++mod tests;
+diff --git a/crates/app/src/lathe_voice_tests.rs b/crates/app/src/lathe_voice_tests.rs
+new file mode 100644
+index 000000000..c95376b80
+--- /dev/null
++++ b/crates/app/src/lathe_voice_tests.rs
+@@ -0,0 +1,274 @@
++//! The lathe-voice law over EVERY operation kind (#1190): for each row
++//! of the kind table, on a path that stays on one meridian (what a lathe
++//! post cannot tell from turning) and on a path that stays on the
++//! spindle axis, the outcome is one of three - work spindle, live tool,
++//! refused by name - and never "a milling cutter on the work spindle".
++
++use super::*;
++use crate::cl::{Cycle, CycleKind, Move};
++use crate::geo2d::Point2;
++use crate::geometry::Point3;
++use crate::operation::{Carried, Height, KindInfo, OpType};
++use crate::schema::{Name, Operation, Toolpath as Cached};
++
++const ORIGIN: [f64; 3] = [0.0, 0.0, 0.0];
++
++fn carried() -> Carried {
++    Carried {
++        feed: 300.0,
++        plunge: 100.0,
++        climb: true,
++        clearance: Height::fixed(30.0),
++        stepover: 2.0,
++        stepdown: 1.0,
++        top: Height::fixed(20.0),
++        bottom: Height::fixed(10.0),
++        retract: Height::fixed(25.0),
++        tilt: None,
++    }
++}
++
++fn params(ty: OpType) -> OpParams {
++    (ty.info().seed)(&carried())
++}
++
++fn p(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++/// A pass along Y = 0 across the axis: a face pass with an end mill,
++/// and - move for move - a lathe's facing pass. Reproduction (b).
++fn meridian() -> Toolpath {
++    Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, p(-14.0, 0.0, 30.0), p(-14.0, 0.0, 4.0), None),
++        Move::new(MoveKind::Feed, p(-14.0, 0.0, 4.0), p(14.0, 0.0, 4.0), Some(300.0)),
++        Move::new(MoveKind::Rapid, p(14.0, 0.0, 4.0), p(14.0, 0.0, 30.0), None),
++    ])
++}
++
++/// One hole down the line through (`x`, `y`): rapid to R, the cycle's
++/// plunge, the exit. Reproduction (a) at (0, 0).
++fn hole(x: f64, y: f64) -> Toolpath {
++    let mut t = Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, p(x, y, 30.0), p(x, y, 20.0), None),
++        Move::new(MoveKind::Plunge, p(x, y, 20.0), p(x, y, 10.0), Some(100.0)),
++        Move::new(MoveKind::Rapid, p(x, y, 10.0), p(x, y, 30.0), None),
++    ]);
++    t.cycles = vec![Cycle {
++        kind: CycleKind::Deep,
++        xy: Point2::new(x, y),
++        r_z: 20.0,
++        bottom_z: 10.0,
++        entry_z: 20.0,
++        peck: 3.0,
++        dwell: 0.0,
++        first_move: 0,
++    }];
++    t
++}
++
++fn stating_c(mut t: Toolpath) -> Toolpath {
++    for m in &mut t.moves {
++        m.rotary = Some(0.0);
++    }
++    t
++}
++
++/// What the law must answer for a kind whose path states no C. An
++/// exhaustive match: a new kind does not compile until it is decided.
++#[derive(Debug, PartialEq)]
++enum Want {
++    /// The turning family: the work spindle, on any path.
++    Turns,
++    /// The Drill: the work spindle on centre, refused off it.
++    OnCentreHole,
++    /// Refused wherever its path lies; its cutter must itself turn (or,
++    /// the probe, has no spindle).
++    Refused,
++}
++
++fn want(ty: OpType) -> Want {
++    match ty {
++        OpType::Facing
++        | OpType::ProfileRough
++        | OpType::ProfileFinish
++        | OpType::GrooveRough
++        | OpType::GrooveFinish
++        | OpType::Part
++        | OpType::Threading
++        | OpType::Chamfering
++        | OpType::TaperTurning
++        | OpType::MultiPassTurning
++        | OpType::FormTurning
++        | OpType::BoringTurning => Want::Turns,
++        OpType::Drill => Want::OnCentreHole,
++        OpType::Face
++        | OpType::Contour
++        | OpType::Pocket
++        | OpType::Slot
++        | OpType::Trace
++        | OpType::Adaptive2D
++        | OpType::Offset2D
++        | OpType::Engrave
++        | OpType::Chamfer2D
++        | OpType::Circular
++        | OpType::Thread
++        | OpType::Bore
++        | OpType::Pocket3D
++        | OpType::Finish3D
++        | OpType::Deburr
++        | OpType::Contour5D
++        | OpType::Parallel5D
++        | OpType::Swarf
++        | OpType::AdvancedSwarf
++        | OpType::RotaryContour
++        | OpType::RotaryParallel
++        | OpType::RotaryOffset
++        | OpType::MultiAxisRough
++        | OpType::Flow5D
++        | OpType::MultiAxisContour
++        | OpType::Probe
++        | OpType::PlasmaProfile
++        | OpType::TrochoidalSlot => Want::Refused,
++    }
++}
++
++fn refusal(v: &LatheVoice) -> &str {
++    match v {
++        LatheVoice::Refused(why) => why,
++        other => panic!("expected a refusal, got {other:?}"),
++    }
++}
++
++#[test]
++fn every_kind_is_work_spindle_live_tool_or_refused_by_name() {
++    let (mut turns, mut holes, mut refused) = (0, 0, 0);
++    for info in KindInfo::ALL {
++        let params = params(info.ty);
++        let (on_meridian, on_axis) = (voice(&params, &meridian(), ORIGIN), voice(&params, &hole(0.0, 0.0), ORIGIN));
++        match want(info.ty) {
++            Want::Turns => {
++                turns += 1;
++                assert_eq!(info.family(), Family::Turn, "{}", info.label);
++                assert_eq!(on_meridian, LatheVoice::WorkSpindle, "{}", info.label);
++                assert_eq!(on_axis, LatheVoice::WorkSpindle, "{}", info.label);
++            }
++            Want::OnCentreHole => {
++                holes += 1;
++                assert_eq!(on_axis, LatheVoice::WorkSpindle, "{} on centre is how a lathe drills", info.label);
++                assert!(refusal(&on_meridian).contains("off the spindle axis"), "{on_meridian:?}");
++            }
++            Want::Refused => {
++                refused += 1;
++                assert_ne!(info.family(), Family::Turn, "{}", info.label);
++                // On the meridian AND on centre: a Bore, a thread mill,
++                // an engrave or a probe on the axis is still not a hole
++                // cycle a lathe runs with the work turning.
++                for v in [&on_meridian, &on_axis] {
++                    let why = refusal(v);
++                    assert!(why.contains(&format!("a {} operation", info.label)), "{}: names its kind: {why}", info.label);
++                    assert!(why.contains("work spindle"), "{}: says what would turn: {why}", info.label);
++                    assert!(why.contains("suppress the operation"), "{}: says what to do: {why}", info.label);
++                }
++            }
++        }
++        // The post's own order: a path stating C is live-tool work.
++        assert_eq!(voice(&params, &stating_c(meridian()), ORIGIN), LatheVoice::LiveTool, "{}", info.label);
++    }
++    assert_eq!((turns, holes, refused), (12, 1, 28), "the table covers every kind");
++    assert_eq!(turns + holes + refused, KindInfo::ALL.len());
++}
++
++#[test]
++fn a_drill_is_admitted_only_with_every_cut_on_the_spindle_axis_along_z() {
++    let drill = params(OpType::Drill);
++    // The axis is world Z through the work offset, wherever that is.
++    assert_eq!(voice(&drill, &hole(5.0, -3.0), [5.0, -3.0, 7.0]), LatheVoice::WorkSpindle);
++    // Off the axis but on the meridian (X 10, Y 0): the post's own
++    // meridian check cannot see it; this law names the hole.
++    let off = voice(&drill, &hole(10.0, 0.0), ORIGIN);
++    assert!(refusal(&off).contains("X10.000 Y0.000 from the work offset"), "{off:?}");
++    // The posts' lattice is the tolerance: half a micron, no more.
++    assert_eq!(voice(&drill, &hole(0.0005, -0.0005), ORIGIN), LatheVoice::WorkSpindle);
++    assert!(matches!(voice(&drill, &hole(0.0006, 0.0), ORIGIN), LatheVoice::Refused(_)));
++    assert!(matches!(voice(&drill, &hole(0.0, f64::NAN), ORIGIN), LatheVoice::Refused(_)));
++    // A cycle record off the axis refuses even if no feed move shows it.
++    let mut stray = hole(0.0, 0.0);
++    stray.cycles[0].xy = Point2::new(0.0, 3.0);
++    assert!(refusal(&voice(&drill, &stray, ORIGIN)).contains("Y3.000"));
++    // Rapids are free: the tool may come in from the side, in air.
++    let mut side = hole(0.0, 0.0);
++    side.moves.insert(0, Move::new(MoveKind::Rapid, p(40.0, 0.0, 30.0), p(0.0, 0.0, 30.0), None));
++    side.cycles[0].first_move = 1;
++    assert_eq!(voice(&drill, &side, ORIGIN), LatheVoice::WorkSpindle);
++    // A feed move off the axis is a cut off the axis.
++    let mut cut = hole(0.0, 0.0);
++    cut.moves.push(Move::new(MoveKind::Feed, p(0.0, 0.0, 30.0), p(2.0, 0.0, 30.0), Some(100.0)));
++    assert!(matches!(voice(&drill, &cut, ORIGIN), LatheVoice::Refused(_)));
++    // A cross hole: the drill is tilted off the spindle axis.
++    let mut cross = hole(0.0, 0.0);
++    for m in &mut cross.moves {
++        m.axis = Some([1.0, 0.0, 0.0]);
++    }
++    assert!(refusal(&voice(&drill, &cross, ORIGIN)).contains("tilted drill"));
++    // A pose along +Z states nothing new.
++    let mut upright = hole(0.0, 0.0);
++    for m in &mut upright.moves {
++        m.axis = Some([0.0, 0.0, 1.0]);
++    }
++    assert_eq!(voice(&drill, &upright, ORIGIN), LatheVoice::WorkSpindle);
++}
++
++fn op_entity(world: &World, name: &str, ty: OpType, path: Toolpath) -> Entity {
++    let op = Operation {
++        tool: "T".into(),
++        src: crate::operation::SrcRef::Stock,
++        params: params(ty),
++        stamp: None,
++        setup: None,
++        area: Default::default(),
++        coolant: Default::default(),
++        after: Default::default(),
++        suppressed: false,
++    };
++    world.entity().set(Name(name.into())).set(op).set(Cached::new(path, Vec::new())).id()
++}
++
++/// The door as the three post bodies call it, over every kind, on the
++/// shipped scripts: a turning dialect refuses by name, a milling
++/// dialect is left alone.
++#[test]
++fn the_door_refuses_on_every_turning_dialect_and_passes_every_milling_one() {
++    let world = crate::world::new_world();
++    for info in KindInfo::ALL {
++        op_entity(&world, &format!("m-{}", info.tag), info.ty, meridian());
++        op_entity(&world, &format!("c-{}", info.tag), info.ty, stating_c(meridian()));
++    }
++    for (post, cps) in crate::posting::BUILTINS {
++        let lathe = crate::posting::LATHE_POSTS.contains(post);
++        assert_eq!(crate::post::dialect::speaks_turning(cps).ok(), Some(lathe), "{post}: manifest and registry agree");
++        for info in KindInfo::ALL {
++            let (m, c) = (format!("m-{}", info.tag), format!("c-{}", info.tag));
++            assert_eq!(at_post(&world, [c.as_str()], cps), Ok(()), "{post}: {} stating C is live-tool work", info.label);
++            let got = at_post(&world, [m.as_str()], cps);
++            if !lathe || want(info.ty) == Want::Turns {
++                assert_eq!(got, Ok(()), "{post}: {}", info.label);
++                continue;
++            }
++            let why = got.expect_err("a lathe post may not open it");
++            assert!(why.starts_with(&format!("{m}: a {} operation", info.label)), "{post}: {why}");
++        }
++    }
++    // The shared predicate: only what the work spindle turns.
++    let drill = op_entity(&world, "on-centre", OpType::Drill, hole(0.0, 0.0));
++    let face = op_entity(&world, "face", OpType::Face, meridian());
++    let live = op_entity(&world, "live", OpType::RotaryContour, stating_c(meridian()));
++    let turn = op_entity(&world, "turn", OpType::Facing, meridian());
++    assert!(on_work_spindle(&world, &drill) && on_work_spindle(&world, &turn));
++    assert!(!on_work_spindle(&world, &face) && !on_work_spindle(&world, &live));
++    // The first refusal in program order is the one named.
++    let both = at_post(&world, ["on-centre", "turn", "face", "live"], "capabilities = 2;");
++    assert!(both.is_err_and(|w| w.starts_with("face: a Face operation would be posted on the work spindle")));
++    // A script that does not load is a refusal, never a pass.
++    assert!(at_post(&world, ["face"], "capabilities = ;").is_err_and(|w| w.starts_with("post engine:")));
++}
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 8d563eefa..4c4a305a1 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -51,6 +51,9 @@ pub mod path_sig;
+ pub mod posting;
+ // #530: the op-family door at post.
+ mod posting_family;
++/// Which spindle a lathe post turns for a section, and the door that
++/// keeps a milling operation off the work spindle (#1190).
++pub mod lathe_voice;
+ // #155: standalone Pause / Home entries in the operation list.
+ pub mod program_entry;
+ pub use camcraft_motion::plasma;
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index 154b4a2b3..08c149b01 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -452,7 +452,10 @@ pub fn post_script(world: &World, out_path: &Path, cps: &str) -> Result<Posted,
+ fn post_script_body(world: &World, out_path: &Path, cps: &str) -> Result<Posted, String> {
+     // #388: the program's one machine (a program over several refuses).
+     let machine = mounts::single(world, false)?.machine;
+-    let records = stream_records(world)?;
++    let streams = op_streams(world)?;
++    // #1190: a turning dialect opens only what a lathe may run.
++    crate::lathe_voice::at_post(world, streams.iter().map(|(n, _)| n.as_str()), cps)?;
++    let records = join_streams(streams);
+     // The verification gate (M2.3 D): the same two program-level
+     // judgments the Deviate cell shows, made binding. Evidence is
+     // computed here and now - never a cached verdict carried in from
+diff --git a/crates/app/src/posting_mounts.rs b/crates/app/src/posting_mounts.rs
+index 98bf5536f..7a85da8ba 100644
+--- a/crates/app/src/posting_mounts.rs
++++ b/crates/app/src/posting_mounts.rs
+@@ -201,6 +201,14 @@ fn post_each(world: &World, out_path: &Path, cps: Option<&str>, mounts: Vec<Moun
+         });
+     }
+     let streams = op_streams(world)?;
++    // #1190: each mount's own script opens only what a lathe may run.
++    for (m, cps) in mounts.iter().zip(&scripts) {
++        let own = streams
++            .iter()
++            .map(|(name, _)| name.as_str())
++            .filter(|name| model::find_by_name(world, name).is_some_and(|e| member(world, &e, &m.setups)));
++        crate::lathe_voice::at_post(world, own, cps)?;
++    }
+     let mut report = verification_report(world);
+     for m in &mounts {
+         report.problems.extend(wcs_slot::shared_word_problems_in(world, Some(&m.setups)));
+diff --git a/crates/app/src/posting_per_op.rs b/crates/app/src/posting_per_op.rs
+index a79f1a3cc..dd2e4ec14 100644
+--- a/crates/app/src/posting_per_op.rs
++++ b/crates/app/src/posting_per_op.rs
+@@ -111,20 +111,28 @@ fn post_per_op_with(
+         return Err(format!("{} is not a folder", dir.display()));
+     }
+     let streams = op_streams(world)?;
++    // Each op's setup and script, resolved once - and the lathe door
++    // (#1190) before anything else is judged: a turning dialect opens
++    // only what a lathe may run.
++    let mut resolved = Vec::with_capacity(streams.len());
++    for (name, _) in &streams {
++        let setup = crate::model::find_by_name(world, name)
++            .and_then(|e| crate::model::operation_of(world, &e))
++            .and_then(|op| op.setup);
++        let effective = crate::setup::effective(world, setup.as_deref()).unwrap_or_default();
++        let cps = script(&effective).ok_or_else(|| format!("{name}: no post resolved for its setup"))?;
++        crate::lathe_voice::at_post(world, [name.as_str()], &cps)?;
++        resolved.push((setup, cps));
++    }
+     let report = verification_report(world);
+     if !report.problems.is_empty() {
+         return Err(format!("post blocked - {}", report.problems.join("; ")));
+     }
+     let options = options_value(post_options(world));
+     let mut files = Vec::with_capacity(streams.len());
+-    for (k, (name, records)) in streams.iter().enumerate() {
++    for (k, ((name, records), (setup, cps))) in streams.iter().zip(resolved).enumerate() {
+         let index = k + 1;
+         let number = u32::try_from(index).map_err(|_| "too many operations to number".to_owned())?;
+-        let setup = crate::model::find_by_name(world, name)
+-            .and_then(|e| crate::model::operation_of(world, &e))
+-            .and_then(|op| op.setup);
+-        let effective = crate::setup::effective(world, setup.as_deref()).unwrap_or_default();
+-        let cps = script(&effective).ok_or_else(|| format!("{name}: no post resolved for its setup"))?;
+         let ext = engine::extension_of(&cps).map_err(|e| format!("post engine: {e}"))?;
+         let ext = sanitise(&ext, "nc");
+         let mch = machine_value_of(world, setup.as_deref());
+diff --git a/crates/app/tests/lathe_work_spindle.rs b/crates/app/tests/lathe_work_spindle.rs
+new file mode 100644
+index 000000000..96583d3b5
+--- /dev/null
++++ b/crates/app/tests/lathe_work_spindle.rs
+@@ -0,0 +1,387 @@
++//! A milling operation is never posted on a lathe's work spindle
++//! (#1190). A lathe post opens every section that states no C angle
++//! with the WORK spindle (`G97 S M03`): right for turning and for a
++//! drill on centre (the work turns, the drill stands still), wrong for
++//! a milling cutter - and the stream names no operation family, so a
++//! face pass that stays on Y = 0 reads to the post like a facing pass.
++//! The program gate knows the kind: through a turning dialect it lets
++//! the turning family, live-tool (C) sections and on-centre Drill
++//! holes pass, and refuses every other operation by name - at every
++//! post entry point, before a line is written. A mill post is not
++//! touched: there `M03` is the tool's own spindle.
++//!
++//! The two reproductions of the issue are the first two tests; the law
++//! over every operation kind is `app::lathe_voice`'s own unit table.
++//!
++//! Provenance: our own tests; that a lathe drills on centre with the
++//! work turning is general handbook practice. No vendor material.
++//!
++//! Gate map (M4.4): covers app::lathe_voice, app::posting (post_script,
++//! post_setup, post_mounts, post_per_op and their script forms),
++//! app::script (the post verb), app::mcp (the post tool), post::post
++//! (dialect), assets/posts/fanuc-lathe.cps and tormach-lathe.cps
++//! (section open).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++mod tormach_lathe_support;
++
++use std::path::PathBuf;
++
++use flecs_ecs::prelude::World;
++use serde_json::{json, Value};
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SelectPost, SetStock};
++use camcraft_app::drilling::{CycleChoice, Hole};
++use camcraft_app::geo2d::Point2;
++use camcraft_app::geometry::Point3;
++use camcraft_app::lathe_voice::{self, LatheVoice};
++use camcraft_app::machine::{AxisLimits, Coolant, LiveToolCodes, Machine};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::post::{cnc, engine};
++use camcraft_app::schema::{Location, PostRef};
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::{model, posting, project};
++use tormach_lathe_support::revolve;
++
++const FANUC_LATHE: &str = include_str!("../../../assets/posts/fanuc-lathe.cps");
++const TORMACH_LATHE: &str = include_str!("../../../assets/posts/tormach-lathe.cps");
++const FANUC_MILL: &str = include_str!("../../../assets/posts/fanuc.cps");
++const REFUSAL: &str = "F1: a Face operation would be posted on the work spindle - a lathe post turns the work at the \
++                       tool's speed while the cutter stands still, so nothing is milled; cut it as C-axis live tooling \
++                       (a rotary operation), or move it to a setup that posts through a mill post, or suppress the \
++                       operation";
++
++/// A mill-turn bench: the spindle is a C rotary, live-tool words are
++/// stated (placeholders, no builder's codes), and the spindle maximum
++/// is above both tools' rpm - so nothing but the law under test stands
++/// between a milling section and the work spindle.
++fn mill_turn() -> Machine {
++    Machine {
++        model: "TestBench mill-turn".into(),
++        kind: Some("mill-turn".into()),
++        spindle_max: Some(15000.0),
++        coolants: vec![Coolant { name: "Flood".into(), m_code: "M8".into() }],
++        axes: vec![
++            AxisLimits { name: "X".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits { name: "Y".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits { name: "Z".into(), feed: Some(4000.0), ..Default::default() },
++            AxisLimits {
++                name: "C".into(),
++                rotary: true,
++                axis: Some([0.0, 0.0, 1.0]),
++                feed: Some(6000.0),
++                rapid: Some(12000.0),
++                ..Default::default()
++            },
++        ],
++        live_tool: Some(LiveToolCodes {
++            c_axis_on: "M1001".into(),
++            c_axis_off: "M1002".into(),
++            spindle_on: "M1003".into(),
++            spindle_off: "M1004".into(),
++        }),
++        ..Default::default()
++    }
++}
++
++/// The bench with `stock` standing on the spindle axis (base at z
++/// `z0`), the two catalog tools, and - when `bar` - the Ø20 bar with a
++/// Ø4.1 centre hole as the model.
++fn world_with(stock: StockShape, z0: f64, bar: bool) -> (World, History) {
++    let world = camcraft_app::world::new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, z0), ..Location::default() };
++    h.execute(&world, SetStock::new(&world, stock, at).expect("stock"));
++    h.execute(&world, LoadMachine::new(&world, "millturn.mch".into(), Some(mill_turn())).expect("mill-turn"));
++    for t in ["DR-0400", "EM-0400-2FL"] {
++        let tool = catalog().into_iter().find(|(n, _)| *n == t).map(|(_, t)| t).expect("catalog entry");
++        h.execute(&world, AddTool::new(&world, t, tool).expect("tool"));
++    }
++    if bar {
++        let bar = revolve(&[(0.0, -20.0), (10.0, -20.0), (10.0, 20.0), (2.05, 20.0), (2.05, 10.0), (0.0, 10.0)], 64);
++        h.execute(&world, ImportModel::from_mesh("bar", bar));
++    }
++    (world, h)
++}
++
++fn create(world: &World, h: &mut History, name: &str, tool: &str, src: SrcRef, params: OpParams) {
++    h.execute(world, CreateOperation::new(world, name, tool, src, params).expect("create"));
++    h.execute(world, GenerateOperation::new(world, name).expect("generate"));
++    let e = model::find_by_name(world, name).expect("op");
++    assert_eq!(camcraft_app::operation::status_of(world, &e), camcraft_app::operation::OpStatus::Ok, "{name} generates");
++}
++
++fn drill(x: f64, y: f64) -> OpParams {
++    OpParams::Drill {
++        clearance_z: Height::fixed(30.0),
++        retract_z: None,
++        top_z: Height::fixed(20.0),
++        bottom_z: None,
++        cycle: CycleChoice::Auto,
++        peck: 0.0,
++        dwell: 0.0,
++        feed: 120.0,
++        plunge_feed: 80.0,
++        holes: vec![Hole { xy: Point2::new(x, y), radius: 2.05, entry_z: 20.0, floor_z: 10.0, through: false, stepped: false }],
++        cross: vec![],
++    }
++}
++
++/// Reproduction (a): a mill-family Drill, one hole at X0 Y0.
++fn drilled() -> (World, History) {
++    let (world, mut h) = world_with(StockShape::Box { dx: 24.0, dy: 24.0, dz: 40.0 }, -20.0, true);
++    create(&world, &mut h, "D1", "DR-0400", SrcRef::Entity("bar".into()), drill(0.0, 0.0));
++    (world, h)
++}
++
++/// Reproduction (b): a Face pass with a flat end mill over a sliver of
++/// stock lying along Y = 0 - one pass, on the meridian.
++fn faced() -> (World, History) {
++    let (world, mut h) = world_with(StockShape::Box { dx: 20.0, dy: 2.0, dz: 8.0 }, -4.0, false);
++    let params = OpParams::Face {
++        holes: Default::default(),
++        blend_turns: false,
++        tilt: None,
++        stepover: 3.0,
++        clearance_z: Height::fixed(30.0),
++        cut_z: Height::fixed(4.0),
++        top_z: None,
++        stepdown: None,
++        feed: 300.0,
++        plunge_feed: 100.0,
++        climb: true,
++    };
++    create(&world, &mut h, "F1", "EM-0400-2FL", SrcRef::Stock, params);
++    (world, h)
++}
++
++/// What the script itself writes for the document's stream, with no
++/// program gate in front of it; the stream's own WARN records (the
++/// verifier's notes) are taken out of the warnings.
++fn gate_free(cps: &str, world: &World) -> engine::PostOutput {
++    let records = posting::stream_records(world).expect("every op generated");
++    let mut out = engine::run(cps, &posting::machine_value(world), &cnc::serialize(&records)).expect("the script runs");
++    let warns: Vec<String> = records
++        .iter()
++        .filter_map(|r| match r {
++            cnc::Record::Warn { text } => Some(text.clone()),
++            _ => None,
++        })
++        .collect();
++    out.warnings.retain(|w| !warns.contains(w));
++    out
++}
++
++/// A scratch folder of this test's own, empty.
++fn scratch(test: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("camcraft-1190-{test}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).expect("scratch folder");
++    dir
++}
++
++fn files_in(dir: &PathBuf) -> Vec<String> {
++    let mut names: Vec<String> = std::fs::read_dir(dir)
++        .expect("scratch folder")
++        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
++        .collect();
++    names.sort();
++    names
++}
++
++fn voice(world: &World, name: &str) -> Option<LatheVoice> {
++    lathe_voice::voice_of(world, &model::find_by_name(world, name).expect("op"))
++}
++
++#[test]
++fn a_drill_on_centre_posts_on_the_work_spindle_as_a_lathe_drills() {
++    let (world, _h) = drilled();
++    assert_eq!(voice(&world, "D1"), Some(LatheVoice::WorkSpindle));
++    let dir = scratch("drill");
++    let posted = posting::post_script(&world, &dir.join("d.nc"), FANUC_LATHE).expect("an on-centre drill posts");
++    let lines: Vec<&str> = posted.program.lines().collect();
++    let at = |word: &str| lines.iter().position(|l| *l == word).unwrap_or_else(|| panic!("{word} in:\n{}", posted.program));
++    // The work turns at the drill's rpm, the drill stands still on X0.
++    assert!(at("G97 S10000 M03") < at("G00 X0 Z20"), "{}", posted.program);
++    assert!(lines.iter().any(|l| l.starts_with("G83 Z10 ")), "{}", posted.program);
++    assert!(!posted.program.contains("M1003"), "no live-tool word in a work-spindle section");
++    // The same hole through a mill post is the mill's own drilling.
++    posting::post_script(&world, &dir.join("m.nc"), FANUC_MILL).expect("a mill post drills it as a mill does");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn a_face_pass_on_the_meridian_is_refused_by_name_never_posted_on_the_work_spindle() {
++    let (world, _h) = faced();
++    // What the lathe scripts write for it on their own: the work
++    // spindle at the end mill's 12000 rpm, feed moves, no refusal -
++    // the pass stays on the meridian, so nothing in the stream tells
++    // it from a facing pass. This is the wrong output of the issue.
++    let bare = gate_free(FANUC_LATHE, &world);
++    assert!(bare.warnings.is_empty(), "the script alone cannot refuse it: {:?}", bare.warnings);
++    for line in ["G97 S12000 M03", "G01 X-24 Z4 F0.0083", "G01 X24 Z4 F0.025"] {
++        assert!(bare.program.lines().any(|l| l == line), "{line} in:\n{}", bare.program);
++    }
++    let bare = gate_free(TORMACH_LATHE, &world);
++    assert!(bare.warnings.is_empty(), "{:?}", bare.warnings);
++    assert!(bare.program.lines().any(|l| l.contains("S12000") && l.contains("M3")), "{}", bare.program);
++
++    // The program gate refuses it by name, through both lathe dialects,
++    // and writes nothing.
++    assert!(matches!(voice(&world, "F1"), Some(LatheVoice::Refused(_))));
++    let dir = scratch("face");
++    for cps in [FANUC_LATHE, TORMACH_LATHE] {
++        let why = posting::post_script(&world, &dir.join("f.nc"), cps).expect_err("a milling pass on a lathe post");
++        assert_eq!(why, REFUSAL);
++    }
++    assert!(files_in(&dir).is_empty(), "nothing written: {:?}", files_in(&dir));
++    // A mill post is left alone: its M03 is the cutter's own spindle.
++    let milled = posting::post_script(&world, &dir.join("m.nc"), FANUC_MILL).expect("a mill post mills it");
++    assert!(milled.program.contains("S12000 M3") || milled.program.contains("S12000 M03"), "{}", milled.program);
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn every_post_entry_point_refuses_it() {
++    let (world, mut h) = faced();
++    let dir = scratch("entries");
++    let out = dir.join("p.nc");
++    // A caller's own script: one file, one file per mount, one per op.
++    assert_eq!(posting::post_script(&world, &out, FANUC_LATHE).err().as_deref(), Some(REFUSAL));
++    assert_eq!(posting::post_mounts_script(&world, &out, FANUC_LATHE).err().as_deref(), Some(REFUSAL));
++    assert_eq!(posting::post_per_op_script(&world, &dir, "p", FANUC_LATHE).err().as_deref(), Some(REFUSAL));
++    // The document's own post (what the GUI's Post and Post per
++    // operation, the script verb and the MCP tool run without a script).
++    h.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("a registry name"));
++    assert_eq!(posting::post_setup(&world, &out).err().as_deref(), Some(REFUSAL));
++    assert_eq!(posting::post_mounts(&world, &out).err().as_deref(), Some(REFUSAL));
++    assert_eq!(posting::post_per_op(&world, &dir, "p").err().as_deref(), Some(REFUSAL));
++    assert!(files_in(&dir).is_empty(), "nothing written: {:?}", files_in(&dir));
++
++    // The MCP post tool (and the script verb under it), on the saved
++    // document: with the document's lathe post, and with one named.
++    let file = dir.join("job.camproj");
++    project::save(&world, &file).expect("the document saves");
++    let mut server = camcraft_app::mcp::Server::new();
++    let init = json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
++    server.handle(&init).expect("the server answers");
++    for (tool, args) in [("open_project", json!({ "path": file.to_string_lossy() })), ("generate", json!({}))] {
++        let (refused, body) = mcp(&mut server, tool, args);
++        assert!(!refused, "{tool}: {body}");
++    }
++    let nc = dir.join("mcp.nc").to_string_lossy().into_owned();
++    for args in [json!({ "output": nc }), json!({ "output": nc, "post": "Fanuc Lathe" }), json!({ "output": nc, "post": "Tormach PathPilot Lathe" })] {
++        let (refused, why) = mcp(&mut server, "post", args);
++        assert!(refused && why.as_str().is_some_and(|w| w.contains(REFUSAL)), "{why}");
++    }
++    assert_eq!(files_in(&dir), vec!["job.camproj".to_owned()], "nothing posted");
++    // Named a mill post, the same document posts.
++    let (refused, body) = mcp(&mut server, "post", json!({ "output": nc, "post": "Fanuc" }));
++    assert!(!refused, "{body}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn a_drill_off_centre_on_the_meridian_is_refused_by_name() {
++    // A hole at X 6 Y 0: on the meridian, so the post's own "milling
++    // work" check does not see it - a drill standing still 6 mm off a
++    // turning work's axis would cut a ring, not a hole.
++    let (world, mut h) = world_with(StockShape::Box { dx: 24.0, dy: 24.0, dz: 40.0 }, -20.0, true);
++    let cmd = CreateOperation::new(&world, "D2", "DR-0400", SrcRef::Entity("bar".into()), drill(6.0, 0.0));
++    h.execute(&world, cmd.expect("create"));
++    h.execute(&world, GenerateOperation::new(&world, "D2").expect("generate"));
++    let dir = scratch("offcentre");
++    let why = posting::post_script(&world, &dir.join("d.nc"), FANUC_LATHE).expect_err("an off-centre hole on a lathe post");
++    assert!(why.starts_with("D2: a Drill operation would be posted on the work spindle with a hole off the spindle axis (X6.000 Y0.000 from the work offset)"), "{why}");
++    assert!(why.contains("only right for a hole on the spindle axis"), "{why}");
++    assert!(files_in(&dir).is_empty());
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// The admitted sections of a mill-turn program pass the door: a C-axis
++/// rotary contour is voiced by the live tool (no work-spindle M03), a
++/// turning-family facing pass by the work spindle.
++#[test]
++fn live_tool_and_turning_sections_pass_the_lathe_door() {
++    let world = camcraft_app::world::new_world();
++    let mut h = History::default();
++    let stock = StockShape::Box { dx: 14.0, dy: 14.0, dz: 34.0 };
++    h.execute(&world, SetStock::new(&world, stock, Location::default()).expect("stock"));
++    h.execute(&world, LoadMachine::new(&world, "millturn.mch".into(), Some(mill_turn())).expect("mill-turn"));
++    for t in ["BN-0600", "TN-1600-0R8"] {
++        let tool = catalog().into_iter().find(|(n, _)| *n == t).map(|(_, t)| t).expect("catalog entry");
++        h.execute(&world, AddTool::new(&world, t, tool).expect("tool"));
++    }
++    let bar = revolve(&[(0.0, -16.0), (6.0, -16.0), (6.0, -2.0), (5.0, 2.0), (5.0, 16.0), (0.0, 16.0)], 16);
++    h.execute(&world, ImportModel::from_mesh("bar", bar));
++    let wrap = OpParams::RotaryContour {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(25.0),
++        retract_z: None,
++        top_z: Height::fixed(6.0),
++        bottom_z: Height::fixed(-8.0),
++        feed: 500.0,
++        plunge_feed: 100.0,
++        climb: true,
++        lead_deg: 0.0,
++        lag_deg: 0.0,
++        max_tilt_deg: 60.0,
++    };
++    create(&world, &mut h, "C1", "BN-0600", SrcRef::Entity("bar".into()), wrap);
++    assert_eq!(voice(&world, "C1"), Some(LatheVoice::LiveTool));
++    // The door lets it through; what the lathe script writes for it is
++    // the live tool's voicing, never the work spindle's.
++    let live = gate_free(FANUC_LATHE, &world);
++    assert!(live.warnings.is_empty(), "{:?}", live.warnings);
++    assert!(live.program.contains("M1003 S") && !live.program.contains("M03"), "{}", live.program);
++    let dir = scratch("admitted-live");
++    // At the full gate this bench's own path is held by the verifier's
++    // rapid-in-stock warnings (as on main, where its suite posts it
++    // gate-free); whatever holds it, it is not the lathe door.
++    let held = posting::post_script(&world, &dir.join("c.nc"), FANUC_LATHE).err().unwrap_or_default();
++    assert!(!held.contains("work spindle"), "the lathe door lets a C section through: {held}");
++    let _ = std::fs::remove_dir_all(&dir);
++
++    // A turning-family facing pass on the same mill-turn: the work spindle.
++    let world = camcraft_app::world::new_world();
++    let mut h = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
++    let stock = StockShape::Cylinder { diameter: 12.0, height: 32.0 };
++    h.execute(&world, SetStock::new(&world, stock, at).expect("bar stock"));
++    h.execute(&world, LoadMachine::new(&world, "millturn.mch".into(), Some(mill_turn())).expect("mill-turn"));
++    let insert = catalog().into_iter().find(|(n, _)| *n == "TN-1600-0R8").map(|(_, t)| t).expect("catalog insert");
++    h.execute(&world, AddTool::new(&world, "TN", insert).expect("insert"));
++    let bar = revolve(&[(0.0, -16.0), (6.0, -16.0), (6.0, 2.0), (5.0, 2.0), (5.0, 16.0), (0.0, 16.0)], 16);
++    h.execute(&world, ImportModel::from_mesh("bar", bar));
++    let facing = OpParams::Facing {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(25.0),
++        top_z: Height::fixed(16.0),
++        bottom_z: Height::fixed(14.0),
++        stepdown: 0.5,
++        feed: 150.0,
++        plunge_feed: 80.0,
++    };
++    create(&world, &mut h, "T1", "TN", SrcRef::Entity("bar".into()), facing);
++    let dir = scratch("admitted-turn");
++    assert_eq!(voice(&world, "T1"), Some(LatheVoice::WorkSpindle));
++    let turned = gate_free(FANUC_LATHE, &world);
++    assert!(turned.program.lines().any(|l| l.starts_with("G97 S") && l.ends_with(" M03")), "{}", turned.program);
++    // Held at the full gate by this bench's finish-envelope warning (as
++    // on main), never by the lathe door.
++    let held = posting::post_script(&world, &dir.join("t.nc"), FANUC_LATHE).err().unwrap_or_default();
++    assert!(!held.contains("work spindle"), "the lathe door lets a turning pass through: {held}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// One MCP tool call on the in-process server: whether the tool
++/// refused, and its error text or structured answer.
++fn mcp(server: &mut camcraft_app::mcp::Server, name: &str, args: Value) -> (bool, Value) {
++    let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
++    let reply = server.handle(&msg).expect("a request gets a response");
++    let result = &reply["result"];
++    assert!(result.is_object(), "tools/call answers with a result: {reply}");
++    let refused = result["isError"] == json!(true);
++    (refused, if refused { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() })
++}
+diff --git a/crates/post/src/post/dialect.rs b/crates/post/src/post/dialect.rs
+new file mode 100644
+index 000000000..e99824e1f
+--- /dev/null
++++ b/crates/post/src/post/dialect.rs
+@@ -0,0 +1,86 @@
++//! What a post script and a section say about WHICH spindle turns
++//! (#1190): the two facts a caller needs before it hands a section to
++//! a turning dialect, each stated once.
++//!
++//! - [`speaks_turning`]: the script's own manifest. Every shipped post
++//!   declares `capabilities`, an integer mask (1 = milling, 2 =
++//!   turning). A turning script opens a plain section with the WORK
++//!   spindle (`G97 S M03`), so the app's program gate must know it is
++//!   about to post through one. A script that declares no mask is read
++//!   as not turning - nothing is guessed about a dialect it does not
++//!   state.
++//! - [`states_live_tool`]: the section's own statement. A path whose
++//!   moves state spindle C angles is live-tool work; the stream's
++//!   `PARAM LiveTool` is written from this one test (`dump`), and the
++//!   app reads the same test, never a second copy.
++//!
++//! Provenance: our own contract (the manifest mask is the `.cps`
++//! reference contract every script in `assets/posts` already states;
++//! the C statement is issue #33's). No vendor material consulted.
++
++use super::js::Script;
++use super::PostError;
++use crate::cl::Toolpath;
++
++/// The `capabilities` bit a turning dialect declares.
++const TURNING: f64 = 2.0;
++
++/// Whether the script's manifest declares the turning dialect
++/// (`capabilities` with the turning bit set).
++///
++/// # Errors
++/// A script that does not load is a clean refusal, as everywhere.
++pub fn speaks_turning(cps: &str) -> Result<bool, PostError> {
++    let mut s = Script::load(cps)?;
++    let mask = s.number_global("capabilities")?.unwrap_or(0.0);
++    if !mask.is_finite() || mask < 0.0 {
++        return Ok(false);
++    }
++    // The mask is a small whole number; read its turning bit without a
++    // float-to-integer cast that could wrap.
++    Ok(((mask / TURNING).floor() % 2.0) >= 1.0)
++}
++
++/// Whether a path is C-axis live-tool work: some move states the
++/// spindle's C angle (issue #33). The stream's `PARAM LiveTool` and
++/// every reader that asks "does a live tool cut this section?" share
++/// this one test.
++#[must_use]
++pub fn states_live_tool(path: &Toolpath) -> bool {
++    path.moves.iter().any(|m| m.rotary.is_some())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::cl::{Move, MoveKind};
++    use crate::geometry::Point3;
++
++    #[test]
++    fn the_turning_bit_is_read_from_the_manifest_mask() {
++        for (text, want) in [
++            ("capabilities = 2;", true),
++            ("capabilities = 3;", true),
++            ("capabilities = 1;", false),
++            ("capabilities = 0;", false),
++            ("capabilities = 4;", false),
++            ("capabilities = -2;", false),
++            ("capabilities = \"2\";", false),
++            ("capabilities = 0 / 0;", false),
++            ("var other = 2;", false),
++        ] {
++            assert_eq!(speaks_turning(text).expect("loads"), want, "{text}");
++        }
++        assert!(speaks_turning("capabilities = ;").is_err(), "a script that does not parse refuses");
++    }
++
++    #[test]
++    fn a_path_is_live_tool_work_only_when_a_move_states_c() {
++        let m = Move::new(MoveKind::Feed, Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Some(100.0));
++        assert!(!states_live_tool(&Toolpath::new(vec![m])));
++        let mut c = m;
++        c.rotary = Some(0.0);
++        assert!(states_live_tool(&Toolpath::new(vec![m, c])));
++        assert!(!states_live_tool(&Toolpath::new(Vec::new())));
++    }
++}
+diff --git a/crates/post/src/post/js.rs b/crates/post/src/post/js.rs
+index 69d7c7b0d..dd8950daf 100644
+--- a/crates/post/src/post/js.rs
++++ b/crates/post/src/post/js.rs
+@@ -279,6 +279,13 @@ impl Script {
+         Ok(v.as_string().map(|s| s.to_std_string_escaped()))
+     }
+ 
++    /// A top-level number the script states (the manifest's
++    /// `capabilities` mask), or `None` when it states none.
++    pub fn number_global(&mut self, name: &str) -> Result<Option<f64>, PostError> {
++        let v = self.eval(&format!("(typeof {name} === \"number\") ? {name} : null"))?;
++        Ok(v.as_number())
++    }
++
+     /// Publish the document's post options once (issue #34).
+     pub fn set_options(&mut self, o: &Value) -> Result<(), PostError> {
+         self.eval(&format!("postOptions = {o};"))?;
+diff --git a/crates/post/src/post/mod.rs b/crates/post/src/post/mod.rs
+index f8bce5ca5..f7b01ea46 100644
+--- a/crates/post/src/post/mod.rs
++++ b/crates/post/src/post/mod.rs
+@@ -31,6 +31,7 @@ pub mod cnc;
+ pub mod cnc_thread;
+ pub mod cnc_torch;
+ mod coolant;
++pub mod dialect;
+ pub mod engine;
+ pub mod invert;
+ pub mod js;
+@@ -258,7 +259,7 @@ pub fn dump(t: &Toolpath, d: &Dump) -> Vec<Record> {
+     // a C turn: the section says so before it opens, so a script can
+     // engage C and the live spindle in its preamble - and the engine
+     // refuses, by name, a script that does not declare `liveTooling`.
+-    if t.moves.iter().any(|m| m.rotary.is_some()) {
++    if dialect::states_live_tool(t) {
+         out.push(Record::Param { name: "LiveTool".into(), value: json!("radial") });
+     }
+     // A thread whose passes need the spindle reversed (#629): the
+diff --git a/docs/decisions/1190-mill-op-on-lathe-post.md b/docs/decisions/1190-mill-op-on-lathe-post.md
+new file mode 100644
+index 000000000..ad82b8a0f
+--- /dev/null
++++ b/docs/decisions/1190-mill-op-on-lathe-post.md
+@@ -0,0 +1,96 @@
++## #1190 - A milling operation is never posted on a lathe's work spindle
++
++**What was decided.** The program gate refuses, by name and before a line
++is written, every operation a lathe post would open on the work spindle
++without that being how a lathe cuts it. One function decides it -
++`app::lathe_voice::voice(params, path, origin)` - and answers one of three:
++
++| The operation | A lathe post writes | Answer |
++|---|---|---|
++| its path states a C angle (`PARAM LiveTool`): the rotary kinds on the spindle's C | the machine's live-spindle word, work held on C | `LiveTool` - posts |
++| a turning-family kind (12 kinds) | `G97 S M03` / `G96` | `WorkSpindle` - posts |
++| Drill with every cutting move and cycle on the spindle axis, tool along +Z (drill, centre drill, tap, reamer on centre) | `G97 S M03`, `G83` / `G84` / `G85` or plain moves | `WorkSpindle` - posts |
++| Drill with a hole off the axis, or a tilted (cross) drill | would be `G97 S M03` | refused, naming the hole |
++| every other kind (28: the 2D, 3D and multi-axis milling kinds - a rotary kind whose path states no C included - the helical Bore, the thread-mill Thread, Probe, Plasma Profile) | would be `G97 S M03` | refused, naming the kind |
++
++The door (`lathe_voice::at_post`) runs wherever a script is known: the
++single-file post (`post_script`, so `post_setup` and one-mount
++`post_mounts`), the per-mount post and the per-operation post - which is
++every entry point (GUI Post and Post per operation, the script verb, the
++MCP tool, the CLI through them). It fires only when the script declares
++the turning dialect in its manifest (`capabilities` with the turning bit,
++which every shipped post already states: 2 for the two lathe posts, 1 for
++the rest). A mill post is untouched - there `M03` is the cutter's own
++spindle.
++
++**Why this is exact for the on-centre hole.** When the cut is on the
++spindle axis and the tool lies along it, tool and work share one axis, so
++it makes no difference to the cut which of the two turns: the relative
++rotation is the same (and M03 on a lathe's work spindle gives a
++right-hand drill the same relative sense as M03 on a mill's). That is how
++a lathe drills, reams and taps on centre. Off the axis the equivalence is
++gone - a drill standing still 6 mm off a turning work's axis cuts a ring
++- so the cutter must itself turn. Hence: Drill on centre yes (a tap on
++centre included - it is a Drill with the tap cycle); Bore no (its cutter
++orbits the hole); the thread-mill Thread no (the cutter must turn);
++everything else no.
++
++**The tolerance** for "on the axis" is `spindle_law::SPINDLE_TOL`
++(0.0005 mm), the same half-micron the two lathe scripts use as `EPS` and
++the spindle law uses for a turned part. Rapids are not judged: a drill
++may come in from the side in air (the seat law of #1026 does exactly
++that).
++
++**Why not a new stream parameter** (the first worker's route: an
++operation-family or spindle-owner `PARAM` through the app, the CL spec,
++the engine and both lathe scripts). The gate already holds everything the
++law needs - the operation's kind, its cached path, its work offset - so
++the refusal can be made before the stream exists. A stream parameter
++would let the *script* refuse, which adds nothing a user sees, while
++changing the stream format and moving goldens in every dialect. It
++becomes worth it only when a lathe post should *voice* a milling section
++(a driven tool with the work held still and no C move - a live-tool face
++mill or cross drill): that needs the script to know the section's kind,
++and is new behaviour, not this fix.
++
++**One derivation.** `voice` is the only place that decides which spindle
++a lathe post turns for an operation; `voice_of(world, entity)` reads it
++from the document and `on_work_spindle(world, entity)` is the predicate
++"is this section voiced on the work spindle?". The workholding rpm limit
++(#1174, PR #1191) should call it instead of keeping a second reading:
++`WorkSpindle` is the section whose stated rpm turns the work, `LiveTool`
++the one whose work turns on C, a refusal one that never reaches a lathe
++post. Note it would newly hold a mill-turn's on-centre Drill to the chuck
++limit, which the present reading (`spindle_law::turns`) leaves out. The
++"does the path state C?" test is `post::dialect::states_live_tool`, which
++the stream's `PARAM LiveTool` is now written from too.
++
++**Considered and dropped.**
++- *Refusing by the machine's kind* (any milling kind on a mill-turn):
++  wrong - a mill-turn posting through a mill post mills correctly, and
++  existing documents do.
++- *Reading the dialect from the registry name* (`LATHE_POSTS`): misses a
++  user's own `.cps` file and a script handed to `post_script`. The
++  manifest is the script's own statement; a unit test pins that the
++  registry list and the manifests agree.
++- *Trusting the script's own on-centre check for Drill*: the Fanuc lathe
++  script refuses a cycle off the axis, but the PathPilot one posts the
++  hole as plain moves and has no such check, and neither sees a hole on
++  the meridian.
++- *Letting a Bore or an end-mill plunge on centre through*: physically
++  the same equivalence would hold for a pure on-axis plunge, but those
++  kinds exist to cut off the axis; one admitted kind keeps the law short.
++
++**Left open.**
++- A user's own lathe script that declares no `capabilities` is not
++  recognised as a turning dialect, so the door does not fire for it (it
++  posts as before this change). Filed as #1199.
++- The door does not make a refused operation postable. A milling pass
++  with a driven tool and no C move on a mill-turn has no lathe voicing
++  yet; it posts through a mill post or as a C-axis rotary operation.
++
++**Cost to change later.** Admitting another kind is one arm in `voice`
++and one row in the unit table (`lathe_voice_tests::want`, an exhaustive
++match - a new operation kind does not compile until it is decided).
++Moving to a stream parameter later keeps `voice` as the app-side source
++of that parameter.

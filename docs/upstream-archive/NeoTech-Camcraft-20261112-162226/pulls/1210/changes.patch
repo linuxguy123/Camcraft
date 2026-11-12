@@ -1,0 +1,2548 @@
+From 42ee5e383b18249049e1dbf1a607ee0a4838defb Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 11 Nov 2026 20:25:00 -0800
+Subject: [PATCH 1/9] fix(motion): microlift pieces take longer chords only
+ where they leave no sliver
+
+The microlift acceptance (adaptive/lift.rs, lift_returns) compared the
+lifted plan's worst reading with the spiral's and flipped on nanometres:
+on the 60 x 14 slot 10 of 30 sub-micron twins read 48.0 or 48.5 deg
+against 47.5 and dropped the lifted plan (the bare spiral then fails the
+travel law and the slot falls to Offset rings).
+
+The reading was not a rounding tie. A piece re-thinned to longer chords
+(0.01 mm sag) cuts inside the arc it replaces and leaves a sliver on the
+stock side; the next piece meets it as one or two rim samples the spiral
+never planned, and which cell centres the sliver covers is chance.
+
+A piece now takes its longer chords only where the planner's stock shows
+they change nothing: they read within the bound and leave standing no
+cell the piece's own chords clear (lift_coarse::cut, Raster::stands_over).
+The acceptance keeps its law with no tolerance (lift::keeps): a lifted
+plan reading over the spiral, or over the bound where the spiral read
+under it, is never kept. 30 of 30 slot twins now keep the lifted plan,
+each reading its worst where the spiral does.
+
+rotary_adaptive's r6.2 neck levels (5.7, 5.2) were pinned refused for
+travel on the same coin (on main one or the other is HSM-planned with
+the openings 16, 62, 250 or 510 nm deeper); they are now HSM-planned on
+microlift returns and pinned so, their dexel load (20.3 % D at the bore
+exit) and radius 5.2's three 5.1-5.5 deg breaks pinned as read (#1050).
+
+coarsen moves to lift_coarse.rs with the new test (lift.rs stays under
+the 400-line law). Decision: docs/decisions/982-microlift-acceptance.md.
+
+Fixes #982
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../motion/src/machining2d/adaptive/lift.rs   |  76 +++-------
+ .../src/machining2d/adaptive/lift_coarse.rs   |  89 +++++++++++
+ .../src/machining2d/adaptive/lift_split.rs    |   3 +-
+ .../src/machining2d/adaptive/lift_tests.rs    |  69 ++++++++-
+ crates/motion/src/machining2d/adaptive/mod.rs |   1 +
+ .../motion/src/machining2d/adaptive/raster.rs |   5 +
+ .../motion/src/machining2d/adaptive/rings.rs  |  14 +-
+ .../motion/src/machining2d/adaptive/tests.rs  |  82 ++++++++--
+ crates/motion/tests/rotary_adaptive.rs        |  63 +++++---
+ docs/decisions/982-microlift-acceptance.md    | 142 ++++++++++++++++++
+ 10 files changed, 451 insertions(+), 93 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/adaptive/lift_coarse.rs
+ create mode 100644 docs/decisions/982-microlift-acceptance.md
+
+diff --git a/crates/motion/src/machining2d/adaptive/lift.rs b/crates/motion/src/machining2d/adaptive/lift.rs
+index c81c6d894..7888da3a7 100644
+--- a/crates/motion/src/machining2d/adaptive/lift.rs
++++ b/crates/motion/src/machining2d/adaptive/lift.rs
+@@ -28,14 +28,17 @@
+ //! none is. The easing laps are split the same way on the stock the
+ //! pieces left; the last lap is cut whole. The re-ordered plan is
+ //! walked on a fresh stock and kept only if it reads no worse than the
+-//! spiral. Ours; the schedule, the pads and the lift are our choices.
++//! spiral ([`keeps`]: no tolerance, issue #982 - a piece is cut on
++//! longer chords only where they leave the stock its own chords leave,
++//! `lift_coarse`, so the two readings differ by stock, never by the
++//! chords). Ours; the schedule, the pads and the lift are our choices.
+ 
+ use crate::geo2d::{Point2, Region};
+ 
+ use super::front::{densify, dist, len};
+-use super::guard::crossing_pairs;
++use super::lift_coarse::{coarsen, cut};
+ use super::lift_link::{Leg, LinkLaw, Return, extend, free_map, landing, legs};
+-use super::lift_split::{Piece, depends, split, thin_turn};
++use super::lift_split::{Piece, depends, split};
+ use super::raster::Raster;
+ use super::{GenError, Planner, Worst};
+ 
+@@ -44,14 +47,6 @@ use super::{GenError, Planner, Worst};
+ /// stepdown.
+ pub(crate) const MICROLIFT: f64 = 0.3;
+ 
+-/// A front's piece is re-thinned to this sag (mm, the verifier's own
+-/// chord tolerance) ...
+-const COARSE_SAG: f64 = 0.01;
+-
+-/// ... and no joint of it turns more than this (degrees): under the
+-/// 5-degree in-cut break law with a margin.
+-const MAX_TURN_DEG: f64 = 4.0;
+-
+ /// The nearest ready pieces a straight return is tried to, in order.
+ const TRIES: usize = 16;
+ 
+@@ -166,42 +161,6 @@ fn ride(tail: &[Point2], p: &Piece) -> Option<Vec<Point2>> {
+     near(t1, l0).then(|| tail[1..].iter().chain(p.lead[1..].iter()).copied().collect())
+ }
+ 
+-/// The fronts' pieces re-thinned to longer chords (the spiral's own sag
+-/// keeps rings microns apart at the walls; a biting piece is where its
+-/// neighbours stand a step apart) under the break law, each keeping its
+-/// fine chords to fall back on - except a piece whose coarser chords
+-/// would cross another piece (either version) or the laps after them
+-/// (`rest`): it keeps only its fine chords. No two posted pieces cross.
+-fn coarsen(pieces: &mut [Piece], rest: &[Point2]) {
+-    let n = pieces.len();
+-    let coarse: Vec<Vec<Point2>> = pieces.iter().map(|p| thin_turn(&p.pts, MAX_TURN_DEG.to_radians(), COARSE_SAG)).collect();
+-    let mut ok: Vec<bool> = coarse.iter().zip(pieces.iter()).map(|(c, p)| c.len() < p.pts.len()).collect();
+-    for _ in 0..8 {
+-        // Walks: the coarse candidates still standing, every fine piece,
+-        // the laps; a candidate may only touch its own fine version.
+-        let live: Vec<usize> = (0..n).filter(|&k| ok[k]).collect();
+-        let mut walks: Vec<Vec<Point2>> = live.iter().map(|&k| coarse[k].clone()).collect();
+-        walks.extend(pieces.iter().map(|p| p.pts.clone()));
+-        walks.push(rest.to_vec());
+-        let m = live.len();
+-        let mut bad = false;
+-        for (a, b) in crossing_pairs(&walks) {
+-            for (x, y) in [(a, b), (b, a)] {
+-                if x < m && y != m + live[x] {
+-                    ok[live[x]] = false;
+-                    bad = true;
+-                }
+-            }
+-        }
+-        if !bad {
+-            for k in live {
+-                pieces[k].fine = Some(std::mem::replace(&mut pieces[k].pts, coarse[k].clone()));
+-            }
+-            return;
+-        }
+-    }
+-}
+-
+ /// Cut `pieces` onto `out` in their order law, nearest ready first, each
+ /// reached by a legal microlift - straight, else routed through the
+ /// cleared area - where one is (else the ladder's hop); `entry`: the
+@@ -290,16 +249,10 @@ fn schedule(out: &mut Lifted, mut pieces: Vec<Piece>, center: &Region, s: &LiftS
+                 out.worst = w;
+             }
+         }
+-        // A coarse piece is cut only where it reads within the bound.
++        // On its longer chords only where they read within the bound and
++        // leave the stock its own chords leave (`lift_coarse::cut`).
+         let p = &mut pieces[next];
+-        if let Some(fine) = p.fine.take() {
+-            let mut trial = out.ras.clone();
+-            let w = trial.walk_until(&p.pts, (s.r, s.rim, s.step), s.bound);
+-            if w.0 > s.bound {
+-                p.pts = fine;
+-            }
+-        }
+-        let w = out.ras.walk(&p.pts, s.r, s.rim, s.step);
++        let w = cut(&mut out.ras, p, s);
+         if w.0 > out.worst.0 {
+             out.worst = w;
+         }
+@@ -337,7 +290,7 @@ impl Planner<'_> {
+         }
+         let (worst, left) = (l.worst.0, l.ras.standing() as f64);
+         let planned = self.ras.standing() as f64;
+-        if worst > self.worst.0.max(self.bound) + 1e-9 || left > planned * (1.0 + CRUMBS) + CRUMB_CELLS {
++        if !keeps(worst, self.worst.0, self.bound) || left > planned * (1.0 + CRUMBS) + CRUMB_CELLS {
+             self.plan.notes.push(format!(
+                 "adaptive: the microlift plan read {worst:.1} deg over the spiral's {:.1} and left {:.1} mm2 over {:.1} - the spiral is posted as planned",
+                 self.worst.0.max(self.bound),
+@@ -350,6 +303,15 @@ impl Planner<'_> {
+     }
+ }
+ 
++/// The acceptance law's reading half (issue #982): the lifted plan is
++/// kept only when its worst reading is not over the spiral's own, or the
++/// bound where the spiral read under it. No tolerance: readings are whole
++/// rim samples, exact in binary, and one sample over is an overload the
++/// spiral did not plan (the `1e-9` is float slack, far under a sample).
++pub(super) fn keeps(lifted: f64, spiral: f64, bound: f64) -> bool {
++    lifted <= spiral.max(bound) + 1e-9
++}
++
+ /// A plan's travel, per level (XY mm): in cut, in air at the floor and
+ /// lifted; and the moves it posts.
+ #[derive(Clone, Copy, Debug, Default)]
+diff --git a/crates/motion/src/machining2d/adaptive/lift_coarse.rs b/crates/motion/src/machining2d/adaptive/lift_coarse.rs
+new file mode 100644
+index 000000000..19c8499a3
+--- /dev/null
++++ b/crates/motion/src/machining2d/adaptive/lift_coarse.rs
+@@ -0,0 +1,89 @@
++//! The lifted pieces' chords (M11.4 C round 4, `lift`; issue #982). The
++//! spiral's own sag keeps its rings microns apart at the walls; a biting
++//! piece is where its neighbours stand a step apart, so it can be posted
++//! on far longer chords (fewer moves, no joint past the in-cut break
++//! law). But a chord cuts inside the arc it replaces: by up to its
++//! sagitta (elementary circle geometry: a chord `c` of a circle `R`
++//! stands `R - sqrt(R^2 - c^2 / 4)` inside it) it leaves stock the
++//! spiral's own chords clear, and the next piece meets that sliver as
++//! engagement the spiral never planned - a rim sample or two over the
++//! bound, appearing and vanishing with nanometres of ring geometry (a
++//! planner cell is about two samples wide at the rim; which cell centres
++//! a 0.01 mm sliver covers is chance). So the longer chords are taken
++//! only where the planner's stock (`raster`) shows they change nothing:
++//! they read within the bound AND leave standing no cell the piece's
++//! own chords clear. The lifted plan's stock is then never more than
++//! its pieces' own chords leave, and its reading is compared with the
++//! spiral's on the same stock. The test is ours.
++
++use crate::geo2d::Point2;
++
++use super::Worst;
++use super::guard::crossing_pairs;
++use super::lift::LiftSpec;
++use super::lift_split::{Piece, thin_turn};
++use super::raster::Raster;
++
++/// A front's piece is re-thinned to this sag (mm, the verifier's own
++/// chord tolerance) ...
++const COARSE_SAG: f64 = 0.01;
++
++/// ... and no joint of it turns more than this (degrees): under the
++/// 5-degree in-cut break law with a margin.
++const MAX_TURN_DEG: f64 = 4.0;
++
++/// The fronts' pieces re-thinned to longer chords (the spiral's own sag
++/// keeps rings microns apart at the walls; a biting piece is where its
++/// neighbours stand a step apart) under the break law, each keeping its
++/// fine chords to fall back on - except a piece whose coarser chords
++/// would cross another piece (either version) or the laps after them
++/// (`rest`): it keeps only its fine chords. No two posted pieces cross.
++pub(super) fn coarsen(pieces: &mut [Piece], rest: &[Point2]) {
++    let n = pieces.len();
++    let coarse: Vec<Vec<Point2>> = pieces.iter().map(|p| thin_turn(&p.pts, MAX_TURN_DEG.to_radians(), COARSE_SAG)).collect();
++    let mut ok: Vec<bool> = coarse.iter().zip(pieces.iter()).map(|(c, p)| c.len() < p.pts.len()).collect();
++    for _ in 0..8 {
++        // Walks: the coarse candidates still standing, every fine piece,
++        // the laps; a candidate may only touch its own fine version.
++        let live: Vec<usize> = (0..n).filter(|&k| ok[k]).collect();
++        let mut walks: Vec<Vec<Point2>> = live.iter().map(|&k| coarse[k].clone()).collect();
++        walks.extend(pieces.iter().map(|p| p.pts.clone()));
++        walks.push(rest.to_vec());
++        let m = live.len();
++        let mut bad = false;
++        for (a, b) in crossing_pairs(&walks) {
++            for (x, y) in [(a, b), (b, a)] {
++                if x < m && y != m + live[x] {
++                    ok[live[x]] = false;
++                    bad = true;
++                }
++            }
++        }
++        if !bad {
++            for k in live {
++                pieces[k].fine = Some(std::mem::replace(&mut pieces[k].pts, coarse[k].clone()));
++            }
++            return;
++        }
++    }
++}
++
++/// Cut `p` on `ras` and return its worst reading: on its longer chords
++/// where they read within the bound and leave no cell standing that its
++/// own (fine) chords clear, else on its own chords - `p.pts` is what was
++/// cut. A sliver the longer chords would leave is stock the next piece
++/// was never planned on (issue #982).
++pub(super) fn cut(ras: &mut Raster, p: &mut Piece, s: &LiftSpec) -> Worst {
++    let read = (s.r, s.rim, s.step);
++    let Some(fine) = p.fine.take() else { return ras.walk(&p.pts, s.r, s.rim, s.step) };
++    let mut coarse = ras.clone();
++    let w = coarse.walk_until(&p.pts, read, s.bound);
++    // The piece's own chords, cut for real: what the spiral leaves here.
++    let own = ras.walk(&fine, s.r, s.rim, s.step);
++    if w.0 <= s.bound && !coarse.stands_over(ras) {
++        *ras = coarse;
++        return w;
++    }
++    p.pts = fine;
++    own
++}
+diff --git a/crates/motion/src/machining2d/adaptive/lift_split.rs b/crates/motion/src/machining2d/adaptive/lift_split.rs
+index aae985bc2..67848fed9 100644
+--- a/crates/motion/src/machining2d/adaptive/lift_split.rs
++++ b/crates/motion/src/machining2d/adaptive/lift_split.rs
+@@ -30,7 +30,8 @@ pub(super) struct Piece {
+     /// where the walk ends): where a return may climb along.
+     pub tail: Vec<Point2>,
+     /// The spiral's own chords when `pts` holds coarser ones (`lift`'s
+-    /// re-thinning), walked instead where those read worse.
++    /// re-thinning), walked instead where those read worse or leave a
++    /// sliver (`lift_coarse::cut`).
+     pub fine: Option<Vec<Point2>>,
+ }
+ 
+diff --git a/crates/motion/src/machining2d/adaptive/lift_tests.rs b/crates/motion/src/machining2d/adaptive/lift_tests.rs
+index 7913d4ada..8fffae70b 100644
+--- a/crates/motion/src/machining2d/adaptive/lift_tests.rs
++++ b/crates/motion/src/machining2d/adaptive/lift_tests.rs
+@@ -3,8 +3,12 @@
+ //! star::wide_enough}): a microlift return is legal only over cleared
+ //! stock, inside the area, off the orbit, never crossing another return
+ //! on its plane - and a crossing one climbs to the next lift; the width
+-//! test admits the star path only 1.4 D wide.
++//! test admits the star path only 1.4 D wide; a piece takes longer
++//! chords only where they leave no sliver (`lift_coarse`, issue #982),
++//! and the lifted plan is kept only at or under the spiral's reading.
+ 
++use super::lift::{LiftSpec, keeps};
++use super::lift_coarse::cut;
+ use super::lift_link::{LinkLaw, Return, legs};
+ use super::lift_split::{Piece, split, thin_turn};
+ use super::raster::Raster;
+@@ -122,3 +126,66 @@ fn the_star_path_admits_only_areas_one_point_four_d_wide() {
+     let Ok(stub) = rect(5.0, 5.0, 35.0, 35.0).union(&rect(30.0, 14.0, 60.0, 26.0)) else { panic!("union") };
+     assert!(matches!(wide_enough(&stub, half), Ok(false)));
+ }
++
++/// A D10 biting 1 mm into the stock round a cleared R16 disc, along a
++/// quarter of the R12 circle: its own chords (one degree each) and what
++/// reads them.
++fn quarter_bite() -> (Raster, Vec<Point2>, LiftSpec) {
++    let Ok(mut ras) = Raster::from_region(&rect(0.0, 0.0, 60.0, 40.0), 0.1, 5.0) else { panic!("raster") };
++    let rim = crate::quality::rim_for(10.0, 0.1);
++    let ring = |rad: f64, a0: usize, a1: usize| -> Vec<Point2> {
++        (a0..=a1).map(|k| (k as f64).to_radians()).map(|a| Point2::new(30.0 + rad * a.cos(), 20.0 + rad * a.sin())).collect()
++    };
++    ras.walk(&ring(11.0, 0, 360), 5.0, rim, 0.5);
++    let spec = LiftSpec { r: 5.0, rim, step: 0.5, bite: crate::load::deg_at_rim(0.005, 10.0, rim), bound: 90.0, laps: (0, 0), orbit: (Point2::new(0.0, 0.0), 0.0) };
++    (ras, ring(12.0, 200, 290), spec)
++}
++
++/// Issue #982: longer chords cut inside the arc they replace and leave a
++/// sliver of stock on its outside, which the next piece would meet as
++/// engagement the spiral never planned. Such a piece is cut on its own
++/// chords, and the stock is what they leave; chords that leave nothing
++/// (a straight run's) are kept, and so are the moves they save.
++#[test]
++fn a_piece_takes_longer_chords_only_where_they_leave_no_sliver() {
++    let (ras0, fine, spec) = quarter_bite();
++    let coarse = thin_turn(&fine, 4f64.to_radians(), 0.01);
++    assert!(coarse.len() * 3 < fine.len(), "{} chords for {}", coarse.len(), fine.len());
++    // What each version leaves: the longer chords stand cells over.
++    let (mut own, mut long) = (ras0.clone(), ras0.clone());
++    own.walk(&fine, spec.r, spec.rim, spec.step);
++    let w = long.walk(&coarse, spec.r, spec.rim, spec.step);
++    assert!(w.0 <= spec.bound && long.stands_over(&own), "the fixture's longer chords read {} and leave no sliver", w.0);
++    let mut ras = ras0.clone();
++    let mut p = Piece { pts: coarse, lead: Vec::new(), tail: Vec::new(), fine: Some(fine.clone()) };
++    cut(&mut ras, &mut p, &spec);
++    assert_eq!(p.pts.len(), fine.len(), "the piece is cut on its own chords");
++    assert!(!ras.stands_over(&own) && !own.stands_over(&ras), "and leaves exactly what they leave");
++    // A straight run a millimetre into a channel's side: two points cut
++    // what its forty-one do.
++    let (mut ras, _) = channel();
++    let run: Vec<Point2> = (0..=40).map(|k| Point2::new(10.0 + k as f64, 23.0)).collect();
++    let mut q = Piece { pts: vec![run[0], run[40]], lead: Vec::new(), tail: Vec::new(), fine: Some(run) };
++    let w = cut(&mut ras, &mut q, &spec);
++    assert!(w.0 > spec.bite && w.0 <= spec.bound, "the run bites: {}", w.0);
++    assert_eq!(q.pts.len(), 2, "chords that leave no sliver are kept");
++    // Over the bound the longer chords were never taken (round 4's law).
++    let (mut ras, tight) = (ras0, LiftSpec { bound: 1.0, ..spec });
++    let mut p = Piece { pts: thin_turn(&fine, 4f64.to_radians(), 0.01), lead: Vec::new(), tail: Vec::new(), fine: Some(fine.clone()) };
++    cut(&mut ras, &mut p, &tight);
++    assert_eq!(p.pts.len(), fine.len());
++}
++
++/// Issue #982: the acceptance has no tolerance. One rim sample (half a
++/// degree) over the spiral's own reading - or over the bound, where the
++/// spiral read under it - drops the lifted plan; the spiral's own named
++/// overload is the most a lifted plan may read.
++#[test]
++fn the_lifted_plan_is_kept_only_at_or_under_the_spiral_reading() {
++    let bound = 47.5014;
++    assert!(keeps(47.5, 47.5, bound), "the spiral's own reading");
++    assert!(keeps(47.5, 40.0, bound), "under the bound, over a lighter spiral");
++    assert!(!keeps(48.0, 47.5, bound), "one sample over the bound");
++    assert!(keeps(49.0, 49.0, bound), "the spiral's own named overload");
++    assert!(!keeps(49.5, 49.0, bound), "one sample over that overload");
++}
+diff --git a/crates/motion/src/machining2d/adaptive/mod.rs b/crates/motion/src/machining2d/adaptive/mod.rs
+index d2dde7a90..69c13f2e1 100644
+--- a/crates/motion/src/machining2d/adaptive/mod.rs
++++ b/crates/motion/src/machining2d/adaptive/mod.rs
+@@ -43,6 +43,7 @@ mod grow;
+ mod guard;
+ mod kernel;
+ mod lift;
++mod lift_coarse;
+ mod lift_link;
+ mod lift_split;
+ mod link;
+diff --git a/crates/motion/src/machining2d/adaptive/raster.rs b/crates/motion/src/machining2d/adaptive/raster.rs
+index 3ed28a7ad..5b9f52672 100644
+--- a/crates/motion/src/machining2d/adaptive/raster.rs
++++ b/crates/motion/src/machining2d/adaptive/raster.rs
+@@ -196,6 +196,11 @@ impl Raster {
+         Point2::new(self.x0 + ((i % self.nx) as f64 + 0.5) * self.h, self.y0 + ((i / self.nx) as f64 + 0.5) * self.h)
+     }
+ 
++    /// Does a cell stand here that `other` has cleared (two cuts compared)?
++    pub(super) fn stands_over(&self, other: &Raster) -> bool {
++        self.cells.len() != other.cells.len() || self.cells.iter().zip(&other.cells).any(|(&a, &b)| a && !b)
++    }
++
+     /// Material cells standing (the progress yardstick of a round).
+     pub(super) fn standing(&self) -> usize {
+         self.cells.iter().filter(|&&c| c).count()
+diff --git a/crates/motion/src/machining2d/adaptive/rings.rs b/crates/motion/src/machining2d/adaptive/rings.rs
+index a90464c84..7732670fe 100644
+--- a/crates/motion/src/machining2d/adaptive/rings.rs
++++ b/crates/motion/src/machining2d/adaptive/rings.rs
+@@ -34,7 +34,19 @@ pub(super) const SEG: f64 = 0.2;
+ pub(super) const NEAR_CELL: f64 = 0.5;
+ 
+ pub(super) fn open(r: &Region, rho: f64) -> Result<Region, GenError> {
+-    Ok(r.offset_fine(-rho, ARC_TOL)?.offset_fine(rho, ARC_TOL)?)
++    #[cfg(test)]
++    let inset = OPEN_INSET.with(std::cell::Cell::get);
++    #[cfg(not(test))]
++    let inset = 0.0;
++    Ok(r.offset_fine(-(rho + inset), ARC_TOL)?.offset_fine(rho, ARC_TOL)?)
++}
++
++#[cfg(test)]
++thread_local! {
++    /// Tests only (issue #982): the opening erodes this much (mm) deeper
++    /// than it dilates back - a sub-micron perturbation of every ring, to
++    /// pin that a plan's verdict does not turn on it.
++    pub(super) static OPEN_INSET: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+ }
+ 
+ pub(super) fn one_loop(r: &Region) -> bool {
+diff --git a/crates/motion/src/machining2d/adaptive/tests.rs b/crates/motion/src/machining2d/adaptive/tests.rs
+index 4ce5f3581..1d8287677 100644
+--- a/crates/motion/src/machining2d/adaptive/tests.rs
++++ b/crates/motion/src/machining2d/adaptive/tests.rs
+@@ -34,17 +34,12 @@ fn a_degenerate_spec_is_refused_not_planned() {
+     assert!(plan(&sq, &sq, &spec).is_err());
+ }
+ 
+-/// Round 3: a 60 x 14 slot (1.4 D wide) is no star cell from its middle; it
+-/// is grown as one ring family - never crossing itself, the load held,
+-/// nothing but the named corner scallops left. Round 4: cut where it
+-/// bites, its pieces joined by microlift returns (one join a pass).
+-#[test]
+-fn a_channel_is_grown_as_one_spiral_that_never_crosses() {
+-    let pts = vec![Point2::new(0.0, 0.0), Point2::new(60.0, 0.0), Point2::new(60.0, 14.0), Point2::new(0.0, 14.0)];
++/// The 60 x 14 slot (1.4 D wide; `dy` wider) as `pocket_hsm` plans it:
++/// the center area, what the cutter standing in it can reach, its plan.
++fn slot_plan(dy: f64) -> (Region, Region, AdaptivePlan) {
++    let pts = vec![Point2::new(0.0, 0.0), Point2::new(60.0, 0.0), Point2::new(60.0, 14.0 + dy), Point2::new(0.0, 14.0 + dy)];
+     let (Ok(l), r) = (crate::geo2d::Loop::new(pts), 5.0) else { panic!("loop") };
+     let Ok(slot) = Region::new(vec![l]) else { panic!("slot") };
+-    // As `pocket_hsm` plans it: the center area, and what the cutter
+-    // standing in it can reach.
+     let (Ok(center), r) = (slot.offset(-r), r) else { panic!("center") };
+     let Ok(reach) = center.offset(r) else { panic!("reach") };
+     let seed = Point2::new(30.0, 7.0);
+@@ -59,17 +54,74 @@ fn a_channel_is_grown_as_one_spiral_that_never_crosses() {
+         helix_r: 1.2,
+         smooth: 2.5,
+     };
+-    budget::PEAK.with(|p| p.set(0));
+     let Ok(pl) = plan(&reach, &center, &spec) else { panic!("plan") };
++    (center, reach, pl)
++}
++
++/// The slot's verdict: cut where it bites, its pieces joined by microlift
++/// returns (one join a pass, nine in ten of them lifted), never crossing,
++/// the load held - no overload named, the lifted plan not dropped for the
++/// bare spiral - and nothing but grid crumbs left.
++fn assert_lifted_within_the_load(what: &str, reach: &Region, pl: &AdaptivePlan) {
++    assert!(pl.passes.len() > 1 && pl.joins.len() == pl.passes.len(), "{what}: lifted pieces: {:?}", pl.notes);
++    assert!(pl.joins.iter().skip(1).filter(|j| j.is_some()).count() * 10 >= 9 * (pl.passes.len() - 1), "{what}: returns lifted: {:?}", pl.notes);
++    assert!(first_crossing(&pl.passes).is_none(), "{what}: {:?}", pl.notes);
++    assert!(!pl.notes.iter().any(|n| n.contains("exceeds") || n.contains("overload") || n.contains("posted as planned")), "{what}: {:?}", pl.notes);
++    assert!(pl.rest < crate::machining2d::pocket_hsm::HSM_REST_MAX * reach.area(), "{what}: rest {} {:?}", pl.rest, pl.notes);
++}
++
++/// Round 3: a 60 x 14 slot (1.4 D wide) is no star cell from its middle; it
++/// is grown as one ring family - never crossing itself, the load held,
++/// nothing but the named corner scallops left. Round 4: cut where it
++/// bites, its pieces joined by microlift returns (one join a pass).
++#[test]
++fn a_channel_is_grown_as_one_spiral_that_never_crosses() {
++    budget::PEAK.with(|p| p.set(0));
++    let (center, reach, pl) = slot_plan(0.0);
+     // Issue #850: it spends ~246 k of the 600 k geometry budget.
+     let peak = budget::PEAK.with(|p| p.get());
+     assert!(peak > 0 && peak as f64 * 1.9 <= budget::GEOM_MAX as f64, "{peak} vertices");
+-    assert!(pl.passes.len() > 1 && pl.joins.len() == pl.passes.len(), "lifted pieces: {:?}", pl.notes);
+-    assert!(pl.joins.iter().skip(1).filter(|j| j.is_some()).count() * 10 >= 9 * (pl.passes.len() - 1), "returns lifted: {:?}", pl.notes);
+-    assert!(first_crossing(&pl.passes).is_none(), "{:?}", pl.notes);
+-    assert!(!pl.notes.iter().any(|n| n.contains("exceeds") || n.contains("overload")), "{:?}", pl.notes);
+-    assert!(pl.rest < crate::machining2d::pocket_hsm::HSM_REST_MAX * reach.area(), "rest {} {:?}", pl.rest, pl.notes);
++    assert_lifted_within_the_load("the slot", &reach, &pl);
+     // Every point stays in the center area (the walls are never cut).
+     let Ok(grown) = center.offset(1e-3) else { panic!("grown") };
+     assert!(pl.passes.iter().flatten().all(|&q| grown.contains(q)));
+ }
++
++/// The slot planned with every ring's opening eroded `inset` mm deeper
++/// than it dilates back (`rings::OPEN_INSET`), on a slot `dy` mm wider.
++fn perturbed_slot(inset: f64, dy: f64) -> (Region, AdaptivePlan) {
++    rings::OPEN_INSET.with(|c| c.set(inset));
++    let (_, reach, pl) = slot_plan(dy);
++    rings::OPEN_INSET.with(|c| c.set(0.0));
++    (reach, pl)
++}
++
++/// Issue #982: the slot's verdict does not turn on nanometres. Its twin
++/// with every opening 32 nm deeper read 48.0 deg on the lifted plan
++/// against the spiral's 47.5 before the fix (a sliver the pieces' longer
++/// chords left, one rim sample), which dropped the lifted plan for the
++/// bare spiral - and that one falls to Offset rings on the travel law.
++/// The twin now decides as the slot does: lifted, the load held.
++#[test]
++fn the_slot_and_its_32_nm_twin_decide_the_same_way() {
++    let (reach, pl) = perturbed_slot(3.2e-5, 0.0);
++    assert_lifted_within_the_load("the opening 32 nm deeper", &reach, &pl);
++}
++
++/// Issue #982's sweep: openings 8 nm to 0.25 um deeper, and the slot
++/// itself 8 nm to 0.51 um wider or narrower. Before the fix the lifted
++/// plan was dropped at 8, 32, 48 and 180 nm of opening and at -125, -62,
++/// -8, +8, +32 and +510 nm of width (Linux x86-64; other platforms'
++/// libm flips other rows). Every twin now decides as the slot does.
++#[test]
++#[ignore = "heavy lane: release --ignored (the slot planned 20 times, ~5 s each in release, minutes in debug)"]
++fn the_slot_keeps_its_verdict_under_sub_micron_perturbations() {
++    for nm in [8.0, 16.0, 24.0, 32.0, 48.0, 62.0, 90.0, 125.0, 180.0, 250.0] {
++        let (reach, pl) = perturbed_slot(nm * 1e-6, 0.0);
++        assert_lifted_within_the_load(&format!("the opening {nm} nm deeper"), &reach, &pl);
++    }
++    for nm in [-250.0, -125.0, -62.0, -32.0, -8.0, 8.0, 32.0, 62.0, 250.0, 510.0] {
++        let (reach, pl) = perturbed_slot(0.0, nm * 1e-6);
++        assert_lifted_within_the_load(&format!("the slot {nm} nm wider"), &reach, &pl);
++    }
++}
+diff --git a/crates/motion/tests/rotary_adaptive.rs b/crates/motion/tests/rotary_adaptive.rs
+index 2707fabc3..f6cb0db00 100644
+--- a/crates/motion/tests/rotary_adaptive.rs
++++ b/crates/motion/tests/rotary_adaptive.rs
+@@ -221,19 +221,37 @@ fn a_window_too_narrow_for_the_helix_is_refused_by_name_before_planning() {
+     assert_refusals_named(&reads, 7.0);
+ }
+ 
+-/// Issue #55, decided final: on the app suites' r6.2 bar the neck's
+-/// material levels (5.7, 5.2) stay refused for out-of-cut travel. Each
+-/// is a band ~78 x 7.8 (5.2: ~78 x 5.8) round the developed neck; the
+-/// spiral re-walks the whole cleared ring every revolution, so only its
+-/// microlift returns keep it in cut, and those read 48.0 deg against the
+-/// plan's 47.5 bound (a named overload if posted). Unlifted the spiral
+-/// rides 8208 mm out of cut for 2529 in cut (5.2: 8828 for 2254), past
+-/// the 1.5x budget. The band's own planner is the thin-band work (#44,
+-/// #47), not the wrap's: here the refusal is pinned by name, the skin
+-/// level still HSM-planned. ~3 min debug: heavy lane.
++/// The r6.2 neck levels' dexel load may stand this far over the optimal
++/// (ae/D, as a factor): both read 20.3 % D on the 0.1 mm measuring stock,
++/// at the first turn out of the entry's bore (55.5 deg; the planner's
++/// own stock reads 47.5 there and names no overload) - half a point past
++/// the whole bar's `1.35`. Issue #982 measured it; the bore exit on a
++/// developed band is the follow-up's (named in the decision file).
++const R62_LOAD_FACTOR: f64 = 1.40;
++
++/// ... and radius 5.2 posts this many in-cut breaks past 5 degrees (5.1,
++/// 5.5 and 5.5 deg at the band's west end, the spiral's own chords);
++/// radius 5.7 posts none.
++const R62_BREAKS: usize = 3;
++
++/// Issues #55 and #982: on the app suites' r6.2 bar the neck's material
++/// levels (5.7, 5.2) are bands ~78 x 7.8 (5.2: ~78 x 5.8) round the
++/// developed neck. The spiral re-walks the whole cleared ring every
++/// revolution, so only its microlift returns keep it in cut (unlifted it
++/// rides ~8200 mm out of cut for ~2500 in cut, past the 1.5x budget,
++/// and Offset rings cut the band at a full-width load). #55 pinned the
++/// levels refused for travel: the lifted plans read 48.0 deg against the
++/// 47.5 bound. #982 found that reading was a sliver the pieces' longer
++/// chords left for the next piece - and the refusal a coin: with every
++/// ring's opening 16, 62, 250 or 510 nm deeper one level or the other
++/// was HSM-planned anyway. The pieces now take longer chords only where
++/// those leave no sliver, so both levels read the spiral's own 47.5 and
++/// are HSM-planned on microlift returns, with or without the nanometres:
++/// nothing refused for travel, no planner overload named. ~3 min debug:
++/// heavy lane.
+ #[test]
+ #[ignore = "heavy lane: release --ignored (three HSM plans over the r6.2 bar, ~3 min debug)"]
+-fn the_r62_neck_levels_are_refused_for_travel_by_name() {
++fn the_r62_neck_levels_are_hsm_planned_on_microlift_returns() {
+     let (f, st) = (bar(), stock(6.2, -16.0, 16.0));
+     let p = params(PocketStrategy::Adaptive);
+     let dev = match rotary_offset_developed(&f, Some(&st), &p) {
+@@ -244,17 +262,26 @@ fn the_r62_neck_levels_are_refused_for_travel_by_name() {
+     println!("r6.2 notes: {:?}", dev.notes);
+     let reads = read_levels(&dev, 6.2, 0.0);
+     for r in &reads {
+-        println!("radius {:.3}: {} planar moves ({} arcs), rings {}", r.rho, r.moves, r.arcs, r.ringed(6.2));
++        println!(
++            "radius {:.3}: {} planar moves ({} arcs), load {:.1}% D, breaks>5 {}, rings {}",
++            r.rho, r.moves, r.arcs, r.load * 100.0, r.breaks, r.ringed(6.2)
++        );
+     }
+-    for rho in [5.7, 5.2] {
+-        let tag = ring_tag(rho);
++    assert!(!dev.notes.iter().any(|n| n.contains("out of cut")), "a level is refused for travel: {:?}", dev.notes);
++    for (rho, breaks) in [(5.7, 0), (5.2, R62_BREAKS)] {
++        let Some(r) = reads.iter().find(|r| (r.rho - rho).abs() < 1e-6) else { panic!("radius {rho} is not cut: {:?}", dev.notes) };
++        assert!(r.arcs > 0 && !r.ringed(6.2) && !r.named, "radius {rho} is HSM-planned, its proved arcs posted: {:?}", dev.notes);
+         assert!(
+-            dev.notes.iter().any(|n| n.contains("out of cut") && n.contains("(over 1.5x)") && n.ends_with(&tag)),
+-            "radius {rho}: refused for travel, by name: {:?}",
+-            dev.notes
++            r.load <= DEFAULT_OPTIMAL_LOAD * R62_LOAD_FACTOR,
++            "radius {rho}: load {:.1}% D past {:.1}% x {R62_LOAD_FACTOR}",
++            r.load * 100.0,
++            DEFAULT_OPTIMAL_LOAD * 100.0
+         );
+-        assert!(reads.iter().any(|r| (r.rho - rho).abs() < 1e-6 && r.ringed(6.2)), "radius {rho} is cut by rings");
++        assert!(r.breaks <= breaks, "radius {rho}: {} in-cut breaks past 5 deg (pinned at {breaks})", r.breaks);
+     }
++    // Each neck level says how it is kept in cut.
++    let lifted = dev.notes.iter().filter(|n| n.contains("microlift returns") && n.contains("replace")).count();
++    assert!(lifted >= 2, "both neck levels are cut on microlift returns: {:?}", dev.notes);
+     assert!(reads.iter().any(|r| (r.rho - 6.2).abs() < 1e-6 && r.arcs > 0), "the skin level stays HSM-planned");
+     assert_refusals_named(&reads, 6.2);
+     let over = planner_overloads(&dev.notes);
+diff --git a/docs/decisions/982-microlift-acceptance.md b/docs/decisions/982-microlift-acceptance.md
+new file mode 100644
+index 000000000..b0cc3af23
+--- /dev/null
++++ b/docs/decisions/982-microlift-acceptance.md
+@@ -0,0 +1,142 @@
++## #982 - Microlift acceptance: remove the sliver, keep the strict law
++
++**What was decided.** The acceptance in `adaptive/lift.rs` keeps its law
++with no tolerance (`lift::keeps`: the lifted plan's worst reading may not
++exceed the spiral's own, or the bound where the spiral read under it).
++What changed is what the two readings are taken on. A lifted piece is
++posted on longer chords (`thin_turn`, 0.01 mm sag, 4 degree joints) only
++where the planner's stock shows they change nothing: they read within the
++bound **and** leave standing no cell the piece's own chords clear
++(`lift_coarse::cut`, `Raster::stands_over`). Otherwise the piece is cut
++on its own chords, the spiral's. The lifted plan's stock is then never
++more than its pieces' own chords leave, so its reading and the spiral's
++differ by stock (a different order, a dropped graze), never by the
++chords.
++
++**Why not a tolerance, which the issue asked for.** A reading is a count
++of rim samples (360 over 180 degrees), so every reading is a whole half
++degree and there is no finer reading to compare. The 48.0 against 47.5
++was not a tie broken by rounding: it was one real sample of engagement.
++A chord cuts inside the arc it replaces, by up to its sagitta, and leaves
++that sliver on the stock side; the next piece meets it. At the slot's
++bound 0.01 mm of extra radial width is about 0.25 degrees, half a sample,
++and a planner cell (D/120) is about two samples wide at the rim - so whether a
++sliver shows as zero, one or two samples depends on which cell centres it
++covers, and that depends on nanometres of ring geometry. A tolerance
++wide enough to absorb it (one sample was tried by the first worker, two
++are needed: 48.5 was read here) accepts a plan that overloads past the
++stated bound and has to name it; the slot's own pin forbids that note.
++Removing the sliver keeps the bound exact: a microlifted plan is never
++kept if it reads over the spiral at all.
++
++**Measured (release, Linux x86-64, upstream/main 3e9b8ae1).** "Opening"
++is `rings::open` eroding that much deeper than it dilates back; "width"
++is the slot itself that much wider. `L/S` is lifted against spiral
++reading in degrees; the bound is 47.5014.
++
++| 60 x 14 slot, D10 | before | after |
++|---|---|---|
++| unperturbed | 47.5 / 47.5 kept | 47.5 / 47.5 kept |
++| opening 8, 32, 48 nm | 48.0 / 47.5 dropped | 47.5 / 47.5 kept |
++| opening 180 nm | 48.5 / 47.5 dropped | 47.5 / 47.5 kept |
++| opening 16, 24, 62, 90, 125, 250, 350, 510, 700, 1000 nm | kept | kept |
++| width -125, -62, -8, +32, +510 nm | 48.0 / 47.5 dropped | 47.5 / 47.5 kept |
++| width +8 nm | 48.5 / 47.5 dropped | 47.5 / 47.5 kept |
++| width -250, -32, -16, +16, +62, +125, +250, +1000, +5000 nm | kept | kept |
++
++Before: 10 of 30 twins dropped the lifted plan (the bare spiral then
++fails the travel law and the slot falls to Offset rings). After: 0 of
++30, and every one reads its worst at the same place the spiral does
++(the first turn out of the entry bore), on the same stock - the tie is
++the same reading, not two readings that happen to agree.
++
++Cost: on the slot a third of the pieces keep longer chords instead of
++two thirds; the `adaptive_hsm` narrow slot posts 14 534 moves instead of
++13 378 (+8.6 %), cut and air lengths within 3 mm. Planning time is
++unchanged (the piece's own chords were walked before only where the
++longer ones failed; now always, in place of the second walk of the
++longer ones).
++
++**The one fixture verdict that changes, and why it must.** The issue's
++Done-means asks that no adaptive fixture's verdict change on main. One
++does: `rotary_adaptive`'s r6.2 neck levels (radius 5.7 and 5.2), pinned
++"refused for travel by name" since #55. That verdict was the same knife
++edge, not a decision. On unchanged main, with only the openings
++perturbed:
++
++| opening | radius 5.7 | radius 5.2 | the old pin |
++|---|---|---|---|
++| 0, 8, 125 nm | rings (48.0 / 47.5) | rings (48.0 / 47.5) | green |
++| 16, 62 nm | **HSM-planned** | rings | red |
++| 250, 510 nm | rings | **HSM-planned** | red |
++
++No acceptance rule can keep the slot at 48.0 against 47.5 and refuse
++these bands at 48.0 against 47.5; they are the same case (a channel a
++few tool diameters wide, kept in cut only by its microlift returns).
++After the fix both levels read 47.5 against 47.5 and are HSM-planned at
++every perturbation tried (0, 16, 32, 250 nm). The pin is rewritten as
++`the_r62_neck_levels_are_hsm_planned_on_microlift_returns`. What they
++were cut by before is Offset rings at a full-width load (100 % D, 15-21
++breaks of 45-135 degrees); what they are cut by now reads 20.3 % D on
++the suite's 0.1 mm dexel and no planner overload.
++
++Two readings of those plans are pinned at what they are rather than at
++the whole bar's laws, and are **not** this change's doing (the same
++readings appear on main whenever the coin lands the other way):
++- **20.3 % D** on both levels, against the whole bar's 19.8 % (optimal
++  + 35 %). It is one move, the first turn out of the entry's bore
++  (55.5 degrees on the 0.1 mm dexel; the r7 bar's lifted level reads
++  53.0 at the same place; the planner's own 0.05 mm stock reads 47.5).
++  The pin holds it to optimal x 1.40.
++- **3 in-cut breaks** past 5 degrees on radius 5.2 (5.1, 5.5, 5.5
++  degrees at the band's west end; the spiral's own chords); radius 5.7
++  has none. The pin holds 5.2 to at most 3.
++Both are filed as #1050 (the developed-band bore exit and end kinks);
++the pin's two constants (`R62_LOAD_FACTOR`, `R62_BREAKS`) go when it
++is fixed.
++
++**Every other verdict is unchanged** (release, `--include-ignored`):
++motion lib, `adaptive_hsm` 6/6 (bore, rectangle, L-pocket, island,
++narrow slot, channel: same strategy, same load, same breaks),
++`adaptive_band` 2/2, `pocket3d_hsm`, `level_links`, and the other four
++`rotary_adaptive` tests. The L-pocket and the rotary skin levels still
++drop their lifted plans, now on what is left once the chords are out of
++it: those plans leave more stock than the spiral (19 to 513 cells: air
++stretches that grazed), read 48.0 to 49.5 at every perturbation, and
++are real overloads the strict law is there to refuse.
++
++**Goldens.** No golden file moves (`tests/golden/` holds no HSM plan).
++Posted programs of lifted plans change (more pieces on their own
++chords); the suites that pin them pin laws, not digests.
++
++**Considered and dropped.**
++- *One- or two-sample tolerance* (the issue's proposal; the first
++  worker's first try). Keeps the slot, but posts plans reading over the
++  stated bound and must name them; where the edge goes next (two samples,
++  three) is again a matter of nanometres.
++- *Fine-chord retry* (the first worker's held commit 39a06802): re-plan
++  the whole lifted plan on fine chords when the coarse one fails. Same
++  verdicts as this change, but it plans twice, gives up every longer
++  chord in the plans it rescues (the slot keeps a third of them here),
++  and leaves the sliver in every plan that happened to pass.
++- *Sub-sample readings* (bisecting the arc ends): still quantized by the
++  cell, and costs every walk.
++- *Headroom in the spiral* (grow to the bound less a sample, accept up
++  to the bound): moves every grown plan in the product by ~4 % more
++  revolutions to protect the lifted ones.
++- *Keeping the r6.2 levels refused by a rule of their own*: nothing
++  honest tells them from the slot at plan time, and the refusal sends
++  them to a full-width ring cut.
++
++**What it would cost to change later.** `lift_coarse::cut` is the one
++place the chords are chosen; loosening it (say, slivers up to n cells)
++is one comparison, and the slot's sweep
++(`the_slot_keeps_its_verdict_under_sub_micron_perturbations`) says at
++once whether the knife edge is back.
++
++**Not settled here.** #882's other two knife edges stand: the #850
++planning budget (the rotary window's and the r7 bar's deepest levels
++flip between "refused past the budget" and HSM-planned when the
++openings are 250 nm deeper, on main and after this change alike; the r7
++pin is red there on both - filed as #1051) and #845's island (PR #953).
++`grow.rs` and `budget.rs` are not touched.
+
+From f23ebc3ca772cb052ab69e4ca3890fb8ac4706f6 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 11 Nov 2026 20:46:29 -0800
+Subject: [PATCH 2/9] docs(decisions): #982 - the bore count pin is unmoved;
+ stacked on #1007
+
+Refs #982
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ docs/decisions/982-microlift-acceptance.md | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/docs/decisions/982-microlift-acceptance.md b/docs/decisions/982-microlift-acceptance.md
+index b0cc3af23..1d88f4f92 100644
+--- a/docs/decisions/982-microlift-acceptance.md
++++ b/docs/decisions/982-microlift-acceptance.md
+@@ -107,7 +107,17 @@ are real overloads the strict law is there to refuse.
+ 
+ **Goldens.** No golden file moves (`tests/golden/` holds no HSM plan).
+ Posted programs of lifted plans change (more pieces on their own
+-chords); the suites that pin them pin laws, not digests.
++chords); the suites that pin them pin laws, not digests. The one count
++pin on an HSM plan, the app's STEP bore
++(`pocket3d_hsm::the_users_bore_roughs_adaptive_level_by_level_and_verifies_clean`,
++moves / planar feeds / arcs), does not move: on Linux it reads
++6490 / 6454 / 222 with and without this change (the 6500 / 6464 / 222
++on main was measured on another platform, so that pin is red on Linux
++either way), and on PR #1032's tree, which re-pins it per platform,
++16196 / 15457 / 1570 with and without.
++
++**Stacked on PR #1007** (#983): it gives the rotary level reader the
++ladder's step, on the same line of the r6.2 pin this change rewrites.
+ 
+ **Considered and dropped.**
+ - *One- or two-sample tolerance* (the issue's proposal; the first
+
+From 5516dbc3c86f3af5123b782633bed562dc3a1e09 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 00:46:05 -0800
+Subject: [PATCH 3/9] fix(motion): hold the adaptive planning budget per margin
+ attempt
+
+The growth planner's running budgets (length, law 2; vertices past a
+length, law 3) were summed over the margin attempts. A plan whose first
+wall margin ran out a revolution before its fronts were done - a matter
+of nanometres of ring geometry - was made again from a wider margin with
+a whole attempt already charged, and refused for it: the rotary r7 bar's
+developed level at radius 5.0 was refused at 22.5 k + 7.6 k tool radii,
+and HSM-planned in 22.3 k with its openings 250 nm deeper.
+
+Each attempt is now counted on its own (Work::attempt, at the top of
+Planner::grow). The limits and refusal texts are unchanged; every
+refusal on our fixtures falls inside its first attempt as before. The
+r7 bar's level 5.0 and the rotary window's levels 6.0 and 5.0 are
+HSM-planned, at 0, 8, 16, 62 and 250 nm of perturbation alike (heavy
+twins in adaptive::budget::twins), and the rotary pins name them.
+
+Stacked on PR #1080 (#982). Decision: docs/decisions/1051-planning-budget-edge.md
+
+Fixes #1051
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/motion/src/lib.rs                      |   5 +
+ .../motion/src/machining2d/adaptive/budget.rs |  74 ++++++++--
+ .../src/machining2d/adaptive/budget_twins.rs  | 135 ++++++++++++++++++
+ .../motion/src/machining2d/adaptive/grow.rs   |   2 +
+ crates/motion/tests/rotary_adaptive.rs        |  21 ++-
+ docs/decisions/1051-planning-budget-edge.md   | 109 ++++++++++++++
+ 6 files changed, 333 insertions(+), 13 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/adaptive/budget_twins.rs
+ create mode 100644 docs/decisions/1051-planning-budget-edge.md
+
+diff --git a/crates/motion/src/lib.rs b/crates/motion/src/lib.rs
+index 8e21ddfa5..1a1c47151 100644
+--- a/crates/motion/src/lib.rs
++++ b/crates/motion/src/lib.rs
+@@ -17,6 +17,11 @@
+ //! finishing - all from public machining literature and G-code
+ //! standards; no vendor strategy was inspected. No flecs, no world.
+ 
++// Tests only (issue #1051): a unit suite reads the integration suites'
++// fixtures (`tests/rotary_adaptive_fixture`), which name this crate.
++#[cfg(test)]
++extern crate self as camcraft_motion;
++
+ pub mod approach;
+ pub mod drilling;
+ pub mod entry;
+diff --git a/crates/motion/src/machining2d/adaptive/budget.rs b/crates/motion/src/machining2d/adaptive/budget.rs
+index 640f9239a..bcf3b3fb0 100644
+--- a/crates/motion/src/machining2d/adaptive/budget.rs
++++ b/crates/motion/src/machining2d/adaptive/budget.rs
+@@ -11,9 +11,9 @@
+ //!    more than the step cap a revolution, over rings averaging `L`
+ //!    round: `L^2 / (2 cap)`. Past [`LEAST_WORK_MAX`] tool radii the
+ //!    area is refused at once, by name.
+-//! 2. **While growing**, the length of every revolution tried is summed;
+-//!    past [`WORK_MAX`] tool radii the plan stops and is refused, whatever
+-//!    the shape (the Prime Directive's "never hang").
++//! 2. **While growing**, the length of every revolution a margin attempt
++//!    tries is summed; past [`WORK_MAX`] tool radii the plan stops and is
++//!    refused, whatever the shape (the Prime Directive's "never hang").
+ //! 3. **While growing** (issue #850), the polygon geometry every step
+ //!    tried runs through is counted too: the vertices of the cleared area
+ //!    it offsets and of the ring it opens, and of each revolution's
+@@ -30,6 +30,20 @@
+ //!    are deterministic (never a wall clock): the same project plans, or
+ //!    is refused, on every machine.
+ //!
++//! Laws 2 and 3 hold **each margin attempt on its own** (issue #1051;
++//! [`Work::attempt`]). The planner grows an area from a wall margin and,
++//! where the margin is spent before the fronts are done, grows it again
++//! from a wider one (`MARGIN_SCALES`, three rungs). Summed over the
++//! attempts, the sums jumped by a whole attempt's work wherever the first
++//! margin ran out a revolution early or late - a matter of nanometres of
++//! ring geometry - and the second attempt, of a plan that fits the budget
++//! from either margin, was refused for what the first had spent: the
++//! rotary bar's developed level at radius 5.0 was refused at 22.5 k +
++//! 7.6 k r, and planned whole in 22.3 k r with its openings 250 nm
++//! deeper. Per attempt, a sum moves by under 1 % under such a change, so
++//! only a plan that close to a limit can turn on it. The whole plan is
++//! bounded by the rungs: at most three times the limits.
++//!
+ //! The refused area is cut by the Offset rings, named (`pocket_hsm`).
+ //! Ours: the bound is plain arithmetic on the ring family's geometry;
+ //! the limits are calibrated on our own fixtures (the 60 x 14 slot needs
+@@ -44,13 +58,13 @@ use crate::geo2d::Region;
+ /// need before it is refused up front.
+ pub(super) const LEAST_WORK_MAX: f64 = 2_000.0;
+ 
+-/// The growth work (tool radii of revolutions tried, every margin
+-/// attempt) a plan may spend before it is refused.
++/// The growth work (tool radii of revolutions tried) a margin attempt
++/// may spend before the plan is refused.
+ pub(super) const WORK_MAX: f64 = 30_000.0;
+ 
+ /// The growth geometry (polygon vertices the trial steps and the
+-/// revolutions' margin areas ran through, every margin attempt) a plan
+-/// may spend past [`GEOM_LEN`] before it is refused. Calibrated on our
++/// revolutions' margin areas ran through) a margin attempt may spend
++/// past [`GEOM_LEN`] before the plan is refused. Calibrated on our
+ /// fixtures, heavy lanes included
+ /// (`docs/decisions/850-adaptive-geometry-budget.md`): of the plans that
+ /// walk past `GEOM_LEN` and finish, the heaviest (the r6.2 rotary neck)
+@@ -58,13 +72,13 @@ pub(super) const WORK_MAX: f64 = 30_000.0;
+ /// first margin attempt alone.
+ pub(super) const GEOM_MAX: u64 = 600_000;
+ 
+-/// The revolution length (tool radii, every margin attempt) past which
++/// The revolution length (tool radii, one margin attempt) past which
+ /// the geometry budget applies. The plans that finish within it - the
+ /// user's STEP bore, 2.6 k r over 1.1 M vertices - are law 2's alone.
+ pub(super) const GEOM_LEN: f64 = 5_000.0;
+ 
+ /// The growth plan's running work: revolution length (mm, law 2) and
+-/// polygon vertices (law 3), summed over every margin attempt, and the
++/// polygon vertices (law 3), summed over one margin attempt, and the
+ /// law-3 limits it is held to ([`GEOM_MAX`], [`GEOM_LEN`]; a test lowers
+ /// them through [`Work::with_limits`]).
+ #[derive(Debug)]
+@@ -89,12 +103,22 @@ impl Work {
+         Self { geom_max, geom_len, ..Self::default() }
+     }
+ 
++    /// A margin attempt begins: its work is counted from nothing (issue
++    /// #1051 - what an attempt that ran out of margin spent is no measure
++    /// of the next one).
++    pub(super) fn attempt(&self) {
++        self.len.set(0.0);
++        self.verts.set(0);
++    }
++
+     /// A revolution `mm` long was tried. A NaN or non-positive length
+     /// (degenerate input) is not counted: it would poison the sum and
+     /// switch law 2 off for every later revolution.
+     pub(super) fn add_len(&self, mm: f64) {
+         if mm.is_finite() && mm > 0.0 {
+             self.len.set(self.len.get() + mm);
++            #[cfg(test)]
++            PEAK_LEN.with(|p| p.set(p.get().max(self.len.get())));
+         }
+     }
+ 
+@@ -129,8 +153,10 @@ impl Work {
+ 
+ #[cfg(test)]
+ thread_local! {
+-    /// The most geometry any growth plan on this thread spent (tests).
++    /// The most geometry any margin attempt on this thread spent (tests).
+     pub(super) static PEAK: Cell<u64> = const { Cell::new(0) };
++    /// ... and the most revolution length (mm).
++    pub(super) static PEAK_LEN: Cell<f64> = const { Cell::new(0.0) };
+ }
+ 
+ /// The channel an area reads as: its length (mm) from its center
+@@ -177,6 +203,10 @@ pub(super) fn over_geometry(revs: usize, (verts, verts_max): (u64, u64), (len, l
+ #[path = "budget_fixtures.rs"]
+ mod fixtures;
+ 
++#[cfg(test)]
++#[path = "budget_twins.rs"]
++mod twins;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -228,6 +258,30 @@ mod tests {
+         assert_eq!(w.verts(), u64::MAX);
+     }
+ 
++    /// Issue #1051: a margin attempt is held to the budget on its own.
++    /// Summed over the attempts, a plan whose first margin ran out after
++    /// 22.5 k r was refused 7.6 k r into its second; the same plan
++    /// finishing inside its first margin (22.3 k r) was kept.
++    #[test]
++    fn each_margin_attempt_is_held_to_the_budget_on_its_own() {
++        let (r, w) = (3.0, Work::default());
++        w.add_len(22_455.0 * r);
++        w.verts.set(380_448);
++        assert!(w.over(r, 144).is_none(), "the first attempt is within both laws");
++        w.attempt();
++        assert_eq!((w.verts(), w.len.get()), (0, 0.0), "the next attempt counts from nothing");
++        w.add_len(24_639.0 * r);
++        w.verts.set(398_169);
++        assert!(w.over(r, 150).is_none(), "the second attempt is not refused for what the first spent");
++        // ... and each attempt is still refused past its own limits.
++        w.add_len((WORK_MAX - 24_639.0) * r + 1.0);
++        assert!(w.over(r, 151).is_some_and(|m| m.contains("planning budget after 151 revolutions")));
++        w.attempt();
++        w.verts.set(GEOM_MAX + 1);
++        w.add_len(GEOM_LEN * r + 1.0);
++        assert!(w.over(r, 9).is_some_and(|m| m.contains("both limits passed")));
++    }
++
+     /// A NaN (or non-positive) revolution length is degenerate input: it
+     /// neither refuses the plan nor switches law 2 off. Before #850 a NaN
+     /// poisoned the sum and no later revolution was ever refused.
+diff --git a/crates/motion/src/machining2d/adaptive/budget_twins.rs b/crates/motion/src/machining2d/adaptive/budget_twins.rs
+new file mode 100644
+index 000000000..a0beb6870
+--- /dev/null
++++ b/crates/motion/src/machining2d/adaptive/budget_twins.rs
+@@ -0,0 +1,135 @@
++//! Issue #1051: the planning budget's verdict does not turn on
++//! nanometres. The rotary suite's r7 bar and its window, developed and
++//! planned with every ring's opening eroded a few nanometres deeper than
++//! it dilates back (`rings::OPEN_INSET`, #982's perturbation): every twin
++//! decides each level as the unperturbed fixture does - HSM-planned, never
++//! refused past the budget - and each margin attempt stays a stated
++//! margin under both budget laws.
++//! Gate map: covers motion::machining2d::adaptive (budget, grow) through
++//! motion::multiaxis (rotary_offset). Heavy lane: release --ignored.
++//! Provenance: our own regressions on `tests/rotary_adaptive_fixture`;
++//! no vendor material consulted.
++
++#[allow(dead_code)]
++#[path = "../../../tests/rotary_adaptive_fixture/mod.rs"]
++mod rotary;
++
++use super::super::rings::OPEN_INSET;
++use super::{GEOM_MAX, PEAK, PEAK_LEN, WORK_MAX};
++use crate::machining2d::PocketStrategy;
++use crate::machining3d::Pocket3DParams;
++use crate::multiaxis::rotary_offset_developed;
++use rotary::{LevelRead, R, bar, params, planner_overloads, read_levels, stock};
++
++/// The openings' perturbations (nm). On Linux x86-64 the first margin
++/// attempt of the r7 bar's level 5.0 runs out of margin at 0, 8, 16, 32
++/// and 510 nm and finishes at 62, 125 and 250 nm; the window's levels
++/// 6.0 and 5.0 finish at 8, 125 and 250 nm and run out at the others.
++const TWINS_NM: [f64; 5] = [0.0, 8.0, 16.0, 62.0, 250.0];
++
++/// Every margin attempt of every twin stays this far under the length
++/// budget (measured: at most 24.7 k of 30 k tool radii, 1.21x) ...
++const LEN_MARGIN: f64 = 1.15;
++
++/// ... and this far under the geometry budget (at most 400 k of 600 k
++/// vertices, 1.50x).
++const GEOM_MARGIN: f64 = 1.4;
++
++/// The r7 bar's level 5.0, planned inside its first margin attempt, posts
++/// up to this many in-cut breaks past 5 degrees (5.0 to 6.2 deg; the
++/// spiral's own chords at the developed band's end - issue #1050, as the
++/// r6.2 neck's `R62_BREAKS`). Planned from the wider margin it posts
++/// none. The constant goes when #1050 is fixed.
++const BAR_50_BREAKS: usize = 5;
++
++/// One twin's reading: its levels, its notes, and the most any margin
++/// attempt in it spent (vertices, tool radii of revolution).
++struct Twin {
++    nm: f64,
++    reads: Vec<LevelRead>,
++    notes: Vec<String>,
++    verts: u64,
++    len_r: f64,
++}
++
++/// The fixture developed with the openings `nm` deeper, on this thread
++/// (the hook and the peaks are thread-local).
++fn twin(nm: f64, p: &Pocket3DParams) -> Twin {
++    OPEN_INSET.with(|c| c.set(nm * 1e-6));
++    PEAK.with(|c| c.set(0));
++    PEAK_LEN.with(|c| c.set(0.0));
++    let (f, st) = (bar(), stock(7.0, -16.0, 16.0));
++    let dev = match rotary_offset_developed(&f, Some(&st), p) {
++        Ok(t) => t,
++        Err(e) => panic!("the developed ladder, openings {nm} nm deeper: {e}"),
++    };
++    OPEN_INSET.with(|c| c.set(0.0));
++    let reads = read_levels(&dev, 7.0, 0.0, p.stepdown);
++    Twin { nm, reads, notes: dev.notes, verts: PEAK.with(|c| c.get()), len_r: PEAK_LEN.with(|c| c.get()) / R }
++}
++
++/// Every twin of the fixture, each on its own thread.
++fn twins(p: &Pocket3DParams) -> Vec<Twin> {
++    std::thread::scope(|s| {
++        let hs: Vec<_> = TWINS_NM.iter().map(|&nm| s.spawn(move || twin(nm, p))).collect();
++        hs.into_iter()
++            .map(|h| match h.join() {
++                Ok(t) => t,
++                Err(_) => panic!("a twin's plan panicked"),
++            })
++            .collect()
++    })
++}
++
++/// The verdict every twin shares: no level refused past the planning
++/// budget, every level under the skin HSM-planned (its proved arcs
++/// posted, no note naming it ring-cut), no planner overload, the load
++/// held; and the budget margins stated above.
++fn assert_same_verdict(what: &str, ts: &[Twin], levels: &[f64], breaks: impl Fn(f64) -> usize) {
++    for t in ts {
++        let nm = t.nm;
++        println!("{what}, openings {nm} nm deeper: peak attempt {} vertices, {:.0} r", t.verts, t.len_r);
++        for r in &t.reads {
++            println!(
++                "  radius {:.3}: {} planar moves ({} arcs), load {:.1}% D, breaks>5 {}, rings {}",
++                r.rho, r.moves, r.arcs, r.load * 100.0, r.breaks, r.ringed(7.0)
++            );
++        }
++        assert!(!t.notes.iter().any(|n| n.contains("planning budget")), "{what} at {nm} nm: refused past the budget: {:?}", t.notes);
++        assert!(planner_overloads(&t.notes).is_empty(), "{what} at {nm} nm: {:?}", t.notes);
++        for &rho in levels {
++            let Some(r) = t.reads.iter().find(|r| (r.rho - rho).abs() < 1e-6) else { panic!("{what} at {nm} nm: radius {rho} is not cut: {:?}", t.notes) };
++            assert!(r.arcs > 0 && !r.ringed(7.0) && !r.named, "{what} at {nm} nm: radius {rho} is HSM-planned: {:?}", t.notes);
++            assert!(r.load <= crate::load::DEFAULT_OPTIMAL_LOAD * 1.35, "{what} at {nm} nm: radius {rho}: load {:.1}% D", r.load * 100.0);
++            assert!(r.breaks <= breaks(rho), "{what} at {nm} nm: radius {rho}: {} in-cut breaks past 5 deg", r.breaks);
++        }
++        assert!(t.verts > 0 && t.verts as f64 * GEOM_MARGIN <= GEOM_MAX as f64, "{what} at {nm} nm: {} vertices in one attempt", t.verts);
++        assert!(t.len_r * LEN_MARGIN <= WORK_MAX, "{what} at {nm} nm: {:.0} r in one attempt", t.len_r);
++    }
++}
++
++/// The r7 bar (`rotary_adaptive`'s whole bar): levels 6.5, 6.0, 5.5 and
++/// 5.0 are HSM-planned in every twin. Before #1051 level 5.0 was refused
++/// past the budget at 0 and 16 nm (its first attempt ran out of margin
++/// after 22.5 k r and the second inherited that spend) and planned at
++/// 250 nm (the first attempt finished, 22.3 k r).
++#[test]
++#[ignore = "heavy lane: release --ignored (the developed r7 bar planned 5 times on 5 threads, ~1 min release)"]
++fn the_r7_bars_levels_decide_the_same_way_under_sub_micron_perturbations() {
++    let ts = twins(&params(PocketStrategy::Adaptive));
++    assert_same_verdict("the r7 bar", &ts, &[6.5, 6.0, 5.5, 5.0], |rho| if (rho - 5.0).abs() < 1e-6 { BAR_50_BREAKS } else { 0 });
++    // The unperturbed bar's level 5.0 is planned from the wider margin:
++    // no break at all (the suite's own pin holds it to the whole law).
++    assert!(ts.iter().filter(|t| t.nm == 0.0).all(|t| t.reads.iter().all(|r| r.breaks == 0)), "the unperturbed bar posts no break");
++}
++
++/// The window (`rotary_adaptive`'s 12 long window, 1 mm stepdown): levels
++/// 6.0 and 5.0 are HSM-planned in every twin, no break past 5 degrees.
++/// Before #1051 they were refused past the budget at 0 and 16 nm and
++/// planned at 250 nm.
++#[test]
++#[ignore = "heavy lane: release --ignored (the developed window planned 5 times on 5 threads, ~1 min release)"]
++fn the_windows_levels_decide_the_same_way_under_sub_micron_perturbations() {
++    let p = Pocket3DParams { top_z: 16.0, bottom_z: 4.0, stepdown: 1.0, ..params(PocketStrategy::Adaptive) };
++    assert_same_verdict("the window", &twins(&p), &[6.0, 5.0], |_| 0);
++}
+diff --git a/crates/motion/src/machining2d/adaptive/grow.rs b/crates/motion/src/machining2d/adaptive/grow.rs
+index 6b0f3a9d1..6d0a7c9e7 100644
+--- a/crates/motion/src/machining2d/adaptive/grow.rs
++++ b/crates/motion/src/machining2d/adaptive/grow.rs
+@@ -96,6 +96,8 @@ impl Planner<'_> {
+     /// otherwise).
+     pub(super) fn grow(&mut self, ring0: &[Point2], (scale, last): (f64, bool)) -> Result<Grown, GenError> {
+         let s = self.s;
++        // One call is one margin attempt: the budget counts it on its own.
++        self.work.attempt();
+         let a0 = orbit_radius(&s);
+         let Some(dom) = slit::open_islands(self.center, s.seed, a0 + 0.5)? else { return Ok(Grown::Unfit) };
+         // The last lap's corners: half the tool radius, or under the
+diff --git a/crates/motion/tests/rotary_adaptive.rs b/crates/motion/tests/rotary_adaptive.rs
+index 57b50255c..60b906a5f 100644
+--- a/crates/motion/tests/rotary_adaptive.rs
++++ b/crates/motion/tests/rotary_adaptive.rs
+@@ -37,9 +37,13 @@ use rotary_adaptive_fixture::{
+     assert_refusals_named, bar, control, params, planner_overloads, read_levels, ring_tag, stock, LevelRead, R, TAU,
+ };
+ 
+-/// The whole turned bar in an r7 bar stock: three developed levels of
+-/// real material (radius 6.5, 6.0, 5.5) go to the HSM planner. About
+-/// ten minutes in debug, a minute in release: the heavy lane's.
++/// The whole turned bar in an r7 bar stock: four developed levels of
++/// real material (radius 6.5, 6.0, 5.5, 5.0) are HSM-planned. Level 5.0
++/// was refused past the planning budget until issue #1051: its first
++/// margin attempt runs out of margin and the second was refused for what
++/// the first had spent (`adaptive::budget`, now held per attempt; its
++/// sub-micron twins are pinned in `adaptive::budget::twins`). About ten
++/// minutes in debug, a minute in release: the heavy lane's.
+ #[test]
+ #[ignore = "heavy lane: release --ignored (three HSM plans over the developed bar, ~10 min debug)"]
+ fn adaptive_plans_the_developed_levels_under_the_load_and_kink_laws() {
+@@ -75,6 +79,10 @@ fn adaptive_plans_the_developed_levels_under_the_load_and_kink_laws() {
+         "a developed level under the skin is HSM-planned, its proved arcs posted: {:?}",
+         dev.notes
+     );
++    assert!(!dev.notes.iter().any(|n| n.contains("planning budget")), "a level is refused past the budget: {:?}", dev.notes);
++    for rho in [6.5, 6.0, 5.5, 5.0] {
++        assert!(planned.iter().any(|r| (r.rho - rho).abs() < 1e-6 && r.arcs > 0), "radius {rho} is HSM-planned: {:?}", dev.notes);
++    }
+     for r in &planned {
+         assert!(
+             r.load <= DEFAULT_OPTIMAL_LOAD * 1.35,
+@@ -151,6 +159,9 @@ fn pull_back(world: &Toolpath, rho_ref: f64) -> Toolpath {
+ /// is lifted - every developed level under the skin reaches the HSM
+ /// planner, which plans it or refuses it naming its radius, Offset rings
+ /// cutting the refused ones - and nothing it plans names an overload.
++/// Since issue #1051 (the planning budget held per margin attempt) both
++/// levels under the skin, 6.0 and 5.0, are HSM-planned; before, they
++/// were refused past the budget, or not, on nanometres.
+ /// Still ~3 min in debug (the skin level's two-lap plan): heavy lane.
+ #[test]
+ #[ignore = "heavy lane: release --ignored (the developed window's HSM plan, ~3 min debug)"]
+@@ -177,6 +188,10 @@ fn the_developed_window_reaches_the_planner_and_names_each_refusal() {
+         dev.notes
+     );
+     assert_refusals_named(&reads, 7.0);
++    assert!(!dev.notes.iter().any(|n| n.contains("planning budget")), "a level is refused past the budget: {:?}", dev.notes);
++    for rho in [6.0, 5.0] {
++        assert!(reads.iter().any(|r| (r.rho - rho).abs() < 1e-6 && r.arcs > 0 && !r.ringed(7.0)), "radius {rho} is HSM-planned: {:?}", dev.notes);
++    }
+     let over = planner_overloads(&dev.notes);
+     assert!(over.is_empty(), "the planner's own load reading broke the law: {over:?}");
+     for r in reads.iter().filter(|r| r.arcs > 0) {
+diff --git a/docs/decisions/1051-planning-budget-edge.md b/docs/decisions/1051-planning-budget-edge.md
+new file mode 100644
+index 000000000..d5972f9ac
+--- /dev/null
++++ b/docs/decisions/1051-planning-budget-edge.md
+@@ -0,0 +1,109 @@
++## #1051 - The planning budget is held per margin attempt
++
++**What was decided.** The growth planner's two running budgets
++(`adaptive/budget.rs`: law 2, 30 k tool radii of revolutions; law 3,
++600 k vertices past 5 k r) are counted for each margin attempt on its
++own (`Work::attempt`, called at the top of `Planner::grow`), no longer
++summed over the attempts. The limits themselves, the up-front law 1 and
++every refusal text are unchanged.
++
++**What the knife edge was.** Not the limits. The planner grows an area
++from a wall margin that closes 2.5 um a revolution; where the margin is
++spent before the fronts are done (`Grown::Short`, about 140 revolutions
++at the first rung) the whole plan is made again from a wider margin
++(`MARGIN_SCALES` 1.0, 1.6, 2.4). Whether a plan that needs about 140
++revolutions finishes inside the first margin or a revolution after it
++is a matter of nanometres of ring geometry. That alone would only choose
++between two HSM plans - but the budget was summed over the attempts, so
++"ran out of margin" also meant "the retry starts with a whole attempt
++already spent". The r7 bar's developed level at radius 5.0 (a band of
++440 mm2, D6):
++
++| openings deeper by | first attempt | second attempt | summed (before) | per attempt (now) |
++|---|---|---|---|---|
++| 0, 8, 16, 32, 510 nm | Short at 22.5 k r, 377-380 k vertices | Done in 24.5-24.7 k r, 396-400 k vertices | refused at 30 k r, 85-86 revolutions into the retry | HSM-planned |
++| 62, 125, 250 nm | Done in 22.3 k r, 375-377 k vertices | - | HSM-planned | HSM-planned |
++
++The window's levels 6.0 and 5.0 (the same band) are the same case, with
++the rows at other nanometres (first attempt Done at 8, 125 and 250 nm).
++The summed budget therefore jumped by 22.5 k r on a change of 8 nm.
++Counted per attempt, the sums of one attempt moved by at most 0.7 %
++(length) and 1.6 % (vertices) over every perturbation tried, so only a
++plan within about that of a limit can still turn on such a change; the
++nearest attempt on our fixtures is 24.7 k of 30 k r (1.21x under) and
++400 k of 600 k vertices (1.50x under), both pinned as margins.
++
++**Why this and not a refusal on both sides.** The plan in question fits
++the budget from either margin, holds the load (18.4 % D on the suite's
++dexel against the 19.8 % law) and names no overload; what the refusal
++sent the level to is Offset rings at a full-width load with 13 breaks.
++Nothing honest refuses the 22.3 k r plan that finishes in one attempt -
++the levels above it on the same bar finish in 17.6 k r - so the only
++stable verdict is "planned".
++
++**Verdicts that change, and why.** Release, Linux x86-64, on PR #1080's
++tree (this PR is stacked on it):
++
++- `rotary_adaptive`, the r7 bar: level 5.0 was "refused past the budget,
++  rings"; it is HSM-planned (8545 planar moves, 1935 arcs, 18.4 % D, no
++  in-cut break past 5 degrees). The pin now names the four levels 6.5,
++  6.0, 5.5, 5.0 as planned and forbids a budget refusal.
++- `rotary_adaptive`, the window: levels 6.0 and 5.0 were refused past
++  the budget; they are HSM-planned (18.8 % D, no break). Pinned the same
++  way.
++- Nothing else: in every motion suite and every app suite that plans
++  Adaptive (`--include-ignored`, release) no other plan reaches a second
++  margin attempt, and every other refusal (the island, the stepped
++  block, the bands refused up front) falls inside its first attempt,
++  with the same counts as before (island: 109 revolutions, 600 037
++  vertices, 9.4 k r).
++
++**The twins** (`adaptive::budget::twins`, heavy lane; openings 0, 8, 16,
++62 and 250 nm deeper through #982's `rings::OPEN_INSET`): every level
++under the skin of the bar and of the window is HSM-planned in every
++twin, no budget refusal, no planner overload, the load within the
++suite's law. Without the change both tests are red at 0 nm.
++
++**What still differs between twins, and is not settled here.** Which
++margin the plan is made from still turns on the nanometres, so the twins
++post different (all lawful-load) plans. On the r7 bar's level 5.0 the
++plan made inside the first margin (62, 125, 250 nm) posts 5 in-cut
++breaks of 5.0-6.2 degrees at the band's end; the plan from the wider
++margin (0, 8, 16, 32, 510 nm, the unperturbed bar among them) posts
++none. Those breaks are #1050's (the same end kinks as the r6.2 neck's
++`R62_BREAKS`), they are on main already whenever the first margin
++suffices, and this change accepts no new plan that has them: the plan
++it newly accepts is the wider-margin one. The twins hold level 5.0 to
++at most 5 (`BAR_50_BREAKS`, to go with #1050) and the unperturbed bar to
++none; the window's levels post none in any twin.
++
++**Cost.** The "never hang" bound is now three attempts of 30 k r
++instead of 30 k r in all. Only a plan that runs out of margin can use
++more than one, and law 3 still stops a heavy plan inside its first
++attempt. Measured: the bar's level 5.0 took ~11 s to be refused (30.1 k
++r) and takes ~14 s to be planned (22.5 k + 24.6 k r).
++
++**Considered and dropped.**
++- *Lowering `WORK_MAX` to refuse level 5.0 on both sides* (20 k r sits
++  between the bar's 17.6 k and 22.3 k levels): keeps the old pin green,
++  but refuses a plan that holds every law, and leaves the jump in place
++  for any other plan whose first margin runs out.
++- *Refusing at once when a first attempt runs out past half the budget*
++  (the retry "cannot fit"): saves the retry's seconds, same knife edge.
++- *Hysteresis on the summed budget*: the sum jumps by a whole attempt,
++  far more than any margin could absorb.
++- *Removing the margin edge itself* (finish a nearly-done plan on the
++  tail schedule, or pick the rung up front from the channel's length):
++  it would make the twins' plans alike, not only their verdicts, but it
++  changes every grown plan's wall runs; that is #882's work.
++- *A budget over the three attempts of 3x, counted once*: the same
++  bound, but a first attempt's spend would again decide the last one's.
++
++**Stacked on PR #1080** (#982, itself on #1007): the twins need its
++`OPEN_INSET` hook, its level reader, and its microlift fix - on main the
++same levels flip to "refused for travel" on the lift edge once the
++budget lets them through.
++
++**What it would cost to change later.** One call (`Work::attempt` in
++`grow`) and its pins: `budget::tests::each_margin_attempt_is_held_to_the_budget_on_its_own`,
++the two twin tests, and the two `rotary_adaptive` pins' level lists.
+
+From 16e129bb7f5715bf3a1ca55d1768378855c641da Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 02:45:59 -0800
+Subject: [PATCH 4/9] fix(motion): hold the bore exit on a coarse rim; spread
+ the laps' kinks (held)
+
+Held work for #1050, not ready to merge. The growth rings' disc phase
+(circles out of the entry bore, a wall conforming to the rim) is read
+on the planner's rim and on a rim twice as coarse (`adaptive::conform`),
+the worse kept; the closing laps' fillet-to-wall kinks are spread
+(`tidy::smooth_walk`). The r6.2 neck levels read 17.3 / 17.7 % D and
+0 breaks (were 20.3 % and 3); the r7 twins post no break at 5.0. The
+measured pins R62_LOAD_FACTOR, R62_BREAKS and BAR_50_BREAKS are removed.
+
+Not mergeable: adaptive_hsm's hsm_report_full_resolution goes red - the
+narrow slot's changed plan posts a retract hop that rapids onto a
+sub-cell wall-side sliver (RapidInStock, 4 descents for 2 levels) the
+planner's stock does not see. See the issue comment.
+
+Refs #1050
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/machining2d/adaptive/budget_twins.rs  | 21 ++---
+ .../src/machining2d/adaptive/conform.rs       | 79 +++++++++++++++++++
+ .../motion/src/machining2d/adaptive/grow.rs   |  5 +-
+ crates/motion/src/machining2d/adaptive/mod.rs |  1 +
+ crates/motion/tests/rotary_adaptive.rs        | 32 +++-----
+ 5 files changed, 100 insertions(+), 38 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/adaptive/conform.rs
+
+diff --git a/crates/motion/src/machining2d/adaptive/budget_twins.rs b/crates/motion/src/machining2d/adaptive/budget_twins.rs
+index a0beb6870..6c738db59 100644
+--- a/crates/motion/src/machining2d/adaptive/budget_twins.rs
++++ b/crates/motion/src/machining2d/adaptive/budget_twins.rs
+@@ -35,13 +35,6 @@ const LEN_MARGIN: f64 = 1.15;
+ /// vertices, 1.50x).
+ const GEOM_MARGIN: f64 = 1.4;
+ 
+-/// The r7 bar's level 5.0, planned inside its first margin attempt, posts
+-/// up to this many in-cut breaks past 5 degrees (5.0 to 6.2 deg; the
+-/// spiral's own chords at the developed band's end - issue #1050, as the
+-/// r6.2 neck's `R62_BREAKS`). Planned from the wider margin it posts
+-/// none. The constant goes when #1050 is fixed.
+-const BAR_50_BREAKS: usize = 5;
+-
+ /// One twin's reading: its levels, its notes, and the most any margin
+ /// attempt in it spent (vertices, tool radii of revolution).
+ struct Twin {
+@@ -85,7 +78,7 @@ fn twins(p: &Pocket3DParams) -> Vec<Twin> {
+ /// budget, every level under the skin HSM-planned (its proved arcs
+ /// posted, no note naming it ring-cut), no planner overload, the load
+ /// held; and the budget margins stated above.
+-fn assert_same_verdict(what: &str, ts: &[Twin], levels: &[f64], breaks: impl Fn(f64) -> usize) {
++fn assert_same_verdict(what: &str, ts: &[Twin], levels: &[f64]) {
+     for t in ts {
+         let nm = t.nm;
+         println!("{what}, openings {nm} nm deeper: peak attempt {} vertices, {:.0} r", t.verts, t.len_r);
+@@ -101,7 +94,7 @@ fn assert_same_verdict(what: &str, ts: &[Twin], levels: &[f64], breaks: impl Fn(
+             let Some(r) = t.reads.iter().find(|r| (r.rho - rho).abs() < 1e-6) else { panic!("{what} at {nm} nm: radius {rho} is not cut: {:?}", t.notes) };
+             assert!(r.arcs > 0 && !r.ringed(7.0) && !r.named, "{what} at {nm} nm: radius {rho} is HSM-planned: {:?}", t.notes);
+             assert!(r.load <= crate::load::DEFAULT_OPTIMAL_LOAD * 1.35, "{what} at {nm} nm: radius {rho}: load {:.1}% D", r.load * 100.0);
+-            assert!(r.breaks <= breaks(rho), "{what} at {nm} nm: radius {rho}: {} in-cut breaks past 5 deg", r.breaks);
++            assert_eq!(r.breaks, 0, "{what} at {nm} nm: radius {rho}: in-cut breaks past 5 deg");
+         }
+         assert!(t.verts > 0 && t.verts as f64 * GEOM_MARGIN <= GEOM_MAX as f64, "{what} at {nm} nm: {} vertices in one attempt", t.verts);
+         assert!(t.len_r * LEN_MARGIN <= WORK_MAX, "{what} at {nm} nm: {:.0} r in one attempt", t.len_r);
+@@ -117,10 +110,10 @@ fn assert_same_verdict(what: &str, ts: &[Twin], levels: &[f64], breaks: impl Fn(
+ #[ignore = "heavy lane: release --ignored (the developed r7 bar planned 5 times on 5 threads, ~1 min release)"]
+ fn the_r7_bars_levels_decide_the_same_way_under_sub_micron_perturbations() {
+     let ts = twins(&params(PocketStrategy::Adaptive));
+-    assert_same_verdict("the r7 bar", &ts, &[6.5, 6.0, 5.5, 5.0], |rho| if (rho - 5.0).abs() < 1e-6 { BAR_50_BREAKS } else { 0 });
+-    // The unperturbed bar's level 5.0 is planned from the wider margin:
+-    // no break at all (the suite's own pin holds it to the whole law).
+-    assert!(ts.iter().filter(|t| t.nm == 0.0).all(|t| t.reads.iter().all(|r| r.breaks == 0)), "the unperturbed bar posts no break");
++    // Issue #1050: level 5.0 posts no in-cut break past 5 degrees from
++    // either margin (planned inside the first it posted up to 5, the
++    // closing laps' fillet kinks, before `adaptive::conform`).
++    assert_same_verdict("the r7 bar", &ts, &[6.5, 6.0, 5.5, 5.0]);
+ }
+ 
+ /// The window (`rotary_adaptive`'s 12 long window, 1 mm stepdown): levels
+@@ -131,5 +124,5 @@ fn the_r7_bars_levels_decide_the_same_way_under_sub_micron_perturbations() {
+ #[ignore = "heavy lane: release --ignored (the developed window planned 5 times on 5 threads, ~1 min release)"]
+ fn the_windows_levels_decide_the_same_way_under_sub_micron_perturbations() {
+     let p = Pocket3DParams { top_z: 16.0, bottom_z: 4.0, stepdown: 1.0, ..params(PocketStrategy::Adaptive) };
+-    assert_same_verdict("the window", &twins(&p), &[6.0, 5.0], |_| 0);
++    assert_same_verdict("the window", &twins(&p), &[6.0, 5.0]);
+ }
+diff --git a/crates/motion/src/machining2d/adaptive/conform.rs b/crates/motion/src/machining2d/adaptive/conform.rs
+new file mode 100644
+index 000000000..e302ee26f
+--- /dev/null
++++ b/crates/motion/src/machining2d/adaptive/conform.rs
+@@ -0,0 +1,79 @@
++//! The bore exit's conforming contact and the grown walk's kinks (issue
++//! #1050). Out of the entry bore the growth rings are circles about the
++//! seed, so the tool (radius r) stands inside a cleared disc only a
++//! little wider than itself: the stock wall it meets curves the same
++//! way as its rim. On such a wall the contact arc grows with the rim's
++//! radius faster than a straight wall's (`load::deg_at_rim`, the law
++//! every reading is converted by), so a revolution read on the
++//! planner's own rim (a planner cell and a half out, `quality::rim_for`)
++//! can hold the bound while the same cut read on a coarser yardstick's
++//! rim stands past it - the rotary bar's neck read 47.5 degrees on the
++//! planner's D/120 stock and 55.5 (20.3 % D) on the suite's D/60 one.
++//! The disc phase is therefore held on both rims: its own, and the rim
++//! of a yardstick twice as coarse, converted back by the straight-wall
++//! law, the worse of the two kept. Off the bore (fronts, wall runs) the
++//! wall is straight or convex to the rim and the readings agree.
++//!
++//! The closing laps' in-cut kinks (where a corner fillet's last chord
++//! lands on a straight wall run they read 5.1 to 6.2 degrees, past the
++//! 5-degree break law) are spread like the star spiral's
++//! (`tidy::smooth_walk`, Taubin 1995's umbrella operator) before the
++//! walk is lifted and read again on the stock (`lift`). Only the laps:
++//! the revolutions' own chords turn under the law, and smoothing them
++//! (24 umbrella passes) would shrink every ring by their sagitta.
++//!
++//! Provenance: the engagement arc of peripheral milling (Altintas 2000,
++//! *Manufacturing Automation*, ch. 2) on a circular wall, the in-process
++//! stock reading of Stori & Wright (2000, J. Manuf. Systems 19(3)); the
++//! measuring rim is `quality`'s own law. No vendor material consulted.
++
++use crate::geo2d::Point2;
++use crate::load::{deg_at_rim, load_at_rim};
++
++use super::raster::Raster;
++use super::{Planner, STAR_SMOOTH_DEG, tidy};
++
++/// The coarser yardstick the disc phase is also held on: this many
++/// planner cells (the suites measure on D/60 to D/120; the planner
++/// plans on D/120).
++const COARSE: f64 = 2.0;
++
++impl Planner<'_> {
++    /// The rim a yardstick [`COARSE`] times the planner's cell reads on.
++    fn coarse_rim(&self) -> f64 {
++        crate::quality::rim_for(2.0 * self.s.r, COARSE * self.ras.h)
++    }
++
++    /// A reading on the coarse rim as the planner's rim would read the
++    /// same load (the straight-wall law both ways).
++    fn from_coarse(&self, deg: f64) -> f64 {
++        let d = 2.0 * self.s.r;
++        deg_at_rim(load_at_rim(deg, d, self.coarse_rim()), d, self.rim)
++    }
++
++    /// A disc-phase revolution walked on `ras` (from the planner's
++    /// stock) and read on both rims: the worse reading, in the planner's
++    /// own degrees, and where. Past `limit` the walk is abandoned (the
++    /// trial has failed).
++    pub(super) fn conform_walk(&self, ras: &mut Raster, rev: &[Point2], limit: f64) -> (f64, Point2) {
++        let mut probe = ras.clone();
++        let fine = ras.walk_until(rev, (self.s.r, self.rim, self.step), limit);
++        if fine.0 > limit {
++            return fine;
++        }
++        let d = 2.0 * self.s.r;
++        let lim = if limit.is_finite() { deg_at_rim(load_at_rim(limit, d, self.rim), d, self.coarse_rim()) } else { f64::INFINITY };
++        let (deg, at) = probe.walk_until(rev, (self.s.r, self.coarse_rim(), self.step), lim);
++        let coarse = self.from_coarse(deg);
++        if coarse > fine.0 { (coarse, at) } else { fine }
++    }
++
++    /// Spread the walk's kinks past [`STAR_SMOOTH_DEG`] from `from` (the
++    /// closing laps' first point) on, inside the center area; a lap
++    /// never marked (`usize::MAX`) leaves the walk as it is.
++    pub(super) fn smooth_grown(&mut self, from: usize) {
++        if let Some(run) = self.walk.get_mut(from.saturating_sub(1)..) {
++            tidy::smooth_walk(run, self.center, STAR_SMOOTH_DEG, 24);
++        }
++    }
++}
+diff --git a/crates/motion/src/machining2d/adaptive/grow.rs b/crates/motion/src/machining2d/adaptive/grow.rs
+index 6d0a7c9e7..fdd9ffaf9 100644
+--- a/crates/motion/src/machining2d/adaptive/grow.rs
++++ b/crates/motion/src/machining2d/adaptive/grow.rs
+@@ -190,7 +190,8 @@ impl Planner<'_> {
+                 let (rev, b) = morph_rev(&ring, &b, LAND);
+                 p.work.add_len(super::front::len(&rev));
+                 let mut ras = p.ras.clone();
+-                let w = ras.walk_until(&rev, (s.r, p.rim, p.step), limit);
++                // Out of the bore the wall conforms to the rim (`conform`).
++                let w = if disc { p.conform_walk(&mut ras, &rev, limit) } else { ras.walk_until(&rev, (s.r, p.rim, p.step), limit) };
+                 Ok(Some((g, yr, b, rev, ras, w, done)))
+             };
+             let (kept, over) = self.step_search(trial, step)?;
+@@ -250,6 +251,8 @@ impl Planner<'_> {
+             ));
+         }
+         self.note_corners(&d0, rho_c);
++        // The laps' fillet-to-wall kinks spread (`conform`).
++        self.smooth_grown(self.laps_from);
+         Ok(Grown::Done)
+     }
+ 
+diff --git a/crates/motion/src/machining2d/adaptive/mod.rs b/crates/motion/src/machining2d/adaptive/mod.rs
+index 69c13f2e1..e6799a541 100644
+--- a/crates/motion/src/machining2d/adaptive/mod.rs
++++ b/crates/motion/src/machining2d/adaptive/mod.rs
+@@ -38,6 +38,7 @@
+ //! too much is left). Every loop is capped; the plan cannot hang.
+ 
+ mod budget;
++mod conform;
+ mod front;
+ mod grow;
+ mod guard;
+diff --git a/crates/motion/tests/rotary_adaptive.rs b/crates/motion/tests/rotary_adaptive.rs
+index 60b906a5f..0f639ec26 100644
+--- a/crates/motion/tests/rotary_adaptive.rs
++++ b/crates/motion/tests/rotary_adaptive.rs
+@@ -236,19 +236,6 @@ fn a_window_too_narrow_for_the_helix_is_refused_by_name_before_planning() {
+     assert_refusals_named(&reads, 7.0);
+ }
+ 
+-/// The r6.2 neck levels' dexel load may stand this far over the optimal
+-/// (ae/D, as a factor): both read 20.3 % D on the 0.1 mm measuring stock,
+-/// at the first turn out of the entry's bore (55.5 deg; the planner's
+-/// own stock reads 47.5 there and names no overload) - half a point past
+-/// the whole bar's `1.35`. Issue #982 measured it; the bore exit on a
+-/// developed band is the follow-up's (named in the decision file).
+-const R62_LOAD_FACTOR: f64 = 1.40;
+-
+-/// ... and radius 5.2 posts this many in-cut breaks past 5 degrees (5.1,
+-/// 5.5 and 5.5 deg at the band's west end, the spiral's own chords);
+-/// radius 5.7 posts none.
+-const R62_BREAKS: usize = 3;
+-
+ /// Issues #55 and #982: on the app suites' r6.2 bar the neck's material
+ /// levels (5.7, 5.2) are bands ~78 x 7.8 (5.2: ~78 x 5.8) round the
+ /// developed neck. The spiral re-walks the whole cleared ring every
+@@ -262,8 +249,12 @@ const R62_BREAKS: usize = 3;
+ /// was HSM-planned anyway. The pieces now take longer chords only where
+ /// those leave no sliver, so both levels read the spiral's own 47.5 and
+ /// are HSM-planned on microlift returns, with or without the nanometres:
+-/// nothing refused for travel, no planner overload named. ~3 min debug:
+-/// heavy lane.
++/// nothing refused for travel, no planner overload named. Issue #1050:
++/// both are held to the whole bar's laws (load within optimal + 35 %,
++/// no in-cut break past 5 degrees) - the bore exit's conforming contact
++/// is held on a coarse rim too and the closing laps' fillet kinks are
++/// spread (`adaptive::conform`); they read 20.3 % D and 3 breaks
++/// before. ~3 min debug: heavy lane.
+ #[test]
+ #[ignore = "heavy lane: release --ignored (three HSM plans over the r6.2 bar, ~3 min debug)"]
+ fn the_r62_neck_levels_are_hsm_planned_on_microlift_returns() {
+@@ -283,16 +274,11 @@ fn the_r62_neck_levels_are_hsm_planned_on_microlift_returns() {
+         );
+     }
+     assert!(!dev.notes.iter().any(|n| n.contains("out of cut")), "a level is refused for travel: {:?}", dev.notes);
+-    for (rho, breaks) in [(5.7, 0), (5.2, R62_BREAKS)] {
++    for rho in [5.7, 5.2] {
+         let Some(r) = reads.iter().find(|r| (r.rho - rho).abs() < 1e-6) else { panic!("radius {rho} is not cut: {:?}", dev.notes) };
+         assert!(r.arcs > 0 && !r.ringed(6.2) && !r.named, "radius {rho} is HSM-planned, its proved arcs posted: {:?}", dev.notes);
+-        assert!(
+-            r.load <= DEFAULT_OPTIMAL_LOAD * R62_LOAD_FACTOR,
+-            "radius {rho}: load {:.1}% D past {:.1}% x {R62_LOAD_FACTOR}",
+-            r.load * 100.0,
+-            DEFAULT_OPTIMAL_LOAD * 100.0
+-        );
+-        assert!(r.breaks <= breaks, "radius {rho}: {} in-cut breaks past 5 deg (pinned at {breaks})", r.breaks);
++        assert!(r.load <= DEFAULT_OPTIMAL_LOAD * 1.35, "radius {rho}: load {:.1}% D past the optimal + 35 %", r.load * 100.0);
++        assert_eq!(r.breaks, 0, "radius {rho}: in-cut breaks past 5 deg");
+     }
+     // Each neck level says how it is kept in cut.
+     let lifted = dev.notes.iter().filter(|n| n.contains("microlift returns") && n.contains("replace")).count();
+
+From c8925911491e685c688956e9a1d9d403c5001aab Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 03:08:30 -0800
+Subject: [PATCH 5/9] fix(motion): land a rapid only on stock the cut pieces
+ swept; hold the bore exit on a coarse rim
+
+#1169: the microlift plan read its landings on the planner's cell
+bitmap, where a wall strip thinner than a cell stands unseen between
+two rows of cell centers. The return over the retract plane rapided to
+its lift with such a strip under the rim (narrow slot 14x60, one
+RapidInStock). The plan now keeps the segments its pieces cut
+(adaptive::lift_swept) and a rapid lands only where the whole footprint
+is proved swept - a quadtree over the disc on exact segment distances,
+refused where the proof does not close. The hop's landing prefers a
+swept lead point; a piece starting where the tool stands is ridden on
+to at the floor instead of a retract and plunge on one spot (the slot's
+two extra descents).
+
+#1050: with that settled the held fix stands (16e129bb): the disc phase
+out of the bore is held on the planner's rim and a rim twice as coarse,
+the closing laps' fillet kinks are spread at 4 degrees, and the
+measured pins R62_LOAD_FACTOR / R62_BREAKS / BAR_50_BREAKS are gone.
+r6.2 neck: 20.3 % D and 3 breaks -> 17.3 / 17.7 % D, 0 breaks.
+
+Pinned by lift_swept::tests (sub-cell strip landing refused),
+lift_tests::a_piece_starting_where_the_tool_stands_is_ridden_on_to,
+adaptive_hsm::hsm_report_full_resolution and rotary_adaptive.
+
+Fixes #1169
+Fixes #1050
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../motion/src/machining2d/adaptive/lift.rs   |  31 ++-
+ .../src/machining2d/adaptive/lift_link.rs     |  27 ++-
+ .../src/machining2d/adaptive/lift_swept.rs    | 217 ++++++++++++++++++
+ .../src/machining2d/adaptive/lift_tests.rs    |  19 +-
+ crates/motion/src/machining2d/adaptive/mod.rs |   1 +
+ docs/decisions/1050-developed-band-exit.md    |  67 ++++++
+ docs/decisions/1169-landing-on-swept-stock.md |  81 +++++++
+ 7 files changed, 424 insertions(+), 19 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/adaptive/lift_swept.rs
+ create mode 100644 docs/decisions/1050-developed-band-exit.md
+ create mode 100644 docs/decisions/1169-landing-on-swept-stock.md
+
+diff --git a/crates/motion/src/machining2d/adaptive/lift.rs b/crates/motion/src/machining2d/adaptive/lift.rs
+index 7888da3a7..0617ce041 100644
+--- a/crates/motion/src/machining2d/adaptive/lift.rs
++++ b/crates/motion/src/machining2d/adaptive/lift.rs
+@@ -39,6 +39,7 @@ use super::front::{densify, dist, len};
+ use super::lift_coarse::{coarsen, cut};
+ use super::lift_link::{Leg, LinkLaw, Return, extend, free_map, landing, legs};
+ use super::lift_split::{Piece, depends, split};
++use super::lift_swept::Swept;
+ use super::raster::Raster;
+ use super::{GenError, Planner, Worst};
+ 
+@@ -105,6 +106,9 @@ pub(super) struct Lifted {
+     pub highs: usize,
+     /// Every return so far, leg by leg.
+     links: Vec<Vec<Leg>>,
++    /// What the pieces cut so far swept, exactly: a rapid's landing is
++    /// proved on it (`lift_swept`, issue #1169).
++    swept: Swept,
+ }
+ 
+ /// Split `walk` at its air stretches and re-order the pieces with lifted
+@@ -120,7 +124,7 @@ pub(super) fn lift(walk: &[Point2], ras0: &Raster, center: &Region, s: &LiftSpec
+         return Ok(None);
+     }
+     coarsen(&mut pieces, &walk[ease..]);
+-    let mut out = Lifted { passes: Vec::new(), joins: Vec::new(), worst: (0.0, w0), ras: ras0.clone(), dropped: 0.0, lift: 0.0, hops: 0, rides: 0, highs: 0, links: Vec::new() };
++    let mut out = Lifted { passes: Vec::new(), joins: Vec::new(), worst: (0.0, w0), ras: ras0.clone(), dropped: 0.0, lift: 0.0, hops: 0, rides: 0, highs: 0, links: Vec::new(), swept: Swept::new(s.r) };
+     schedule(&mut out, pieces, center, s, true);
+     if out.hops > HOP_CAP {
+         return Ok(Some(out));
+@@ -145,12 +149,19 @@ pub(super) fn lift(walk: &[Point2], ras0: &Raster, center: &Region, s: &LiftSpec
+     Ok(Some(out))
+ }
+ 
+-/// The ride from where a piece with air `tail` ended onto `p`, when the
+-/// spiral runs on to it there: the tail (and `p`'s lead) - the walk's own
+-/// air, cut at the floor; `None` where it does not.
+-fn ride(tail: &[Point2], p: &Piece) -> Option<Vec<Point2>> {
+-    let (&t0, &t1) = (tail.first()?, tail.last()?);
++/// The ride from `at`, where a piece with air `tail` ended, onto `p`,
++/// when the spiral runs on to it there: the tail (and `p`'s lead) - the
++/// walk's own air, cut at the floor; `None` where it does not. A piece
++/// starting where the tool stands (the growth's last piece handing over
++/// to the first easing lap, both in cut) is the walk itself running on:
++/// ridden with no air between, never a retract and a plunge on one spot
++/// (issue #1169: the reader counts that plunge a descent into stock).
++pub(super) fn ride(at: Point2, tail: &[Point2], p: &Piece) -> Option<Vec<Point2>> {
+     let near = |a: Point2, b: Point2| dist(a, b) <= 1e-9;
++    if near(at, p.pts[0]) {
++        return Some(Vec::new());
++    }
++    let (&t0, &t1) = (tail.first()?, tail.last()?);
+     if near(t0, p.pts[0]) {
+         return Some(Vec::new());
+     }
+@@ -181,14 +192,14 @@ fn schedule(out: &mut Lifted, mut pieces: Vec<Piece>, center: &Region, s: &LiftS
+                 let mut ready: Vec<usize> = (0..pieces.len()).filter(|&j| !done[j] && deps[j].iter().all(|&i| done[i])).collect();
+                 ready.sort_by(|&a, &b| dist(at, pieces[a].pts[0]).total_cmp(&dist(at, pieces[b].pts[0])).then(a.cmp(&b)));
+                 let Some(&first) = ready.first() else { break };
+-                let law = LinkLaw { ras: &out.ras, center, links: &out.links, r: s.r, rim: s.rim, step: s.step, bite: s.bite, orbit: s.orbit };
++                let law = LinkLaw { ras: &out.ras, center, links: &out.links, swept: &out.swept, r: s.r, rim: s.rim, step: s.step, bite: s.bite, orbit: s.orbit };
+                 let mut pick = ready.iter().take(TRIES).find_map(|&j| law.find(at, &tail, &pieces[j], None).map(|r| (j, r)));
+                 // Else the walk's own order: its next piece (always ready),
+                 // ridden on to through the spiral's own air where it runs
+                 // on from here, else reached over the retract plane or by
+                 // a routed return.
+                 let low = ready.iter().copied().min().unwrap_or(first);
+-                let rode = if pick.is_none() { ride(&tail, &pieces[low]).map(|r| (low, r)) } else { None };
++                let rode = if pick.is_none() { ride(at, &tail, &pieces[low]).map(|r| (low, r)) } else { None };
+                 if pick.is_none() && rode.is_none() {
+                     pick = law.high(&pieces[low]).map(|r| (low, r));
+                     if pick.is_some() {
+@@ -225,7 +236,7 @@ fn schedule(out: &mut Lifted, mut pieces: Vec<Piece>, center: &Region, s: &LiftS
+                     }
+                     (None, None) => {
+                         // The hop plunges where the rim reads no stock.
+-                        let st = landing(&out.ras, &pieces[first], s.rim);
++                        let st = landing(&out.ras, &out.swept, &pieces[first], (s.r, s.rim));
+                         extend(&mut pieces[first], st);
+                         out.hops += 1;
+                         out.joins.push(None);
+@@ -245,6 +256,7 @@ fn schedule(out: &mut Lifted, mut pieces: Vec<Piece>, center: &Region, s: &LiftS
+             run.extend_from_slice(path);
+             run.push(pieces[next].pts[0]);
+             let w = out.ras.walk(&run, s.r, s.rim, s.step);
++            out.swept.cut(&run);
+             if w.0 > out.worst.0 {
+                 out.worst = w;
+             }
+@@ -256,6 +268,7 @@ fn schedule(out: &mut Lifted, mut pieces: Vec<Piece>, center: &Region, s: &LiftS
+         if w.0 > out.worst.0 {
+             out.worst = w;
+         }
++        out.swept.cut(&p.pts);
+         match (ride_on, out.passes.last_mut()) {
+             (Some(path), Some(last)) => {
+                 last.extend(path);
+diff --git a/crates/motion/src/machining2d/adaptive/lift_link.rs b/crates/motion/src/machining2d/adaptive/lift_link.rs
+index 925232d57..d8987aad8 100644
+--- a/crates/motion/src/machining2d/adaptive/lift_link.rs
++++ b/crates/motion/src/machining2d/adaptive/lift_link.rs
+@@ -11,6 +11,7 @@ use crate::geo2d::{Point2, Region};
+ use super::front::dist;
+ use super::lift::MICROLIFT;
+ use super::lift_split::{Piece, seg_dist};
++use super::lift_swept::{EDGE, Swept};
+ use super::raster::Raster;
+ use super::route::{clearance, route};
+ use crate::machining2d::slots::chord_clears;
+@@ -64,6 +65,8 @@ pub(super) struct LinkLaw<'a> {
+     pub ras: &'a Raster,
+     pub center: &'a Region,
+     pub links: &'a [Vec<Leg>],
++    /// The stock the pieces cut so far swept, exactly (issue #1169).
++    pub swept: &'a Swept,
+     pub r: f64,
+     pub rim: f64,
+     pub step: f64,
+@@ -191,13 +194,17 @@ impl LinkLaw<'_> {
+     /// The return over the retract plane onto `p`: down the shortest end
+     /// of its lead at least [`RAMP_RUN`] long whose first point's disc
+     /// holds no stock (the rapid's column), the descent reading air and
+-    /// crossing no earlier return's legs.
++    /// crossing no earlier return's legs. The column is proved twice:
++    /// on the planner's cells and on the swept stock (`lift_swept`,
++    /// issue #1169) - a rapid lands only where the pieces cut so far
++    /// swept the whole footprint, so a wall strip thinner than a cell
++    /// is never rapided onto.
+     pub(super) fn high(&self, p: &Piece) -> Option<Return> {
+         let n = p.lead.len();
+         let mut run = 0.0;
+         for k in (0..n.saturating_sub(1)).rev() {
+             run += dist(p.lead[k], p.lead[k + 1]);
+-            if run < RAMP_RUN || !self.ras.stock_clear(p.lead[k], self.r) {
++            if run < RAMP_RUN || !self.ras.stock_clear(p.lead[k], self.r) || !self.swept.covers(p.lead[k], self.r - EDGE) {
+                 continue;
+             }
+             let ret = Return { lift: LIFTS[0], high: true, up: Vec::new(), via: Vec::new(), down: p.lead[k..].to_vec() };
+@@ -278,14 +285,18 @@ pub(super) fn crosses_any(p: &[Leg], links: &[Vec<Leg>]) -> bool {
+ 
+ /// Where a hop lands on `p`: its first point, or - when stock stands
+ /// within the rim there (a plunge onto it would bite) - the nearest
+-/// point of its lead with the rim clear of stock.
+-pub(super) fn landing(ras: &Raster, p: &Piece, rim: f64) -> Point2 {
++/// point of its lead with the rim clear of stock. A point whose whole
++/// footprint the pieces cut so far swept (`lift_swept`, issue #1169) is
++/// taken before one only the planner's cells read clear: the cells miss
++/// a wall strip thinner than one. The hop comes down at plunge feed
++/// from over the stock (`ladder_links::pass_link`), never in rapid, so
++/// where no point is proved the cells' choice stands - a descent the
++/// reader counts, not a rapid into stock.
++pub(super) fn landing(ras: &Raster, swept: &Swept, p: &Piece, (r, rim): (f64, f64)) -> Point2 {
+     let rad = rim + ras.h;
+     let first = p.pts[0];
+-    if ras.stock_clear(first, rad) {
+-        return first;
+-    }
+-    p.lead.iter().rev().copied().find(|&q| ras.stock_clear(q, rad)).unwrap_or(first)
++    let spots = || std::iter::once(first).chain(p.lead.iter().rev().copied()).filter(|&q| ras.stock_clear(q, rad));
++    spots().find(|&q| swept.covers(q, r - EDGE)).or_else(|| spots().next()).unwrap_or(first)
+ }
+ 
+ /// Start `p` at `st` (a point of its lead): the lead from there on is
+diff --git a/crates/motion/src/machining2d/adaptive/lift_swept.rs b/crates/motion/src/machining2d/adaptive/lift_swept.rs
+new file mode 100644
+index 000000000..d8bf427bf
+--- /dev/null
++++ b/crates/motion/src/machining2d/adaptive/lift_swept.rs
+@@ -0,0 +1,217 @@
++//! The lifted plan's exact stock (issue #1169): the capsules its cut
++//! pieces sweep, kept as segments, so a rapid's landing is proved on
++//! what the posted moves leave and not on the planner's cells
++//! (`raster`), where a wall strip thinner than a cell stands unseen
++//! between two rows of cell centers. A disc is covered when every point
++//! of it lies within the cutter radius, less [`FIT`], of a segment
++//! already cut: proved square by square (a quadtree over the disc; the
++//! distance to a segment set is 1-Lipschitz, so a square whose center
++//! is within the bound less its half-diagonal is covered whole), and
++//! refused where the proof does not close at [`MIN_SIDE`] - never
++//! sampled. Point-to-segment distance and the uniform grid broad phase
++//! are textbook computational geometry (O'Rourke, "Computational
++//! Geometry in C"; de Berg et al., "Computational Geometry", quadtrees).
++//! Ours, no vendor material.
++
++use std::collections::HashMap;
++
++use crate::geo2d::Point2;
++
++use super::lift_split::seg_dist;
++
++/// What a posted cut may stand off its planned chord (mm): the adaptive
++/// arc fit (`arcs::ARC_FIT_TOL / 4`) and the chords an arc is read back
++/// on, each 2.5 um; the output lattice (1e-6) is far under it.
++pub(super) const FIT: f64 = 0.005;
++
++/// The landing disc proved is the cutter's less this (mm): the rim's
++/// last 10 um is tangency with the cut that made the wall, the gouge
++/// tolerance every disc reading of the mill laws grants.
++pub(super) const EDGE: f64 = 0.01;
++
++/// The smallest square the proof divides to (mm, its side): its
++/// half-diagonal, 0.7 um, is far inside `EDGE - FIT`, so a landing ON
++/// an earlier cut's own path is proved.
++const MIN_SIDE: f64 = 0.001;
++
++/// Most squares one proof may open; past it the landing is refused.
++const MAX_SQUARES: usize = 4_000_000;
++
++/// The segments cut so far by a cutter of radius `r`.
++#[derive(Clone, Debug)]
++pub(super) struct Swept {
++    r: f64,
++    segs: Vec<(Point2, Point2)>,
++    /// Segment indices by the `r`-sized buckets their boxes meet.
++    grid: HashMap<(i64, i64), Vec<u32>>,
++}
++
++impl Swept {
++    pub(super) fn new(r: f64) -> Self {
++        Swept { r: if r.is_finite() && r > 0.0 { r } else { 0.0 }, segs: Vec::new(), grid: HashMap::new() }
++    }
++
++    fn bucket(&self, v: f64) -> i64 {
++        // Saturating: a float past the i64 range clamps (`as`).
++        (v / self.r).floor() as i64
++    }
++
++    /// The walk `pts` was cut at the floor (one point: where it stood).
++    pub(super) fn cut(&mut self, pts: &[Point2]) {
++        if self.r <= 0.0 {
++            return;
++        }
++        let one = pts.first().map(|&p| [p, p]);
++        let pairs = pts.windows(2).map(|w| (w[0], w[1])).chain(one.iter().filter(|_| pts.len() == 1).map(|w| (w[0], w[1])));
++        for (a, b) in pairs {
++            if !(a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()) {
++                continue;
++            }
++            let Ok(id) = u32::try_from(self.segs.len()) else { return };
++            let (x0, x1) = (self.bucket(a.x.min(b.x)), self.bucket(a.x.max(b.x)));
++            let (y0, y1) = (self.bucket(a.y.min(b.y)), self.bucket(a.y.max(b.y)));
++            // A chord across more buckets than any pocket holds is not
++            // a cut this stock can index: left out (the proof then
++            // refuses what only it would cover).
++            if x1.saturating_sub(x0) > 4096 || y1.saturating_sub(y0) > 4096 {
++                continue;
++            }
++            self.segs.push((a, b));
++            for ix in x0..=x1 {
++                for iy in y0..=y1 {
++                    self.grid.entry((ix, iy)).or_default().push(id);
++                }
++            }
++        }
++    }
++
++    /// Is a cut segment within `lim` (at most `r`) of `q`?
++    fn near(&self, q: Point2, lim: f64) -> bool {
++        let (bx, by) = (self.bucket(q.x), self.bucket(q.y));
++        (-1..=1).any(|dx| {
++            (-1..=1).any(|dy| {
++                self.grid
++                    .get(&(bx.saturating_add(dx), by.saturating_add(dy)))
++                    .is_some_and(|ids| ids.iter().any(|&i| self.segs.get(i as usize).is_some_and(|s| seg_dist(q, s.0, s.1) <= lim)))
++            })
++        })
++    }
++
++    /// Is the whole disc of radius `rad` at `c` cut already - every
++    /// point of it within `r - FIT` of a cut segment? Proved, or `false`.
++    pub(super) fn covers(&self, c: Point2, rad: f64) -> bool {
++        let lim = self.r - FIT;
++        if !(c.x.is_finite() && c.y.is_finite() && rad.is_finite() && rad >= 0.0 && lim > 0.0) {
++            return false;
++        }
++        let mut open = vec![(c, rad.max(0.5 * MIN_SIDE))];
++        let mut spent = 0usize;
++        while let Some((p, half)) = open.pop() {
++            spent += 1;
++            if spent > MAX_SQUARES {
++                return false;
++            }
++            // Wholly off the disc: nothing of it to prove.
++            let off = ((p.x - c.x).abs() - half).max(0.0).hypot(((p.y - c.y).abs() - half).max(0.0));
++            if off > rad {
++                continue;
++            }
++            let diag = half * std::f64::consts::SQRT_2;
++            if lim > diag && self.near(p, lim - diag) {
++                continue;
++            }
++            if 2.0 * half <= MIN_SIDE {
++                return false;
++            }
++            let q = 0.5 * half;
++            for (sx, sy) in [(-q, -q), (q, -q), (-q, q), (q, q)] {
++                open.push((Point2::new(p.x + sx, p.y + sy), q));
++            }
++        }
++        true
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::lift_link::{LinkLaw, Return};
++    use super::super::lift_split::Piece;
++    use super::super::raster::Raster;
++    use super::*;
++    use crate::geo2d::{Loop, Region};
++
++    fn p(x: f64, y: f64) -> Point2 {
++        Point2::new(x, y)
++    }
++
++    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
++        let Ok(l) = Loop::new(vec![p(x0, y0), p(x1, y0), p(x1, y1), p(x0, y1)]) else { panic!("loop") };
++        let Ok(r) = Region::new(vec![l]) else { panic!("region") };
++        r
++    }
++
++    #[test]
++    fn a_disc_is_covered_on_the_cut_and_not_a_hair_past_it() {
++        let mut s = Swept::new(5.0);
++        assert!(!s.covers(p(10.0, 7.0), 4.99), "nothing cut: nothing covered");
++        s.cut(&[p(10.0, 7.0), p(50.0, 7.0)]);
++        // On the cut's own path, and a few microns off it.
++        assert!(s.covers(p(30.0, 7.0), 5.0 - EDGE));
++        assert!(s.covers(p(30.0, 7.004), 5.0 - EDGE));
++        // Past `EDGE - FIT` off it the far rim stands on uncut stock.
++        assert!(!s.covers(p(30.0, 7.02), 5.0 - EDGE));
++        assert!(!s.covers(p(30.0, 7.075), 5.0 - EDGE));
++        // A second pass takes the strip: covered.
++        s.cut(&[p(50.0, 7.075), p(10.0, 7.075)]);
++        assert!(s.covers(p(30.0, 7.075), 5.0 - EDGE));
++        assert!(s.covers(p(30.0, 7.04), 5.0 - EDGE));
++        // Off the pass's end: the disc reaches past the end cap.
++        assert!(!s.covers(p(9.0, 7.0), 5.0 - EDGE));
++        assert!(!s.covers(p(f64::NAN, 7.0), 4.0) && !s.covers(p(30.0, 7.0), f64::INFINITY));
++    }
++
++    /// Issue #1169, the narrow slot's landing: a 14 mm slot cleared by a
++    /// D10 up to y = 8.96, the last lap (y = 9.0) still owed a 0.04 mm
++    /// strip along the wall - thinner than the planner's 0.083 mm cell
++    /// and between two rows of cell centers, so the cells read the
++    /// landing on the lap's lead as clear (the slot of
++    /// `adaptive_hsm::hsm_report_full_resolution` stood 0.075 mm). The return
++    /// over the retract plane rapids down to its lift there: refused on
++    /// the swept stock, allowed once a pass has taken the strip.
++    #[test]
++    fn a_rapid_landing_on_a_sub_cell_wall_strip_is_refused() {
++        let reach = rect(0.0, 0.0, 60.0, 14.0);
++        let center = rect(5.0, 5.0, 55.0, 9.0);
++        let (r, h) = (5.0, 10.0 / 120.0);
++        let Ok(mut ras) = Raster::from_region(&reach, h, r) else { panic!("raster") };
++        let rim = crate::quality::rim_for(10.0, ras.h);
++        let cut = [p(5.0, 5.0), p(55.0, 5.0), p(55.0, 8.96), p(5.0, 8.96)];
++        ras.walk(&cut, r, rim, 0.5);
++        let mut swept = Swept::new(r);
++        swept.cut(&cut);
++        // The last lap's piece, its lead the lap's own line.
++        let lead: Vec<Point2> = (0..=10).map(|k| p(20.0 - 0.3 * k as f64, 9.0)).collect();
++        let piece = Piece { pts: vec![p(17.0, 9.0), p(6.0, 9.0)], lead, tail: Vec::new(), fine: None };
++        let land = p(17.9, 9.0);
++        // The planner's cells read the landing as clear (the gap) ...
++        assert!(ras.stock_clear(land, rim + ras.h), "the fixture no longer hides the strip from the cells");
++        // ... the swept stock does not, and the return is refused.
++        assert!(!swept.covers(land, r - EDGE));
++        let bite = crate::load::deg_at_rim(0.005, 10.0, rim);
++        let law = |swept| LinkLaw { ras: &ras, center: &center, links: &[], swept, r, rim, step: 0.5, bite, orbit: (p(0.0, 0.0), 0.0) };
++        assert_eq!(law(&swept).high(&piece), None, "a rapid onto the wall strip");
++        // The strip cut (the lap's own line walked): the same return stands.
++        let mut after = swept.clone();
++        after.cut(&[p(55.0, 9.0), p(5.0, 9.0)]);
++        let Some(Return { high: true, down, .. }) = law(&after).high(&piece) else { panic!("the landing on cut stock") };
++        assert!(after.covers(down[0], r - EDGE));
++        // The hop's landing takes a lead point the pieces swept before
++        // one only the cells read clear; with none proved, the cells'.
++        let landing = super::super::lift_link::landing;
++        assert_eq!(landing(&ras, &swept, &piece, (r, rim)), piece.pts[0], "no point proved: the cells' choice");
++        let mut bent = piece.clone();
++        bent.lead.insert(0, p(20.0, 8.96));
++        assert_eq!(landing(&ras, &swept, &bent, (r, rim)), p(20.0, 8.96), "the swept point of the lead");
++        assert_eq!(landing(&ras, &after, &bent, (r, rim)), piece.pts[0], "the strip cut: the piece's own start");
++    }
++}
+diff --git a/crates/motion/src/machining2d/adaptive/lift_tests.rs b/crates/motion/src/machining2d/adaptive/lift_tests.rs
+index 8fffae70b..b569f72dc 100644
+--- a/crates/motion/src/machining2d/adaptive/lift_tests.rs
++++ b/crates/motion/src/machining2d/adaptive/lift_tests.rs
+@@ -1,5 +1,5 @@
+ //! Round 4's laws (Gate map (M11.4 C): covers
+-//! motion::machining2d::adaptive::{lift, lift_link, lift_split, route,
++//! motion::machining2d::adaptive::{lift, lift_link, lift_split, lift_swept, route,
+ //! star::wide_enough}): a microlift return is legal only over cleared
+ //! stock, inside the area, off the orbit, never crossing another return
+ //! on its plane - and a crossing one climbs to the next lift; the width
+@@ -33,9 +33,12 @@ fn channel() -> (Raster, Region) {
+     (ras, rect(5.0, 5.0, 55.0, 35.0))
+ }
+ 
++/// No swept stock: these laws are the cells' (`lift_swept` has its own).
++static NO_SWEEP: std::sync::LazyLock<super::lift_swept::Swept> = std::sync::LazyLock::new(|| super::lift_swept::Swept::new(5.0));
++
+ fn law<'a>(ras: &'a Raster, center: &'a Region, links: &'a [Vec<super::lift_link::Leg>], orbit: (Point2, f64)) -> LinkLaw<'a> {
+     let rim = crate::quality::rim_for(10.0, 0.1);
+-    LinkLaw { ras, center, links, r: 5.0, rim, step: 0.5, bite: crate::load::deg_at_rim(0.005, 10.0, rim), orbit }
++    LinkLaw { ras, center, links, swept: &NO_SWEEP, r: 5.0, rim, step: 0.5, bite: crate::load::deg_at_rim(0.005, 10.0, rim), orbit }
+ }
+ 
+ fn ret(lift: f64, down: Point2) -> Return {
+@@ -189,3 +192,15 @@ fn the_lifted_plan_is_kept_only_at_or_under_the_spiral_reading() {
+     assert!(keeps(49.0, 49.0, bound), "the spiral's own named overload");
+     assert!(!keeps(49.5, 49.0, bound), "one sample over that overload");
+ }
++
++/// Issue #1169: a piece starting where the tool stands (the growth's
++/// last piece handing over to the first easing lap) is ridden on to at
++/// the floor - no retract and plunge on one spot; one starting anywhere
++/// else, with no air tail leading to it, is not.
++#[test]
++fn a_piece_starting_where_the_tool_stands_is_ridden_on_to() {
++    let at = Point2::new(5.135, 7.3118);
++    let piece = |from: Point2| Piece { pts: vec![from, Point2::new(5.135, 6.8)], lead: Vec::new(), tail: Vec::new(), fine: None };
++    assert_eq!(super::lift::ride(at, &[], &piece(at)), Some(Vec::new()));
++    assert_eq!(super::lift::ride(at, &[], &piece(Point2::new(5.135, 7.2))), None);
++}
+diff --git a/crates/motion/src/machining2d/adaptive/mod.rs b/crates/motion/src/machining2d/adaptive/mod.rs
+index e6799a541..e1d823bd0 100644
+--- a/crates/motion/src/machining2d/adaptive/mod.rs
++++ b/crates/motion/src/machining2d/adaptive/mod.rs
+@@ -47,6 +47,7 @@ mod lift;
+ mod lift_coarse;
+ mod lift_link;
+ mod lift_split;
++mod lift_swept;
+ mod link;
+ mod loops;
+ // Issue #5: the trochoidal fallback (`pocket_hsm`: spiral -> trochoid ->
+diff --git a/docs/decisions/1050-developed-band-exit.md b/docs/decisions/1050-developed-band-exit.md
+new file mode 100644
+index 000000000..4cf1a331e
+--- /dev/null
++++ b/docs/decisions/1050-developed-band-exit.md
+@@ -0,0 +1,67 @@
++## #1050 - The bore exit is held on a coarse rim too; the closing laps' kinks are spread
++
++**What was decided.** Two changes in the growth planner, both in the new
++`adaptive::conform` (two call lines in `grow.rs`):
++
++1. The disc phase - the revolutions out of the entry bore, circles about
++   the seed - is read on the planner's own rim and on the rim of a
++   yardstick twice as coarse (`COARSE` = 2 planner cells), the second
++   reading converted back by the straight-wall law (`load::deg_at_rim`),
++   and the worse of the two is what the revolution is held to.
++2. The closing laps are spread by `tidy::smooth_walk` at 4 degrees (the
++   star spiral's law, `STAR_SMOOTH_DEG`) before the walk is lifted and
++   read again on the stock.
++
++With them the measured pins `R62_LOAD_FACTOR` (1.40), `R62_BREAKS` (3)
++and `BAR_50_BREAKS` are removed from `rotary_adaptive.rs` and the budget
++twins: the r6.2 neck levels and the r7 bar's level 5.0 are held to the
++whole bar's laws (load within optimal + 35 %, no in-cut break past
++5 degrees). No law and no pin's bound was loosened.
++
++**Cause, measured (release, Linux x86-64).**
++
++- *The bore exit's 20.3 % D* was not a planner overload but a
++  conforming-contact reading. Out of the bore the tool (r 3) stands
++  inside a cleared disc of radius about 4, a wall curving the same way
++  as its rim. There the contact arc grows with the rim's radius faster
++  than the straight-wall law converts it. The same r6.2 level 5.7
++  program read on a dexel of D/120 (the planner's cell): 47.5 deg (the
++  planner's bound); D/80: 51.5; D/60 (the suite's): 55.5 = 20.3 % D.
++  Worst move: the second revolution out of the orbit, arc
++  (21.685, 7.722) -> (20.753, 6.837).
++- *The 5-6 degree breaks* were the closing laps' own chords: where the
++  corner fillet (R1.25) hands over to a straight wall run, one longer
++  junction chord (0.19 mm against 0.054) turns 5.1-5.5 deg (headings
++  99.9 -> 94.4 -> 90.0). The arc fitter leaves them chords.
++
++**Readings.** r6.2 level 5.7: 20.3 % D / 0 breaks -> 17.3 % / 0. Level
++5.2: 20.3 % / 3 -> 17.7 % / 0. The r7 bar: 6.5 and 6.0 read 19.5 %, 5.5
++17.3 %, 5.0 18.4 %, 0 breaks on every planned level (law 19.8 %). The
++window's 6.0 and 5.0: 18.4 %, 0 breaks.
++
++**What it moved elsewhere.** The changed disc phase moves every grown
++plan's first revolutions. On `adaptive_hsm`'s fixtures the readings stay
++inside their laws (bore 15.4 % D, rectangle 15.4, L-pocket 15.7, narrow
++slot 15.4; 0 breaks). On the narrow slot the new plan exposed two latent
++faults of the microlift plan - a rapid landing on a wall strip thinner
++than a planner cell, and a retract-and-plunge on one spot between two
++abutting pieces - which are #1169's, fixed in the same PR
++(`docs/decisions/1169-landing-on-swept-stock.md`).
++
++**Considered and dropped.**
++- *Smoothing the whole grown walk*: 24 umbrella passes shrink every ring
++  by its sagitta and the neck levels lose their microlift plan.
++- *Measuring on a finer dexel*: that loosens the yardstick.
++- *A tolerance on the bore exit*: a pin by another name.
++- *Refusing the neck levels to Offset rings*: the planner holds the law
++  there once the contact is read on both rims; the rings read 100 % D.
++- *Scoping the coarse-rim hold so it leaves the slot's plan alone* (the
++  way out named when the work was escalated): it would have hidden
++  #1169's landing fault behind an edge drawn for that purpose; the fault
++  is fixed instead.
++
++**What it would cost to change.** `COARSE` names the coarsest yardstick
++the disc phase is promised on (D/60 for a D/120 plan). A suite measuring
++coarser than that can read the bore exit past the law again; the remedy
++is the constant, at the price of smaller first steps out of the bore
++(more revolutions in the disc phase, a few percent of a plan's length).
+diff --git a/docs/decisions/1169-landing-on-swept-stock.md b/docs/decisions/1169-landing-on-swept-stock.md
+new file mode 100644
+index 000000000..699a1f514
+--- /dev/null
++++ b/docs/decisions/1169-landing-on-swept-stock.md
+@@ -0,0 +1,81 @@
++## #1169 - A rapid lands only on stock the cut pieces swept, proved exactly
++
++**What was decided.** The microlift plan (`adaptive::lift`) keeps a
++second, exact record of the stock beside its cell raster: the segments
++its pieces have cut so far (`adaptive::lift_swept::Swept`). The one
++return that comes down in rapid - the return over the retract plane,
++`LinkLaw::high`, which rapids to its lift 0.3 mm over the floor and
++ramps down the piece's lead - now lands only where the whole cutter
++footprint (radius r less 10 um, `EDGE`) lies within r less 5 um (`FIT`)
++of a segment already cut. The proof is a quadtree over the disc: a
++square is covered when its center is within the bound less its
++half-diagonal of a cut segment (the distance to a segment set is
++1-Lipschitz), divided to 1 um, and the landing is refused where the
++proof does not close. Nothing is sampled, so a strip of any thickness
++is seen. The cell test stays as the cheap first reading.
++
++Two smaller changes ride with it:
++
++- The hop's landing (`lift_link::landing`) takes a lead point the
++  pieces swept before one only the cells read clear. With none proved
++  the cells' choice stands: the hop comes down at plunge feed from over
++  the stock (`ladder_links::pass_link`), never in rapid, so that case is
++  a descent the reader counts, not a rapid into stock.
++- A piece that starts exactly where the tool stands is ridden on to at
++  the floor (`lift::ride`), no longer reached by a retract and a plunge
++  on one spot.
++
++**Why.** The planner's stock is a bitmap of cell centers (D/120 =
++0.083 mm on the suite's D10). The easing laps are split at their air
++stretches as that bitmap reads them, so a wall strip thinner than a cell
++that falls between two rows of centers is "air", is dropped from the
++plan, and stands until the last lap takes it. On the narrow slot 14x60
++with #1050's change the last lap's lead ran along such a strip (0.075 mm
++at y = 13.881 to 13.956; the cell row at 13.958 is just past the
++footprint). `high` read the landing (17.407, 8.956) clear on the cells
++and rapided to 0.3 mm over the floor with the strip under the rim: the
++verifier's `RapidInStock` at move 14089 (footprint point 5.064 mm from
++every earlier cut on the level). The verifier was right; the posted
++program and the stock the planner read differed by less than a cell.
++
++The second reading on that slot, "4 descents into stock for 2 levels",
++was not the strip. The growth's last piece and the first easing lap
++both stood in cut at the point they share, (5.135, 7.312); no lifted
++return lands in cut, so the plan fell to the ladder's hop: a retract
++and a plunge on the same spot, at the cut front, which the reader
++counts (39 deg on the plunge). The walk runs on there - riding on is
++the spiral's own path, and it removes the hop.
++
++**Readings (release, narrow slot 14x60, with #1050's change).**
++Before: verifier 1 `RapidInStock`, 4 descents, 200 returns, 3 over the
++retract plane, 1 retract hop. After: verifier silent, 2 descents, 199
++returns (1349 mm lifted), 3 over the retract plane, 2 rides, 0 hops;
++load 15.4 % D, 0 breaks. A proof costs 250-750 squares, 5-25 ms, and is
++asked a few tens of times a plan.
++
++**Considered and dropped.**
++- *A wall-clearance test on the landing* (footprint off the wall cells
++  too; tried by the previous worker): changes nothing, the strip is not
++  on the grid.
++- *A margin on the cell test* (land only a cell or more off any stock or
++  wall cell): refuses every landing beside a wall, where the spiral's
++  air leads mostly run, and still proves nothing about a strip between
++  two rows.
++- *A finer planner grid*: moves the unseen thickness, never removes it,
++  and costs every plan.
++- *A sampled footprint like the verifier's* (73 points): the planner
++  would then pass exactly what the verifier's samples miss; the proof
++  must be stronger than the check, not equal to it.
++- *Proving the ramp down the lead on the swept stock too*: the ramp is a
++  feed above the floor - a strip under it is cut, not collided with -
++  and the spiral's air leads ride the cleared outline tangentially, so
++  an exact law there would refuse most returns. Left on the cells.
++- *Loosening the verifier or the descents law*: never.
++
++**What it would cost to change.** `EDGE` (10 um) is the gouge tolerance
++the mill laws' disc readings grant; `FIT` (5 um) covers the adaptive arc
++fit (2.5 um) and the chords an arc is read back on. Should either
++tolerance grow past `EDGE`, a landing on an earlier cut's own path is no
++longer proved and `high` falls to the routed return or the hop - slower
++plans, never unsafe ones. The swept record holds one entry per posted
++chord per level (bucketed by r); it is dropped with the plan.
+
+From 9baa839ccfe30a2869c3a3cf142c11be359fb42c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 03:08:53 -0800
+Subject: [PATCH 6/9] refactor(motion): name the coarse-rim conversion without
+ the from_ prefix (clippy)
+
+Refs #1050
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/motion/src/machining2d/adaptive/conform.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/motion/src/machining2d/adaptive/conform.rs b/crates/motion/src/machining2d/adaptive/conform.rs
+index e302ee26f..3817d75e3 100644
+--- a/crates/motion/src/machining2d/adaptive/conform.rs
++++ b/crates/motion/src/machining2d/adaptive/conform.rs
+@@ -46,7 +46,7 @@ impl Planner<'_> {
+ 
+     /// A reading on the coarse rim as the planner's rim would read the
+     /// same load (the straight-wall law both ways).
+-    fn from_coarse(&self, deg: f64) -> f64 {
++    fn coarse_as_planned(&self, deg: f64) -> f64 {
+         let d = 2.0 * self.s.r;
+         deg_at_rim(load_at_rim(deg, d, self.coarse_rim()), d, self.rim)
+     }
+@@ -64,7 +64,7 @@ impl Planner<'_> {
+         let d = 2.0 * self.s.r;
+         let lim = if limit.is_finite() { deg_at_rim(load_at_rim(limit, d, self.rim), d, self.coarse_rim()) } else { f64::INFINITY };
+         let (deg, at) = probe.walk_until(rev, (self.s.r, self.coarse_rim(), self.step), lim);
+-        let coarse = self.from_coarse(deg);
++        let coarse = self.coarse_as_planned(deg);
+         if coarse > fine.0 { (coarse, at) } else { fine }
+     }
+ 
+
+From ba3cdd8ec38e4a91b64ba425a0e5fcda05ea9fee Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 03:10:46 -0800
+Subject: [PATCH 7/9] fix(motion): prove a landing against the cut as the
+ verifier reads it (arc chords, 12.5 um)
+
+The swept-stock proof held a cut 5 um off its planned chord; the
+verifier flattens a posted arc at its gouge tolerance (10 um, inside
+the arc) on top of the 2.5 um arc fit. FIT is 12.5 um, so a landing the
+proof accepts is one the verifier's column reading accepts too.
+
+Refs #1169
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../src/machining2d/adaptive/lift_swept.rs    | 73 ++++++++++---------
+ 1 file changed, 39 insertions(+), 34 deletions(-)
+
+diff --git a/crates/motion/src/machining2d/adaptive/lift_swept.rs b/crates/motion/src/machining2d/adaptive/lift_swept.rs
+index d8bf427bf..0623dfef8 100644
+--- a/crates/motion/src/machining2d/adaptive/lift_swept.rs
++++ b/crates/motion/src/machining2d/adaptive/lift_swept.rs
+@@ -19,19 +19,22 @@ use crate::geo2d::Point2;
+ 
+ use super::lift_split::seg_dist;
+ 
+-/// What a posted cut may stand off its planned chord (mm): the adaptive
+-/// arc fit (`arcs::ARC_FIT_TOL / 4`) and the chords an arc is read back
+-/// on, each 2.5 um; the output lattice (1e-6) is far under it.
+-pub(super) const FIT: f64 = 0.005;
+-
+-/// The landing disc proved is the cutter's less this (mm): the rim's
+-/// last 10 um is tangency with the cut that made the wall, the gouge
+-/// tolerance every disc reading of the mill laws grants.
++/// What the cut the verifier reads may stand off its planned chord
++/// (mm): the adaptive arc fit (`arcs::ARC_FIT_TOL / 4`, 2.5 um) and the
++/// chords the verifier flattens a posted arc to (its gouge tolerance,
++/// 10 um, inside the arc); the output lattice (1e-6) is far under it.
++pub(super) const FIT: f64 = 0.0125;
++
++/// The landing disc proved is the cutter's less this (mm): the gouge
++/// tolerance every disc reading of the mill laws grants the rim
++/// (`verify::rapids`, the footprint of radius `r - gouge_tol`).
+ pub(super) const EDGE: f64 = 0.01;
+ 
+-/// The smallest square the proof divides to (mm, its side): its
+-/// half-diagonal, 0.7 um, is far inside `EDGE - FIT`, so a landing ON
+-/// an earlier cut's own path is proved.
++/// The smallest square the proof divides to (mm, its side; half-diagonal
++/// 0.7 um): what is not proved by then is refused. `FIT` is past `EDGE`,
++/// so a landing ON an earlier cut's own path is not proved by that cut
++/// alone - the stock about it must have been swept by its neighbours
++/// too, as it is anywhere but along a wall.
+ const MIN_SIDE: f64 = 0.001;
+ 
+ /// Most squares one proof may open; past it the landing is refused.
+@@ -155,29 +158,32 @@ mod tests {
+         let mut s = Swept::new(5.0);
+         assert!(!s.covers(p(10.0, 7.0), 4.99), "nothing cut: nothing covered");
+         s.cut(&[p(10.0, 7.0), p(50.0, 7.0)]);
+-        // On the cut's own path, and a few microns off it.
+-        assert!(s.covers(p(30.0, 7.0), 5.0 - EDGE));
+-        assert!(s.covers(p(30.0, 7.004), 5.0 - EDGE));
+-        // Past `EDGE - FIT` off it the far rim stands on uncut stock.
+-        assert!(!s.covers(p(30.0, 7.02), 5.0 - EDGE));
+-        assert!(!s.covers(p(30.0, 7.075), 5.0 - EDGE));
+-        // A second pass takes the strip: covered.
++        // A disc inside the cut's capsule less `FIT` is covered ...
++        assert!(s.covers(p(30.0, 7.0), 5.0 - 0.02));
++        assert!(s.covers(p(30.0, 7.004), 5.0 - 0.02));
++        // ... the footprint on the cut's own path is not, by that cut
++        // alone (the verifier reads an arc's chords up to `FIT` inside),
++        // and off the path its far rim stands on uncut stock.
++        assert!(!s.covers(p(30.0, 7.0), 5.0 - EDGE));
++        assert!(!s.covers(p(30.0, 7.04), 5.0 - EDGE));
++        // A second pass takes the strip: covered between the two.
+         s.cut(&[p(50.0, 7.075), p(10.0, 7.075)]);
+-        assert!(s.covers(p(30.0, 7.075), 5.0 - EDGE));
+         assert!(s.covers(p(30.0, 7.04), 5.0 - EDGE));
++        assert!(!s.covers(p(30.0, 7.2), 5.0 - EDGE));
+         // Off the pass's end: the disc reaches past the end cap.
+-        assert!(!s.covers(p(9.0, 7.0), 5.0 - EDGE));
++        assert!(!s.covers(p(9.0, 7.04), 5.0 - EDGE));
+         assert!(!s.covers(p(f64::NAN, 7.0), 4.0) && !s.covers(p(30.0, 7.0), f64::INFINITY));
+     }
+ 
+     /// Issue #1169, the narrow slot's landing: a 14 mm slot cleared by a
+-    /// D10 up to y = 8.96, the last lap (y = 9.0) still owed a 0.04 mm
+-    /// strip along the wall - thinner than the planner's 0.083 mm cell
+-    /// and between two rows of cell centers, so the cells read the
+-    /// landing on the lap's lead as clear (the slot of
+-    /// `adaptive_hsm::hsm_report_full_resolution` stood 0.075 mm). The return
+-    /// over the retract plane rapids down to its lift there: refused on
+-    /// the swept stock, allowed once a pass has taken the strip.
++    /// D10 up to y = 8.96, the lap at y = 9.0 still owed a 0.04 mm strip
++    /// along the wall - thinner than the planner's 0.083 mm cell and
++    /// between two rows of cell centers, so the cells read a landing
++    /// over it as clear (the slot of
++    /// `adaptive_hsm::hsm_report_full_resolution` stood 0.075 mm). The
++    /// return over the retract plane rapids down to its lift on the
++    /// piece's lead (y = 8.98, the strip under its rim): refused on the
++    /// swept stock, allowed once the lap has taken the strip.
+     #[test]
+     fn a_rapid_landing_on_a_sub_cell_wall_strip_is_refused() {
+         let reach = rect(0.0, 0.0, 60.0, 14.0);
+@@ -189,10 +195,9 @@ mod tests {
+         ras.walk(&cut, r, rim, 0.5);
+         let mut swept = Swept::new(r);
+         swept.cut(&cut);
+-        // The last lap's piece, its lead the lap's own line.
+-        let lead: Vec<Point2> = (0..=10).map(|k| p(20.0 - 0.3 * k as f64, 9.0)).collect();
+-        let piece = Piece { pts: vec![p(17.0, 9.0), p(6.0, 9.0)], lead, tail: Vec::new(), fine: None };
+-        let land = p(17.9, 9.0);
++        let lead: Vec<Point2> = (0..=10).map(|k| p(20.0 - 0.3 * k as f64, 8.98)).collect();
++        let piece = Piece { pts: vec![p(17.0, 8.98), p(6.0, 8.98)], lead, tail: Vec::new(), fine: None };
++        let land = p(17.9, 8.98);
+         // The planner's cells read the landing as clear (the gap) ...
+         assert!(ras.stock_clear(land, rim + ras.h), "the fixture no longer hides the strip from the cells");
+         // ... the swept stock does not, and the return is refused.
+@@ -200,7 +205,7 @@ mod tests {
+         let bite = crate::load::deg_at_rim(0.005, 10.0, rim);
+         let law = |swept| LinkLaw { ras: &ras, center: &center, links: &[], swept, r, rim, step: 0.5, bite, orbit: (p(0.0, 0.0), 0.0) };
+         assert_eq!(law(&swept).high(&piece), None, "a rapid onto the wall strip");
+-        // The strip cut (the lap's own line walked): the same return stands.
++        // The strip cut (the lap at y = 9 walked): the same return stands.
+         let mut after = swept.clone();
+         after.cut(&[p(55.0, 9.0), p(5.0, 9.0)]);
+         let Some(Return { high: true, down, .. }) = law(&after).high(&piece) else { panic!("the landing on cut stock") };
+@@ -210,8 +215,8 @@ mod tests {
+         let landing = super::super::lift_link::landing;
+         assert_eq!(landing(&ras, &swept, &piece, (r, rim)), piece.pts[0], "no point proved: the cells' choice");
+         let mut bent = piece.clone();
+-        bent.lead.insert(0, p(20.0, 8.96));
+-        assert_eq!(landing(&ras, &swept, &bent, (r, rim)), p(20.0, 8.96), "the swept point of the lead");
++        bent.lead.insert(0, p(20.0, 8.9));
++        assert_eq!(landing(&ras, &swept, &bent, (r, rim)), p(20.0, 8.9), "the swept point of the lead");
+         assert_eq!(landing(&ras, &after, &bent, (r, rim)), piece.pts[0], "the strip cut: the piece's own start");
+     }
+ }
+
+From ba17d15cceb9b2c798998565db6c8eb09e49ade4 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 05:32:22 -0800
+Subject: [PATCH 8/9] docs(decisions): #1169 - the final landing tolerance and
+ the slot's readings
+
+Refs #1169
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ docs/decisions/1169-landing-on-swept-stock.md | 44 +++++++++++++------
+ 1 file changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/docs/decisions/1169-landing-on-swept-stock.md b/docs/decisions/1169-landing-on-swept-stock.md
+index 699a1f514..c620125db 100644
+--- a/docs/decisions/1169-landing-on-swept-stock.md
++++ b/docs/decisions/1169-landing-on-swept-stock.md
+@@ -6,8 +6,8 @@ its pieces have cut so far (`adaptive::lift_swept::Swept`). The one
+ return that comes down in rapid - the return over the retract plane,
+ `LinkLaw::high`, which rapids to its lift 0.3 mm over the floor and
+ ramps down the piece's lead - now lands only where the whole cutter
+-footprint (radius r less 10 um, `EDGE`) lies within r less 5 um (`FIT`)
+-of a segment already cut. The proof is a quadtree over the disc: a
++footprint (radius r less 10 um, `EDGE`) lies within r less 12.5 um
++(`FIT`) of a segment already cut. The proof is a quadtree over the disc: a
+ square is covered when its center is within the bound less its
+ half-diagonal of a cut segment (the distance to a segment set is
+ 1-Lipschitz), divided to 1 um, and the landing is refused where the
+@@ -47,11 +47,17 @@ counts (39 deg on the plunge). The walk runs on there - riding on is
+ the spiral's own path, and it removes the hop.
+ 
+ **Readings (release, narrow slot 14x60, with #1050's change).**
+-Before: verifier 1 `RapidInStock`, 4 descents, 200 returns, 3 over the
+-retract plane, 1 retract hop. After: verifier silent, 2 descents, 199
+-returns (1349 mm lifted), 3 over the retract plane, 2 rides, 0 hops;
+-load 15.4 % D, 0 breaks. A proof costs 250-750 squares, 5-25 ms, and is
+-asked a few tens of times a plan.
++
++| | verifier | descents (2 levels) | returns | over the retract plane | rides | hops | out of cut / cut |
++|---|---|---|---|---|---|---|---|
++| before | 1 `RapidInStock` | 4 | 200 | 3 | 0 | 1 | - |
++| after | silent | 2 | 199 (1365 mm) | 0 | 2 | 0 | 0.88 (law 1.5) |
++
++Load 15.4 % D and 0 breaks, as before. The slot's three returns over
++the retract plane all landed on leads along the walls; none is proved
++at `FIT`, and each is now a lifted return routed through the cleared
++area (a feed, 0.3 mm over the floor). A proof costs 250-750 squares,
++5-25 ms, and is asked a few tens of times a plan.
+ 
+ **Considered and dropped.**
+ - *A wall-clearance test on the landing* (footprint off the wall cells
+@@ -72,10 +78,22 @@ asked a few tens of times a plan.
+   an exact law there would refuse most returns. Left on the cells.
+ - *Loosening the verifier or the descents law*: never.
+ 
++- *`FIT` at 5 um* (the arc fit and a like chord sag; the first cut of
++  this fix): it proves a landing on an earlier cut's own path and kept
++  the slot's three returns over the retract plane, verifier silent. But
++  the verifier flattens a posted arc at its gouge tolerance, 10 um
++  inside the arc, so a landing proved with under 12.5 um to spare could
++  still be read as stock by it. The law must hold on the verifier's
++  reading, not beside it.
++
+ **What it would cost to change.** `EDGE` (10 um) is the gouge tolerance
+-the mill laws' disc readings grant; `FIT` (5 um) covers the adaptive arc
+-fit (2.5 um) and the chords an arc is read back on. Should either
+-tolerance grow past `EDGE`, a landing on an earlier cut's own path is no
+-longer proved and `high` falls to the routed return or the hop - slower
+-plans, never unsafe ones. The swept record holds one entry per posted
+-chord per level (bucketed by r); it is dropped with the plan.
++the mill laws' footprint is shrunk by; `FIT` (12.5 um) is the adaptive
++arc fit (2.5 um) plus the chords the verifier reads an arc on (10 um).
++`FIT` is past `EDGE`, so a landing on an earlier cut's own path is
++proved only where neighbouring cuts swept the stock about it - anywhere
++but along a wall. Along a wall `high` therefore gives way to the routed
++lifted return or the hop: more lifted travel in a slot (1349 -> 1365 mm
++here), never an unsafe landing. A verifier that read arcs exactly would
++let `FIT` drop to the arc fit and return those landings. The swept
++record holds one entry per posted chord of the level (bucketed by r);
++it is dropped with the plan.
+
+From 6ce96777b44be43892a5010886b87ad2d2d74b0c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 05:41:21 -0800
+Subject: [PATCH 9/9] test(pocket3d_hsm): the bore's Linux triple, measured
+ with #1050 and #1169
+
+Linux x86-64 rode the band of the Windows and macOS triples; the
+planner changes of #1050 and #1169 move the plan out of it (15561 /
+14837 / 1561, two release runs identical; every level verifies clean,
+none falls back). Added as its own exact arm. The Windows and macOS
+triples predate the change and are owed a re-measure there; they are
+left as measured.
+
+Refs #1050
+Refs #1169
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/pocket3d_hsm.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/crates/app/tests/pocket3d_hsm.rs b/crates/app/tests/pocket3d_hsm.rs
+index 8996cf454..15e04b0a4 100644
+--- a/crates/app/tests/pocket3d_hsm.rs
++++ b/crates/app/tests/pocket3d_hsm.rs
+@@ -131,6 +131,18 @@ fn bore_path_matches(got: (usize, usize, usize)) -> bool {
+         // Measured by the contributor's reviewer at 608126a5 on Apple
+         // silicon (https://github.com/NeoTech/Camcraft/pull/1032).
+         got == (16160, 15432, 1571)
++    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
++        // Measured on issue/1050-developed-band-exit (issues #1050 and
++        // #1169), two release runs, identical. Both issues change the
++        // plan: the disc phase out of the bore is held on a coarse rim
++        // too (smaller first steps), the closing laps are spread, and
++        // abutting pieces ride on (Z 20: 56 microlift returns, 7 rides,
++        // 1 retract hop). Every level still verifies clean and none
++        // falls back. The Windows and macOS triples above were measured
++        // BEFORE those changes and are owed a re-measure on their own
++        // platforms (named in the PR); they are left as measured, not
++        // widened.
++        got == (15561, 14837, 1561)
+     } else {
+         // Not measured here yet: measure this platform and add its exact
+         // triple above. Until then a band covering both measured ones.
