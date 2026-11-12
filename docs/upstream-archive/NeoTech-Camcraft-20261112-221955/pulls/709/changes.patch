@@ -1,0 +1,3669 @@
+From 643d0d06af1f8c4ea1e962c83f196f9b9681b3b5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Tue, 10 Nov 2026 05:54:18 -0800
+Subject: [PATCH 1/3] feat(app): one feature graph and pick API - welded faces,
+ feature edges and points, visible-first (#692 step 1)
+
+app::pick::feature_graph builds per mesh the only pickable things:
+welded faces (geometry::feature's facet_patch weld, the patches
+list_features reports), feature edges (open boundaries, non-manifold
+folds, creases between welded faces - never the strip seams of a
+tessellated wall or a flat face's diagonals), feature points (3+ edges,
+chain ends, turns past 30 degrees) and round-run centres. Cached per
+facet digest like model::features_of_local.
+
+app::pick::feature_pick resolves a ray (perspective or ortho) to the
+front-most surface hit, then snaps within a radius by point > centre >
+edge > face among the accepted kinds, each edge/point occlusion-tested
+toward the eye unless `through` is set. Placements honoured as in
+first_hit_f; pick::ray_triangle is now pub(crate) and shared.
+
+UI pickers and MCP pick tools are untouched (step 2).
+
+Pinned by crates/app/tests/feature_pick.rs.
+
+Refs #692
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/pick.rs               |  11 +-
+ crates/app/src/pick/feature_arc.rs   |  90 ++++++++
+ crates/app/src/pick/feature_graph.rs | 330 +++++++++++++++++++++++++++
+ crates/app/src/pick/feature_pick.rs  | 314 +++++++++++++++++++++++++
+ crates/app/tests/feature_pick.rs     | 264 +++++++++++++++++++++
+ docs/decisions/692-pick-graph.md     |  54 +++++
+ 6 files changed, 1062 insertions(+), 1 deletion(-)
+ create mode 100644 crates/app/src/pick/feature_arc.rs
+ create mode 100644 crates/app/src/pick/feature_graph.rs
+ create mode 100644 crates/app/src/pick/feature_pick.rs
+ create mode 100644 crates/app/tests/feature_pick.rs
+ create mode 100644 docs/decisions/692-pick-graph.md
+
+diff --git a/crates/app/src/pick.rs b/crates/app/src/pick.rs
+index 38c41aa5f..df731c06a 100644
+--- a/crates/app/src/pick.rs
++++ b/crates/app/src/pick.rs
+@@ -7,6 +7,9 @@
+ pub mod align;
+ pub mod axis;
+ pub mod face;
++pub mod feature_arc;
++pub mod feature_graph;
++pub mod feature_pick;
+ pub mod plane;
+ pub mod winding;
+ 
+@@ -14,6 +17,12 @@ pub use align::{Alignment, align_321};
+ pub use axis::{AxisPick, InPlaneAxes, InPlaneAxis, in_plane_turn_deg, pick_coords, turn_in_plane};
+ pub use plane::{PlaneLay, lay_on_plane, plane_label, plane_side};
+ pub use face::{FaceOrigin, face_origin, facets_centroid};
++pub use feature_arc::ArcCentre;
++pub use feature_graph::{FeatureGraph, FeaturePoint, PointKind, WeldedFace, feature_graph, feature_graph_cached};
++pub use feature_pick::{
++    FeaturePick, PickBody, PickKinds, PickQuery, PickRay, PickTarget, Projection, pick_bodies, pick_bodies_of,
++    pick_feature,
++};
+ 
+ use flecs_ecs::prelude::World;
+ 
+@@ -171,7 +180,7 @@ pub fn soup_hit(tris: &[Triangle], origin: [f64; 3], dir: [f64; 3]) -> Option<(u
+ 
+ /// Ray/triangle crossing in the entity's local frame; the ray direction need
+ /// not be normalized. Returns t along the ray.
+-fn ray_triangle(facet: Triangle, origin: Point3, dir: Point3) -> Option<f64> {
++pub(crate) fn ray_triangle(facet: Triangle, origin: Point3, dir: Point3) -> Option<f64> {
+     let (a, b, c) = (facet.a, facet.b, facet.c);
+     if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+         return None;
+diff --git a/crates/app/src/pick/feature_arc.rs b/crates/app/src/pick/feature_arc.rs
+new file mode 100644
+index 000000000..520d3b146
+--- /dev/null
++++ b/crates/app/src/pick/feature_arc.rs
+@@ -0,0 +1,90 @@
++//! Arc and circle centres of round feature-edge runs (#692): a hole rim
++//! or a boss edge tessellated into chords still has one centre, and a
++//! point pick that asks for centres can snap to it.
++//!
++//! Provenance: the circumcentre of three points (standard vector form,
++//! c = p0 + ((|a|^2 b - |b|^2 a) x (a x b)) / (2 |a x b|^2)) checked
++//! against every vertex of the run - textbook analytic geometry; our own
++//! code, no vendor material consulted.
++
++/// Every vertex of a run must sit this close to the fitted circle,
++/// relative to its radius. Tessellated rims put their vertices ON the
++/// circle (only chords cut inside it), so this is float noise plus lattice
++/// welding (1 µm), not a fit tolerance.
++pub const ARC_REL_TOL: f64 = 1e-3;
++
++/// Absolute floor of the same tolerance, mm (a tiny hole at the 1 µm weld).
++pub const ARC_ABS_TOL: f64 = 1e-3;
++
++/// A run needs at least this many edges before it is called round: a
++/// single chord or a two-segment kink is not an arc.
++pub const ARC_MIN_EDGES: usize = 3;
++
++/// The centre of one round feature-edge run, local frame.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ArcCentre {
++    pub centre: [f64; 3],
++    /// Unit normal of the circle's plane (sign follows the run's walk).
++    pub normal: [f64; 3],
++    pub radius: f64,
++    /// A full circle (the run closes on itself) rather than an arc.
++    pub closed: bool,
++    /// The run's edges, as indices into `Features::edges`.
++    pub edges: Vec<u32>,
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
++}
++
++/// The circle through three points: (centre, unit normal, radius), or
++/// `None` when they are (nearly) collinear or the math is not finite.
++#[must_use]
++pub fn circumcircle(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Option<([f64; 3], [f64; 3], f64)> {
++    let (a, b) = (sub(p1, p0), sub(p2, p0));
++    let n = cross(a, b);
++    let nn = dot(n, n);
++    // Collinear (sin of the angle at p0 under 1e-4): no circle - a
++    // straight run with weld noise must not fit a kilometre-wide arc.
++    if !(nn.is_finite() && nn > 1e-8 * dot(a, a) * dot(b, b)) {
++        return None;
++    }
++    let (aa, bb) = (dot(a, a), dot(b, b));
++    let w = [aa * b[0] - bb * a[0], aa * b[1] - bb * a[1], aa * b[2] - bb * a[2]];
++    let off = cross(w, n);
++    let c = [p0[0] + off[0] / (2.0 * nn), p0[1] + off[1] / (2.0 * nn), p0[2] + off[2] / (2.0 * nn)];
++    let r = dot(sub(p0, c), sub(p0, c)).sqrt();
++    let m = nn.sqrt();
++    let unit = [n[0] / m, n[1] / m, n[2] / m];
++    (c.iter().chain(unit.iter()).all(|v| v.is_finite()) && r.is_finite() && r > 0.0).then_some((c, unit, r))
++}
++
++/// Fit a circle to a walked run's vertices (`pts`, in walk order; a closed
++/// run repeats its start at the end). `None` unless the run has at least
++/// [`ARC_MIN_EDGES`] edges and every vertex lies on one circle, in one
++/// plane, within tolerance.
++#[must_use]
++pub fn fit_arc(pts: &[[f64; 3]], closed: bool, edges: Vec<u32>) -> Option<ArcCentre> {
++    if edges.len() < ARC_MIN_EDGES || pts.len() < ARC_MIN_EDGES + 1 {
++        return None;
++    }
++    // Three well-spread samples: thirds of the run.
++    let n = if closed { pts.len() - 1 } else { pts.len() };
++    let (i1, i2) = if closed { (n / 3, 2 * n / 3) } else { (n / 2, n - 1) };
++    let (centre, normal, radius) = circumcircle(*pts.first()?, *pts.get(i1)?, *pts.get(i2)?)?;
++    let tol = (radius * ARC_REL_TOL).max(ARC_ABS_TOL);
++    let on_circle = pts.iter().all(|p| {
++        let d = sub(*p, centre);
++        let r = dot(d, d).sqrt();
++        (r - radius).abs() <= tol && dot(d, normal).abs() <= tol
++    });
++    on_circle.then_some(ArcCentre { centre, normal, radius, closed, edges })
++}
+diff --git a/crates/app/src/pick/feature_graph.rs b/crates/app/src/pick/feature_graph.rs
+new file mode 100644
+index 000000000..4387a69bf
+--- /dev/null
++++ b/crates/app/src/pick/feature_graph.rs
+@@ -0,0 +1,330 @@
++//! The pick feature graph (#692): one mesh's welded faces, feature edges,
++//! feature points and round-edge centres - the only things a click may
++//! land on, for every picker in the app.
++//!
++//! Provenance: our own code over `geometry::feature`'s weld (this repo's
++//! M1.5 dihedral-threshold clustering); edge-adjacency walks and turn-angle
++//! corner detection from general mesh-processing practice; no vendor
++//! material consulted.
++//!
++//! The weld is `geometry::feature`'s, not a second one: a welded face is
++//! one `facet_patch` root (facets joined across seams under its 40-degree
++//! dihedral rule), so the faces `list_features` (#180) reports and the
++//! faces a click picks are the same faces. What this module adds is the
++//! filter that topology does not: `Features::edges` also carries the
++//! "tangent seams between distinct faces" its exact-plane split makes -
++//! every facet edge of a tessellated cylinder - and those must never be
++//! pickable. Here an edge is a feature edge only when it separates two
++//! welded faces (or bends past the crease angle inside one), or bounds an
++//! open sheet, or is a non-manifold fold.
++
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use crate::geometry::Triangle;
++use crate::geometry::feature::{self, EdgeKind, Features, VertexId};
++use crate::model;
++use crate::operation::FeatureSel;
++
++use super::feature_arc::{ArcCentre, fit_arc};
++
++/// Dihedral angle past which an edge inside one welded face still counts
++/// as a crease (degrees). Matches `geometry::feature`'s weld rule, so the
++/// two can only disagree on an edge whose patch closed around it.
++pub const CREASE_DEG: f64 = 40.0;
++
++/// A degree-2 feature vertex is a feature point when its two feature
++/// edges turn by more than this (degrees). Equals the tangent rule of
++/// `feature::chains` (`CHAIN_TANGENT_DEG`): what splits a chain is a corner.
++pub const TURN_DEG: f64 = 30.0;
++
++/// Why a vertex is a feature point.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PointKind {
++    /// Three or more feature edges meet (a box corner).
++    Corner,
++    /// Two feature edges meet at a turn sharper than [`TURN_DEG`].
++    Turn,
++    /// The end of an open feature-edge chain (one edge).
++    End,
++}
++
++/// One feature point, in the mesh's local frame.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct FeaturePoint {
++    /// Index into `Features::verts`.
++    pub vert: u32,
++    /// Stable id - the `FeatureSel::Vertex` key.
++    pub id: VertexId,
++    pub kind: PointKind,
++    pub at: [f64; 3],
++}
++
++/// One welded face: the facets a click anywhere on it selects.
++#[derive(Clone, Debug)]
++pub struct WeldedFace {
++    /// Facet indices into the mesh's facet array.
++    pub facets: Vec<u32>,
++    /// The selection the rest of the app keys this face by: a `Patch` for
++    /// a multi-strip smooth wall, else the planar `Face`. `None` only for
++    /// a face the topology could not name (a degenerate facet).
++    pub sel: Option<FeatureSel>,
++}
++
++/// The pickable structure of one mesh, local frame.
++#[derive(Clone, Debug, Default)]
++pub struct FeatureGraph {
++    /// The shared topology this graph filters.
++    pub features: Arc<Features>,
++    /// facet index -> index into [`FeatureGraph::faces`].
++    pub face_of_facet: Vec<u32>,
++    pub faces: Vec<WeldedFace>,
++    /// Indices into `features.edges` that are feature edges, ascending.
++    pub edges: Vec<u32>,
++    pub points: Vec<FeaturePoint>,
++    /// Centres of round feature-edge runs (circles and arcs).
++    pub arcs: Vec<ArcCentre>,
++}
++
++impl FeatureGraph {
++    /// The welded face a facet belongs to.
++    #[must_use]
++    pub fn face_of(&self, facet: usize) -> Option<&WeldedFace> {
++        self.faces.get(*self.face_of_facet.get(facet)? as usize)
++    }
++
++    /// The local endpoints of feature edge `edge` (an index into
++    /// `features.edges`).
++    #[must_use]
++    pub fn edge_ends(&self, edge: u32) -> Option<([f64; 3], [f64; 3])> {
++        let e = self.features.edges.get(edge as usize)?;
++        Some((*self.features.verts.get(e.a as usize)?, *self.features.verts.get(e.b as usize)?))
++    }
++}
++
++/// Build the graph of a mesh from its facets (local frame). Total on any
++/// input: empty or garbage facets give an empty or partial graph.
++#[must_use]
++pub fn feature_graph(tris: &[Triangle]) -> FeatureGraph {
++    graph_of(model::features_of_local(tris), tris)
++}
++
++thread_local! {
++    /// Cap-8 MRU of graphs keyed by the facets' content digest, the same
++    /// key and policy as `model::features_of_local` (pure fuel: a miss
++    /// only recomputes).
++    static GRAPH_CACHE: std::cell::RefCell<Vec<(u64, Arc<FeatureGraph>)>> =
++        const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// [`feature_graph`], memoized by content - what a per-frame hover calls.
++#[must_use]
++pub fn feature_graph_cached(tris: &[Triangle]) -> Arc<FeatureGraph> {
++    if tris.is_empty() {
++        return Arc::new(FeatureGraph::default());
++    }
++    let key = feature::digest_of(tris);
++    GRAPH_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
++            let entry = cache.remove(i);
++            cache.push(entry.clone());
++            return entry.1;
++        }
++        let g = Arc::new(feature_graph(tris));
++        if cache.len() >= 8 {
++            cache.remove(0);
++        }
++        cache.push((key, g.clone()));
++        g
++    })
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
++}
++
++/// Cosine of the angle between two vectors; `None` when either is null
++/// or the math is not finite.
++fn cos_between(a: [f64; 3], b: [f64; 3]) -> Option<f64> {
++    let m = (dot(a, a) * dot(b, b)).sqrt();
++    let c = dot(a, b) / m;
++    (m > 0.0 && c.is_finite()).then_some(c)
++}
++
++fn facet_normal(t: &Triangle) -> [f64; 3] {
++    let (a, b, c) = ([t.a.x, t.a.y, t.a.z], [t.b.x, t.b.y, t.b.z], [t.c.x, t.c.y, t.c.z]);
++    cross(sub(b, a), sub(c, a))
++}
++
++fn welded_faces(f: &Features) -> (Vec<u32>, Vec<WeldedFace>) {
++    // Face id -> patch id, for the selection key.
++    let mut patch_of: HashMap<u64, u64> = HashMap::new();
++    for p in feature::patches(f) {
++        for fid in p.faces {
++            patch_of.insert(fid, p.id);
++        }
++    }
++    let mut slot: HashMap<u32, u32> = HashMap::new();
++    let mut faces: Vec<WeldedFace> = Vec::new();
++    let mut face_of_facet = Vec::with_capacity(f.facet_patch.len());
++    for (t, &root) in f.facet_patch.iter().enumerate() {
++        let k = *slot.entry(root).or_insert_with(|| {
++            let sel = f
++                .facet_face
++                .get(t)
++                .and_then(|&fi| f.faces.get(fi as usize))
++                .map(|fa| patch_of.get(&fa.id).map_or(FeatureSel::Face(fa.id), |p| FeatureSel::Patch(*p)));
++            faces.push(WeldedFace { facets: Vec::new(), sel });
++            (faces.len() - 1) as u32
++        });
++        if let Some(face) = faces.get_mut(k as usize) {
++            face.facets.push(t as u32);
++        }
++        face_of_facet.push(k);
++    }
++    (face_of_facet, faces)
++}
++
++/// A facet with real area: finite corners and a non-null normal. Slivers
++/// (zero-area STL facets, T-junction fillers) bound nothing and so make
++/// no feature edge of their own.
++fn has_area(tris: &[Triangle], t: u32) -> bool {
++    tris.get(t as usize).is_some_and(|t| {
++        let n = facet_normal(t);
++        let nn = dot(n, n);
++        nn.is_finite() && nn > 1e-18
++    })
++}
++
++/// Is `features.edges[i]` a real model edge (see the module doc)?
++fn is_feature_edge(f: &Features, tris: &[Triangle], i: usize) -> bool {
++    let Some(e) = f.edges.get(i) else { return false };
++    let incident = &e.facets[..(e.n_facets.min(3) as usize)];
++    let real = incident.iter().filter(|&&t| has_area(tris, t)).count();
++    match e.kind {
++        EdgeKind::Boundary => real == 1,
++        EdgeKind::NonManifold => real >= 2,
++        EdgeKind::Degenerate => false, // a flaw, drawn but never a pick
++        EdgeKind::Crease => {
++            let [t0, t1, _] = e.facets;
++            if real < 2 {
++                return false; // a sliver's seam
++            }
++            let root = |t: u32| f.facet_patch.get(t as usize).copied();
++            if root(t0) != root(t1) {
++                return true; // two welded faces meet here
++            }
++            // One welded face: a crease only if it really bends.
++            let (Some(a), Some(b)) = (tris.get(t0 as usize), tris.get(t1 as usize)) else {
++                return false;
++            };
++            cos_between(facet_normal(a), facet_normal(b))
++                .is_some_and(|c| c < CREASE_DEG.to_radians().cos())
++        }
++    }
++}
++
++fn graph_of(features: Arc<Features>, tris: &[Triangle]) -> FeatureGraph {
++    let f = &*features;
++    let (face_of_facet, faces) = welded_faces(f);
++    let edges: Vec<u32> = (0..f.edges.len()).filter(|&i| is_feature_edge(f, tris, i)).map(|i| i as u32).collect();
++
++    // Vertex -> incident feature edges.
++    let mut incident: HashMap<u32, Vec<u32>> = HashMap::new();
++    for &ei in &edges {
++        if let Some(e) = f.edges.get(ei as usize) {
++            incident.entry(e.a).or_default().push(ei);
++            incident.entry(e.b).or_default().push(ei);
++        }
++    }
++    let other_end = |ei: u32, v: u32| -> Option<u32> {
++        let e = f.edges.get(ei as usize)?;
++        Some(if e.a == v { e.b } else { e.a })
++    };
++    let vert = |v: u32| f.verts.get(v as usize).copied();
++
++    let mut points: Vec<FeaturePoint> = Vec::new();
++    let mut verts: Vec<&u32> = incident.keys().collect();
++    verts.sort_unstable();
++    for &v in verts {
++        let Some(es) = incident.get(&v) else { continue };
++        let kind = match es.len() {
++            1 => Some(PointKind::End),
++            2 => {
++                let turn = (|| {
++                    let (p, a, b) = (vert(v)?, vert(other_end(es[0], v)?)?, vert(other_end(es[1], v)?)?);
++                    // Directions along the run: in from `a`, out to `b`.
++                    cos_between(sub(p, a), sub(b, p))
++                })();
++                // A turn that refuses to measure is shown, not hidden.
++                turn.is_none_or(|c| c < TURN_DEG.to_radians().cos()).then_some(PointKind::Turn)
++            }
++            _ => Some(PointKind::Corner),
++        };
++        if let (Some(kind), Some(at), Some(id)) = (kind, vert(v), feature::vertex_id(f, v)) {
++            points.push(FeaturePoint { vert: v, id, kind, at });
++        }
++    }
++
++    // Runs between feature points (or closed loops with none) -> arcs.
++    let is_point = |v: u32| points.binary_search_by_key(&v, |p| p.vert).is_ok();
++    let mut used = vec![false; f.edges.len()];
++    let mut arcs = Vec::new();
++    let walk = |start_v: u32, start_e: u32, used: &mut Vec<bool>| -> (Vec<u32>, Vec<[f64; 3]>, bool) {
++        let mut run = Vec::new();
++        let mut pts: Vec<[f64; 3]> = vert(start_v).into_iter().collect();
++        let (mut v, mut e) = (start_v, start_e);
++        while let Some(flag) = used.get_mut(e as usize) {
++            if *flag {
++                break;
++            }
++            *flag = true;
++            run.push(e);
++            let Some(n) = other_end(e, v) else { break };
++            pts.extend(vert(n));
++            if n == start_v {
++                return (run, pts, true);
++            }
++            if is_point(n) {
++                break;
++            }
++            let next = incident.get(&n).and_then(|es| es.iter().copied().find(|&x| x != e));
++            match next {
++                Some(x) => (v, e) = (n, x),
++                None => break,
++            }
++        }
++        (run, pts, false)
++    };
++    let mut starts: Vec<(u32, u32)> = Vec::new();
++    for p in &points {
++        for &ei in incident.get(&p.vert).map(Vec::as_slice).unwrap_or(&[]) {
++            starts.push((p.vert, ei));
++        }
++    }
++    for &ei in &edges {
++        if let Some(e) = f.edges.get(ei as usize) {
++            starts.push((e.a, ei)); // whatever is left is a closed loop
++        }
++    }
++    for (v, ei) in starts {
++        if used.get(ei as usize).copied().unwrap_or(true) {
++            continue;
++        }
++        let (run, pts, closed) = walk(v, ei, &mut used);
++        if let Some(arc) = fit_arc(&pts, closed, run) {
++            arcs.push(arc);
++        }
++    }
++
++    FeatureGraph { features, face_of_facet, faces, edges, points, arcs }
++}
+diff --git a/crates/app/src/pick/feature_pick.rs b/crates/app/src/pick/feature_pick.rs
+new file mode 100644
+index 000000000..1a2f40c54
+--- /dev/null
++++ b/crates/app/src/pick/feature_pick.rs
+@@ -0,0 +1,314 @@
++//! The one pick rule (#692): a ray resolves to the front-most visible
++//! surface, then snaps within a radius to a feature point, a round-edge
++//! centre, a feature edge or the welded face - in that order, and only
++//! among the kinds the asking tool accepts. Edges and points behind the
++//! model are never picked unless the caller explicitly asks to pick
++//! through.
++//!
++//! Provenance: ray casting with the Möller–Trumbore crossing test
++//! (Möller & Trumbore, J. Graphics Tools 1997, `pick::ray_triangle`), the
++//! closest point between a ray and a segment, and an occlusion ray back
++//! toward the eye (or, orthographic, along the parallel view direction) -
++//! general computer-graphics practice; our own code, no vendor material.
++
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use crate::geometry::{
++    Point3, Triangle, quat_conjugate, quat_rotate_point, transform_inverse_point, transform_point,
++};
++use crate::model;
++use crate::operation::FeatureSel;
++use crate::schema::Location;
++
++use super::feature_graph::{FeatureGraph, FeaturePoint, feature_graph_cached};
++use super::ray_triangle;
++
++/// How the view casts rays: perspective sight lines meet at the ray's
++/// origin (the eye); orthographic sight lines are all parallel to `dir`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Projection {
++    Perspective,
++    Ortho,
++}
++
++/// One pick ray, in the frame the viewport draws in.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct PickRay {
++    pub origin: [f64; 3],
++    pub dir: [f64; 3],
++    pub projection: Projection,
++}
++
++/// Which kinds of feature the asking tool accepts.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct PickKinds {
++    pub faces: bool,
++    pub edges: bool,
++    pub points: bool,
++    /// Centres of round feature edges (circles and arcs).
++    pub centres: bool,
++}
++
++impl PickKinds {
++    pub const FACES: PickKinds = PickKinds { faces: true, edges: false, points: false, centres: false };
++    pub const EDGES: PickKinds = PickKinds { faces: false, edges: true, points: false, centres: false };
++    pub const POINTS: PickKinds = PickKinds { faces: false, edges: false, points: true, centres: false };
++    pub const CENTRES: PickKinds = PickKinds { faces: false, edges: false, points: false, centres: true };
++    /// Faces, edges and points (centres stay opt-in).
++    pub const ALL: PickKinds = PickKinds { faces: true, edges: true, points: true, centres: false };
++}
++
++/// One pick request.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct PickQuery {
++    pub ray: PickRay,
++    /// Snap radius in world units (mm) at the surface hit. In perspective
++    /// it scales with depth, so it stays one screen-space size.
++    pub radius: f64,
++    pub kinds: PickKinds,
++    /// Ignore occlusion: pick edges and points behind the model. Off by
++    /// default everywhere; only an explicit "pick through" mode sets it.
++    pub through: bool,
++}
++
++/// What a pick landed on, keyed into the entity's [`FeatureGraph`].
++#[derive(Clone, Debug, PartialEq)]
++pub enum PickTarget {
++    Point(FeaturePoint),
++    /// Index into [`FeatureGraph::arcs`].
++    Centre { arc: usize },
++    /// Index into `features.edges` (one of [`FeatureGraph::edges`]).
++    Edge { edge: u32 },
++    /// The facet the ray hit and the welded face it belongs to (index into
++    /// [`FeatureGraph::faces`]), with that face's selection key.
++    Face { facet: usize, face: u32, sel: Option<FeatureSel> },
++}
++
++/// A resolved pick.
++#[derive(Clone, Debug, PartialEq)]
++pub struct FeaturePick {
++    pub entity: String,
++    pub target: PickTarget,
++    /// The picked spot, world frame: the point, the centre, the nearest
++    /// point of the edge to the ray, or the surface hit.
++    pub at: [f64; 3],
++    /// The front-most surface hit along the ray, if any.
++    pub surface: Option<[f64; 3]>,
++}
++
++/// One pickable mesh: local facets, their graph and the placement the
++/// viewport draws them at.
++#[derive(Clone, Debug)]
++pub struct PickBody {
++    pub name: String,
++    pub tris: Arc<[Triangle]>,
++    pub graph: Arc<FeatureGraph>,
++    pub pose: Location,
++    /// Stock is translucent: it never hides a model, and a model hit
++    /// beats it at any depth (the `first_hit_f` rule).
++    pub stock: bool,
++}
++
++impl PickBody {
++    /// A model body at `pose`, its graph from the shared cache.
++    #[must_use]
++    pub fn new(name: &str, tris: Arc<[Triangle]>, pose: Location) -> PickBody {
++        let graph = feature_graph_cached(&tris);
++        PickBody { name: name.to_string(), tris, graph, pose, stock: false }
++    }
++}
++
++/// Visibility slack of the occlusion ray, mm: the facets that meet AT an
++/// edge or corner cross the sight line at its own distance.
++fn sight_tol(len: f64) -> f64 {
++    (len.abs() * 1e-4).max(1e-3)
++}
++
++fn p3(p: [f64; 3]) -> Point3 {
++    Point3::new(p[0], p[1], p[2])
++}
++
++fn a3(p: Point3) -> [f64; 3] {
++    [p.x, p.y, p.z]
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn along(o: [f64; 3], d: [f64; 3], t: f64) -> [f64; 3] {
++    [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t]
++}
++
++fn world_of(b: &PickBody, p: [f64; 3]) -> [f64; 3] {
++    a3(transform_point(p3(p), b.pose.pos, b.pose.rot))
++}
++
++/// (depth along the unit ray, perpendicular distance) of world point `w`.
++fn ray_measure(o: [f64; 3], d: [f64; 3], w: [f64; 3]) -> Option<(f64, f64)> {
++    let rel = sub(w, o);
++    let depth = dot(rel, d);
++    let foot = sub(rel, [d[0] * depth, d[1] * depth, d[2] * depth]);
++    let perp = dot(foot, foot).sqrt();
++    (depth.is_finite() && perp.is_finite() && depth > 0.0).then_some((depth, perp))
++}
++
++/// The point of segment `a`-`b` nearest the ray's line (world frame).
++fn segment_near_ray(o: [f64; 3], d: [f64; 3], a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    let e = sub(b, a);
++    let w0 = sub(a, o);
++    let (ee, ed) = (dot(e, e), dot(e, d));
++    let denom = ee - ed * ed; // |d| = 1
++    let u = if denom > 1e-12 * ee.max(1e-300) { (ed * dot(d, w0) - dot(e, w0)) / denom } else { 0.0 };
++    let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
++    along(a, e, u)
++}
++
++/// Does any occluding facet cross the sight segment from `p` (world)
++/// back to the viewer before reaching `p`?
++fn occluded(bodies: &[PickBody], own: usize, ray: &PickRay, d: [f64; 3], p: [f64; 3]) -> bool {
++    let eye = match ray.projection {
++        Projection::Perspective => ray.origin,
++        Projection::Ortho => along(p, d, -dot(sub(p, ray.origin), d)),
++    };
++    let seg = sub(p, eye);
++    let len = dot(seg, seg).sqrt();
++    if !(len.is_finite() && len > 1e-12) {
++        return false; // the eye sits on the point: nothing in between
++    }
++    let cut = 1.0 - sight_tol(len) / len; // t along the segment: 1 is at p
++    bodies.iter().enumerate().filter(|(i, b)| !b.stock || *i == own).any(|(_, b)| {
++        let e_l = transform_inverse_point(p3(eye), b.pose.pos, b.pose.rot);
++        let p_l = transform_inverse_point(p3(p), b.pose.pos, b.pose.rot);
++        let dir = p_l - e_l;
++        e_l.is_finite()
++            && dir.is_finite()
++            && b.tris.iter().any(|t| ray_triangle(*t, e_l, dir).is_some_and(|hit| hit < cut))
++    })
++}
++
++/// The front-most surface hit: (body, facet, t along the unit ray).
++/// Models beat stock at any depth.
++fn front_hit(bodies: &[PickBody], o: [f64; 3], d: [f64; 3]) -> Option<(usize, usize, f64)> {
++    let mut model: Option<(usize, usize, f64)> = None;
++    let mut stock: Option<(usize, usize, f64)> = None;
++    for (bi, b) in bodies.iter().enumerate() {
++        let o_l = transform_inverse_point(p3(o), b.pose.pos, b.pose.rot);
++        let d_l = quat_rotate_point(quat_conjugate(b.pose.rot), p3(d));
++        if !(o_l.is_finite() && d_l.is_finite()) {
++            continue;
++        }
++        let best = if b.stock { &mut stock } else { &mut model };
++        for (fi, t) in b.tris.iter().enumerate() {
++            if let Some(hit) = ray_triangle(*t, o_l, d_l)
++                && best.is_none_or(|(_, _, bt)| hit < bt)
++            {
++                *best = Some((bi, fi, hit));
++            }
++        }
++    }
++    model.or(stock)
++}
++
++/// A snap candidate: (perp, depth, body, target, world position).
++type Cand = (f64, f64, usize, PickTarget, [f64; 3]);
++
++/// The pure rule over explicit bodies (what [`pick_feature`] runs on the
++/// world's). `None` on a miss or on any degenerate input - never a panic.
++#[must_use]
++pub fn pick_bodies(bodies: &[PickBody], q: &PickQuery) -> Option<FeaturePick> {
++    let (o, d0) = (q.ray.origin, q.ray.dir);
++    let len = dot(d0, d0).sqrt();
++    if !(o.iter().all(|v| v.is_finite()) && len.is_finite() && len > 1e-12) {
++        return None;
++    }
++    let d = [d0[0] / len, d0[1] / len, d0[2] / len];
++    let radius = if q.radius.is_finite() && q.radius > 0.0 { q.radius } else { 0.0 };
++    let hit = front_hit(bodies, o, d);
++    let surface = hit.map(|(_, _, t)| along(o, d, t));
++    // Perspective: one screen-space radius means a world radius growing
++    // with depth, anchored at the surface hit.
++    let reach = |depth: f64| match (q.ray.projection, hit) {
++        (Projection::Perspective, Some((_, _, t))) if t > 0.0 => radius * depth / t,
++        _ => radius,
++    };
++    let keep = |w: [f64; 3]| ray_measure(o, d, w).filter(|(depth, perp)| *perp <= reach(*depth));
++
++    let mut tiers: [Vec<Cand>; 3] = [Vec::new(), Vec::new(), Vec::new()];
++    for (bi, b) in bodies.iter().enumerate() {
++        let g = &b.graph;
++        if q.kinds.points {
++            for p in &g.points {
++                let w = world_of(b, p.at);
++                if let Some((depth, perp)) = keep(w) {
++                    tiers[0].push((perp, depth, bi, PickTarget::Point(*p), w));
++                }
++            }
++        }
++        if q.kinds.centres {
++            for (k, a) in g.arcs.iter().enumerate() {
++                let w = world_of(b, a.centre);
++                if let Some((depth, perp)) = keep(w) {
++                    tiers[1].push((perp, depth, bi, PickTarget::Centre { arc: k }, w));
++                }
++            }
++        }
++        if q.kinds.edges {
++            for &ei in &g.edges {
++                let Some((a, z)) = g.edge_ends(ei) else { continue };
++                let w = segment_near_ray(o, d, world_of(b, a), world_of(b, z));
++                if let Some((depth, perp)) = keep(w) {
++                    tiers[2].push((perp, depth, bi, PickTarget::Edge { edge: ei }, w));
++                }
++            }
++        }
++    }
++    for mut tier in tiers {
++        // Nearest the ray first, then nearest the eye; only the winners
++        // pay for the occlusion test.
++        tier.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
++        let found = tier.into_iter().find(|c| q.through || !occluded(bodies, c.2, &q.ray, d, c.4));
++        if let Some((_, _, bi, target, at)) = found {
++            let entity = bodies.get(bi)?.name.clone();
++            return Some(FeaturePick { entity, target, at, surface });
++        }
++    }
++    if !q.kinds.faces {
++        return None;
++    }
++    let (bi, facet, _) = hit?;
++    let b = bodies.get(bi)?;
++    let face = *b.graph.face_of_facet.get(facet)?;
++    let sel = b.graph.faces.get(face as usize)?.sel;
++    Some(FeaturePick { entity: b.name.clone(), target: PickTarget::Face { facet, face, sel }, at: surface?, surface })
++}
++
++/// The world's pickable bodies: every named entity with facets except
++/// those `skip` names (hidden in the view), at its view pose (#326).
++#[must_use]
++pub fn pick_bodies_of(world: &World, skip: impl Fn(&str) -> bool) -> Vec<PickBody> {
++    let mut out = Vec::new();
++    for (name, entity) in model::named_entities(world) {
++        if skip(&name) {
++            continue;
++        }
++        let Some(tris) = model::facets_of(world, &entity) else { continue };
++        let pose = crate::setup_align::view_pose(world, &entity).unwrap_or_default();
++        let mut body = PickBody::new(&name, tris, pose);
++        body.stock = model::is_stock(world, &entity);
++        out.push(body);
++    }
++    out
++}
++
++/// The app-wide pick: [`pick_bodies`] over the world's entities.
++#[must_use]
++pub fn pick_feature(world: &World, q: &PickQuery, skip: impl Fn(&str) -> bool) -> Option<FeaturePick> {
++    pick_bodies(&pick_bodies_of(world, skip), q)
++}
+diff --git a/crates/app/tests/feature_pick.rs b/crates/app/tests/feature_pick.rs
+new file mode 100644
+index 000000000..bd082edc6
+--- /dev/null
++++ b/crates/app/tests/feature_pick.rs
+@@ -0,0 +1,264 @@
++//! #692 step 1: the one feature graph and pick rule - welded faces,
++//! feature edges and feature points only, visible first, never through
++//! the part unless asked. Pins the issue's "Done means" cases in both
++//! perspective and orthographic rays, plus degenerate input.
++//!
++//! Gate map (#692): covers app::pick::feature_graph, app::pick::feature_arc,
++//! app::pick::feature_pick, app::pick (ray_triangle).
++
++use std::sync::Arc;
++
++use camcraft_app::commands::{Command, ImportModel};
++use camcraft_app::geometry::{IDENTITY_Q, Mesh, Point3, Triangle, cube, cylinder};
++use camcraft_app::model;
++use camcraft_app::operation::FeatureSel;
++use camcraft_app::pick::feature_arc::{circumcircle, fit_arc};
++use camcraft_app::pick::{
++    FeaturePick, PickBody, PickKinds, PickQuery, PickRay, PickTarget, PointKind, Projection, feature_graph,
++    pick_bodies, pick_feature,
++};
++use camcraft_app::schema::Location;
++use camcraft_app::world::new_world;
++
++fn body(name: &str, tris: Vec<Triangle>) -> PickBody {
++    PickBody::new(name, Arc::from(tris), Location::default())
++}
++
++fn block() -> Vec<Triangle> {
++    cube(Point3::ZERO, Point3::new(20.0, 20.0, 10.0)).facets.to_vec()
++}
++
++fn mesh_tris(m: Mesh) -> Vec<Triangle> {
++    m.facets.to_vec()
++}
++
++fn query(origin: [f64; 3], dir: [f64; 3], projection: Projection, kinds: PickKinds) -> PickQuery {
++    PickQuery { ray: PickRay { origin, dir, projection }, radius: 1.0, kinds, through: false }
++}
++
++/// A ray from `eye` aimed at `at`.
++fn aim(eye: [f64; 3], at: [f64; 3], projection: Projection, kinds: PickKinds) -> PickQuery {
++    query(eye, [at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]], projection, kinds)
++}
++
++fn near(a: [f64; 3], b: [f64; 3], tol: f64) -> bool {
++    (a[0] - b[0]).abs() <= tol && (a[1] - b[1]).abs() <= tol && (a[2] - b[2]).abs() <= tol
++}
++
++fn edge_ends(b: &PickBody, pick: &FeaturePick) -> ([f64; 3], [f64; 3]) {
++    let PickTarget::Edge { edge } = pick.target else { panic!("not an edge: {pick:?}") };
++    b.graph.edge_ends(edge).expect("edge resolves")
++}
++
++#[test]
++fn flat_face_triangulation_edges_are_not_pickable() {
++    let b = body("block", block());
++    // A box: 12 real edges and 8 corners, whatever its triangulation.
++    assert_eq!(b.graph.edges.len(), 12, "only the box's own edges are feature edges");
++    assert_eq!(b.graph.points.len(), 8);
++    assert!(b.graph.points.iter().all(|p| p.kind == PointKind::Corner));
++    // Straight down onto the top face's diagonal (0,0)-(20,20).
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        let mut q = query([10.0, 10.0, 50.0], [0.0, 0.0, -1.0], proj, PickKinds::EDGES);
++        q.radius = 2.0;
++        assert_eq!(pick_bodies(std::slice::from_ref(&b), &q), None, "the diagonal is no edge ({proj:?})");
++        q.through = true;
++        assert_eq!(pick_bodies(std::slice::from_ref(&b), &q), None, "not even picking through");
++        q.through = false;
++        q.kinds = PickKinds::ALL;
++        let pick = pick_bodies(std::slice::from_ref(&b), &q).expect("the face");
++        let PickTarget::Face { face, sel, .. } = pick.target else { panic!("not a face: {pick:?}") };
++        assert_eq!(b.graph.faces[face as usize].facets.len(), 2, "the whole top face, both triangles");
++        assert!(matches!(sel, Some(FeatureSel::Face(_))), "a flat face keys as a Face");
++        assert!(near(pick.at, [10.0, 10.0, 10.0], 1e-9));
++    }
++}
++
++#[test]
++fn cylinder_facet_edges_are_not_pickable_but_its_rim_is() {
++    let b = body("rod", mesh_tris(cylinder(20.0, 10.0, 48)));
++    let raw = b.graph.features.edges.len();
++    assert_eq!(b.graph.edges.len(), 96, "two 48-segment rims, nothing else");
++    assert!(raw > 96, "the topology also carries the strip seams ({raw}); the graph filters them");
++    assert!(b.graph.points.is_empty(), "a round rim has no corners");
++    // Its two circles, with centres.
++    assert_eq!(b.graph.arcs.len(), 2);
++    for z in [0.0, 10.0] {
++        let a = b.graph.arcs.iter().find(|a| (a.centre[2] - z).abs() < 1e-6).expect("rim circle");
++        assert!(a.closed && (a.radius - 10.0).abs() < 1e-6, "{a:?}");
++        assert!(near(a.centre, [0.0, 0.0, z], 1e-6), "{a:?}");
++        assert_eq!(a.edges.len(), 48);
++    }
++    let one = std::slice::from_ref(&b);
++    // Straight at the wall's facet seam (x = 10, y = 0): no edge there.
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        let q = query([100.0, 0.0, 5.0], [-1.0, 0.0, 0.0], proj, PickKinds::EDGES);
++        assert_eq!(pick_bodies(one, &q), None, "a facet seam is no edge ({proj:?})");
++        let q = query([100.0, 0.0, 5.0], [-1.0, 0.0, 0.0], proj, PickKinds::ALL);
++        let pick = pick_bodies(one, &q).expect("the wall");
++        let PickTarget::Face { face, sel, .. } = pick.target else { panic!("not a face: {pick:?}") };
++        assert_eq!(b.graph.faces[face as usize].facets.len(), 96, "the whole wall");
++        assert!(matches!(sel, Some(FeatureSel::Patch(_))), "a smooth wall keys as a Patch");
++    }
++    // At the top rim from above and outside: the rim edge.
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        let q = aim([60.0, 3.0, 40.0], [10.0, 0.0, 10.0], proj, PickKinds::ALL);
++        let pick = pick_bodies(one, &q).expect("the rim");
++        let (p, r) = edge_ends(&b, &pick);
++        assert!((p[2] - 10.0).abs() < 1e-9 && (r[2] - 10.0).abs() < 1e-9, "top rim edge, got {p:?} {r:?}");
++    }
++    // The cap's fan centre is an interior vertex - but the rim's centre
++    // is there when centres are asked for.
++    let q = query([0.3, 0.0, 50.0], [0.0, 0.0, -1.0], Projection::Ortho, PickKinds::POINTS);
++    assert_eq!(pick_bodies(one, &q), None, "an interior vertex is no point");
++    let q = query([0.3, 0.0, 50.0], [0.0, 0.0, -1.0], Projection::Ortho, PickKinds::CENTRES);
++    let pick = pick_bodies(one, &q).expect("the rim centre");
++    assert!(matches!(pick.target, PickTarget::Centre { .. }));
++    assert!(near(pick.at, [0.0, 0.0, 10.0], 1e-6), "{pick:?}");
++}
++
++/// The block with its top face fanned from (10, 10, 10): an interior
++/// vertex inside a flat face.
++fn fanned_block() -> Vec<Triangle> {
++    let mut tris: Vec<Triangle> = block().into_iter().filter(|t| !(t.a.z == 10.0 && t.b.z == 10.0 && t.c.z == 10.0)).collect();
++    let c = Point3::new(10.0, 10.0, 10.0);
++    let ring = [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
++    for k in 0..4 {
++        let (p, q) = (ring[k], ring[(k + 1) % 4]);
++        tris.push(Triangle::new(c, Point3::new(p[0], p[1], 10.0), Point3::new(q[0], q[1], 10.0)));
++    }
++    tris
++}
++
++#[test]
++fn a_box_corner_is_a_point_but_a_vertex_inside_a_face_is_not() {
++    let b = body("block", block());
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        let q = aim([60.0, -40.0, 40.0], [20.2, 0.1, 9.9], proj, PickKinds::ALL);
++        let pick = pick_bodies(std::slice::from_ref(&b), &q).expect("the corner");
++        let PickTarget::Point(p) = pick.target else { panic!("not a point: {pick:?}") };
++        assert_eq!(p.kind, PointKind::Corner);
++        assert!(near(pick.at, [20.0, 0.0, 10.0], 1e-9), "{pick:?}");
++    }
++    let f = body("fanned", fanned_block());
++    assert_eq!(f.graph.edges.len(), 12, "the fan's spokes are no edges");
++    assert!(!f.graph.points.iter().any(|p| near(p.at, [10.0, 10.0, 10.0], 1e-9)), "the fan centre is no point");
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        let q = query([10.0, 10.0, 50.0], [0.0, 0.0, -1.0], proj, PickKinds::POINTS);
++        assert_eq!(pick_bodies(std::slice::from_ref(&f), &q), None, "the fan centre is not pickable");
++        let q = query([10.0, 10.0, 50.0], [0.0, 0.0, -1.0], proj, PickKinds::ALL);
++        let pick = pick_bodies(std::slice::from_ref(&f), &q).expect("the face");
++        let PickTarget::Face { face, .. } = pick.target else { panic!("not a face: {pick:?}") };
++        assert_eq!(f.graph.faces[face as usize].facets.len(), 4, "all four fan triangles are one face");
++    }
++}
++
++/// Rays through the block's back-bottom edge at (10, 20, 0), looking
++/// forward and down, so the near (front) face hides it.
++fn far_edge_queries() -> [PickQuery; 2] {
++    let n = (1.0_f64 + 0.09).sqrt();
++    let d = [0.0, 1.0 / n, -0.3 / n];
++    let t = [10.0, 20.0, 0.0];
++    let back = |s: f64| [t[0] - d[0] * s, t[1] - d[1] * s, t[2] - d[2] * s];
++    [
++        // Perspective: the ray leaves the eye, diverging sight lines.
++        query(back(100.0), d, Projection::Perspective, PickKinds::EDGES),
++        // Ortho: a parallel ray from the view plane, farther back.
++        query(back(400.0), d, Projection::Ortho, PickKinds::EDGES),
++    ]
++}
++
++#[test]
++fn a_far_side_edge_is_not_picked_through_the_near_face() {
++    let b = body("block", block());
++    let one = std::slice::from_ref(&b);
++    for q in far_edge_queries() {
++        assert_eq!(pick_bodies(one, &q), None, "hidden edge picked ({:?})", q.ray.projection);
++        let mut all = q;
++        all.kinds = PickKinds::ALL;
++        let pick = pick_bodies(one, &all).expect("the front face");
++        assert!(matches!(pick.target, PickTarget::Face { .. }), "{pick:?}");
++        assert!(pick.at[1].abs() < 1e-9, "the near face, y = 0: {pick:?}");
++    }
++}
++
++#[test]
++fn pick_through_does_pick_the_far_side_edge() {
++    let b = body("block", block());
++    for mut q in far_edge_queries() {
++        q.through = true;
++        let pick = pick_bodies(std::slice::from_ref(&b), &q).expect("the far edge, through");
++        let (p, r) = edge_ends(&b, &pick);
++        assert!(p[1] == 20.0 && r[1] == 20.0 && p[2] == 0.0 && r[2] == 0.0, "back-bottom edge, got {p:?} {r:?}");
++        assert!(near(pick.at, [10.0, 20.0, 0.0], 1e-6), "{pick:?}");
++    }
++}
++
++#[test]
++fn the_world_pick_honours_placements() {
++    let world = new_world();
++    ImportModel::from_mesh("block", cube(Point3::ZERO, Point3::new(20.0, 20.0, 10.0))).apply(&world);
++    let e = model::find_by_name(&world, "block").expect("entity");
++    model::set_transform(&world, &e, Location { pos: Point3::new(100.0, 0.0, 0.0), rot: IDENTITY_Q });
++    let q = aim([160.0, -40.0, 40.0], [120.0, 0.0, 10.0], Projection::Perspective, PickKinds::ALL);
++    let pick = pick_feature(&world, &q, |_| false).expect("the placed corner");
++    assert_eq!(pick.entity, "block");
++    assert!(matches!(pick.target, PickTarget::Point(_)), "{pick:?}");
++    assert!(near(pick.at, [120.0, 0.0, 10.0], 1e-9), "{pick:?}");
++    // The unplaced spot is empty now.
++    let q = aim([60.0, -40.0, 40.0], [20.0, 0.0, 10.0], Projection::Perspective, PickKinds::ALL);
++    assert_eq!(pick_feature(&world, &q, |_| false), None);
++    assert_eq!(pick_feature(&world, &q, |n| n == "block"), None, "a skipped entity is not there");
++}
++
++#[test]
++fn degenerate_input_picks_nothing_and_never_panics() {
++    let down = query([0.5, 0.5, 10.0], [0.0, 0.0, -1.0], Projection::Ortho, PickKinds::ALL);
++    assert_eq!(pick_bodies(&[], &down), None, "no bodies");
++    let empty = body("empty", Vec::new());
++    assert!(empty.graph.edges.is_empty() && empty.graph.points.is_empty() && empty.graph.faces.is_empty());
++    assert_eq!(pick_bodies(std::slice::from_ref(&empty), &down), None, "an empty mesh");
++
++    let nan = f64::NAN;
++    let junk = vec![
++        Triangle::new(Point3::new(nan, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)),
++        Triangle::new(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0), Point3::new(2.0, 2.0, 0.0)),
++        Triangle::new(Point3::ZERO, Point3::ZERO, Point3::ZERO),
++        Triangle::new(Point3::new(f64::INFINITY, 0.0, 0.0), Point3::ZERO, Point3::new(0.0, 0.0, 1.0)),
++    ];
++    let g = feature_graph(&junk);
++    assert!(g.points.iter().all(|p| p.at.iter().all(|v| v.is_finite())));
++    let j = body("junk", junk);
++    for proj in [Projection::Ortho, Projection::Perspective] {
++        for through in [false, true] {
++            let mut q = down;
++            q.ray.projection = proj;
++            q.through = through;
++            assert_eq!(pick_bodies(std::slice::from_ref(&j), &q), None, "junk mesh ({proj:?}, through {through})");
++        }
++    }
++
++    // Garbage rays and radii against a real block.
++    let b = body("block", block());
++    let one = std::slice::from_ref(&b);
++    for (o, d) in [
++        ([nan, 0.0, 0.0], [0.0, 0.0, -1.0]),
++        ([10.0, 10.0, 50.0], [0.0, 0.0, 0.0]),
++        ([10.0, 10.0, 50.0], [0.0, nan, -1.0]),
++        ([10.0, 10.0, 50.0], [0.0, 0.0, f64::INFINITY]),
++    ] {
++        assert_eq!(pick_bodies(one, &query(o, d, Projection::Perspective, PickKinds::ALL)), None);
++    }
++    for r in [nan, -5.0, f64::INFINITY] {
++        let mut q = aim([60.0, -40.0, 40.0], [20.2, 0.1, 9.9], Projection::Perspective, PickKinds::POINTS);
++        q.radius = r;
++        assert_eq!(pick_bodies(one, &q), None, "radius {r} snaps to nothing");
++    }
++
++    // The arc fit refuses straight and too-short runs.
++    assert_eq!(circumcircle([0.0; 3], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]), None);
++    assert_eq!(circumcircle([0.0; 3], [0.0; 3], [nan, 0.0, 0.0]), None);
++    let line: Vec<[f64; 3]> = (0..5).map(|i| [f64::from(i), 0.0, 0.0]).collect();
++    assert_eq!(fit_arc(&line, false, vec![0, 1, 2, 3]), None);
++    assert_eq!(fit_arc(&[], true, Vec::new()), None);
++}
+diff --git a/docs/decisions/692-pick-graph.md b/docs/decisions/692-pick-graph.md
+new file mode 100644
+index 000000000..dd2d8b565
+--- /dev/null
++++ b/docs/decisions/692-pick-graph.md
+@@ -0,0 +1,54 @@
++## #692 - one feature graph and pick rule (step 1: the app-layer service)
++
++- **Chosen:** `app::pick::feature_graph` builds, per mesh, the only things a
++  click may land on: welded faces (one `geometry::feature` `facet_patch`
++  root each), feature edges, feature points and round-edge centres.
++  `app::pick::feature_pick` resolves a ray against it: the front-most
++  surface hit (models beat stock, as `first_hit_f`), then a snap within the
++  radius by point > centre > edge > face, only among the kinds the caller
++  accepts, each edge/point candidate occlusion-tested unless `through`.
++  The UI pickers and MCP tools are not rewired yet (step 2).
++- **Reuse, not a second weld:** the welded faces are `geometry::feature`'s
++  smooth patches (its 40-degree dihedral union), the same ones
++  `list_features` reports, so the MCP view and the click agree; the graph
++  is built from the content-cached `model::features_of_local` and cached
++  itself the same way (cap-8 MRU by facet digest). `list_features` is
++  unchanged.
++- **Thresholds:**
++  - Feature edge: open boundary (one facet with area), non-manifold fold
++    (two or more facets with area), or a crease between two DIFFERENT
++    welded faces; inside one welded face only if it bends past
++    `CREASE_DEG` = 40 degrees (the weld's own rule, so they cannot
++    disagree). `Features::edges` alone was not enough: it keeps the
++    "tangent seams" between exact-plane strips - every facet edge of a
++    tessellated cylinder - which is the issue's bug.
++  - Zero-area / non-finite facets make no feature edge (slivers bound
++    nothing; this is also what keeps junk meshes pick-free).
++  - Feature point: a vertex with 3+ feature edges (corner), exactly 1 (open
++    chain end), or 2 turning by more than `TURN_DEG` = 30 degrees - the
++    same angle as `feature::CHAIN_TANGENT_DEG`, so a point is exactly where
++    a chain would split. A 48-segment rim (7.5 degrees per vertex) has no
++    points; a box corner always does.
++  - Arc centre: a run of 3+ feature edges between feature points (or a
++    closed loop with none) whose vertices all lie on the circumcircle of
++    three spread samples within max(0.1 % of r, 1 µm), in plane to the same
++    tolerance; samples with sin(angle) under 1e-4 count as straight (no
++    kilometre-wide "arcs" from weld noise on a straight edge).
++  - Visibility: the sight segment from the candidate back to the eye
++    (perspective) or along the parallel view direction to the view plane
++    (ortho) must not cross a non-stock facet (or the candidate's own body)
++    earlier than max(1 µm, 1e-4 x distance) before the candidate - the
++    vertex picker's existing `depth_tol`, so the slack is unchanged.
++  - Radius: world units at the surface hit; in perspective it scales with
++    depth (radius x depth / hit depth) so it stays one screen size. A
++    non-finite or negative radius snaps to nothing (faces still pick).
++- **Dropped:** a screen-space API taking the MVP and pixel radius (keeps
++  the service camera-free and testable; the UI converts px to mm at the
++  hit in step 2); occlusion against the stock (translucent, and a model
++  beats it at any depth already); feature points at every feature-edge
++  endpoint (`feature::corner_verts`, today's vertex pick) - it makes every
++  rim vertex of a round hole pickable, which the issue forbids. That
++  function stays for the existing `FeatureSel::Vertex` ids.
++- **Cost to change later:** the angles are named constants in
++  `pick/feature_graph.rs` and `pick/feature_arc.rs`; the pin tests in
++  `crates/app/tests/feature_pick.rs` say which cases each one protects.
+
+From 9a61c2e16090071c7fb1e1072501e46db76606f3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Tue, 10 Nov 2026 06:19:01 -0800
+Subject: [PATCH 2/3] feat(ui,app): every picker resolves through the one pick
+ rule (#692 step 2)
+
+Every viewport Face/Edge/Vertex click and hover now goes through
+ui::feature_click -> app::pick::pick_selection (pick_feature plus the
+FeatureSel a page stores). The plane row takes faces only, an axis takes
+edges or points, and operation geometry takes faces / edges+faces / points
+by mode. The armed Setups row decides the kinds before the pick mode does.
+Removed: interact's screen-space edge_nearest (no occlusion test, facet
+seams included), feature_of_facet, the raycast face pick, and
+vertex_pick's nearest_vertex/sight_origin/vertex_nearest.
+
+App:
+- PickQuery::radius_per_depth holds one screen size at the silhouette.
+- feature_graph_shared caches graphs per facet allocation (no per-frame
+  re-hash).
+- Chains and runs are memoized on the graph.
+- At most 32 sight rays per tier.
+- pick_bodies_of skips non-active setups' stocks.
+- MCP list_features lists only feature chains and feature points, and
+  every pick by id passes pick::check_pickable.
+
+Pick-through is not offered (through: false everywhere); see
+docs/decisions/692-pick-wire.md.
+
+Refs #692 (fixture locate wires when #566 lands)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/mcp/features.rs                |  42 +--
+ crates/app/src/mcp/pick.rs                    |   5 +-
+ crates/app/src/pick.rs                        |   8 +-
+ crates/app/src/pick/feature_graph.rs          |  70 ++++-
+ crates/app/src/pick/feature_pick.rs           |  39 ++-
+ crates/app/src/pick/feature_sel.rs            | 122 ++++++++
+ crates/app/tests/feature_pick.rs              |   2 +-
+ crates/app/tests/feature_pick_wire.rs         | 181 ++++++++++++
+ crates/app/tests/mcp_pick.rs                  |  28 ++
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ crates/ui/src/egui_app/tests/one_pick_rule.rs | 248 ++++++++++++++++
+ .../ui/src/egui_app/tests/plane_face_pick.rs  |  10 +-
+ crates/ui/src/feature_click.rs                | 164 +++++++++++
+ crates/ui/src/interact.rs                     | 269 ++----------------
+ crates/ui/src/law_tests.rs                    |  37 ++-
+ crates/ui/src/lib.rs                          |   1 +
+ crates/ui/src/vertex_pick.rs                  | 171 +----------
+ crates/ui/src/vertex_pick_tests.rs            | 164 +++++------
+ docs/decisions/692-pick-wire.md               |  83 ++++++
+ 19 files changed, 1101 insertions(+), 545 deletions(-)
+ create mode 100644 crates/app/src/pick/feature_sel.rs
+ create mode 100644 crates/app/tests/feature_pick_wire.rs
+ create mode 100644 crates/ui/src/egui_app/tests/one_pick_rule.rs
+ create mode 100644 crates/ui/src/feature_click.rs
+ create mode 100644 docs/decisions/692-pick-wire.md
+
+diff --git a/crates/app/src/mcp/features.rs b/crates/app/src/mcp/features.rs
+index 62fe85fb8..29c80813e 100644
+--- a/crates/app/src/mcp/features.rs
++++ b/crates/app/src/mcp/features.rs
+@@ -1,6 +1,9 @@
+ //! `list_features` (#180): a model's pickable features - faces with their
+ //! boundary loops, tangent edge chains, welded smooth faces and corner
+ //! vertices - each under the stable geometry-hash id the pick tools take.
++//! #692: chains and vertices are the one pick rule's (`pick::feature_sel`):
++//! feature edges and feature points only, never a smooth wall's facet
++//! seams or the vertices along a round rim.
+ //!
+ //! Provenance: our own read-only view over `geometry::feature`'s topology
+ //! (this repo's M1.5 / M13.4 design); no vendor material consulted.
+@@ -11,6 +14,7 @@ use crate::geometry::feature::{self, FaceKind, Features, LoopKind};
+ use crate::geometry::{transform_point, Point3};
+ use crate::model;
+ use crate::operation::FeatureSel;
++use crate::pick::{FeatureGraph, feature_chains, feature_graph_shared};
+ use crate::schema::Location;
+ use crate::script::{fnum, Env};
+ 
+@@ -77,9 +81,10 @@ fn facing(n: [f64; 3]) -> &'static str {
+ 
+ /// Feature edge -> tangent chain id, keyed by its welded end pair, so a
+ /// face's boundary ring can name the chains that run it.
+-fn edge_chains(f: &Features) -> HashMap<(u32, u32), u64> {
++fn edge_chains(g: &FeatureGraph) -> HashMap<(u32, u32), u64> {
++    let f = &*g.features;
+     let mut out = HashMap::new();
+-    for c in feature::chains(f) {
++    for c in feature_chains(g) {
+         for &ei in &c.edges {
+             if let Some(e) = f.edges.get(ei as usize) {
+                 out.insert((e.a.min(e.b), e.a.max(e.b)), c.id);
+@@ -118,8 +123,9 @@ fn loop_view(lp: &feature::Loop, by_edge: &HashMap<(u32, u32), u64>, loc: &Locat
+     })
+ }
+ 
+-fn faces_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
+-    let by_edge = edge_chains(f);
++fn faces_view(g: &FeatureGraph, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let f = &*g.features;
++    let by_edge = edge_chains(g);
+     // Strip -> welded smooth face, so a strip names the logical face too.
+     let mut patch_of: HashMap<u64, u64> = HashMap::new();
+     for p in feature::patches(f) {
+@@ -148,8 +154,9 @@ fn faces_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize)
+     (rows, planar.len())
+ }
+ 
+-fn chains_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
+-    let all = feature::chains(f);
++fn chains_view(g: &FeatureGraph, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let f = &*g.features;
++    let all = feature_chains(g);
+     let rows = all
+         .iter()
+         .take(limit)
+@@ -190,14 +197,11 @@ fn patches_view(f: &Features, limit: usize) -> (Vec<Value>, usize) {
+     (rows, all.len())
+ }
+ 
+-fn vertices_view(f: &Features, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
+-    let all: Vec<Value> = feature::corner_verts(f)
++fn vertices_view(g: &FeatureGraph, loc: &Location, limit: usize) -> (Vec<Value>, usize) {
++    let all: Vec<Value> = g
++        .points
+         .iter()
+-        .filter_map(|&vi| {
+-            let id = feature::vertex_id(f, vi)?;
+-            let p = f.verts.get(vi as usize)?;
+-            Some(json!({ "id": feature_id(FeatureSel::Vertex(id)), "at": pt(world_pt(loc, *p)) }))
+-        })
++        .map(|p| json!({ "id": feature_id(FeatureSel::Vertex(p.id)), "at": pt(world_pt(loc, p.at)) }))
+         .collect();
+     let total = all.len();
+     (all.into_iter().take(limit).collect(), total)
+@@ -235,16 +239,18 @@ pub(super) fn list_features(env: &mut Env, a: &Map<String, Value>) -> Result<Val
+     let limit = limit_of(a)?;
+     let e = req_model(env, name)?;
+     let w = &env.world;
+-    let f = model::features_of(w, &e).ok_or_else(|| format!("'{name}' has no geometry to pick from"))?;
++    let tris = model::facets_of(w, &e).ok_or_else(|| format!("'{name}' has no geometry to pick from"))?;
++    let g = feature_graph_shared(&tris);
++    let f = &*g.features;
+     let loc = model::transform_of(w, &e).unwrap_or_default();
+     let mut out = json!({ "model": name, "frame": "world", "truncated": false });
+     let mut truncated = false;
+     for k in kinds {
+         let (rows, total) = match k {
+-            "faces" => faces_view(&f, &loc, limit),
+-            "chains" => chains_view(&f, &loc, limit),
+-            "patches" => patches_view(&f, limit),
+-            _ => vertices_view(&f, &loc, limit),
++            "faces" => faces_view(&g, &loc, limit),
++            "chains" => chains_view(&g, &loc, limit),
++            "patches" => patches_view(f, limit),
++            _ => vertices_view(&g, &loc, limit),
+         };
+         truncated |= rows.len() < total;
+         out[k] = Value::Array(rows);
+diff --git a/crates/app/src/mcp/pick.rs b/crates/app/src/mcp/pick.rs
+index 55b4ad934..bd9144099 100644
+--- a/crates/app/src/mcp/pick.rs
++++ b/crates/app/src/mcp/pick.rs
+@@ -72,7 +72,10 @@ fn pick_of(env: &Env, v: &Value) -> Result<GeoSel, String> {
+     let entity = req_str(m, "model")?;
+     req_model(env, entity)?;
+     let feature = parse_feature_id(req_str(m, "id")?)?;
+-    Ok(GeoSel { entity: entity.to_owned(), feature })
++    let pick = GeoSel { entity: entity.to_owned(), feature };
++    // #692: the one pick rule - an id is taken only if a click could land on it.
++    crate::pick::check_pickable(&env.world, &pick)?;
++    Ok(pick)
+ }
+ 
+ /// A pick list: a non-empty array of `{model, id}`.
+diff --git a/crates/app/src/pick.rs b/crates/app/src/pick.rs
+index df731c06a..ccac719e0 100644
+--- a/crates/app/src/pick.rs
++++ b/crates/app/src/pick.rs
+@@ -10,6 +10,7 @@ pub mod face;
+ pub mod feature_arc;
+ pub mod feature_graph;
+ pub mod feature_pick;
++pub mod feature_sel;
+ pub mod plane;
+ pub mod winding;
+ 
+@@ -18,11 +19,16 @@ pub use axis::{AxisPick, InPlaneAxes, InPlaneAxis, in_plane_turn_deg, pick_coord
+ pub use plane::{PlaneLay, lay_on_plane, plane_label, plane_side};
+ pub use face::{FaceOrigin, face_origin, facets_centroid};
+ pub use feature_arc::ArcCentre;
+-pub use feature_graph::{FeatureGraph, FeaturePoint, PointKind, WeldedFace, feature_graph, feature_graph_cached};
++pub use feature_graph::{
++    FeatureGraph, FeaturePoint, PointKind, WeldedFace, feature_graph, feature_graph_cached, feature_graph_shared,
++};
+ pub use feature_pick::{
+     FeaturePick, PickBody, PickKinds, PickQuery, PickRay, PickTarget, Projection, pick_bodies, pick_bodies_of,
+     pick_feature,
+ };
++pub use feature_sel::{
++    EdgeUnit, check_pickable, feature_chains, graph_of, is_feature_chain, pick_selection, selection_of,
++};
+ 
+ use flecs_ecs::prelude::World;
+ 
+diff --git a/crates/app/src/pick/feature_graph.rs b/crates/app/src/pick/feature_graph.rs
+index 4387a69bf..eb5368a94 100644
+--- a/crates/app/src/pick/feature_graph.rs
++++ b/crates/app/src/pick/feature_graph.rs
+@@ -19,10 +19,10 @@
+ //! open sheet, or is a non-manifold fold.
+ 
+ use std::collections::HashMap;
+-use std::sync::Arc;
++use std::sync::{Arc, OnceLock};
+ 
+ use crate::geometry::Triangle;
+-use crate::geometry::feature::{self, EdgeKind, Features, VertexId};
++use crate::geometry::feature::{self, Chain, EdgeKind, Features, VertexId};
+ use crate::model;
+ use crate::operation::FeatureSel;
+ 
+@@ -84,6 +84,11 @@ pub struct FeatureGraph {
+     pub points: Vec<FeaturePoint>,
+     /// Centres of round feature-edge runs (circles and arcs).
+     pub arcs: Vec<ArcCentre>,
++    /// `feature::chains` / `feature::edge_runs` of `features`, derived on
++    /// first use and kept with the cached graph, so a per-frame edge
++    /// hover never re-walks them.
++    chains: OnceLock<Vec<Chain>>,
++    runs: OnceLock<Vec<Chain>>,
+ }
+ 
+ impl FeatureGraph {
+@@ -93,6 +98,18 @@ impl FeatureGraph {
+         self.faces.get(*self.face_of_facet.get(facet)? as usize)
+     }
+ 
++    /// Every tangent chain of the topology (memoized `feature::chains`).
++    #[must_use]
++    pub fn chains(&self) -> &[Chain] {
++        self.chains.get_or_init(|| feature::chains(&self.features))
++    }
++
++    /// Every run of the topology (memoized `feature::edge_runs`).
++    #[must_use]
++    pub fn runs(&self) -> &[Chain] {
++        self.runs.get_or_init(|| feature::edge_runs(&self.features))
++    }
++
+     /// The local endpoints of feature edge `edge` (an index into
+     /// `features.edges`).
+     #[must_use]
+@@ -140,6 +157,53 @@ pub fn feature_graph_cached(tris: &[Triangle]) -> Arc<FeatureGraph> {
+     })
+ }
+ 
++/// How many live meshes [`feature_graph_shared`] remembers.
++const SHARED_CAP: usize = 32;
++
++/// One shared-cache entry: the mesh allocation (weak) and its graph.
++type SharedEntry = (std::sync::Weak<[Triangle]>, Arc<FeatureGraph>);
++
++thread_local! {
++    /// Graphs keyed by the facet allocation itself (#692 step 2): an
++    /// entity's `Facets` is an immutable `Arc<[Triangle]>` that every
++    /// landing replaces, so a live allocation at the same address IS the
++    /// same geometry. Entries whose mesh is gone are dropped on the next
++    /// call; a hit costs a pointer compare, never a re-hash of the facets.
++    static SHARED_CACHE: std::cell::RefCell<Vec<SharedEntry>> =
++        const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// [`feature_graph_cached`] for a mounted mesh, memoized by its shared
++/// allocation first - what the per-frame hover pick calls for every body.
++#[must_use]
++pub fn feature_graph_shared(tris: &Arc<[Triangle]>) -> Arc<FeatureGraph> {
++    if tris.is_empty() {
++        return Arc::new(FeatureGraph::default());
++    }
++    let key = Arc::downgrade(tris);
++    let hit = SHARED_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        cache.retain(|(w, _)| w.strong_count() > 0);
++        let i = cache.iter().position(|(w, _)| w.ptr_eq(&key))?;
++        let entry = cache.remove(i);
++        let g = entry.1.clone();
++        cache.push(entry); // MRU bump
++        Some(g)
++    });
++    if let Some(g) = hit {
++        return g;
++    }
++    let g = feature_graph_cached(tris);
++    SHARED_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.len() >= SHARED_CAP {
++            cache.remove(0);
++        }
++        cache.push((key, g.clone()));
++    });
++    g
++}
++
+ fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+ }
+@@ -326,5 +390,5 @@ fn graph_of(features: Arc<Features>, tris: &[Triangle]) -> FeatureGraph {
+         }
+     }
+ 
+-    FeatureGraph { features, face_of_facet, faces, edges, points, arcs }
++    FeatureGraph { features, face_of_facet, faces, edges, points, arcs, chains: OnceLock::new(), runs: OnceLock::new() }
+ }
+diff --git a/crates/app/src/pick/feature_pick.rs b/crates/app/src/pick/feature_pick.rs
+index 1a2f40c54..32fe52f1f 100644
+--- a/crates/app/src/pick/feature_pick.rs
++++ b/crates/app/src/pick/feature_pick.rs
+@@ -22,7 +22,7 @@ use crate::model;
+ use crate::operation::FeatureSel;
+ use crate::schema::Location;
+ 
+-use super::feature_graph::{FeatureGraph, FeaturePoint, feature_graph_cached};
++use super::feature_graph::{FeatureGraph, FeaturePoint, feature_graph_shared};
+ use super::ray_triangle;
+ 
+ /// How the view casts rays: perspective sight lines meet at the ray's
+@@ -67,6 +67,13 @@ pub struct PickQuery {
+     /// Snap radius in world units (mm) at the surface hit. In perspective
+     /// it scales with depth, so it stays one screen-space size.
+     pub radius: f64,
++    /// Perspective only (#692 step 2): when finite and above 0, the snap
++    /// radius at depth `t` along the ray is `radius_per_depth * t` mm -
++    /// one screen-space size at every depth, a miss included (the
++    /// silhouette, where an edge pick belongs and no surface anchors
++    /// `radius`). The viewport sets it from its pixel radius and field of
++    /// view; 0 keeps `radius` anchored at the hit.
++    pub radius_per_depth: f64,
+     pub kinds: PickKinds,
+     /// Ignore occlusion: pick edges and points behind the model. Off by
+     /// default everywhere; only an explicit "pick through" mode sets it.
+@@ -112,14 +119,22 @@ pub struct PickBody {
+ }
+ 
+ impl PickBody {
+-    /// A model body at `pose`, its graph from the shared cache.
++    /// A model body at `pose`, its graph from the shared cache (keyed by
++    /// the facet allocation, so a per-frame call never re-hashes a mesh).
+     #[must_use]
+     pub fn new(name: &str, tris: Arc<[Triangle]>, pose: Location) -> PickBody {
+-        let graph = feature_graph_cached(&tris);
++        let graph = feature_graph_shared(&tris);
+         PickBody { name: name.to_string(), tris, graph, pose, stock: false }
+     }
+ }
+ 
++/// At most this many candidates per tier pay for a sight ray (#692 step
++/// 2): a dense run of hidden ones - the far rim of a finely tessellated
++/// bore - would otherwise cost one full ray per chord. Past the cap the
++/// tier yields to the next (an edge to the face); the loss is a visible
++/// feature ranked below 32 hidden ones, never a hidden pick.
++const OCCLUSION_TRIES: usize = 32;
++
+ /// Visibility slack of the occlusion ray, mm: the facets that meet AT an
+ /// edge or corner cross the sight line at its own distance.
+ fn sight_tol(len: f64) -> f64 {
+@@ -234,7 +249,9 @@ pub fn pick_bodies(bodies: &[PickBody], q: &PickQuery) -> Option<FeaturePick> {
+     let surface = hit.map(|(_, _, t)| along(o, d, t));
+     // Perspective: one screen-space radius means a world radius growing
+     // with depth, anchored at the surface hit.
++    let per_depth = if q.radius_per_depth.is_finite() && q.radius_per_depth > 0.0 { q.radius_per_depth } else { 0.0 };
+     let reach = |depth: f64| match (q.ray.projection, hit) {
++        (Projection::Perspective, _) if per_depth > 0.0 => per_depth * depth,
+         (Projection::Perspective, Some((_, _, t))) if t > 0.0 => radius * depth / t,
+         _ => radius,
+     };
+@@ -273,7 +290,8 @@ pub fn pick_bodies(bodies: &[PickBody], q: &PickQuery) -> Option<FeaturePick> {
+         // Nearest the ray first, then nearest the eye; only the winners
+         // pay for the occlusion test.
+         tier.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+-        let found = tier.into_iter().find(|c| q.through || !occluded(bodies, c.2, &q.ray, d, c.4));
++        let tries = if q.through { usize::MAX } else { OCCLUSION_TRIES };
++        let found = tier.into_iter().take(tries).find(|c| q.through || !occluded(bodies, c.2, &q.ray, d, c.4));
+         if let Some((_, _, bi, target, at)) = found {
+             let entity = bodies.get(bi)?.name.clone();
+             return Some(FeaturePick { entity, target, at, surface });
+@@ -289,19 +307,26 @@ pub fn pick_bodies(bodies: &[PickBody], q: &PickQuery) -> Option<FeaturePick> {
+     Some(FeaturePick { entity: b.name.clone(), target: PickTarget::Face { facet, face, sel }, at: surface?, surface })
+ }
+ 
+-/// The world's pickable bodies: every named entity with facets except
+-/// those `skip` names (hidden in the view), at its view pose (#326).
++/// The world's pickable bodies - what the viewport draws: every named
++/// entity with facets except those `skip` names (hidden in the view) and
++/// the stocks of setups other than the active one (only the active
++/// setup's stock stands in the viewport), each at its view pose (#326).
+ #[must_use]
+ pub fn pick_bodies_of(world: &World, skip: impl Fn(&str) -> bool) -> Vec<PickBody> {
++    let shown_stock = crate::setup::stock_entity_name(world, crate::setup::active(world).as_deref());
+     let mut out = Vec::new();
+     for (name, entity) in model::named_entities(world) {
+         if skip(&name) {
+             continue;
+         }
++        let stock = model::is_stock(world, &entity);
++        if stock && name != shown_stock {
++            continue;
++        }
+         let Some(tris) = model::facets_of(world, &entity) else { continue };
+         let pose = crate::setup_align::view_pose(world, &entity).unwrap_or_default();
+         let mut body = PickBody::new(&name, tris, pose);
+-        body.stock = model::is_stock(world, &entity);
++        body.stock = stock;
+         out.push(body);
+     }
+     out
+diff --git a/crates/app/src/pick/feature_sel.rs b/crates/app/src/pick/feature_sel.rs
+new file mode 100644
+index 000000000..e59d2de3f
+--- /dev/null
++++ b/crates/app/src/pick/feature_sel.rs
+@@ -0,0 +1,122 @@
++//! From a resolved pick to the selection the pages store (#692 step 2):
++//! a feature point is a `Vertex`, a welded face its `Face`/`Patch` key,
++//! and a feature edge the `Chain` the asking page takes - the tangent
++//! chain, the run (one straight stretch or one arc) or the one segment.
++//! Plus the one rule read backwards, for picks made by id (MCP): a stored
++//! vertex or chain is pickable only if a click could have landed on it.
++//!
++//! Provenance: our own code over this repo's `geometry::feature` chains
++//! and runs (M1.5 / M11.5 design); no vendor material consulted.
++
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use crate::geometry::feature::{self, Chain};
++use crate::model;
++use crate::operation::{FeatureSel, GeoSel};
++
++use super::feature_graph::{FeatureGraph, feature_graph_shared};
++use super::feature_pick::{FeaturePick, PickQuery, PickTarget, pick_feature};
++
++/// What an edge pick selects.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum EdgeUnit {
++    /// The tangent-continuous chain the edge lies on (operation geometry).
++    #[default]
++    Chain,
++    /// The run: one straight stretch or one arc (a boundary, an axis).
++    Run,
++    /// That one segment alone (the Alt pick).
++    Segment,
++}
++
++/// The feature graph of the named entity's mounted facets (shared cache:
++/// a pointer compare on a hit).
++#[must_use]
++pub fn graph_of(world: &World, entity: &str) -> Option<Arc<FeatureGraph>> {
++    let e = model::find_by_name(world, entity)?;
++    let tris = model::facets_of(world, &e)?;
++    Some(feature_graph_shared(&tris))
++}
++
++fn edge_selection(g: &FeatureGraph, edge: u32, unit: EdgeUnit) -> Option<FeatureSel> {
++    let has = |c: &&Chain| c.edges.contains(&edge);
++    let id = match unit {
++        EdgeUnit::Segment => feature::singleton_chain_id(&g.features, edge)?,
++        EdgeUnit::Run => g.runs().iter().find(has)?.id,
++        EdgeUnit::Chain => g.chains().iter().find(has)?.id,
++    };
++    Some(FeatureSel::Chain(id))
++}
++
++/// The selection a pick stands for on `graph` (the picked entity's).
++/// `None` for a centre (no page stores one yet) or a face the topology
++/// could not name.
++#[must_use]
++pub fn selection_of(graph: &FeatureGraph, pick: &FeaturePick, unit: EdgeUnit) -> Option<FeatureSel> {
++    match &pick.target {
++        PickTarget::Point(p) => Some(FeatureSel::Vertex(p.id)),
++        PickTarget::Face { sel, .. } => *sel,
++        PickTarget::Edge { edge } => edge_selection(graph, *edge, unit),
++        PickTarget::Centre { .. } => None,
++    }
++}
++
++/// The one pick over the world, resolved to its stored selection: the
++/// pick (for the highlight) and what a page would store for it.
++#[must_use]
++pub fn pick_selection(
++    world: &World,
++    q: &PickQuery,
++    unit: EdgeUnit,
++    skip: impl Fn(&str) -> bool,
++) -> Option<(FeaturePick, Option<FeatureSel>)> {
++    let pick = pick_feature(world, q, skip)?;
++    let sel = graph_of(world, &pick.entity).and_then(|g| selection_of(&g, &pick, unit));
++    Some((pick, sel))
++}
++
++/// Does every edge of `chain` lie on a feature edge of `graph`?
++#[must_use]
++pub fn is_feature_chain(graph: &FeatureGraph, chain: &Chain) -> bool {
++    !chain.edges.is_empty() && chain.edges.iter().all(|e| graph.edges.binary_search(e).is_ok())
++}
++
++/// The model's tangent chains a click can land on: those made of feature
++/// edges only (never the facet seams of a smooth wall).
++#[must_use]
++pub fn feature_chains(graph: &FeatureGraph) -> Vec<Chain> {
++    graph.chains().iter().filter(|c| is_feature_chain(graph, c)).cloned().collect()
++}
++
++/// The one rule read backwards, for a pick made by id: a vertex must be a
++/// feature point and a chain must run along feature edges. Faces and
++/// welded walls always qualify. An id the model no longer holds is left
++/// to the command's own stale-pick check. Err is a reason the user (or
++/// agent) can act on.
++pub fn check_pickable(world: &World, g: &GeoSel) -> Result<(), String> {
++    let Some(graph) = graph_of(world, &g.entity) else { return Ok(()) };
++    match g.feature {
++        FeatureSel::Vertex(id) => {
++            let known = feature::resolve_vertex(&graph.features, id).is_some();
++            if !known || graph.points.iter().any(|p| p.id == id) {
++                return Ok(());
++            }
++            Err(format!(
++                "{} of '{}' is not a feature point - a point is a corner where model edges meet or the end \
++                 of an open edge, never a vertex along a smooth edge or inside a face",
++                g.feature, g.entity
++            ))
++        }
++        FeatureSel::Chain(id) => match feature::resolve_chain(&graph.features, id) {
++            Some(c) if !is_feature_chain(&graph, &c) => Err(format!(
++                "{} of '{}' runs along the mesh's own triangles, not a model edge - pick an edge where two \
++                 faces meet",
++                g.feature, g.entity
++            )),
++            _ => Ok(()),
++        },
++        FeatureSel::Face(_) | FeatureSel::Patch(_) => Ok(()),
++    }
++}
+diff --git a/crates/app/tests/feature_pick.rs b/crates/app/tests/feature_pick.rs
+index bd082edc6..813c555ca 100644
+--- a/crates/app/tests/feature_pick.rs
++++ b/crates/app/tests/feature_pick.rs
+@@ -33,7 +33,7 @@ fn mesh_tris(m: Mesh) -> Vec<Triangle> {
+ }
+ 
+ fn query(origin: [f64; 3], dir: [f64; 3], projection: Projection, kinds: PickKinds) -> PickQuery {
+-    PickQuery { ray: PickRay { origin, dir, projection }, radius: 1.0, kinds, through: false }
++    PickQuery { ray: PickRay { origin, dir, projection }, radius: 1.0, radius_per_depth: 0.0, kinds, through: false }
+ }
+ 
+ /// A ray from `eye` aimed at `at`.
+diff --git a/crates/app/tests/feature_pick_wire.rs b/crates/app/tests/feature_pick_wire.rs
+new file mode 100644
+index 000000000..552883228
+--- /dev/null
++++ b/crates/app/tests/feature_pick_wire.rs
+@@ -0,0 +1,181 @@
++//! #692 step 2: the one pick rule as the pages call it - a pick resolved
++//! to the selection a page stores (vertex, chain / run / segment, face),
++//! the screen-size radius held at a miss, the per-allocation graph cache a
++//! per-frame hover leans on, the rule read backwards for picks made by id
++//! (MCP), and only the active setup's stock as a pick body. Plus the
++//! timing lane on the largest testdata model.
++//!
++//! Gate map (#692): covers app::pick::feature_sel, app::pick::feature_pick
++//! (radius_per_depth, pick_bodies_of), app::pick::feature_graph
++//! (feature_graph_shared).
++
++use std::sync::Arc;
++use std::time::Instant;
++
++use camcraft_app::commands::{Command, ImportModel};
++use camcraft_app::geometry::{Point3, Triangle, cube, cylinder, feature};
++use camcraft_app::model;
++use camcraft_app::operation::{FeatureSel, GeoSel};
++use camcraft_app::pick::{
++    EdgeUnit, PickBody, PickKinds, PickQuery, PickRay, PickTarget, Projection, check_pickable, feature_graph_shared,
++    graph_of, pick_bodies, pick_selection,
++};
++use camcraft_app::schema::Location;
++use camcraft_app::world::new_world;
++
++fn aim(eye: [f64; 3], at: [f64; 3], kinds: PickKinds) -> PickQuery {
++    let dir = [at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]];
++    let ray = PickRay { origin: eye, dir, projection: Projection::Perspective };
++    PickQuery { ray, radius: 1.0, radius_per_depth: 0.0, kinds, through: false }
++}
++
++fn block_world() -> flecs_ecs::prelude::World {
++    let world = new_world();
++    ImportModel::from_mesh("block", cube(Point3::ZERO, Point3::new(20.0, 20.0, 10.0))).apply(&world);
++    world
++}
++
++#[test]
++fn a_pick_resolves_to_the_selection_its_page_stores() {
++    let world = block_world();
++    let g = graph_of(&world, "block").expect("graph");
++    let f = &*g.features;
++    // A corner: the vertex id.
++    let (pick, sel) =
++        pick_selection(&world, &aim([60.0, -40.0, 40.0], [20.0, 0.0, 10.0], PickKinds::POINTS), EdgeUnit::Chain, |_| false)
++            .expect("the corner");
++    let Some(FeatureSel::Vertex(id)) = sel else { panic!("a point is a vertex: {sel:?}") };
++    assert!(feature::resolve_vertex(f, id).is_some(), "it resolves as stored");
++    assert!(matches!(pick.target, PickTarget::Point(_)));
++    // The top rim's middle, y = 0: chain, run and segment.
++    let q = aim([10.0, -40.0, 40.0], [10.0, 0.0, 10.0], PickKinds::EDGES);
++    let edge_of = |unit| pick_selection(&world, &q, unit, |_| false).expect("the rim");
++    let (pick, chain) = edge_of(EdgeUnit::Chain);
++    let PickTarget::Edge { edge } = pick.target else { panic!("an edge: {pick:?}") };
++    let Some(FeatureSel::Chain(c)) = chain else { panic!("{chain:?}") };
++    assert!(feature::resolve_chain(f, c).is_some_and(|c| c.edges.contains(&edge)));
++    let (_, run) = edge_of(EdgeUnit::Run);
++    assert_eq!(run, feature::run_containing(f, edge).map(|r| FeatureSel::Chain(r.id)));
++    let (_, seg) = edge_of(EdgeUnit::Segment);
++    assert_eq!(seg, feature::singleton_chain_id(f, edge).map(FeatureSel::Chain));
++    // The top face's middle: the planar face key.
++    let (_, face) =
++        pick_selection(&world, &aim([10.0, 10.0, 60.0], [10.0, 10.0, 10.0], PickKinds::FACES), EdgeUnit::Chain, |_| false)
++            .expect("the top");
++    assert!(matches!(face, Some(FeatureSel::Face(_))), "{face:?}");
++}
++
++#[test]
++fn the_per_depth_radius_holds_at_a_miss() {
++    // A ray passing 1 mm beside the block's top-front rim, missing the
++    // block: the anchored radius has no surface to anchor to, the per-depth
++    // one is one screen size at the rim's own depth.
++    let tris: Arc<[Triangle]> = Arc::from(cube(Point3::ZERO, Point3::new(20.0, 20.0, 10.0)).facets.to_vec());
++    let bodies = [PickBody::new("block", tris, Location::default())];
++    let mut q = aim([10.0, -100.0, 11.0], [10.0, 0.0, 11.0], PickKinds::EDGES); // depth 100, 1 mm over the rim
++    q.radius = 0.5;
++    assert_eq!(pick_bodies(&bodies, &q), None, "0.5 mm misses a rim 1 mm off");
++    q.radius_per_depth = 0.02; // 2 mm at depth 100
++    assert!(pick_bodies(&bodies, &q).is_some_and(|p| matches!(p.target, PickTarget::Edge { .. })));
++    q.radius_per_depth = 0.005; // 0.5 mm at depth 100
++    assert_eq!(pick_bodies(&bodies, &q), None);
++    q.radius_per_depth = f64::NAN; // refused, falls back to `radius`
++    assert_eq!(pick_bodies(&bodies, &q), None);
++}
++
++#[test]
++fn the_shared_graph_cache_answers_the_same_allocation_without_rebuilding() {
++    let tris: Arc<[Triangle]> = Arc::from(cylinder(20.0, 10.0, 16).facets.to_vec());
++    let a = feature_graph_shared(&tris);
++    let b = feature_graph_shared(&tris);
++    assert!(Arc::ptr_eq(&a, &b), "the same allocation is one graph");
++    let copy: Arc<[Triangle]> = Arc::from(tris.to_vec());
++    let c = feature_graph_shared(&copy);
++    assert_eq!(c.edges, a.edges, "equal content, equal graph");
++    assert!(feature_graph_shared(&Arc::from(Vec::<Triangle>::new())).edges.is_empty());
++}
++
++#[test]
++fn a_pick_by_id_must_be_one_a_click_could_make() {
++    let world = new_world();
++    ImportModel::from_mesh("boss", cylinder(20.0, 10.0, 16)).apply(&world);
++    let e = model::find_by_name(&world, "boss").expect("entity");
++    let f = model::features_of(&world, &e).expect("features");
++    let g = graph_of(&world, "boss").expect("graph");
++    let pick = |feature| GeoSel { entity: "boss".into(), feature };
++    // A rim vertex is an end of a feature edge but no feature point.
++    let rim = feature::corner_verts(&f)
++        .into_iter()
++        .filter_map(|v| feature::vertex_id(&f, v))
++        .find(|id| !g.points.iter().any(|p| p.id == *id))
++        .expect("a vertex along the rim");
++    let msg = check_pickable(&world, &pick(FeatureSel::Vertex(rim))).expect_err("a rim vertex is no point");
++    assert!(msg.contains("not a feature point"), "{msg}");
++    // A wall seam chain is refused; the rim chain is taken.
++    let chains = feature::chains(&f);
++    let seam = chains.iter().find(|c| !camcraft_app::pick::is_feature_chain(&g, c)).expect("a seam chain");
++    let msg = check_pickable(&world, &pick(FeatureSel::Chain(seam.id))).expect_err("a seam is no edge");
++    assert!(msg.contains("not a model edge"), "{msg}");
++    let rim_chain = camcraft_app::pick::feature_chains(&g).into_iter().next().expect("a rim chain");
++    assert!(rim_chain.closed, "the rim is a closed loop");
++    assert_eq!(check_pickable(&world, &pick(FeatureSel::Chain(rim_chain.id))), Ok(()));
++    // Faces always qualify; a stale id is left to the command.
++    assert_eq!(check_pickable(&world, &pick(FeatureSel::Face(1))), Ok(()));
++    assert_eq!(check_pickable(&world, &pick(FeatureSel::Vertex(1))), Ok(()));
++    assert_eq!(check_pickable(&world, &GeoSel { entity: "ghost".into(), feature: FeatureSel::Vertex(rim) }), Ok(()));
++}
++
++/// 400 hover picks over a 20 x 20 grid across `mesh`'s bounds, per kind
++/// set, at a 12 px radius on a 720 px pane; printed, never asserted.
++fn time_hover(label: &str, mesh: camcraft_app::geometry::Mesh) {
++    let n = mesh.facets.len();
++    let world = new_world();
++    ImportModel::from_mesh("part", mesh).apply(&world);
++    let e = model::find_by_name(&world, "part").expect("entity");
++    let tris = model::facets_of(&world, &e).expect("facets");
++    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
++    for t in tris.iter() {
++        for p in [t.a, t.b, t.c] {
++            for (k, v) in [p.x, p.y, p.z].into_iter().enumerate() {
++                lo[k] = lo[k].min(v);
++                hi[k] = hi[k].max(v);
++            }
++        }
++    }
++    let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
++    let span = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
++    let eye = [c[0] + span, c[1] - span, c[2] + span];
++    let per_depth = 12.0 * 2.0 * std::f64::consts::FRAC_PI_6.tan() / 720.0; // 12 px on a 720 px pane
++    let t0 = Instant::now();
++    let g = graph_of(&world, "part").expect("graph");
++    let cold = t0.elapsed();
++    println!("{label}: {n} facets, {} feature edges, {} points; cold graph {cold:?}", g.edges.len(), g.points.len());
++    let edges_faces = PickKinds { faces: true, ..PickKinds::EDGES };
++    for (kind, kinds) in
++        [("faces", PickKinds::FACES), ("edges+faces", edges_faces), ("points", PickKinds::POINTS), ("all", PickKinds::ALL)]
++    {
++        let (mut total, mut worst, mut hits) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
++        for i in 0..20 {
++            for j in 0..20 {
++                let at = [lo[0] + (hi[0] - lo[0]) * f64::from(i) / 19.0, lo[1] + (hi[1] - lo[1]) * f64::from(j) / 19.0, c[2]];
++                let mut q = aim(eye, at, kinds);
++                q.radius_per_depth = per_depth;
++                let t = Instant::now();
++                hits += usize::from(pick_selection(&world, &q, EdgeUnit::Chain, |_| false).is_some());
++                let dt = t.elapsed();
++                total += dt;
++                worst = worst.max(dt);
++            }
++        }
++        println!("  {kind:>12}: 400 hover picks, mean {:?}, worst {worst:?}, {hits} hits", total / 400);
++    }
++}
++
++#[test]
++#[ignore = "timing lane (#692 step 2): cargo test --release -p camcraft-app --test feature_pick_wire -- --ignored --nocapture"]
++fn hover_pick_timing_on_the_largest_testdata_model() {
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/sample_ap214.step");
++    time_hover("sample_ap214.step", camcraft_app::geometry::load_model(&path).expect("sample_ap214 imports"));
++    // The testdata models are small; a dense smooth wall is the stress.
++    time_hover("cylinder x25000", cylinder(80.0, 40.0, 25_000));
++}
+diff --git a/crates/app/tests/mcp_pick.rs b/crates/app/tests/mcp_pick.rs
+index 4a1a2db95..86fffa4b5 100644
+--- a/crates/app/tests/mcp_pick.rs
++++ b/crates/app/tests/mcp_pick.rs
+@@ -301,3 +301,31 @@ fn bad_picks_are_tool_errors_never_a_panic() {
+     assert_eq!(g["source"], json!({ "model": "part" }), "{g}");
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++/// #692: list_features names only what a click can pick - a cylinder's
++/// two rims are its chains (never the 16 facet seams of its wall), and a
++/// round rim has no feature points (its chord vertices are not corners);
++/// a seam chain asked for by id is refused by the one rule.
++#[test]
++fn listed_chains_and_vertices_follow_the_one_pick_rule() {
++    let dir = tmp_dir("rule");
++    let stl = dir.join("boss.stl");
++    let mut s = String::from("solid boss\n");
++    for t in camcraft_app::geometry::cylinder(20.0, 10.0, 16).facets.iter() {
++        s.push_str(" facet normal 0 0 0\n  outer loop\n");
++        for p in [t.a, t.b, t.c] {
++            s.push_str(&format!("   vertex {} {} {}\n", p.x, p.y, p.z));
++        }
++        s.push_str("  endloop\n endfacet\n");
++    }
++    s.push_str("endsolid boss\n");
++    std::fs::write(&stl, s).expect("write stl");
++    let mut c = Client::new();
++    let imp = c.ok("import_model", json!({ "path": stl.display().to_string() }));
++    let name = imp["model"].as_str().expect("model name").to_owned();
++    let f = c.ok("list_features", json!({ "model": name, "kinds": ["chains", "vertices"] }));
++    assert_eq!(f["chains_total"], json!(2), "two rims, no wall seams: {f}");
++    assert!(f["chains"].as_array().is_some_and(|cs| cs.iter().all(|c| c["closed"] == json!(true))), "{f}");
++    assert_eq!(f["vertices_total"], json!(0), "a round rim has no corner: {f}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index ef7c16316..59eaa0b38 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -92,6 +92,8 @@ mod first_setup;
+ mod structural;
+ // #554: the plane row's click takes the face, an axis row's the edge.
+ mod plane_face_pick;
++// #692: one pick rule on the op page, the setup page and a smooth wall.
++mod one_pick_rule;
+ // #664: a left Setups page disarms its picks.
+ mod setup_picks_disarm;
+ mod one_wcs;
+diff --git a/crates/ui/src/egui_app/tests/one_pick_rule.rs b/crates/ui/src/egui_app/tests/one_pick_rule.rs
+new file mode 100644
+index 000000000..89489c8e2
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/one_pick_rule.rs
+@@ -0,0 +1,248 @@
++//! #692's frame tests: one pick rule on every page. Real viewport clicks
++//! on the seed's 60 x 60 x 30 block, on the operation page (Edge mode,
++//! Contour1's geometry) and on the Setups page (an axis row armed):
++//! a click on a flat face's triangulation diagonal never picks an edge;
++//! a click over an edge hidden behind the block takes the near face or
++//! nothing, never that edge; a box corner picks as a point where points
++//! are taken, and as an edge where only edges and faces are. Plus the
++//! smooth-wall case at the State level: a cylinder's facet seam is no
++//! edge.
++//! Provenance: our own pick law test over our own shell; no vendor
++//! material consulted.
++
++use camcraft_app::commands::ImportModel;
++use camcraft_app::geometry::{Point3, cylinder, transform_point};
++use camcraft_app::operation::GeoSel;
++use camcraft_app::pick::{EdgeUnit, PickKinds, PickTarget};
++
++use super::*;
++
++type P = [f64; 3];
++
++/// Where world point `q` draws, if well inside the pane.
++fn px_of(sh: &ShellUi, q: P) -> Option<egui::Pos2> {
++    let ([x0, y0], [x1, y1]) = sh.state.viewport_rect;
++    let (w, hgt) = (x1 - x0, y1 - y0);
++    let uv = interact::project_uv(&sh.state.cam.mvp(f64::from(w / hgt)), q)?;
++    (uv[0] > 0.05 && uv[0] < 0.95 && uv[1] > 0.05 && uv[1] < 0.95)
++        .then(|| egui::pos2(x0 + uv[0] * w, y0 + uv[1] * hgt))
++}
++
++fn dot(a: P, b: P) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn mid(a: P, b: P) -> P {
++    [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5]
++}
++
++/// The block's twelve edges: (a, b, the outward normals of its two faces).
++fn block_edges() -> Vec<(P, P, P, P)> {
++    let (hi, mut out) = ([60.0, 60.0, 30.0], Vec::new());
++    for axis in 0..3 {
++        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
++        for su in [false, true] {
++            for sv in [false, true] {
++                let mut a = [0.0; 3];
++                a[u] = if su { hi[u] } else { 0.0 };
++                a[v] = if sv { hi[v] } else { 0.0 };
++                let mut b = a;
++                b[axis] = hi[axis];
++                let (mut nu, mut nv) = ([0.0; 3], [0.0; 3]);
++                nu[u] = if su { 1.0 } else { -1.0 };
++                nv[v] = if sv { 1.0 } else { -1.0 };
++                out.push((a, b, nu, nv));
++            }
++        }
++    }
++    out
++}
++
++/// Faces toward the eye at `p` (on the face).
++fn facing(sh: &ShellUi, p: P, n: P) -> bool {
++    let e = sh.state.cam.eye();
++    dot([e[0] - p[0], e[1] - p[1], e[2] - p[2]], n) > 0.0
++}
++
++fn seg_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
++    let ab = b - a;
++    let t = if ab.length_sq() > 0.0 { ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
++    (a + ab * t - p).length()
++}
++
++/// The pixel over the middle of a block edge hidden behind the block
++/// (both its faces turned away), the one drawn farthest from every
++/// visible edge - and that distance, px.
++fn over_a_hidden_edge(sh: &ShellUi) -> (egui::Pos2, f32) {
++    let edges = block_edges();
++    let shown: Vec<(egui::Pos2, egui::Pos2)> = edges
++        .iter()
++        .filter(|(a, b, nu, nv)| facing(sh, mid(*a, *b), *nu) || facing(sh, mid(*a, *b), *nv))
++        .filter_map(|(a, b, _, _)| Some((px_of(sh, *a)?, px_of(sh, *b)?)))
++        .collect();
++    edges
++        .iter()
++        .filter(|(a, b, nu, nv)| !facing(sh, mid(*a, *b), *nu) && !facing(sh, mid(*a, *b), *nv))
++        .filter_map(|(a, b, _, _)| px_of(sh, mid(*a, *b)))
++        .map(|p| (p, shown.iter().map(|(a, b)| seg_dist(p, *a, *b)).fold(f32::MAX, f32::min)))
++        .max_by(|x, y| x.1.total_cmp(&y.1))
++        .expect("the default camera hides an edge of the block")
++}
++
++/// The pixel over the middle of the top face's triangulation diagonal:
++/// the one facet edge shared by two of the top face's triangles.
++fn over_the_top_diagonal(sh: &ShellUi) -> egui::Pos2 {
++    let w = &sh.state.world;
++    let e = model::find_by_name(w, "Block").expect("seed has Block");
++    let tris = model::facets_of(w, &e).expect("Block has facets");
++    let loc = model::transform_of(w, &e).unwrap_or_default();
++    let top: Vec<_> = tris.iter().filter(|t| [t.a, t.b, t.c].iter().all(|p| (p.z - 30.0).abs() < 1e-9)).collect();
++    let key = |p: Point3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
++    let mut seen: Vec<([u64; 3], [u64; 3], Point3, Point3)> = Vec::new();
++    for t in &top {
++        for (a, b) in [(t.a, t.b), (t.b, t.c), (t.c, t.a)] {
++            let (ka, kb) = (key(a), key(b));
++            if let Some(&(_, _, a, b)) = seen.iter().find(|s| (s.0 == kb && s.1 == ka) || (s.0 == ka && s.1 == kb)) {
++                let m = transform_point(Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, 30.0), loc.pos, loc.rot);
++                return px_of(sh, [m.x, m.y, m.z]).expect("the top face's middle is on screen");
++            }
++            seen.push((ka, kb, a, b));
++        }
++    }
++    panic!("the block's top face is not two triangles: {top:?}");
++}
++
++/// The block's corner nearest the eye, on screen.
++fn a_corner(sh: &ShellUi) -> egui::Pos2 {
++    let e = sh.state.cam.eye();
++    let mut best: Option<(f64, egui::Pos2)> = None;
++    for c in block_edges().iter().map(|x| x.0) {
++        let d = (c[0] - e[0]).powi(2) + (c[1] - e[1]).powi(2) + (c[2] - e[2]).powi(2);
++        if let Some(p) = px_of(sh, c)
++            && best.is_none_or(|(bd, _)| d < bd)
++        {
++            best = Some((d, p));
++        }
++    }
++    best.expect("the block shows a corner").1
++}
++
++/// Click `p` on Contour1's page in Edge mode; Contour1's picks after.
++fn op_click(harness: &mut Harness<'static, ShellUi>, p: egui::Pos2) -> Vec<GeoSel> {
++    crate::actions::target(&mut harness.state_mut().state, UiTarget::Operation("Contour1".into()));
++    harness.run();
++    harness.state_mut().state.geo_pick = GeoPick::Edge;
++    click_viewport(harness, p);
++    let st = &harness.state().state;
++    assert_eq!(st.status, "geometry selection updated for Contour1", "the operation takes the click");
++    let op = model::find_by_name(&st.world, "Contour1").expect("seed has Contour1");
++    match model::operation_of(&st.world, &op).map(|o| o.src) {
++        Some(SrcRef::Selection(items)) => items,
++        other => panic!("Contour1's source became {other:?}"),
++    }
++}
++
++/// Make Setup1, show its page and choose `mode` for +Y (which arms it).
++fn arm_axis(harness: &mut Harness<'static, ShellUi>, mode: &str) {
++    if camcraft_app::setup::active(&harness.state().state.world).is_none() {
++        harness.state_mut().state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
++        harness.run();
++    }
++    crate::actions::target(
++        &mut harness.state_mut().state,
++        UiTarget::SetupNode("Setup1".into(), crate::state::SetupPage::Settings),
++    );
++    harness.run();
++    harness.get_by_label(mode).click();
++    harness.run();
++    assert!(crate::axis_pick::collecting(&harness.state().state), "{mode} arms +Y");
++}
++
++fn axis_y(harness: &Harness<'static, ShellUi>) -> Vec<GeoSel> {
++    let d = harness.state().state.axis_pick.clone().expect("the axis draft");
++    d.axes.y.map(|a| a.picks).unwrap_or_default()
++}
++
++#[test]
++fn a_click_on_a_flat_faces_diagonal_picks_the_face_never_an_edge() {
++    let mut harness = shell_harness();
++    let p = over_the_top_diagonal(harness.state());
++    let items = op_click(&mut harness, p);
++    assert_eq!(items.len(), 1, "{items:?}");
++    let FeatureSel::Face(fid) = items[0].feature else {
++        panic!("an Edge-mode click on the diagonal takes the face, got {:?}", items[0].feature);
++    };
++    let st = &harness.state().state;
++    let block = model::find_by_name(&st.world, "Block").expect("Block");
++    let faces = model::features_of(&st.world, &block).expect("features");
++    let face = faces.faces.iter().find(|f| f.id == fid).expect("picked face exists");
++    assert!(face.normal[2].abs() > 0.9, "the top face, under the diagonal");
++
++    // The Setups page's axis takes edges only: on the diagonal, nothing.
++    arm_axis(&mut harness, "+Y by Edge");
++    click_viewport(&mut harness, p);
++    assert!(axis_y(&harness).is_empty(), "the diagonal is no edge: {:?}", axis_y(&harness));
++    assert!(harness.state().state.status.contains("no edge under the cursor"), "{}", harness.state().state.status);
++}
++
++#[test]
++fn a_click_over_a_hidden_edge_takes_the_near_face_or_nothing_never_the_edge() {
++    let mut harness = shell_harness();
++    let (p, clear) = over_a_hidden_edge(harness.state());
++    assert!(clear > 2.0 * crate::feature_click::PICK_EDGE_PX, "no visible edge within snap reach ({clear} px)");
++    let items = op_click(&mut harness, p);
++    assert_eq!(items.len(), 1, "{items:?}");
++    assert!(matches!(items[0].feature, FeatureSel::Face(_)), "the near face, not the hidden edge: {items:?}");
++
++    arm_axis(&mut harness, "+Y by Edge");
++    click_viewport(&mut harness, p);
++    assert!(axis_y(&harness).is_empty(), "a hidden edge is never picked: {:?}", axis_y(&harness));
++}
++
++#[test]
++fn a_box_corner_picks_as_a_point_where_points_are_taken() {
++    let mut harness = shell_harness();
++    let p = a_corner(harness.state());
++    // The operation's Edge mode takes edges and faces, not points: the
++    // corner's click lands on an edge through it.
++    let items = op_click(&mut harness, p);
++    assert_eq!(items.len(), 1, "{items:?}");
++    assert!(matches!(items[0].feature, FeatureSel::Chain(_)), "Edge mode never snaps to a point: {items:?}");
++
++    arm_axis(&mut harness, "+Y by Two points");
++    click_viewport(&mut harness, p);
++    let y = axis_y(&harness);
++    assert_eq!(y.len(), 1, "one point for +Y: {y:?} ({})", harness.state().state.status);
++    assert!(matches!(y[0].feature, FeatureSel::Vertex(_)), "the corner, as a point: {y:?}");
++}
++
++#[test]
++fn a_smooth_walls_facet_seam_is_no_edge() {
++    // A 40 mm bore-like boss, 60 tall: its 24 wall strips meet at facet
++    // seams the old screen-space edge search offered as edges.
++    let mut state = State::new();
++    state.history.execute(&state.world, ImportModel::from_mesh("boss", cylinder(40.0, 60.0, 24)));
++    state.viewport_rect = ([0.0, 0.0], [400.0, 400.0]);
++    state.cam = crate::viewport::Camera { target: [0.0, 0.0, 30.0], yaw: 0.3, pitch: 0.2, dist: 160.0, ..Default::default() };
++    let e = state.cam.eye();
++    let mvp = state.cam.mvp(1.0);
++    // The vertical seam nearest the eye, at mid-height.
++    let seam = (0..24)
++        .map(|i| {
++            let a = std::f64::consts::TAU * f64::from(i) / 24.0;
++            [20.0 * a.cos(), 20.0 * a.sin(), 30.0]
++        })
++        .min_by(|x, y| {
++            let d = |q: &P| (q[0] - e[0]).powi(2) + (q[1] - e[1]).powi(2) + (q[2] - e[2]).powi(2);
++            d(x).total_cmp(&d(y))
++        })
++        .expect("seams");
++    let uv = interact::project_uv(&mvp, seam).expect("on screen");
++    let p = [uv[0] * 400.0, uv[1] * 400.0];
++    let edges = crate::feature_click::Ask { kinds: PickKinds::EDGES, unit: EdgeUnit::Chain };
++    assert!(crate::feature_click::feature_at(&state, p, edges).is_none(), "a facet seam is no edge");
++    let both = crate::feature_click::Ask { kinds: PickKinds { faces: true, ..PickKinds::EDGES }, unit: EdgeUnit::Chain };
++    let (pick, sel) = crate::feature_click::feature_at(&state, p, both).expect("the wall");
++    assert!(matches!(pick.target, PickTarget::Face { .. }), "{pick:?}");
++    assert!(matches!(sel, Some(FeatureSel::Patch(_))), "the whole welded wall: {sel:?}");
++}
+diff --git a/crates/ui/src/egui_app/tests/plane_face_pick.rs b/crates/ui/src/egui_app/tests/plane_face_pick.rs
+index 5926ad19a..5f5583172 100644
+--- a/crates/ui/src/egui_app/tests/plane_face_pick.rs
++++ b/crates/ui/src/egui_app/tests/plane_face_pick.rs
+@@ -55,7 +55,15 @@ fn a_click_beside_an_edge_picks_the_face_for_the_plane_and_the_edge_for_an_axis(
+     harness.run();
+     let p = beside_an_edge(harness.state());
+     assert!(
+-        interact::edge_nearest(&harness.state().state, [p.x, p.y], interact::PICK_EDGE_PX).is_some(),
++        crate::feature_click::feature_at(
++            &harness.state().state,
++            [p.x, p.y],
++            crate::feature_click::Ask {
++                kinds: camcraft_app::pick::PickKinds::EDGES,
++                unit: camcraft_app::pick::EdgeUnit::Chain
++            },
++        )
++        .is_some(),
+         "the pixel is inside the edge-snap radius - an Edge-mode click there would take the edge"
+     );
+     crate::plane_pick::arm(&mut harness.state_mut().state, "Setup1");
+diff --git a/crates/ui/src/feature_click.rs b/crates/ui/src/feature_click.rs
+new file mode 100644
+index 000000000..28c67a82b
+--- /dev/null
++++ b/crates/ui/src/feature_click.rs
+@@ -0,0 +1,164 @@
++//! The viewport's feature click and hover (#692 step 2): every Face, Edge
++//! and Vertex pick - operation geometry, a boundary, the Setups page's
++//! plane and axis rows, the picks the WCS origin chips read - resolves
++//! through the app's one pick rule (`camcraft_app::pick::pick_selection`):
++//! the front-most visible surface, then a feature point, a feature edge or
++//! the welded face under the cursor, only among the kinds the asking tool
++//! accepts. Nothing here measures geometry; it builds the camera's ray,
++//! says which kinds the armed tool takes, and routes the answer to the
++//! draft or command that already owned that click.
++//!
++//! Provenance: our own routing over our own pick API; the pixel-to-mm
++//! scale is the pinhole camera's (2 tan(fov/2) depth per image height) -
++//! general computer-graphics practice. No vendor material consulted.
++
++use camcraft_app::operation::{FeatureSel, GeoSel};
++use camcraft_app::pick::{self, EdgeUnit, FeaturePick, PickKinds, PickQuery, PickRay, PickTarget, Projection};
++
++use crate::axis_pick::AxisBy;
++use crate::interact::{Mods, queue_boundary_pick, queue_feature_pick, ray_at};
++use crate::state::{GeoPick, HoverHit, State};
++use crate::viewport::ProjectionMode;
++
++/// How close a feature edge must draw to the cursor to be pickable, in
++/// logical px - the same tolerance the anchor markers use.
++pub(crate) const PICK_EDGE_PX: f32 = 12.0;
++
++/// How close a feature point must draw to the cursor to be pickable, px.
++pub(crate) const PICK_POINT_PX: f32 = 8.0;
++
++/// What the asking tool takes right now.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Ask {
++    pub kinds: PickKinds,
++    /// What an edge pick selects.
++    pub unit: EdgeUnit,
++}
++
++impl Ask {
++    /// The snap radius, px: a point's when only points are taken.
++    fn px(self) -> f32 {
++        if self.kinds.points && !self.kinds.edges { PICK_POINT_PX } else { PICK_EDGE_PX }
++    }
++
++    /// What a miss says is missing.
++    fn noun(self) -> &'static str {
++        match (self.kinds.faces, self.kinds.edges, self.kinds.points) {
++            (true, _, _) => "face",
++            (false, true, _) => "edge",
++            _ => "vertex",
++        }
++    }
++}
++
++/// The kinds the armed tool accepts: the Setups page rows first (the plane
++/// takes faces only, #554; an axis one straight edge or two points, #557),
++/// else the pick mode (Edge falls back to the face between the edges). A
++/// boundary and an axis take one run per edge click; Alt one segment.
++pub(crate) fn ask(state: &State, mods: Mods) -> Ask {
++    let chain = if mods.alt {
++        EdgeUnit::Segment
++    } else if state.boundary_pick.is_some() || crate::axis_pick::collecting(state) {
++        EdgeUnit::Run
++    } else {
++        EdgeUnit::Chain
++    };
++    let kinds = if crate::plane_pick::collecting(state) {
++        PickKinds::FACES
++    } else if let Some(by) = state.axis_pick.as_ref().and_then(|d| d.picking.map(|a| d.by(a))) {
++        match by {
++            AxisBy::Edge => PickKinds::EDGES,
++            AxisBy::Points => PickKinds::POINTS,
++        }
++    } else {
++        match state.geo_pick {
++            GeoPick::Edge => PickKinds { faces: true, ..PickKinds::EDGES },
++            GeoPick::Vertex => PickKinds::POINTS,
++            GeoPick::Face | GeoPick::Model => PickKinds::FACES,
++        }
++    };
++    Ask { kinds, unit: chain }
++}
++
++/// The pick query through a logical-px viewport point: the camera's ray
++/// and the pixel radius as world mm (ortho: one scale everywhere;
++/// perspective: per unit of depth, so it holds at the silhouette too).
++/// Never "pick through" - that mode is not offered (see the decision
++/// record), so `through` stays off.
++pub(crate) fn query_at(state: &State, p: [f32; 2], ask: Ask) -> Option<PickQuery> {
++    let ([_, y0], [_, y1]) = state.viewport_rect;
++    let h = f64::from(y1 - y0);
++    let (origin, dir) = ray_at(state, p)?;
++    let px = f64::from(ask.px());
++    let (projection, radius, radius_per_depth) = match state.cam.projection {
++        ProjectionMode::Orthographic => (Projection::Ortho, px * 2.0 * state.cam.ortho_half_height() / h, 0.0),
++        // `Camera::ray_through`'s 60-degree vertical field.
++        ProjectionMode::Perspective => {
++            (Projection::Perspective, 0.0, px * 2.0 * std::f64::consts::FRAC_PI_6.tan() / h)
++        }
++    };
++    let ray = PickRay { origin, dir, projection };
++    Some(PickQuery { ray, radius, radius_per_depth, kinds: ask.kinds, through: false })
++}
++
++/// The one pick under a viewport point, and the selection it stands for.
++pub(crate) fn feature_at(state: &State, p: [f32; 2], ask: Ask) -> Option<(FeaturePick, Option<FeatureSel>)> {
++    let q = query_at(state, p, ask)?;
++    pick::pick_selection(&state.world, &q, ask.unit, |name| state.hidden_in_view(name))
++}
++
++fn hover_of(pick: &FeaturePick, sel: Option<FeatureSel>) -> HoverHit {
++    let facet = match pick.target {
++        PickTarget::Face { facet, .. } => facet,
++        _ => usize::MAX, // no facet drives an edge or point highlight
++    };
++    HoverHit { entity: pick.entity.clone(), facet, feature: sel }
++}
++
++/// Hover in a feature mode: what a click here would take, or nothing.
++pub(crate) fn hover(state: &mut State, p: [f32; 2]) {
++    let ask = ask(state, Mods::default());
++    state.hover = feature_at(state, p, ask).map(|(pick, sel)| hover_of(&pick, sel));
++}
++
++/// A Face/Edge/Vertex click: resolve it by the one rule, then hand it to
++/// whoever collects - an axis or plane row, the stray-click hint, a
++/// boundary, or the open operation's geometry (edges through the edge
++/// pick's Ctrl/Shift law, faces and points straight into the list).
++pub(crate) fn click(state: &mut State, p: [f32; 2], mods: Mods) {
++    let ask = ask(state, mods);
++    let Some((found, sel)) = feature_at(state, p, ask) else {
++        state.hover = None;
++        state.status = format!("no {} under the cursor", ask.noun());
++        return;
++    };
++    // Mirror the pick in the hover so highlight and click agree.
++    state.hover = Some(hover_of(&found, sel));
++    let Some(feature) = sel else {
++        state.status = format!("the pick on '{}' names no feature - try beside it", found.entity);
++        return;
++    };
++    let pick = GeoSel { entity: found.entity, feature };
++    if crate::axis_pick::collecting(state) {
++        crate::axis_pick::take(state, pick); // #557
++        return;
++    }
++    if crate::plane_pick::collecting(state) {
++        crate::plane_pick::take(state, pick); // #330 / #554
++        return;
++    }
++    if crate::axis_pick::hint_stray(state) {
++        return; // #557: the axes rows are open, nothing armed
++    }
++    let append = mods.ctrl || mods.shift;
++    match (found.target, state.boundary_pick.is_some()) {
++        (PickTarget::Point(_), true) => {
++            // A point bounds nothing: refused by name, never drafted.
++            state.status =
++                format!("{} of '{}' is a point - a boundary takes faces or edges", pick.feature, pick.entity);
++        }
++        (PickTarget::Edge { .. }, false) => crate::edge_pick::queue_edge_pick(state, pick, mods),
++        (_, true) => queue_boundary_pick(state, pick, mods),
++        _ => queue_feature_pick(state, pick, append),
++    }
++}
+diff --git a/crates/ui/src/interact.rs b/crates/ui/src/interact.rs
+index c4f10e5c8..cfcbdc296 100644
+--- a/crates/ui/src/interact.rs
++++ b/crates/ui/src/interact.rs
+@@ -55,10 +55,6 @@ impl From<ModifiersState> for Mods {
+ /// not the law; the shells' must agree).
+ pub(crate) const CLICK_TRAVEL_PX: f32 = 4.0;
+ 
+-/// How close a feature edge must draw to the cursor to be pickable, in
+-/// logical px - the same tolerance the anchor markers use.
+-pub(crate) const PICK_EDGE_PX: f32 = 12.0;
+-
+ // ------------------------------------------------------------ gestures
+ 
+ /// Is the point inside the published viewport image rect? Clicks start
+@@ -71,7 +67,7 @@ pub(crate) fn inside_viewport(state: &State, p: [f32; 2]) -> bool {
+ 
+ /// Camera ray through a logical-px viewport point; None outside a
+ /// laid-out image or behind the camera. Shared by picking and hover.
+-fn ray_at(state: &State, p: [f32; 2]) -> Option<([f64; 3], [f64; 3])> {
++pub(crate) fn ray_at(state: &State, p: [f32; 2]) -> Option<([f64; 3], [f64; 3])> {
+     let ([x0, y0], [x1, y1]) = state.viewport_rect;
+     let (w, h) = (x1 - x0, y1 - y0);
+     if w <= 1.0 || h <= 1.0 {
+@@ -105,9 +101,8 @@ pub(crate) fn pick_at(state: &mut State, p: [f32; 2], mods: Mods) {
+     }
+     match state.geo_pick {
+         GeoPick::Model => pick_model(state, p),
+-        GeoPick::Face => pick_face(state, p, mods),
+-        GeoPick::Edge => pick_edge(state, p, mods),
+-        GeoPick::Vertex => crate::vertex_pick::pick_vertex(state, p, mods),
++        // #692: every feature click resolves through the one pick rule.
++        GeoPick::Face | GeoPick::Edge | GeoPick::Vertex => crate::feature_click::click(state, p, mods),
+     }
+ }
+ 
+@@ -147,35 +142,6 @@ fn pick_model(state: &mut State, p: [f32; 2]) {
+     state.pending.push_back(CommandKind::Select(hit));
+ }
+ 
+-/// Face pick: the raycast facet's feature face becomes a geometry pick
+-/// for the open operation. Queues ONLY SetOperationGeometry - a feature
+-/// click never touches entity selection, so Ctrl+Z walks the pick list,
+-/// not the tree highlight. A miss is a status line, nothing else.
+-fn pick_face(state: &mut State, p: [f32; 2], mods: Mods) {
+-    let Some((entity, sel)) = hover_feature_at(state, p) else {
+-        state.status = String::from("no face under the cursor");
+-        return;
+-    };
+-    let pick = GeoSel { entity, feature: sel };
+-    if crate::axis_pick::collecting(state) {
+-        crate::axis_pick::take(state, pick); // #557: refuses a face by name
+-        return;
+-    }
+-    if crate::plane_pick::collecting(state) {
+-        crate::plane_pick::take(state, pick); // #330: the Setups page's draft
+-        return;
+-    }
+-    if crate::axis_pick::hint_stray(state) {
+-        return; // #557: the axes rows are open, nothing armed
+-    }
+-    if state.boundary_pick.is_some() {
+-        queue_boundary_pick(state, pick, mods);
+-        return;
+-    }
+-    let append = mods.ctrl || mods.shift;
+-    queue_feature_pick(state, pick, append);
+-}
+-
+ /// A Face/Edge pick while the Boundary group collects (M11.5 UX): Ctrl
+ /// toggles the pick in or out of the target entry, Shift adds it and
+ /// closes the entry around its face loop, a plain click replaces the
+@@ -194,95 +160,14 @@ pub fn queue_boundary_pick(state: &mut State, pick: GeoSel, mods: Mods) {
+     crate::boundary_draft::take_pick(state, target, pick, m);
+ }
+ 
+-/// Edge pick: the nearest visible feature edge in screen space names a
+-/// chain (its tangent run), or just that segment under Alt. With no
+-/// edge near the cursor the click falls through to the face rule -
+-/// faces own the pixels between edges.
+-fn pick_edge(state: &mut State, p: [f32; 2], mods: Mods) {
+-    let Some((entity, edge)) = edge_nearest(state, p, PICK_EDGE_PX) else {
+-        pick_face(state, p, mods);
+-        return;
+-    };
+-    let Some(found) = model::find_by_name(&state.world, &entity) else {
+-        return;
+-    };
+-    let Some(features) = model::features_of(&state.world, &found) else {
+-        return;
+-    };
+-    let sel = if mods.alt {
+-        feature::singleton_chain_id(&features, edge).map(FeatureSel::Chain)
+-    } else if state.boundary_pick.is_some() || crate::plane_pick::collecting(state) || crate::axis_pick::collecting(state) {
+-        // A boundary (and a #557 axis pick) takes ONE edge per click (M11.5 UX): the run - one
+-        // straight stretch or one arc - never the whole tangent loop a
+-        // filleted rim chains into.
+-        feature::run_containing(&features, edge).map(|r| FeatureSel::Chain(r.id))
+-    } else {
+-        feature::chains(&features)
+-            .iter()
+-            .find(|c| c.edges.contains(&edge))
+-            .map(|c| FeatureSel::Chain(c.id))
+-    };
+-    let Some(sel) = sel else {
+-        pick_face(state, p, mods);
+-        return;
+-    };
+-    // Mirror the pick in the hover so highlight and click agree even
+-    // when the cursor sits on the silhouette, where the ray misses.
+-    let facet = ray_at(state, p)
+-        .and_then(|(origin, dir)| {
+-            pick::first_hit_f(&state.world, origin, dir, |name| {
+-                state.hidden_in_view(name)
+-            })
+-        })
+-        .map_or(usize::MAX, |(_, facet, _)| facet);
+-    state.hover = Some(HoverHit {
+-        entity: entity.clone(),
+-        facet,
+-        feature: Some(sel),
+-    });
+-    if crate::axis_pick::collecting(state) {
+-        crate::axis_pick::take(state, GeoSel { entity, feature: sel }); // #557
+-        return;
+-    }
+-    if crate::plane_pick::collecting(state) {
+-        crate::plane_pick::take(state, GeoSel { entity, feature: sel }); // #554: refused by name
+-        return;
+-    }
+-    if crate::axis_pick::hint_stray(state) {
+-        return; // #557: the axes rows are open, nothing armed
+-    }
+-    if state.boundary_pick.is_some() {
+-        queue_boundary_pick(state, GeoSel { entity, feature: sel }, mods);
+-        return;
+-    }
+-    crate::edge_pick::queue_edge_pick(state, GeoSel { entity, feature: sel }, mods);
+-}
+-
+-/// Shared hover/raycast for the Face pick: sets state.hover with the
+-/// face feature resolved and returns (entity, feature). None (with the
+-/// hover reflecting the raw hit) on a miss or a facetless mesh.
+-fn hover_feature_at(state: &mut State, p: [f32; 2]) -> Option<(String, FeatureSel)> {
+-    let (origin, dir) = ray_at(state, p)?;
+-    let (entity, facet, _) = pick::first_hit_f(&state.world, origin, dir, |name| {
+-        state.hidden_in_view(name)
+-    })?;
+-    let sel = feature_of_facet(state, &entity, facet);
+-    state.hover = Some(HoverHit {
+-        entity: entity.clone(),
+-        facet,
+-        feature: sel,
+-    });
+-    Some((entity, sel?))
+-}
+-
+-/// Refresh the hover highlight from the cursor: a filtered raycast (plus
+-/// the screen-space edge pass in Edge mode), only while the pointer is
++/// Refresh the hover highlight from the cursor: a filtered raycast (the
++/// one pick rule in the feature modes, #692), only while the pointer is
+ /// over the live viewport image with no button held and no menu or popup
+ /// on top of it. Anywhere else the highlight clears - it must never
+-/// linger where the cursor isn't. In Face/Edge mode the hover carries
+-/// the feature it resolves to, so the highlight draws the same loops or
+-/// chain the click would pick; the rule and the projection are shared,
+-/// so they cannot disagree. Ephemeral view state; never a command
++/// linger where the cursor isn't. In a feature mode the hover carries
++/// the feature it resolves to, so the highlight draws the same face,
++/// chain or point the click would pick; the rule is shared, so they
++/// cannot disagree. Ephemeral view state; never a command
+ /// (AGENTS.md). `held` stands in for the shell's own left-press book-
+ /// keeping (the app keeps `left_press` OUTSIDE State, across frames).
+ pub(crate) fn update_hover(state: &mut State, p: [f32; 2], held: bool) {
+@@ -293,54 +178,25 @@ pub(crate) fn update_hover(state: &mut State, p: [f32; 2], held: bool) {
+         state.hover = None;
+         return;
+     }
+-    // Vertex mode is screen-space only: a corner or nothing (M13.4).
+-    if state.geo_pick == GeoPick::Vertex {
+-        crate::vertex_pick::hover_vertex(state, p);
+-        return;
+-    }
+-    // Edge mode leads with the screen-space pass: the silhouette of a
+-    // chain is exactly where a ray misses but an edge pick belongs.
+-    if state.geo_pick == GeoPick::Edge
+-        && let Some((entity, edge)) = edge_nearest(state, p, PICK_EDGE_PX)
+-        && let Some(found) = model::find_by_name(&state.world, &entity)
+-        && let Some(features) = model::features_of(&state.world, &found)
+-        && let Some(c) = if state.boundary_pick.is_some() || crate::axis_pick::collecting(state) {
+-            // The run a boundary click takes, not the tangent loop.
+-            feature::run_containing(&features, edge)
+-        } else {
+-            feature::chains(&features).into_iter().find(|c| c.edges.contains(&edge))
+-        }
+-    {
+-        state.hover = Some(HoverHit {
+-            entity,
+-            facet: usize::MAX, // no facet drives this highlight
+-            feature: Some(FeatureSel::Chain(c.id)),
+-        });
++    // #692: a feature mode hovers exactly what its click would take - the
++    // one pick rule, the armed tool's kinds.
++    if state.geo_pick != GeoPick::Model {
++        crate::feature_click::hover(state, p);
+         return;
+     }
+     let Some((origin, dir)) = ray_at(state, p) else {
+         state.hover = None;
+         return;
+     };
+-    let mode = state.geo_pick;
+     let hit = pick::first_hit_f(&state.world, origin, dir, |name| {
+         state.hidden_in_view(name)
+     });
+     // The machined mesh, when drawn, is what a stock hover reports
+-    // (M13.1 owed) - never the uncut box the ray crossed.
++    // (M13.1 owed) - never the uncut box the ray crossed. Model mode keeps
++    // hover free of features: the triangle highlight is its answer.
+     let (hit, facet) = crate::machined::filter_hit_facet(state, origin, dir, hit);
+     state.hover_mesh = facet;
+-    state.hover = hit.map(|(entity, facet, _)| {
+-        let feature = match mode {
+-            // The triangle highlight is exactly what the feature modes
+-            // replace - Model mode keeps hover free of features. In
+-            // Edge mode a facet's face is the fallback, matching the
+-            // click rule (faces own the pixels between edges).
+-            GeoPick::Model | GeoPick::Vertex => None,
+-            GeoPick::Face | GeoPick::Edge => feature_of_facet(state, &entity, facet),
+-        };
+-        HoverHit { entity, facet, feature }
+-    });
++    state.hover = hit.map(|(entity, facet, _)| HoverHit { entity, facet, feature: None });
+ }
+ 
+ /// Fold one feature pick into the open operation's geometry list and
+@@ -384,99 +240,6 @@ pub fn queue_feature_pick(state: &mut State, pick: GeoSel, append: bool) {
+     state.pending.push_back(CommandKind::SetOperationGeometry { name, items });
+ }
+ 
+-/// The feature edge nearest a logical-px point, within `radius` px:
+-/// (entity, edge index). Screen-space by design - the raycast Face pick
+-/// cannot see the silhouette, the edge the user actually aims at. Every
+-/// visible model's feature edges are projected through the camera and
+-/// measured against the point; hidden models drop out, stock is included
+-/// (its top edges are pickable geometry like any model's). Iteration runs
+-/// in name order (`model_entities` sorts), so the nearest wins
+-/// deterministically and a tie goes to the earlier name.
+-pub(crate) fn edge_nearest(state: &State, p: [f32; 2], radius: f32) -> Option<(String, u32)> {
+-    let ([x0, y0], [x1, y1]) = state.viewport_rect;
+-    let (w, h) = (x1 - x0, y1 - y0);
+-    if w <= 1.0 || h <= 1.0 {
+-        return None; // no laid-out image: nothing to project into
+-    }
+-    let mvp = state.cam.mvp(f64::from(w / h));
+-    let mut entities: Vec<(String, flecs_ecs::prelude::Entity)> = model::model_entities(&state.world)
+-        .into_iter()
+-        .filter(|(name, _)| !state.hidden_models.iter().any(|hid| hid == name))
+-        .collect();
+-    // The stock that stands in the viewport is the ACTIVE setup's - the
+-    // pick law follows the one-order law's context, not a global name.
+-    let stock_name = camcraft_app::setup::stock_entity_name(
+-        &state.world,
+-        camcraft_app::setup::active(&state.world).as_deref(),
+-    );
+-    if !state.active_stock_hidden()
+-        && let Some(stock) = model::find_by_name(&state.world, &stock_name)
+-    {
+-        entities.push((stock_name, stock));
+-    }
+-    let to_px = |uv: [f32; 2]| [x0 + uv[0] * w, y0 + uv[1] * h];
+-    let mut best: Option<(f32, String, u32)> = None;
+-    for (name, entity) in entities {
+-        let Some(features) = model::features_of(&state.world, &entity) else {
+-            continue;
+-        };
+-        let loc = camcraft_app::setup_align::view_pose(&state.world, &entity).unwrap_or_default(); // #326
+-        for (i, e) in features.edges.iter().enumerate() {
+-            let (Some(a), Some(b)) = (features.verts.get(e.a as usize), features.verts.get(e.b as usize)) else {
+-                continue;
+-            };
+-            let proj = |v: &[f64; 3]| {
+-                let w = transform_point(Point3::new(v[0], v[1], v[2]), loc.pos, loc.rot);
+-                project_uv(&mvp, [w.x, w.y, w.z]).map(to_px)
+-            };
+-            let (Some(a), Some(b)) = (proj(a), proj(b)) else {
+-                continue; // behind the camera: not what is on screen
+-            };
+-            let d = point_seg_dist_px(p, a, b);
+-            if d <= radius && best.as_ref().is_none_or(|&(bd, _, _)| d < bd) {
+-                best = Some((d, name.clone(), i as u32));
+-            }
+-        }
+-    }
+-    best.map(|(_, name, edge)| (name, edge))
+-}
+-
+-/// Distance from a point to a segment, px. Clamped-parameter form: no
+-/// division, no NaN through a zero-length segment (a weld-degenerate edge
+-/// then reads as the distance to its one endpoint).
+-fn point_seg_dist_px(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+-    let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
+-    let len2 = abx * abx + aby * aby;
+-    let t = if len2 > 0.0 {
+-        ((( p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len2).clamp(0.0, 1.0)
+-    } else {
+-        0.0
+-    };
+-    let (qx, qy) = (a[0] + t * abx - p[0], a[1] + t * aby - p[1]);
+-    (qx * qx + qy * qy).sqrt()
+-}
+-
+-/// The face feature a raycast facet belongs to, through the model's
+-/// facet-to-face map. A strip of a welded wall promotes to its patch:
+-/// the wall tessellates into strips only because it curves, and the
+-/// user who picks "the wall" must get the wall, not the one strip under
+-/// the cursor (M1.5.2 issue: "selects a facet - we need welded faces").
+-/// Flat faces are their own logical unit and stay a plain Face - the
+-/// promotion cannot re-key what was never split. None when the entity
+-/// or its features are gone.
+-pub(crate) fn feature_of_facet(state: &State, entity: &str, facet: usize) -> Option<FeatureSel> {
+-    let found = model::find_by_name(&state.world, entity)?;
+-    let features = model::features_of(&state.world, &found)?;
+-    let fi = *features.facet_face.get(facet)?;
+-    let fid = features.faces.get(fi as usize)?.id;
+-    Some(
+-        feature::patches(&features)
+-            .into_iter()
+-            .find(|p| p.faces.contains(&fid))
+-            .map_or(FeatureSel::Face(fid), |p| FeatureSel::Patch(p.id)),
+-    )
+-}
+-
+ // ------------------------------------------------- gizmos and anchors
+ 
+ /// Compass names for the 3x3 XY anchor grid, row-major north-to-south,
+diff --git a/crates/ui/src/law_tests.rs b/crates/ui/src/law_tests.rs
+index 14dfb325f..59ad8c7ee 100644
+--- a/crates/ui/src/law_tests.rs
++++ b/crates/ui/src/law_tests.rs
+@@ -14,9 +14,9 @@ use camcraft_app::{model, operation};
+ 
+ use crate::egui_app::world;
+ use crate::interact::{
+-    CLEARANCE_RGB, CUT_RGB, FEED_RGB, MAX_OVERLAY_VERTICES, PICK_EDGE_PX, PLUNGE_RGB, RAPID_RGB,
++    CLEARANCE_RGB, CUT_RGB, FEED_RGB, MAX_OVERLAY_VERTICES, PLUNGE_RGB, RAPID_RGB,
+     REGION_RGB, RETRACT_RGB, anchor_hit, anchor_points, anchor_reference, capped, chevrons,
+-    collect_overlay, edge_nearest, feature_of_facet, ftoz, height_plane_lines, height_planes,
++    collect_overlay, ftoz, height_plane_lines, height_planes,
+     gizmo_segments, hover_features, is_axis_label, overlay_labels, plane_corner, plane_rect, project_uv, queue_feature_pick,
+     region_lines, selection_feature_lines, shown_regions, toolpath_lines,
+ };
+@@ -970,9 +970,9 @@ mod feature_pick_tests {
+     //! The Face/Edge click path as it lands on State: a plain click
+     //! replaces the open operation's geometry list, Ctrl/Shift adds to it,
+     //! a repeat is refused as a no-op, and with no operation open nothing
+-    //! queues. The screen-space edge search - the half `pick_edge` reads
+-    //! but headless tests cannot drive through a window - is pinned here
+-    //! too, at the same projection the gizmo and anchor tests use.
++    //! queues. The edge pick - the one pick rule (#692) as the viewport
++    //! asks it, `feature_click::feature_at` - is pinned here too, at the
++    //! same projection the gizmo and anchor tests use.
+ 
+     use super::*;
+     use camcraft_app::commands::{AddTool, CreateOperation, ImportModel};
+@@ -981,6 +981,25 @@ mod feature_pick_tests {
+     use camcraft_app::stock::StockShape;
+     use camcraft_app::tools::catalog;
+ 
++    /// The welded face a facet belongs to, by the one pick rule's graph
++    /// (what a Face click on that facet stores).
++    fn feature_of_facet(state: &State, entity: &str, facet: usize) -> Option<FeatureSel> {
++        camcraft_app::pick::graph_of(&state.world, entity)?.face_of(facet)?.sel
++    }
++
++    /// The feature edge an Edge-only pick takes at `p`: (entity, edge).
++    fn edge_nearest(state: &State, p: [f32; 2]) -> Option<(String, u32)> {
++        let ask = crate::feature_click::Ask {
++            kinds: camcraft_app::pick::PickKinds::EDGES,
++            unit: camcraft_app::pick::EdgeUnit::Chain,
++        };
++        let (pick, _) = crate::feature_click::feature_at(state, p, ask)?;
++        match pick.target {
++            camcraft_app::pick::PickTarget::Edge { edge } => Some((pick.entity, edge)),
++            _ => None,
++        }
++    }
++
+     fn state_with_op() -> State {
+         let mut state = State::new();
+         state.pending.push_back(CommandKind::SetStock {
+@@ -1188,14 +1207,14 @@ mod feature_pick_tests {
+         let (edge, mid) = rim_mid_px(&state, &mvp, "part", 4.9, 800.0, 600.0)
+             .expect("a part rim edge visible from the default camera");
+         let (name, hit) =
+-            edge_nearest(&state, mid, PICK_EDGE_PX).expect("an edge under its own midpoint");
++            edge_nearest(&state, mid).expect("an edge under its own midpoint");
+         assert_eq!(name, "part", "the part draws over the stock here");
+         assert_eq!(hit, edge, "and it is the edge that drew there");
+ 
+         // The browser eye closes the geometry off the screen too.
+         state.hidden_models.push("part".into());
+         assert!(
+-            edge_nearest(&state, mid, 4.0 * PICK_EDGE_PX).is_none_or(|(n, _)| n != "part"),
++            edge_nearest(&state, mid).is_none_or(|(n, _)| n != "part"),
+             "a hidden model's edges are not on screen, even nearby"
+         );
+     }
+@@ -1210,14 +1229,14 @@ mod feature_pick_tests {
+         });
+         state.drain_actions();
+         assert!(
+-            edge_nearest(&state, [10.0, 10.0], 50.0).is_none(),
++            edge_nearest(&state, [10.0, 10.0]).is_none(),
+             "pre-layout there is no image to project into - no phantom picks"
+         );
+         state.viewport_rect = ([0.0, 0.0], [800.0, 600.0]);
+         let mvp = state.cam.mvp(800.0 / 600.0);
+         let (_, mid) = rim_mid_px(&state, &mvp, STOCK_NAME, 19.9, 800.0, 600.0)
+             .expect("a stock rim edge visible from the default camera");
+-        let (name, _) = edge_nearest(&state, mid, PICK_EDGE_PX).expect("the stock's own edge");
++        let (name, _) = edge_nearest(&state, mid).expect("the stock's own edge");
+         assert_eq!(name, STOCK_NAME, "the stock's top is pickable geometry, no tree needed");
+     }
+ }
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 53efa64f6..3215c3077 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod boundary_draft;
+ pub mod boundary_viz;
+ pub mod boundary_summary;
+ pub mod edge_pick;
++pub mod feature_click;
+ pub mod egui_app;
+ pub mod feedback;
+ pub mod headless_gpu;
+diff --git a/crates/ui/src/vertex_pick.rs b/crates/ui/src/vertex_pick.rs
+index 773bc09d3..e9c288bd6 100644
+--- a/crates/ui/src/vertex_pick.rs
++++ b/crates/ui/src/vertex_pick.rs
+@@ -1,130 +1,21 @@
+-//! Vertex picking (M13.4): the feature corner nearest the cursor in
+-//! screen space, depth-tested so a corner hidden behind the part never
+-//! wins. Hover lights it, a click folds it into the open operation's
+-//! geometry list through the same command the face and edge picks queue.
++//! Vertex picks (M13.4): where a picked feature point sits, and the
++//! work-origin moves a picked vertex or face drives (the WCS chips). The
++//! pick itself is the app's one rule (#692 step 2, `crate::feature_click`):
++//! a feature point - a corner, a sharp turn, an open edge's end - visible
++//! under the cursor; never a vertex inside a face or along a round rim.
+ //!
+-//! Provenance: standard screen-space point picking (project every
+-//! candidate through the view-projection, nearest within a pixel radius,
+-//! then an occlusion ray - from the eye, or in orthographic back along
+-//! the parallel view direction) - our own code from general graphics practice;
+-//! no vendor material consulted.
++//! Provenance: our own code over the app's pick and origin targets; the
++//! screen marker is plain viewport projection. No vendor material
++//! consulted.
+ 
+ use camcraft_app::geometry::feature::{self, VertexId};
+ use camcraft_app::geometry::{Point3, transform_point};
+-use camcraft_app::operation::{FeatureSel, GeoSel};
++use camcraft_app::operation::FeatureSel;
+ use camcraft_app::{model, pick};
+ 
+-use crate::interact::{Mods, project_uv, queue_feature_pick};
++use crate::interact::project_uv;
+ 
+-use crate::state::{CommandKind, HoverHit, State};
+-use crate::viewport::{Camera, ProjectionMode};
+-
+-/// How close a corner must draw to the cursor to be pickable, logical px.
+-pub(crate) const PICK_VERTEX_PX: f32 = 8.0;
+-
+-/// The pure law: of the world-space `cands`, the index of the one whose
+-/// projection through `mvp` lands nearest `cursor` (logical px, inside the
+-/// image rect `rect`), within `radius` px, among those `visible` accepts.
+-/// Candidates are measured nearest-first and only the winners pay for the
+-/// visibility test - a hidden corner yields to the next-nearest visible
+-/// one, never to nothing. Ties go to the lower index (deterministic).
+-pub fn nearest_vertex(
+-    cands: &[[f64; 3]],
+-    mvp: &[[f32; 4]; 4],
+-    rect: ([f32; 2], [f32; 2]),
+-    cursor: [f32; 2],
+-    radius: f32,
+-    visible: impl Fn(usize) -> bool,
+-) -> Option<usize> {
+-    let ([x0, y0], [x1, y1]) = rect;
+-    let (w, h) = (x1 - x0, y1 - y0);
+-    if !(w > 1.0 && h > 1.0) || !radius.is_finite() || radius < 0.0 {
+-        return None;
+-    }
+-    let mut near: Vec<(f32, usize)> = cands
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(i, c)| {
+-            let uv = project_uv(mvp, *c)?; // behind the camera: not on screen
+-            let (dx, dy) = (x0 + uv[0] * w - cursor[0], y0 + uv[1] * h - cursor[1]);
+-            let d2 = dx * dx + dy * dy;
+-            (d2.is_finite() && d2 <= radius * radius).then_some((d2, i))
+-        })
+-        .collect();
+-    near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+-    near.into_iter().map(|(_, i)| i).find(|&i| visible(i))
+-}
+-
+-/// Where the occlusion ray toward world point `q` starts: the eye in
+-/// perspective; in orthographic (#610) `q`'s own point on the eye plane,
+-/// so the ray runs back along the parallel view direction as
+-/// `Camera::ray_through` casts it. `None` for a point at or behind the
+-/// eye plane (nothing on screen to test) or degenerate math.
+-pub(crate) fn sight_origin(cam: &Camera, q: [f64; 3]) -> Option<[f64; 3]> {
+-    let eye = cam.eye();
+-    if cam.projection == ProjectionMode::Perspective {
+-        return Some(eye);
+-    }
+-    let (_, _, f) = cam.view_basis();
+-    let depth = (q[0] - eye[0]) * f.0 + (q[1] - eye[1]) * f.1 + (q[2] - eye[2]) * f.2;
+-    let o = [q[0] - f.0 * depth, q[1] - f.1 * depth, q[2] - f.2 * depth];
+-    (depth.is_finite() && depth > 1e-9 && o.iter().all(|v| v.is_finite())).then_some(o)
+-}
+-
+-/// Depth tolerance for the occlusion ray: the facets meeting AT a corner
+-/// hit at its own distance; this absorbs their float noise.
+-fn depth_tol(dist: f64) -> f64 {
+-    (dist.abs() * 1e-4).max(1e-3)
+-}
+-
+-/// The visible feature corner nearest a logical-px point, within
+-/// `radius`: (entity, vertex id). Every visible model's corners plus the
+-/// active setup's stock are candidates, in world space.
+-pub(crate) fn vertex_nearest(state: &State, p: [f32; 2], radius: f32) -> Option<(String, VertexId)> {
+-    let ([x0, y0], [x1, y1]) = state.viewport_rect;
+-    let (w, h) = (x1 - x0, y1 - y0);
+-    if w <= 1.0 || h <= 1.0 {
+-        return None;
+-    }
+-    let mvp = state.cam.mvp(f64::from(w / h));
+-    let hidden = |name: &str| state.hidden_in_view(name);
+-    let mut entities: Vec<(String, flecs_ecs::prelude::Entity)> =
+-        model::model_entities(&state.world).into_iter().filter(|(n, _)| !hidden(n)).collect();
+-    let stock_name = camcraft_app::setup::stock_entity_name(
+-        &state.world,
+-        camcraft_app::setup::active(&state.world).as_deref(),
+-    );
+-    if !state.active_stock_hidden()
+-        && let Some(stock) = model::find_by_name(&state.world, &stock_name)
+-    {
+-        entities.push((stock_name, stock));
+-    }
+-    // (entity, id, world position) per candidate, aligned with `pts`.
+-    let mut tags: Vec<(usize, VertexId)> = Vec::new();
+-    let mut pts: Vec<[f64; 3]> = Vec::new();
+-    for (k, (_, entity)) in entities.iter().enumerate() {
+-        let Some(features) = model::features_of(&state.world, entity) else {
+-            continue;
+-        };
+-        let loc = camcraft_app::setup_align::view_pose(&state.world, entity).unwrap_or_default(); // #326
+-        for vi in feature::corner_verts(&features) {
+-            let (Some(v), Some(id)) = (features.verts.get(vi as usize), feature::vertex_id(&features, vi)) else {
+-                continue;
+-            };
+-            let w = transform_point(Point3::new(v[0], v[1], v[2]), loc.pos, loc.rot);
+-            tags.push((k, id));
+-            pts.push([w.x, w.y, w.z]);
+-        }
+-    }
+-    let best = nearest_vertex(&pts, &mvp, state.viewport_rect, p, radius, |i| {
+-        let q = pts[i];
+-        let Some(o) = sight_origin(&state.cam, q) else { return false };
+-        let dist = ((q[0] - o[0]).powi(2) + (q[1] - o[1]).powi(2) + (q[2] - o[2]).powi(2)).sqrt();
+-        pick::point_visible(&state.world, o, q, depth_tol(dist), hidden)
+-    })?;
+-    let (k, id) = *tags.get(best)?;
+-    Some((entities.get(k)?.0.clone(), id))
+-}
++use crate::state::{CommandKind, State};
+ 
+ /// The world position of a picked vertex, if it still resolves.
+ pub(crate) fn vertex_world(state: &State, entity: &str, id: VertexId) -> Option<[f64; 3]> {
+@@ -137,46 +28,6 @@ pub(crate) fn vertex_world(state: &State, entity: &str, id: VertexId) -> Option<
+     Some([w.x, w.y, w.z])
+ }
+ 
+-/// Hover in Vertex mode: the corner under the cursor, or nothing.
+-pub(crate) fn hover_vertex(state: &mut State, p: [f32; 2]) {
+-    state.hover = vertex_nearest(state, p, PICK_VERTEX_PX).map(|(entity, id)| HoverHit {
+-        entity,
+-        facet: usize::MAX, // no facet drives this highlight
+-        feature: Some(FeatureSel::Vertex(id)),
+-    });
+-}
+-
+-/// Click in Vertex mode: the corner joins the open operation's geometry
+-/// (plain replaces, Ctrl/Shift adds) - the face/edge pick's own command.
+-pub(crate) fn pick_vertex(state: &mut State, p: [f32; 2], mods: Mods) {
+-    hover_vertex(state, p);
+-    let Some(hit) = state.hover.clone() else {
+-        state.status = String::from("no vertex under the cursor");
+-        return;
+-    };
+-    let Some(sel) = hit.feature else {
+-        return;
+-    };
+-    let pick = GeoSel { entity: hit.entity, feature: sel };
+-    if crate::axis_pick::collecting(state) {
+-        crate::axis_pick::take(state, pick); // #557: a point of an axis
+-        return;
+-    }
+-    if crate::plane_pick::collecting(state) {
+-        crate::plane_pick::take(state, pick); // #554: a point sets no plane, refused by name
+-        return;
+-    }
+-    if crate::axis_pick::hint_stray(state) {
+-        return; // #557: the axes rows are open, nothing armed
+-    }
+-    if state.boundary_pick.is_some() {
+-        // A point bounds nothing: refused by name, never drafted.
+-        state.status = format!("{} of '{}' is a point - a boundary takes faces or edges", pick.feature, pick.entity);
+-        return;
+-    }
+-    queue_feature_pick(state, pick, mods.ctrl || mods.shift);
+-}
+-
+ /// Queue the work origin onto a picked vertex: the WCS pane's angles, the vertex's world position, through the one `SetWcs` command
+ /// the anchor grid also queues (undoable like any origin move).
+ pub fn queue_origin_at_vertex(state: &mut State, entity: &str, id: VertexId) {
+diff --git a/crates/ui/src/vertex_pick_tests.rs b/crates/ui/src/vertex_pick_tests.rs
+index 2284ff083..affecea42 100644
+--- a/crates/ui/src/vertex_pick_tests.rs
++++ b/crates/ui/src/vertex_pick_tests.rs
+@@ -1,17 +1,21 @@
+-//! M13.4 law: the pure vertex-pick function on a cube seen down its body
+-//! diagonal - the front corner and the hidden back corner project onto
+-//! the same pixel, and only the front one may win.
++//! M13.4 law, on the one pick rule (#692 step 2): a Vertex-mode pick on a
++//! cube seen down its body diagonal - the front corner and the hidden back
++//! corner project onto the same pixel, and only the front one may win; a
++//! corner hidden behind the part is never picked, in perspective or
++//! orthographic, unless the app's explicit pick-through is asked for.
+ //!
+ //! Provenance: our own test, standard picking geometry.
+ 
++use camcraft_app::commands::ImportModel;
+ use camcraft_app::geometry::{Point3, cube};
+-use camcraft_app::pick::sight_blocked;
++use camcraft_app::pick::{self, EdgeUnit, PickKinds, PickTarget};
+ 
+-use crate::vertex_pick::{nearest_vertex, sight_origin};
++use crate::feature_click::{Ask, feature_at, query_at};
++use crate::state::State;
+ use crate::viewport::{Camera, ProjectionMode};
+ 
+-const RECT: ([f32; 2], [f32; 2]) = ([0.0, 0.0], [400.0, 400.0]);
+ const CENTER: [f32; 2] = [200.0, 200.0];
++const POINTS: Ask = Ask { kinds: PickKinds::POINTS, unit: EdgeUnit::Chain };
+ 
+ /// Looking from +X+Y+Z at the origin: (10,10,10) faces the eye and
+ /// (-10,-10,-10) sits straight behind it.
+@@ -25,103 +29,81 @@ fn diagonal_cam() -> Camera {
+     }
+ }
+ 
+-fn corners() -> Vec<[f64; 3]> {
+-    let mut out = Vec::new();
+-    for x in [-10.0, 10.0] {
+-        for y in [-10.0, 10.0] {
+-            for z in [-10.0, 10.0] {
+-                out.push([x, y, z]);
+-            }
+-        }
+-    }
+-    out
++/// A 20 mm cube centred on the origin, the only thing in the view.
++fn cube_state(projection: ProjectionMode) -> State {
++    let mut state = State::new();
++    state.history.execute(
++        &state.world,
++        ImportModel::from_mesh("c", cube(Point3::new(-10.0, -10.0, -10.0), Point3::new(10.0, 10.0, 10.0))),
++    );
++    state.viewport_rect = ([0.0, 0.0], [400.0, 400.0]);
++    state.cam = Camera { projection, ..diagonal_cam() };
++    state
+ }
+ 
+-#[test]
+-fn nearest_visible_corner_wins_and_the_hidden_back_corner_never_does() {
+-    let cam = diagonal_cam();
+-    let mvp = cam.mvp(1.0);
+-    let eye = cam.eye();
+-    let tris = cube(Point3::new(-10.0, -10.0, -10.0), Point3::new(10.0, 10.0, 10.0)).facets;
+-    let pts = corners();
+-    let visible = |i: usize| !sight_blocked(&tris, eye, pts[i], 1e-3);
+-    let front = pts.iter().position(|p| *p == [10.0, 10.0, 10.0]).expect("front");
+-    let back = pts.iter().position(|p| *p == [-10.0, -10.0, -10.0]).expect("back");
++/// The picked point's world position (`None` for no pick or no point).
++fn point_at(state: &State, p: [f32; 2]) -> Option<[f64; 3]> {
++    let (pick, _) = feature_at(state, p, POINTS)?;
++    matches!(pick.target, PickTarget::Point(_)).then_some(pick.at)
++}
+ 
+-    // Both project to the image center; the occlusion ray decides.
+-    assert_eq!(nearest_vertex(&pts, &mvp, RECT, CENTER, 8.0, visible), Some(front));
++fn near(a: [f64; 3], b: [f64; 3]) -> bool {
++    (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() < 1e-6
++}
+ 
+-    // The back corner alone, at the exact pixel it projects to: hidden.
+-    let only_back = [pts[back]];
+-    let back_visible = |_: usize| !sight_blocked(&tris, eye, only_back[0], 1e-3);
+-    assert_eq!(nearest_vertex(&only_back, &mvp, RECT, CENTER, 8.0, back_visible), None, "a corner behind the part is never picked");
++/// Where world point `q` draws, logical px.
++fn px(state: &State, q: [f64; 3]) -> [f32; 2] {
++    let uv = crate::interact::project_uv(&state.cam.mvp(1.0), q).expect("on screen");
++    [uv[0] * 400.0, uv[1] * 400.0]
++}
+ 
+-    // Without the depth test the same pixel finds a corner (proof the
+-    // test above refused on depth, not on distance).
+-    assert!(nearest_vertex(&only_back, &mvp, RECT, CENTER, 8.0, |_| true).is_some());
++/// The back corner, tilted off the front one, and checked hidden: the
++/// view pick finds nothing (or another corner) there, the explicit
++/// pick-through finds it.
++fn back_corner_is_never_picked(mut state: State) {
++    state.cam.yaw += 0.25;
++    let back = [-10.0, -10.0, -10.0];
++    let at = px(&state, back);
++    assert!(point_at(&state, at).is_none_or(|w| !near(w, back)), "a corner behind the part is never picked");
++    let mut q = query_at(&state, at, POINTS).expect("a query");
++    q.through = true;
++    let through = pick::pick_feature(&state.world, &q, |_| false).expect("pick-through finds a corner");
++    assert!(near(through.at, back), "proof the view pick refused on depth, not distance: {through:?}");
++}
+ 
++#[test]
++fn nearest_visible_corner_wins_and_the_hidden_back_corner_never_does() {
++    let state = cube_state(ProjectionMode::Perspective);
++    // Both project to the image centre; the occlusion ray decides.
++    let front = point_at(&state, CENTER).expect("the front corner");
++    assert!(near(front, [10.0, 10.0, 10.0]), "{front:?}");
+     // Far from every corner: nothing within the radius.
+-    assert_eq!(nearest_vertex(&pts, &mvp, RECT, [5.0, 5.0], 8.0, visible), None);
++    assert_eq!(point_at(&state, [5.0, 5.0]), None);
++    back_corner_is_never_picked(state);
+ }
+ 
+ #[test]
+ fn degenerate_inputs_pick_nothing() {
+-    let cam = diagonal_cam();
+-    let mvp = cam.mvp(1.0);
+-    let pts = corners();
+-    assert_eq!(nearest_vertex(&pts, &mvp, ([0.0, 0.0], [0.0, 0.0]), CENTER, 8.0, |_| true), None, "no image rect");
+-    assert_eq!(nearest_vertex(&pts, &mvp, RECT, CENTER, f32::NAN, |_| true), None, "NaN radius");
+-    assert_eq!(nearest_vertex(&[[f64::NAN; 3]], &mvp, RECT, CENTER, 8.0, |_| true), None, "NaN vertex");
+-    assert_eq!(nearest_vertex(&[], &mvp, RECT, CENTER, 8.0, |_| true), None);
+-}
+-
+-/// A 4 mm block centred at `c`: the occluder of the orthographic test.
+-fn block(c: [f64; 3]) -> Vec<camcraft_app::geometry::Triangle> {
+-    cube(Point3::new(c[0] - 2.0, c[1] - 2.0, c[2] - 2.0), Point3::new(c[0] + 2.0, c[1] + 2.0, c[2] + 2.0)).facets.to_vec()
++    let mut state = cube_state(ProjectionMode::Perspective);
++    assert!(point_at(&state, [f32::NAN, 200.0]).is_none(), "NaN cursor");
++    state.viewport_rect = ([0.0, 0.0], [0.0, 0.0]);
++    assert!(point_at(&state, CENTER).is_none(), "no image rect");
++    let mut empty = State::new();
++    empty.viewport_rect = ([0.0, 0.0], [400.0, 400.0]);
++    empty.cam = diagonal_cam();
++    assert!(point_at(&empty, CENTER).is_none(), "nothing in the view");
++    let mut nan = cube_state(ProjectionMode::Perspective);
++    nan.cam.dist = f64::NAN;
++    assert!(point_at(&nan, CENTER).is_none(), "a NaN camera");
+ }
+ 
+ #[test]
+-fn orthographic_visibility_runs_along_the_view_direction_not_to_the_eye() {
+-    // #610: two corners 30 mm off the view axis. A block sits on the
+-    // first corner's parallel view ray (hidden in ortho) but off its
+-    // line to the eye; another sits on the second corner's line to the
+-    // eye but off its parallel ray (visible in ortho). The eye-point
+-    // test reads both backwards; the parallel one reads them as the
+-    // screen shows them. Perspective keeps the eye-point segment.
+-    let mut cam = diagonal_cam();
+-    cam.projection = ProjectionMode::Orthographic;
+-    let (r, _, f) = cam.view_basis();
+-    let eye = cam.eye();
+-    let at = |base: [f64; 3], k: f64, d: [f64; 3]| [base[0] + k * d[0], base[1] + k * d[1], base[2] + k * d[2]];
+-    let (r, f) = ([r.0, r.1, r.2], [f.0, f.1, f.2]);
+-    let hidden_corner = at([0.0; 3], 30.0, r);
+-    let shown_corner = at([0.0; 3], -30.0, r);
+-    let mut tris = block(at(hidden_corner, -20.0, f)); // 20 mm up its view ray
+-    let to_eye = [eye[0] - shown_corner[0], eye[1] - shown_corner[1], eye[2] - shown_corner[2]];
+-    tris.extend(block(at(shown_corner, 0.2, to_eye))); // 20 mm up its eye line
+-    let pts = [hidden_corner, shown_corner];
+-    let ortho_visible = |i: usize| sight_origin(&cam, pts[i]).is_some_and(|o| !sight_blocked(&tris, o, pts[i], 1e-3));
+-    assert!(!ortho_visible(0), "a corner behind a block along the view direction is hidden in ortho");
+-    assert!(ortho_visible(1), "a corner with a clear parallel view ray is visible in ortho");
+-    // The old eye-point law reads both the other way round - the bug.
+-    assert!(!sight_blocked(&tris, eye, pts[0], 1e-3) && sight_blocked(&tris, eye, pts[1], 1e-3));
+-
+-    // Through the pick itself: the cursor on the hidden corner yields
+-    // nothing; on the shown one, that corner.
+-    let mvp = cam.mvp(1.0);
+-    let px = |q: [f64; 3]| {
+-        let uv = crate::interact::project_uv(&mvp, q).expect("on screen");
+-        [uv[0] * 400.0, uv[1] * 400.0]
+-    };
+-    assert_eq!(nearest_vertex(&pts, &mvp, RECT, px(hidden_corner), 8.0, ortho_visible), None);
+-    assert_eq!(nearest_vertex(&pts, &mvp, RECT, px(shown_corner), 8.0, ortho_visible), Some(1));
+-
+-    // Perspective: the occlusion ray still starts at the eye.
+-    cam.projection = ProjectionMode::Perspective;
+-    for q in pts {
+-        assert_eq!(sight_origin(&cam, q), Some(cam.eye()));
+-    }
+-    // A point behind the ortho eye plane has nothing on screen to test.
+-    cam.projection = ProjectionMode::Orthographic;
+-    assert_eq!(sight_origin(&cam, at(eye, -1.0, f)), None);
++fn orthographic_picks_are_visible_first_too() {
++    // #610: the ortho occlusion ray runs back along the parallel view
++    // direction (the app's rule); the corner in front still wins and the
++    // one behind is still never picked.
++    let state = cube_state(ProjectionMode::Orthographic);
++    let front = point_at(&state, CENTER).expect("the front corner");
++    assert!(near(front, [10.0, 10.0, 10.0]), "{front:?}");
++    back_corner_is_never_picked(state);
+ }
+diff --git a/docs/decisions/692-pick-wire.md b/docs/decisions/692-pick-wire.md
+new file mode 100644
+index 000000000..b4b1cce47
+--- /dev/null
++++ b/docs/decisions/692-pick-wire.md
+@@ -0,0 +1,83 @@
++## #692 - one pick rule for the whole app (step 2: every picker on it)
++
++- **Chosen:** every viewport Face/Edge/Vertex click and hover goes through
++  one UI router, `ui::feature_click`. It builds the camera's `PickRay`,
++  states the kinds the armed tool accepts, and calls
++  `app::pick::pick_selection`, which is `pick_feature` plus a mapping to the
++  stored `FeatureSel`. The answer goes to whoever already owned the click:
++  the axis or plane draft, the stray-click hint, the boundary draft, or the
++  open operation's geometry (edges keep the Ctrl/Shift law of
++  `edge_pick`). The local rules are gone: interact's screen-space
++  `edge_nearest` (it had no occlusion test, and its candidates were every
++  `Features::edges` entry, facet seams included), `feature_of_facet`, the
++  raycast face pick, and vertex_pick's `nearest_vertex`, `sight_origin` and
++  `vertex_nearest` (its candidates were every endpoint of `Features::edges`).
++- **Kinds per picker:**
++  - Plane row: faces only (#554), whatever the mode.
++  - Axis by edge: edges only (a run). Axis by two points: points only.
++  - Operation geometry in Face mode: faces. In Edge mode: edges, and the
++    face between them; a tangent chain, a run while a boundary collects,
++    one segment with Alt. In Vertex mode: points.
++  - A boundary refuses a point by name, as before.
++  - The armed Setups row decides the kinds before the pick mode does, so an
++    axis row never snaps to a face and the plane row never snaps to an edge.
++  - The old refuse-by-name arms in `axis_pick::take` and `plane_pick::take`
++    stay as defence.
++- **Radius:** the pixel radius is 12 px for edges and 8 px for points
++  (unchanged). In ortho it becomes world mm once: 2 x ortho half-height /
++  pane height. In perspective it becomes mm per mm of depth through a new
++  `PickQuery::radius_per_depth` (2 tan 30 deg / pane height), so it holds
++  at the silhouette, where no surface hit anchors `radius`. Step 1's
++  hit-anchored `radius` stays the default when the new field is 0.
++- **Pick through: not offered.** `through` is `false` at every call site. A
++  toggle needs a ribbon or view-cube control, its state and display, and a
++  test of its own. That is not cheap here, and the rule is safe without it.
++  The app API keeps `through` for when a page asks for it.
++- **Performance:**
++  - Graphs are cached per facet allocation (`feature_graph_shared`): a
++    `Weak<[Triangle]>` pointer compare, cap 32, dead entries pruned on each
++    call. This works because `Facets` is an immutable `Arc` that every
++    landing replaces. Hover no longer hashes every mesh each frame.
++  - Chains and runs are memoized on the cached graph.
++  - At most 32 candidates per tier pay for a sight ray. Without a cap, a
++    finely tessellated far rim cost one full ray per hidden chord: a
++    100k-facet cylinder took more than 0.4 s per hover pick in debug.
++    Before choosing 32, I tried 8: it lost 9 of 16 visible point hits on
++    sample_ap214, while 32 loses none.
++  - Release timings, 400 hover picks:
++    - sample_ap214.step (1,550 facets): 10-32 us mean.
++    - A 100k-facet cylinder: 0.4 ms mean for faces, 2.8 ms mean for edges
++      (36 ms worst, the first call, which builds the chain memo).
++- **Pick bodies:** `pick_bodies_of` now leaves out the stocks of non-active
++  setups, because the viewport draws only the active one. Before this,
++  `first_hit_f` (the face pick) could land on an undrawn stock.
++- **Model mode is unchanged:** it still uses `first_hit_f` and the machined
++  mesh filter. It selects entities, not features. In the feature modes the
++  machined-mesh hover triangle (`hover_mesh`) no longer shows; the feature
++  highlight replaces it.
++- **MCP:** `list_features` lists chains made of feature edges only, and
++  feature points only as vertices. A face-loop span over a facet seam
++  therefore reads `complete: false` (its documented "pick the face"
++  answer). Every pick by id (`picks_of`: geometry, area, axes) goes through
++  `pick::check_pickable`. It refuses a vertex that is not a feature point,
++  and a chain that runs along facet seams. Stale ids are left to the
++  commands.
++- **Changed behaviour users will see:**
++  - The rim vertices of round holes and bosses are no longer pickable
++    points.
++  - Facet seams of smooth walls are no longer pickable edges.
++  - Edges and points behind the part can no longer be picked: the Edge-mode
++    pick had no occlusion test at all before.
++- **Not here:**
++  - Fixture locate (#561) is unmerged, in PR #566. It must call
++    `feature_click`/`pick_selection` when it lands.
++  - Round-edge centres are not stored by any page yet, so no `FeatureSel`
++    variant was added.
++  - The WCS anchor markers stay a screen-space marker pick: they are
++    overlay points, not model features.
++  - The user-docs note (#688) is owed.
++- **Cost to change:**
++  - Adding pick-through is one `Ask` flag, one control, and `through:
++    true`.
++  - A page that wants centres adds a `FeatureSel` variant and a
++    `selection_of` arm.
+
+From e5d3b32e826d6ebc1d86d304bc98fe940b668a9a Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Tue, 10 Nov 2026 11:50:06 -0800
+Subject: [PATCH 3/3] fix(ui): both points of a two-point axis pick stay marked
+ (#709 hand check)
+
+A picked point's only marker was the violet 3D cross in the overlay
+buffer: arms of (gizmo_len * 0.05).max(0.5) = 0.5 mm on the user's
+60 mm part, ~1.1-1.6 px per arm at a framed view, 1 px lines, depth-
+tested and half sunk into the faces and wire of the corner they mark.
+Both crosses were in the buffer (the draft held and resolved both
+points), but whether a ~3 px z-fighting smudge shows is per-corner
+luck, so a picked corner could vanish.
+
+Every shown picked point now also carries a screen-space violet diamond
+(vertex_pick::picked_point_marks, the hover's vertex_marker shape),
+painted over the image so depth never hides it. interact::shown_picks
+is split out of selection_feature_lines so the cross and the mark draw
+the same pick list. PICK_RGB moves to module level for both.
+
+Pinned by two_point_marks::both_points_of_a_two_point_axis_stay_marked_on_the_users_part
+(real clicks on testdata/models/Milling-test.step), plus
+setup_axis_tests::both_picked_points_keep_their_markers and
+one_pick_rule::both_clicked_points_of_an_axis_keep_their_markers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/ui/src/egui_app/setup_axis_tests.rs    |  20 ++++
+ crates/ui/src/egui_app/shell.rs               |  12 +-
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ crates/ui/src/egui_app/tests/one_pick_rule.rs |  27 +++++
+ .../ui/src/egui_app/tests/two_point_marks.rs  | 112 ++++++++++++++++++
+ crates/ui/src/interact.rs                     |  34 +++---
+ crates/ui/src/vertex_pick.rs                  |  17 +++
+ 7 files changed, 200 insertions(+), 24 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/tests/two_point_marks.rs
+
+diff --git a/crates/ui/src/egui_app/setup_axis_tests.rs b/crates/ui/src/egui_app/setup_axis_tests.rs
+index 5401b8f9b..ac051aff0 100644
+--- a/crates/ui/src/egui_app/setup_axis_tests.rs
++++ b/crates/ui/src/egui_app/setup_axis_tests.rs
+@@ -280,3 +280,23 @@ fn flip_after_apply_re_applies_as_its_own_undo_step() {
+     key(&mut h, Key::Z);
+     assert_eq!(setup_align::stored(&h.state().world, "Setup1"), None, "a second undo restores as modelled");
+ }
++
++/// #709 hand check: after the second of two points, BOTH keep their
++/// purple marker - the overlay draws every picked point (three arms each),
++/// not only the first.
++#[test]
++fn both_picked_points_keep_their_markers() {
++    let mut h = harness();
++    h.get_by_label("+X by Two points").click();
++    h.run();
++    let a = corner(h.state(), [0.0, 0.0, 0.0]);
++    let b = corner(h.state(), [0.0, 20.0, 0.0]);
++    crate::axis_pick::take(h.state_mut(), a);
++    h.run();
++    let one = crate::interact::selection_feature_lines(h.state()).len();
++    assert!(one > 0, "one point: its cross is drawn");
++    crate::axis_pick::take(h.state_mut(), b);
++    h.run();
++    let two = crate::interact::selection_feature_lines(h.state()).len();
++    assert_eq!(two, 2 * one, "two points: two crosses, the second as visible as the first");
++}
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index 915becb44..cc2cfa032 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -1312,14 +1312,12 @@ fn viewport_panel(
+                 ui.painter().text(at, egui::Align2::LEFT_TOP, text, font.clone(), rgb8(rgb));
+             }
+         }
++        // #709: picked points, violet and never occluded; the hover over them.
++        for (a, b) in crate::vertex_pick::picked_point_marks(state, aspect) {
++            ui.painter().line_segment([to_px(a), to_px(b)], egui::Stroke::new(2.0, rgb8(interact::PICK_RGB)));
++        }
+         for (a, b) in interact::hover_features(state, aspect) {
+-            ui.painter().line_segment(
+-                [
+-                    egui::pos2(rx0 + a[0] * rw, ry0 + a[1] * rh),
+-                    egui::pos2(rx0 + b[0] * rw, ry0 + b[1] * rh),
+-                ],
+-                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 217, 102)),
+-            );
++            ui.painter().line_segment([to_px(a), to_px(b)], egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 217, 102)));
+         }
+         // The machined mesh's hovered facet (#25): the hover ink's yellow,
+         // a veil over the class colour and its outline.
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 67a96703f..a44b76b4f 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -117,6 +117,8 @@ mod theme_door;
+ mod recent_door;
+ // #509: the Fixtures page rows fit the pane.
+ mod fixture_rows;
++// #709 hand check: both points of a two-point axis stay marked.
++mod two_point_marks;
+ 
+ /// What the per-frame state of `Shell` is, minus the GPU half: the fields
+ /// `shell_layout` touches, so the harness exercises the window's real body.
+diff --git a/crates/ui/src/egui_app/tests/one_pick_rule.rs b/crates/ui/src/egui_app/tests/one_pick_rule.rs
+index 4e7e8786b..f22758286 100644
+--- a/crates/ui/src/egui_app/tests/one_pick_rule.rs
++++ b/crates/ui/src/egui_app/tests/one_pick_rule.rs
+@@ -311,3 +311,30 @@ fn locate_and_points_drafts_take_box_corners_as_points() {
+     assert_eq!(picks(&harness).len(), 2, "the face is not drafted");
+     assert!(harness.state().state.status.contains("is a face"), "{}", harness.state().state.status);
+ }
++
++/// #709 hand check: "+Y by Two points" - after the SECOND real click both
++/// picked corners keep their purple marker, the overlay drawing each.
++#[test]
++fn both_clicked_points_of_an_axis_keep_their_markers() {
++    let mut harness = shell_harness();
++    arm_axis(&mut harness, "+Y by Two points");
++    // The two visible top corners nearest the eye, as real clicks.
++    let e = harness.state().state.cam.eye();
++    let mut tops: Vec<(f64, egui::Pos2)> = [[0.0, 0.0, 30.0], [60.0, 0.0, 30.0], [60.0, 60.0, 30.0], [0.0, 60.0, 30.0]]
++        .iter()
++        .filter_map(|c: &P| {
++            let d = (c[0] - e[0]).powi(2) + (c[1] - e[1]).powi(2) + (c[2] - e[2]).powi(2);
++            px_of(harness.state(), *c).map(|p| (d, p))
++        })
++        .collect();
++    tops.sort_by(|a, b| a.0.total_cmp(&b.0));
++    assert!(tops.len() >= 2, "two top corners on screen");
++    click_viewport(&mut harness, tops[0].1);
++    let one = interact::selection_feature_lines(&harness.state().state).len();
++    assert_eq!(axis_y(&harness).len(), 1, "{}", harness.state().state.status);
++    assert!(one > 0, "the first point is marked");
++    click_viewport(&mut harness, tops[1].1);
++    assert_eq!(axis_y(&harness).len(), 2, "{}", harness.state().state.status);
++    let two = interact::selection_feature_lines(&harness.state().state).len();
++    assert_eq!(two, 2 * one, "both points marked: {:?}", axis_y(&harness));
++}
+diff --git a/crates/ui/src/egui_app/tests/two_point_marks.rs b/crates/ui/src/egui_app/tests/two_point_marks.rs
+new file mode 100644
+index 000000000..7a96ff3f7
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/two_point_marks.rs
+@@ -0,0 +1,112 @@
++//! #709 hand check: on the user's own part (`Milling-test.step`, the
++//! D-shaped plate), the Setups page's "+Y by Two points" keeps BOTH
++//! picked points marked after the second real click. The 3D cross of a
++//! picked point is ~1 mm, depth-tested and half sunk in its corner (~3 px
++//! across at a framed part), so a picked corner could vanish; each pick
++//! now also carries a screen-space violet diamond that depth cannot hide.
++//! Provenance: our own test over our own shell; no vendor material
++//! consulted.
++//!
++//! Gate map (M4.4): covers ui::interact (shown_picks,
++//! selection_feature_lines), ui::vertex_pick (picked_point_marks),
++//! ui::axis_pick, ui::feature_click.
++
++use camcraft_app::geometry::{Point3, transform_point};
++use camcraft_app::pick;
++
++use super::*;
++
++fn part_path() -> std::path::PathBuf {
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/Milling-test.step")
++}
++
++/// A blank window holding the user's part and Setup1, framed, with the
++/// Setups page showing.
++fn part_on_setups_page() -> Harness<'static, ShellUi> {
++    let mut h = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, ShellUi::blank());
++    {
++        let st = &mut h.state_mut().state;
++        st.pending.push_back(CommandKind::ImportFile(part_path()));
++        st.settle();
++        st.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
++        st.drain_actions();
++        crate::actions::frame_all(st);
++        st.drain_actions();
++        crate::actions::target(st, UiTarget::SetupNode("Setup1".into(), crate::state::SetupPage::Settings));
++    }
++    h.run_steps(3);
++    h
++}
++
++/// The part's feature points on the top face (z max), world frame, with
++/// where each draws in the pane (px).
++fn top_points(st: &State) -> Vec<([f64; 3], egui::Pos2)> {
++    let e = model::find_by_name(&st.world, "Milling-test").expect("the part imports as Milling-test");
++    let tris = model::facets_of(&st.world, &e).expect("facets");
++    let g = pick::feature_graph_shared(&tris);
++    let loc = camcraft_app::setup_align::view_pose(&st.world, &e).unwrap_or_default();
++    let ([x0, y0], [x1, y1]) = st.viewport_rect;
++    let mvp = st.cam.mvp(f64::from((x1 - x0) / (y1 - y0)));
++    let world: Vec<[f64; 3]> = g
++        .points
++        .iter()
++        .map(|p| transform_point(Point3::new(p.at[0], p.at[1], p.at[2]), loc.pos, loc.rot))
++        .map(|w| [w.x, w.y, w.z])
++        .collect();
++    let top = world.iter().map(|w| w[2]).fold(f64::MIN, f64::max);
++    world
++        .into_iter()
++        .filter(|w| (w[2] - top).abs() < 1e-6)
++        .filter_map(|w| {
++            let uv = interact::project_uv(&mvp, w)?;
++            Some((w, egui::pos2(x0 + uv[0] * (x1 - x0), y0 + uv[1] * (y1 - y0))))
++        })
++        .collect()
++}
++
++/// The centres (px) of the picked-point diamonds, four segments each.
++fn mark_centres(st: &State) -> Vec<egui::Pos2> {
++    let ([x0, y0], [x1, y1]) = st.viewport_rect;
++    let (w, h) = (x1 - x0, y1 - y0);
++    let segs = crate::vertex_pick::picked_point_marks(st, f64::from(w / h));
++    assert_eq!(segs.len() % 4, 0, "whole diamonds: {segs:?}");
++    segs.chunks(4)
++        .map(|d| {
++            let (sx, sy) = d.iter().fold((0.0, 0.0), |(sx, sy), (a, _)| (sx + a[0], sy + a[1]));
++            egui::pos2(x0 + sx / 4.0 * w, y0 + sy / 4.0 * h)
++        })
++        .collect()
++}
++
++#[test]
++fn both_points_of_a_two_point_axis_stay_marked_on_the_users_part() {
++    let mut h = part_on_setups_page();
++    h.get_by_label("+Y by Two points").click();
++    h.run();
++    assert!(crate::axis_pick::collecting(&h.state().state), "+Y by Two points arms the pick");
++    let tops = top_points(&h.state().state);
++    assert_eq!(tops.len(), 2, "the D's flat meets its round at two top corners: {tops:?}");
++
++    for (k, (_, px)) in tops.iter().enumerate() {
++        click_viewport(&mut h, *px);
++        let st = &h.state().state;
++        let picks = st.axis_pick.as_ref().and_then(|d| d.axes.y.clone()).map(|a| a.picks).unwrap_or_default();
++        assert_eq!(picks.len(), k + 1, "{}", st.status);
++        assert!(picks.iter().all(|g| matches!(g.feature, FeatureSel::Vertex(_))), "{picks:?}");
++        // Both resolve into the 3D overlay: one three-arm cross each.
++        assert_eq!(interact::selection_feature_lines(st).len(), 6 * (k + 1), "a cross per point");
++        // And each has its screen mark, centred where the point draws.
++        let marks = mark_centres(st);
++        assert_eq!(marks.len(), k + 1, "a screen mark per picked point after click {}: {marks:?}", k + 1);
++        for (_, want) in &tops[..=k] {
++            assert!(
++                marks.iter().any(|m| m.distance(*want) < 1.0),
++                "a mark sits on the point at {want:?}: {marks:?}"
++            );
++        }
++    }
++    // The page still reads both points.
++    assert!(h.state().state.status.contains("2 points for +Y"), "{}", h.state().state.status);
++}
+diff --git a/crates/ui/src/interact.rs b/crates/ui/src/interact.rs
+index 3bf6cf6d4..3f85cb94c 100644
+--- a/crates/ui/src/interact.rs
++++ b/crates/ui/src/interact.rs
+@@ -1432,43 +1432,43 @@ pub(crate) fn height_plane_lines(state: &State) -> Vec<[f32; 6]> {
+ /// place while orbiting. A vanished pick - hidden model, deleted entity,
+ /// stale id - draws nothing rather than a ghost, the hover rule again.
+ pub(crate) fn selection_feature_lines(state: &State) -> Vec<[f32; 6]> {
++    feature_lines(state, &shown_picks(state))
++}
++
++/// The picks shown: the collecting Setups page draft, else the open operation's.
++pub(crate) fn shown_picks(state: &State) -> Vec<GeoSel> {
+     // #330: while the Setups page collects a lay-on-a-plane pick, its
+     // draft picks are the ones drawn.
+     // #561: the locate draft's mates and its waiting half.
+     if let Some(d) = &state.locate_pick {
+-        let picks: Vec<GeoSel> =
+-            d.mates.iter().flat_map(|m| [m.part.clone(), m.fixture.clone()]).chain(d.half.clone()).collect();
+-        return feature_lines(state, &picks);
++        return d.mates.iter().flat_map(|m| [m.part.clone(), m.fixture.clone()]).chain(d.half.clone()).collect();
+     }
+     if let Some(draft) = state.plane_pick.as_ref().filter(|d| d.picking) {
+-        return feature_lines(state, &draft.picks);
++        return draft.picks.clone();
+     }
+     // #555: the three-points draft's picks.
+     if let Some(d) = &state.points_pick {
+-        return feature_lines(state, &d.picks);
++        return d.picks.clone();
+     }
+     // #557: the axes-in-the-plane draft's picks, while it collects.
+     if let Some(d) = state.axis_pick.as_ref().filter(|d| d.picking.is_some()) {
+-        let picks: Vec<GeoSel> = [&d.axes.y, &d.axes.x].into_iter().flatten().flat_map(|p| p.picks.clone()).collect();
+-        return feature_lines(state, &picks);
++        return [&d.axes.y, &d.axes.x].into_iter().flatten().flat_map(|p| p.picks.clone()).collect();
+     }
+     if state.op_ui.name.is_empty() || state.hidden_paths.contains(&state.op_ui.name) {
+         return Vec::new(); // nothing open: nothing picked to pin down
+     }
+-    let Some(op) = model::find_by_name(&state.world, &state.op_ui.name)
+-        .and_then(|e| model::operation_of(&state.world, &e))
+-    else {
+-        return Vec::new();
+-    };
+-    let operation::SrcRef::Selection(items) = &op.src else {
+-        return Vec::new();
+-    };
+-    feature_lines(state, items)
++    let op = model::find_by_name(&state.world, &state.op_ui.name).and_then(|e| model::operation_of(&state.world, &e));
++    match op.map(|o| o.src) {
++        Some(operation::SrcRef::Selection(items)) => items,
++        _ => Vec::new(),
++    }
+ }
+ 
++/// The pick violet: the 3D outlines and the picked points' screen marks.
++pub(crate) const PICK_RGB: [f32; 3] = [0.72, 0.44, 0.86];
++
+ /// The picks' outlines in 3D, violet (see [`selection_feature_lines`]).
+ fn feature_lines(state: &State, items: &[GeoSel]) -> Vec<[f32; 6]> {
+-    const PICK_RGB: [f32; 3] = [0.72, 0.44, 0.86];
+     let mut out = Vec::new();
+     for item in items {
+         if state.hidden_in_view(&item.entity) {
+diff --git a/crates/ui/src/vertex_pick.rs b/crates/ui/src/vertex_pick.rs
+index e9c288bd6..c21bb2d42 100644
+--- a/crates/ui/src/vertex_pick.rs
++++ b/crates/ui/src/vertex_pick.rs
+@@ -102,6 +102,23 @@ pub fn queue_wcs_321(state: &mut State) {
+     });
+ }
+ 
++/// #709 hand check: every shown picked point's screen diamond (see
++/// [`vertex_marker`]), drawn violet over the image. The 3D cross of
++/// `interact::selection_feature_lines` is a ~1 mm, depth-tested 1 px
++/// line star half sunk in the corner it marks: at a framed part it
++/// spans ~3 px and z-fights the faces and wire it lies on, so a picked
++/// corner could vanish. This mark is never occluded and keeps its size
++/// at any zoom. Hidden models and stale ids draw nothing.
++pub(crate) fn picked_point_marks(state: &State, aspect: f64) -> Vec<([f32; 2], [f32; 2])> {
++    let mut out = Vec::new();
++    for g in crate::interact::shown_picks(state) {
++        if matches!(g.feature, FeatureSel::Vertex(_)) {
++            crate::interact::feature_segments(state, &g.entity, g.feature, aspect, &mut out);
++        }
++    }
++    out
++}
++
+ /// Screen-space marker for a vertex: a small diamond around its
+ /// projection, as viewport-uv segment pairs like `feature_segments`.
+ pub(crate) fn vertex_marker(

@@ -1,0 +1,479 @@
+From 7501d654c08231fd89562caa66da6b25b27c9461 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 9 Nov 2026 15:10:38 -0800
+Subject: [PATCH] fix(app): a probe searches a short way past the face and
+ feeds below the safe plane
+
+Found on a real Tormach 770MX (#521's hands-on test): a new Probe op
+searched 5 mm past the expected face (G38.2 Z-0.1969), deep enough to
+bottom a stylus when the face is missing, and rapided straight down to
+the approach point over the part.
+
+- A new Probe op's probe distance is max(2 x tolerance, 1 mm) (1 mm for
+  the seeded tolerance); existing documents keep their stated value.
+- A probe distance past 2 mm draws a named, non-blocking
+  Warning::ProbeSearch (the post is not held).
+- The probe cycle opens with a positioning rapid that ends at the safe
+  plane, then FEEDS down to the approach point: no probe rapid runs
+  below the safe plane. Fanuc probe goldens gain that line.
+- The probe page's hint says the distance is a search limit, not a
+  destination.
+
+Pinned by probe_search (3 tests; below_the_safe_plane_a_probe_only_feeds
+fails on the old cycle).
+
+Fixes #570
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/app/src/mcp/job.rs                     |   1 +
+ crates/app/src/operation/kinds.rs             |   5 +-
+ crates/app/src/operation/probe_op.rs          |  26 +++++
+ crates/app/src/warned_moves.rs                |   3 +-
+ .../golden/nc/fanuc/probe_bore_centre.nc      |   3 +-
+ .../golden/nc/fanuc/probe_corner_negative.nc  |   3 +-
+ .../golden/nc/fanuc/probe_edge_negative_x.nc  |   3 +-
+ crates/app/tests/probe_pick.rs                |   2 +-
+ crates/app/tests/probe_reach.rs               |   4 +-
+ crates/app/tests/probe_search.rs              | 108 ++++++++++++++++++
+ crates/motion/src/probing.rs                  |  23 ++--
+ crates/sim/src/verify/types.rs                |  13 ++-
+ crates/ui/src/egui_app/probe_page.rs          |   2 +-
+ crates/ui/src/operations.rs                   |   5 +-
+ .../570-probe-search-and-approach.md          |  19 +++
+ 15 files changed, 202 insertions(+), 18 deletions(-)
+ create mode 100644 crates/app/tests/probe_search.rs
+ create mode 100644 docs/decisions/570-probe-search-and-approach.md
+
+diff --git a/crates/app/src/mcp/job.rs b/crates/app/src/mcp/job.rs
+index 3f466daa4..c74c8f4d3 100644
+--- a/crates/app/src/mcp/job.rs
++++ b/crates/app/src/mcp/job.rs
+@@ -184,6 +184,7 @@ fn finding(op: &str, w: &Warning) -> Value {
+         Warning::Envelope { at, .. } => ("envelope", *at),
+         Warning::RestUnjudged { at, .. } => ("rest_unjudged", *at),
+         Warning::Scallop { at, .. } => ("scallop", *at),
++        Warning::ProbeSearch { at, .. } => ("probe_search", *at),
+     };
+     json!({
+         "op": op,
+diff --git a/crates/app/src/operation/kinds.rs b/crates/app/src/operation/kinds.rs
+index 0af1a0330..46767340f 100644
+--- a/crates/app/src/operation/kinds.rs
++++ b/crates/app/src/operation/kinds.rs
+@@ -958,7 +958,10 @@ fn seed_probe(c: &Carried) -> OpParams {
+         target: [0.0, 0.0, 0.0],
+         radius: 10.0,
+         approach: 5.0,
+-        overtravel: 5.0,
++        // #570: a search limit, not a destination - twice the 0.5 mm
++        // tolerance below, so a face inside tolerance always trips well
++        // before it, and a missing one alarms 1 mm past, not 5.
++        overtravel: crate::operation::probe_op::default_overtravel(0.5),
+         backoff: 1.0,
+         fast_feed: 300.0,
+         slow_feed: 30.0,
+diff --git a/crates/app/src/operation/probe_op.rs b/crates/app/src/operation/probe_op.rs
+index 0ba32f220..5f9536b60 100644
+--- a/crates/app/src/operation/probe_op.rs
++++ b/crates/app/src/operation/probe_op.rs
+@@ -22,6 +22,31 @@ use super::types::OpParams;
+ /// so this is the facet lattice's numeric slack, not a cut allowance.
+ pub const STYLUS_SLACK: f64 = 0.01;
+ 
++/// The deepest search past the expected contact a stylus is trusted to
++/// take without a word (#570). Touch-probe styli are rated for a few
++/// millimetres of overtravel at most; past this, a missing feature drives
++/// the stylus toward the end of its travel before the control alarms.
++pub const SEARCH_LIMIT_MM: f64 = 2.0;
++
++/// A new probe op's search limit for a `tolerance` (#570): twice the
++/// tolerance, never under 1 mm - far enough that a feature inside the
++/// tolerance always trips, short enough that a missing one alarms early.
++#[must_use]
++pub fn default_overtravel(tolerance: f64) -> f64 {
++    (2.0 * tolerance).max(1.0)
++}
++
++/// The advisory for a search limit past [`SEARCH_LIMIT_MM`]: one, at the
++/// first seek, naming the distance - never blocking.
++#[must_use]
++pub fn search_advisory(path: &Toolpath, overtravel: f64) -> Option<Warning> {
++    if overtravel <= SEARCH_LIMIT_MM {
++        return None;
++    }
++    let at = path.probes.first().map_or(0, |t| t.index);
++    Some(Warning::ProbeSearch { at, mm: overtravel, limit_mm: SEARCH_LIMIT_MM })
++}
++
+ /// The cycle's numbers from the op's, with the resolved safe plane.
+ pub(super) fn probe_params(params: &OpParams, tool: &Tool, clearance_z: f64) -> Result<ProbeParams, GenError> {
+     let OpParams::Probe {
+@@ -85,6 +110,7 @@ pub(super) fn generate_probe(
+     let path = probe_cycle(&p)?;
+     let mut warns = stylus_hits(&path, tool.diameter * 0.5, facets);
+     warns.extend(stylus_reach_hits(&path, tool, facets, &warns));
++    warns.extend(search_advisory(&path, p.overtravel));
+     Ok((path, warns))
+ }
+ 
+diff --git a/crates/app/src/warned_moves.rs b/crates/app/src/warned_moves.rs
+index 91705bd8b..2294a7138 100644
+--- a/crates/app/src/warned_moves.rs
++++ b/crates/app/src/warned_moves.rs
+@@ -30,7 +30,8 @@ pub fn moves_named(w: &Warning) -> [Option<usize>; 2] {
+         | Warning::HolderHit { at, .. }
+         | Warning::NonFinite { at }
+         | Warning::Envelope { at, .. }
+-        | Warning::Scallop { at, .. } => [Some(*at), None],
++        | Warning::Scallop { at, .. }
++        | Warning::ProbeSearch { at, .. } => [Some(*at), None],
+         Warning::RestUnjudged { .. } => [None, None],
+     }
+ }
+diff --git a/crates/app/tests/golden/nc/fanuc/probe_bore_centre.nc b/crates/app/tests/golden/nc/fanuc/probe_bore_centre.nc
+index ea2325e62..95773a72e 100644
+--- a/crates/app/tests/golden/nc/fanuc/probe_bore_centre.nc
++++ b/crates/app/tests/golden/nc/fanuc/probe_bore_centre.nc
+@@ -5,7 +5,8 @@ G90 G54 G40 G49 G80
+ (T07 PROBE-4 - D4)
+ T07 M6
+ G43 H07
+-G00 X30 Y30 Z25
++G00 X30 Y30 Z50
++G01 X30 Y30 Z25 F300
+ G01 X30 Y30 Z15 F300
+ G31 X43 Y30 Z15 F300
+ IF[ABS[#5061-43]LT0.001]THEN#3000=2(PROBE NO CONTACT)
+diff --git a/crates/app/tests/golden/nc/fanuc/probe_corner_negative.nc b/crates/app/tests/golden/nc/fanuc/probe_corner_negative.nc
+index 329864802..61c575eae 100644
+--- a/crates/app/tests/golden/nc/fanuc/probe_corner_negative.nc
++++ b/crates/app/tests/golden/nc/fanuc/probe_corner_negative.nc
+@@ -5,7 +5,8 @@ G90 G54 G40 G49 G80
+ (T07 PROBE-4 - D4)
+ T07 M6
+ G43 H07
+-G00 X-22 Y-5 Z25
++G00 X-22 Y-5 Z50
++G01 X-22 Y-5 Z25 F300
+ G01 X-22 Y-5 Z15 F300
+ G31 X-12 Y-5 Z15 F300
+ IF[ABS[#5061+12]LT0.001]THEN#3000=2(PROBE NO CONTACT)
+diff --git a/crates/app/tests/golden/nc/fanuc/probe_edge_negative_x.nc b/crates/app/tests/golden/nc/fanuc/probe_edge_negative_x.nc
+index be6b91edb..4ae5af786 100644
+--- a/crates/app/tests/golden/nc/fanuc/probe_edge_negative_x.nc
++++ b/crates/app/tests/golden/nc/fanuc/probe_edge_negative_x.nc
+@@ -5,7 +5,8 @@ G90 G54 G40 G49 G80
+ (T07 PROBE-4 - D4)
+ T07 M6
+ G43 H07
+-G00 X-22 Y5 Z25
++G00 X-22 Y5 Z50
++G01 X-22 Y5 Z25 F300
+ G01 X-22 Y5 Z15 F300
+ G31 X-12 Y5 Z15 F300
+ IF[ABS[#5061+12]LT0.001]THEN#3000=2(PROBE NO CONTACT)
+diff --git a/crates/app/tests/probe_pick.rs b/crates/app/tests/probe_pick.rs
+index 5459688d1..b01b6a7b5 100644
+--- a/crates/app/tests/probe_pick.rs
++++ b/crates/app/tests/probe_pick.rs
+@@ -123,7 +123,7 @@ fn probe_params() -> OpParams {
+         target: [0.0; 3],
+         radius: 10.0,
+         approach: 5.0,
+-        overtravel: 5.0,
++        overtravel: 1.0, // #570: the new-op default
+         backoff: 1.0,
+         fast_feed: 300.0,
+         slow_feed: 30.0,
+diff --git a/crates/app/tests/probe_reach.rs b/crates/app/tests/probe_reach.rs
+index e92c3fe03..41f219c6c 100644
+--- a/crates/app/tests/probe_reach.rs
++++ b/crates/app/tests/probe_reach.rs
+@@ -34,7 +34,7 @@ fn edge(dir: ProbeDir, target: Point3, depth: f64) -> ProbeParams {
+         radius: 0.0,
+         ball_diameter: 4.0,
+         approach: 5.0,
+-        overtravel: 5.0,
++        overtravel: 1.0, // #570: the new-op default
+         backoff: 1.0,
+         fast_feed: 300.0,
+         slow_feed: 30.0,
+@@ -164,7 +164,7 @@ fn edge_world(stylus_len: f64, depth: f64) -> (World, History) {
+         target: [b.min.x, (b.min.y + b.max.y) * 0.5, b.max.z],
+         radius: 0.0,
+         approach: 5.0,
+-        overtravel: 5.0,
++        overtravel: 1.0, // #570: the new-op default
+         backoff: 1.0,
+         fast_feed: 300.0,
+         slow_feed: 30.0,
+diff --git a/crates/app/tests/probe_search.rs b/crates/app/tests/probe_search.rs
+new file mode 100644
+index 000000000..15649b700
+--- /dev/null
++++ b/crates/app/tests/probe_search.rs
+@@ -0,0 +1,108 @@
++//! #570, found on a real Tormach 770MX: a probe op searched 5 mm past the
++//! expected face by default (deep enough to bottom a stylus when the face
++//! is missing) and rapided down to the approach point over the part. Now:
++//! a new op searches `max(2 x tolerance, 1 mm)`, a search past 2 mm is
++//! named by a non-blocking advisory, and below the safe plane the probe
++//! only ever feeds.
++//!
++//! Gate map (#570): covers app::operation::probe_op (default_overtravel,
++//! search_advisory), app::operation::kinds (seed_probe), motion::probing
++//! (probe_cycle's opening).
++//! Provenance: touch-probe practice (protected positioning, rated stylus
++//! overtravel); our own fixtures.
++
++use camcraft_app::cl::MoveKind;
++use camcraft_app::operation::probe_op::{SEARCH_LIMIT_MM, default_overtravel, search_advisory};
++use camcraft_app::operation::{self, Height, HeightReference, OpParams, OpType};
++use camcraft_app::probing::{ProbeDir, ProbeMode, ProbeParams, probe_cycle};
++use camcraft_app::geometry::Point3;
++use camcraft_app::verify::Warning;
++
++fn params(mode: ProbeMode, overtravel: f64) -> ProbeParams {
++    ProbeParams {
++        mode,
++        dir: ProbeDir::ZNeg,
++        dir_y: ProbeDir::YPos,
++        target: Point3::new(0.0, 0.0, 10.0),
++        radius: 10.0,
++        ball_diameter: 4.0,
++        approach: 5.0,
++        overtravel,
++        backoff: 1.0,
++        fast_feed: 300.0,
++        slow_feed: 30.0,
++        depth: 3.0,
++        inset: 5.0,
++        clearance_z: 50.0,
++    }
++}
++
++#[test]
++fn a_new_probe_op_searches_a_short_way_past_the_face() {
++    assert_eq!(default_overtravel(0.5), 1.0);
++    assert_eq!(default_overtravel(0.1), 1.0, "never under 1 mm");
++    assert_eq!(default_overtravel(0.8), 1.6, "twice a looser tolerance");
++    // What the Create ribbon / Type combo seeds: a fresh Probe draft from
++    // an op whose own probe distance was the old 5 mm - the seed never
++    // carries it over.
++    let old = OpParams::Probe {
++        clearance_z: Height::of(HeightReference::TopOfStock, 15.0),
++        mode: ProbeMode::Face,
++        dir: ProbeDir::ZNeg,
++        dir_y: ProbeDir::YPos,
++        target: [0.0; 3],
++        radius: 10.0,
++        approach: 5.0,
++        overtravel: 5.0,
++        backoff: 1.0,
++        fast_feed: 300.0,
++        slow_feed: 30.0,
++        depth: 3.0,
++        inset: 5.0,
++        set_wcs: Some(0),
++        tolerance: 0.5,
++    };
++    let seeded = operation::retype_params(&old, OpType::Probe.ordinal());
++    let OpParams::Probe { overtravel, tolerance, .. } = seeded else {
++        panic!("a probe seed: {seeded:?}");
++    };
++    assert_eq!(overtravel, default_overtravel(tolerance), "the seed follows its tolerance");
++    assert!(overtravel <= SEARCH_LIMIT_MM, "a new op draws no advisory");
++}
++
++#[test]
++fn a_deep_search_is_named_and_never_holds_the_post() {
++    let path = probe_cycle(&params(ProbeMode::Face, 5.0)).expect("cycle");
++    let w = search_advisory(&path, 5.0).expect("5 mm past the face is named");
++    assert!(matches!(w, Warning::ProbeSearch { mm, limit_mm, .. } if mm == 5.0 && limit_mm == SEARCH_LIMIT_MM));
++    assert!(!w.blocks_post(), "advisory: an old document still posts");
++    assert!(w.to_string().contains("probe distance 5.000 mm"), "{w}");
++    let short = probe_cycle(&params(ProbeMode::Face, SEARCH_LIMIT_MM)).expect("cycle");
++    assert_eq!(search_advisory(&short, SEARCH_LIMIT_MM), None, "at the limit: silent");
++}
++
++#[test]
++fn below_the_safe_plane_a_probe_only_feeds() {
++    for mode in [ProbeMode::Face, ProbeMode::Edge, ProbeMode::Corner, ProbeMode::Bore, ProbeMode::Boss] {
++        let mut p = params(mode, 1.0);
++        if mode != ProbeMode::Face {
++            p.dir = ProbeDir::XPos; // an edge or corner is touched along X / Y
++        }
++        let path = probe_cycle(&p).expect("cycle");
++        // The path states tips; the safe plane is a tip height.
++        let safe = p.clearance_z - 1e-9;
++        let first = path.moves.first().expect("a move");
++        assert_eq!(first.kind, MoveKind::Rapid, "{mode:?}: opens with the positioning rapid");
++        assert!(first.to.z >= safe, "{mode:?}: positioning ends at the safe plane, not {}", first.to.z);
++        for (i, m) in path.moves.iter().enumerate() {
++            if m.kind == MoveKind::Rapid {
++                assert!(
++                    m.from.z >= safe && m.to.z >= safe,
++                    "{mode:?}: move {i} rapids below the safe plane ({} -> {})",
++                    m.from.z,
++                    m.to.z
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/motion/src/probing.rs b/crates/motion/src/probing.rs
+index 868bd3746..77d215a12 100644
+--- a/crates/motion/src/probing.rs
++++ b/crates/motion/src/probing.rs
+@@ -201,7 +201,7 @@ fn contacts(p: &ProbeParams) -> Vec<Contact> {
+ }
+ 
+ /// Build the probing path. Every touch: travel at the safe plane, feed
+-/// down to the approach point, seek fast to the expected trip, back
++/// down to the approach point (never a rapid below the safe plane, #570), seek fast to the expected trip, back
+ /// off, re-probe slow, return to the approach point and rise. A bore
+ /// is entered once at its centre and left from there.
+ pub fn probe_cycle(p: &ProbeParams) -> Result<Toolpath, GenError> {
+@@ -227,10 +227,14 @@ pub fn probe_cycle(p: &ProbeParams) -> Result<Toolpath, GenError> {
+     let home = |q: Point3| Point3::new(q.x, q.y, p.clearance_z + r);
+     let tip = |c: Point3| Point3::new(c.x, c.y, c.z - r);
+     let entry = if bore { centre } else { first_start };
+-    // The rapid plane: the ball the approach clearance over the probed
+-    // feature's top. The safe plane must stand above it, so the path
+-    // always opens with a rapid down to it - the positioning block a
+-    // post writes first - before any feed or touch.
++    // The approach plane: the ball the approach clearance over the probed
++    // feature's top. The safe plane must stand above it. Below the safe
++    // plane a probe never rapids (#570, the protected move of touch-probe
++    // practice): the path opens at the safe plane over its first start
++    // and FEEDS down to the approach plane at the seek feed, so a stylus
++    // meeting something on the way down trips at a feed the probe can
++    // take, never at full rapid. The posts position X Y, then Z down to
++    // the safe plane, before a first feed (tormach.cps `startXY`).
+     let rapid_z = p.target.z + r + p.approach;
+     if p.clearance_z <= rapid_z {
+         return Err(GenError::Invalid(format!(
+@@ -247,7 +251,12 @@ pub fn probe_cycle(p: &ProbeParams) -> Result<Toolpath, GenError> {
+             at = to;
+         }
+     };
+-    go(MoveKind::Rapid, Point3::new(entry.x, entry.y, rapid_z), None, &mut moves);
++    // The positioning block every post writes first: a rapid that ends
++    // at the safe plane over the first start (the path's own start, so it
++    // runs nowhere in the path's frame - what it positions FROM is the
++    // tool change, which no path knows). Then the protected feed down.
++    moves.push(Move::new(MoveKind::Rapid, tip(home(entry)), tip(home(entry)), None));
++    go(MoveKind::Feed, Point3::new(entry.x, entry.y, rapid_z), Some(p.fast_feed), &mut moves);
+     if bore {
+         go(MoveKind::Feed, centre, Some(p.fast_feed), &mut moves);
+     }
+@@ -257,7 +266,7 @@ pub fn probe_cycle(p: &ProbeParams) -> Result<Toolpath, GenError> {
+         let back = add(expect, c.dir, -p.backoff);
+         let target = add(expect, c.dir, p.overtravel);
+         if !bore {
+-            // The first touch is already over its start at the rapid
++            // The first touch is already over its start at the approach
+             // plane; later ones travel over at the safe plane.
+             if k > 0 {
+                 go(MoveKind::Rapid, home(start), None, &mut moves);
+diff --git a/crates/sim/src/verify/types.rs b/crates/sim/src/verify/types.rs
+index 192e7a724..2158af634 100644
+--- a/crates/sim/src/verify/types.rs
++++ b/crates/sim/src/verify/types.rs
+@@ -224,6 +224,13 @@ pub enum Warning {
+     /// "M13.8 B" (3)): shown and named everywhere a warning is, and
+     /// the one kind that never blocks the post.
+     Scallop { at: usize, mm: f64, gate_mm: f64 },
++    /// A probe op's search limit (#570): the seek at move `at` may run
++    /// `mm` past the expected contact before the control alarms, more
++    /// than the `limit_mm` a touch probe's stylus is trusted to take. A
++    /// missing or misplaced feature then drives the stylus that far into
++    /// its overtravel. Advisory like the scallop: shown and named, never
++    /// binding - a stated probe distance is the operator's to choose.
++    ProbeSearch { at: usize, mm: f64, limit_mm: f64 },
+ }
+ 
+ impl Warning {
+@@ -231,7 +238,7 @@ impl Warning {
+     /// reading (M13.9), which is a quality note - shown, never binding.
+     #[must_use]
+     pub fn blocks_post(&self) -> bool {
+-        !matches!(self, Warning::Scallop { .. })
++        !matches!(self, Warning::Scallop { .. } | Warning::ProbeSearch { .. })
+     }
+ 
+     /// The envelope report's unjudged hidden half, as the warning that
+@@ -305,6 +312,10 @@ impl core::fmt::Display for Warning {
+                 f,
+                 "scallop {mm:.3} mm over the {gate_mm:.3} mm tolerance at move {at} (surface quality - the post is not held)"
+             ),
++            Warning::ProbeSearch { at, mm, limit_mm } => write!(
++                f,
++                "probe distance {mm:.3} mm at move {at}: the search may run that far past the expected contact, beyond the {limit_mm:.3} mm a stylus is trusted to overtravel (the post is not held)"
++            ),
+         }
+     }
+ }
+diff --git a/crates/ui/src/egui_app/probe_page.rs b/crates/ui/src/egui_app/probe_page.rs
+index f615f39c3..91afeac05 100644
+--- a/crates/ui/src/egui_app/probe_page.rs
++++ b/crates/ui/src/egui_app/probe_page.rs
+@@ -86,7 +86,7 @@ pub(super) fn fields(ui: &mut Ui, world: &World, params: &mut OpParams, cx: &mut
+         prop_row(ui, "Back-off", |ui| num(ui, u, backoff));
+         prop_row(ui, "Depth below edge", |ui| num(ui, u, depth));
+         prop_row(ui, "Corner inset", |ui| num(ui, u, inset));
+-        hint(ui, "the probe distance is how far past the expected contact the control searches before it alarms");
++        hint(ui, "the probe distance is a search LIMIT past the expected contact, not a destination: the probe stops where it touches, and alarms if nothing trips by then - keep it small (over 2 mm is flagged)");
+     }
+     if tab == SEC_FEEDS {
+         prop_row(ui, "Seek feed", |ui| num_feed(ui, u, fast_feed));
+diff --git a/crates/ui/src/operations.rs b/crates/ui/src/operations.rs
+index 99259027f..e874576c7 100644
+--- a/crates/ui/src/operations.rs
++++ b/crates/ui/src/operations.rs
+@@ -243,6 +243,8 @@ pub fn fold_warnings_located(warnings: &[Warning]) -> Vec<(String, Option<usize>
+             Warning::RestUnjudged { .. } => (210, false),
+             // The scallop reading (M13.9): a quality note, its own line.
+             Warning::Scallop { .. } => (211, false),
++            // A probe's deep search limit (#570): advisory, its own line.
++            Warning::ProbeSearch { .. } => (214, false),
+             // A lathe holder's rub (#369) splits part from stock too.
+             Warning::HolderHit { part, .. } => (212 + *part as u8, false),
+         }
+@@ -259,7 +261,8 @@ pub fn fold_warnings_located(warnings: &[Warning]) -> Vec<(String, Option<usize>
+             | Warning::NonFinite { at }
+             | Warning::Envelope { at, .. }
+             | Warning::RestUnjudged { at, .. }
+-            | Warning::Scallop { at, .. } => *at,
++            | Warning::Scallop { at, .. }
++            | Warning::ProbeSearch { at, .. } => *at,
+         }
+     }
+     let mut lines: Vec<(String, Option<usize>)> = Vec::new();
+diff --git a/docs/decisions/570-probe-search-and-approach.md b/docs/decisions/570-probe-search-and-approach.md
+new file mode 100644
+index 000000000..78aa7c9ed
+--- /dev/null
++++ b/docs/decisions/570-probe-search-and-approach.md
+@@ -0,0 +1,19 @@
++## #570 - probe search limit and protected approach
++
++Found on the contributor's real Tormach 770MX (#521's hands-on test, 2026-11-09).
++
++- **Default search limit:** a new Probe op's `overtravel` ("Probe distance") is `default_overtravel(tolerance) = max(2 x tolerance, 1 mm)`, which gives 1 mm for the seeded 0.5 mm tolerance. Before this it was a fixed 5 mm.
++  - **Why:** a feature inside the tolerance still trips well before the limit, and a missing one alarms 1 mm past instead of 5, so the stylus is never driven toward the end of its travel.
++  - **Dropped:** a fixed 2 mm default. It ignores the tolerance the op already states.
++- **Too-deep search is advisory, not refused:** a new non-blocking `Warning::ProbeSearch` names any limit past `SEARCH_LIMIT_MM = 2 mm`. Like `Scallop`, it never holds the post.
++  - **Why:** existing documents keep their stated value and still post, as the issue requires. The probe distance is the operator's choice.
++  - **Dropped:**
++    - **Refusing past a cap:** it would break every saved probe op at 5 mm.
++    - **Citing the probe's rated overtravel:** `Tool` states none today. That needs a tool field first, so it is left for a follow-up if wanted.
++- **Protected approach:** below the safe plane a probe only feeds.
++  - **What changed in the path:** it used to open with a rapid straight down to the approach point, the ball 5 mm over the feature, which the operator found alarming. It now opens with a positioning rapid that ends at the safe plane over the first start. Then it feeds at the seek feed down to the approach point.
++  - **Why:** standard touch-probe practice. A stylus that meets something on the way down trips at a feed it can absorb.
++  - **Positioning rapid:** this is a zero-length rapid at the path's start, because the path does not know the tool-change position. Every post writes it as the positioning block (`G00 X Y Z<safe>`).
++  - **Dropped:** relying on the posts' own XY-first positioning. Only the Tormach post has it, and the Fanuc post would have fed diagonally from the tool change.
++- **Goldens:** the three Fanuc probe goldens gain the safe-plane rapid plus one feed line. No snapshot changed.
++- **UI help:** the probe distance hint now says "search LIMIT ... not a destination" and that over 2 mm is flagged.

@@ -1,0 +1,1474 @@
+From d6a54b2bac1aebf74731be557d58c5cfcce5f7cd Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Mon, 9 Nov 2026 20:55:25 -0800
+Subject: [PATCH] feat(ui): recent projects and models on Open and Model
+
+Two recent lists (projects, models), newest first, de-duplicated by
+canonical path and capped (the recents file's `limit` key: default 10,
+0 = off). An entry is added after a successful open, save or import.
+
+- app::recent: the list logic, our own camcraft-recent/1 JSON in
+  <config>/camcraft/recent.json (CAMCRAFT_CONFIG_DIR overrides), an
+  atomic write, and a corrupt or unreadable file starts empty with a
+  logged warning.
+- The ribbon's Open and Model buttons open their list when it has
+  entries (file name, full path on hover, then "Clear recent" and
+  "Browse..."); with none they open the dialog as before.
+- A missing file is greyed "(missing)" and refused by name. A recent
+  project goes through Open's unsaved-changes prompt.
+- Only the real window reads and writes the per-user file; headless
+  States keep the lists in memory.
+
+Fixes #662
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/lib.rs                       |   1 +
+ crates/app/src/recent.rs                    | 295 ++++++++++++++++++++
+ crates/app/tests/recent_files.rs            | 210 ++++++++++++++
+ crates/ui/src/egui_app/mod.rs               |   1 +
+ crates/ui/src/egui_app/panes.rs             |  16 +-
+ crates/ui/src/egui_app/recent_drop.rs       | 209 ++++++++++++++
+ crates/ui/src/egui_app/shell.rs             |   4 +-
+ crates/ui/src/egui_app/tests.rs             |   1 +
+ crates/ui/src/egui_app/tests/recent_door.rs | 235 ++++++++++++++++
+ crates/ui/src/state.rs                      |  29 +-
+ crates/ui/src/state_recent.rs               |  90 ++++++
+ crates/ui/src/unsaved.rs                    |  15 +-
+ docs/decisions/662-recent-files.md          |  75 +++++
+ 13 files changed, 1172 insertions(+), 9 deletions(-)
+ create mode 100644 crates/app/src/recent.rs
+ create mode 100644 crates/app/tests/recent_files.rs
+ create mode 100644 crates/ui/src/egui_app/recent_drop.rs
+ create mode 100644 crates/ui/src/egui_app/tests/recent_door.rs
+ create mode 100644 crates/ui/src/state_recent.rs
+ create mode 100644 docs/decisions/662-recent-files.md
+
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index ea477d70c..5516b918b 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -39,6 +39,7 @@ pub use camcraft_motion::probing;
+ pub mod project;
+ // #182: the CPU rasteriser behind the MCP stock render.
+ pub mod raster;
++pub mod recent;
+ pub mod rest;
+ pub mod ribbon;
+ pub mod schema;
+diff --git a/crates/app/src/recent.rs b/crates/app/src/recent.rs
+new file mode 100644
+index 000000000..32b4ccc32
+--- /dev/null
++++ b/crates/app/src/recent.rs
+@@ -0,0 +1,295 @@
++//! Recent files (issue #662): the last N projects and the last N models
++//! the user opened, imported or saved, kept per user in the OS config
++//! folder so a re-open is one click instead of a file-dialog walk.
++//!
++//! The lists are app PREFERENCE state, not document state: nothing here
++//! touches the world or the command history (AGENTS.md "Everything Is a
++//! Command" - opening a recent file rides the same command as the
++//! dialog; the list itself is outside undo). Each list is newest first,
++//! de-duplicated by canonical path and capped at `limit` (default 10,
++//! 0 turns the feature off). A missing, unreadable or corrupt file
++//! starts both lists empty and says why, never a crash.
++//!
++//! Provenance: our own design, specced from issue #662's "Proposed
++//! behaviour"; the folder per the platforms' published per-user config
++//! locations (Windows `%APPDATA%`, macOS `~/Library/Application
++//! Support`, the XDG Base Directory spec's `$XDG_CONFIG_HOME` /
++//! `~/.config`) - the same resolver shape as `machine::store`'s data
++//! folder (#287); the write is that module's write-temp-then-rename.
++
++use std::ffi::OsString;
++use std::path::{Path, PathBuf};
++
++use serde::{Deserialize, Serialize};
++
++/// The override: an absolute folder that holds `recent.json`.
++pub const ENV_VAR: &str = "CAMCRAFT_CONFIG_DIR";
++/// The recents file's name inside the config folder.
++pub const FILE_NAME: &str = "recent.json";
++/// The format tag the file carries; any other tag is refused.
++pub const FORMAT: &str = "camcraft-recent/1";
++/// How many entries each list keeps unless the file says otherwise.
++pub const DEFAULT_LIMIT: usize = 10;
++/// The most the `limit` key may ask for; larger values clamp here.
++pub const MAX_LIMIT: usize = 50;
++
++/// Which of the two lists.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum RecentKind {
++    /// `.camproj` documents (Open).
++    Project,
++    /// Mesh models (Model import).
++    Model,
++}
++
++impl RecentKind {
++    /// The list's name in words, for status lines.
++    #[must_use]
++    pub fn noun(self) -> &'static str {
++        match self {
++            RecentKind::Project => "project",
++            RecentKind::Model => "model",
++        }
++    }
++}
++
++/// The two recent lists and their cap.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct RecentFiles {
++    limit: usize,
++    projects: Vec<PathBuf>,
++    models: Vec<PathBuf>,
++}
++
++impl Default for RecentFiles {
++    fn default() -> Self {
++        Self::with_limit(DEFAULT_LIMIT)
++    }
++}
++
++/// The file layout. Unknown keys are ignored so a newer build's file
++/// still reads; a missing `limit` is the default.
++#[derive(Serialize, Deserialize)]
++struct OnDisk {
++    format: String,
++    #[serde(default = "default_limit")]
++    limit: usize,
++    #[serde(default)]
++    projects: Vec<String>,
++    #[serde(default)]
++    models: Vec<String>,
++}
++
++fn default_limit() -> usize {
++    DEFAULT_LIMIT
++}
++
++/// The path a list stores for `path`: canonical when the file can be
++/// resolved (so `a/../b.stl` and `b.stl` are one entry), else made
++/// absolute as given. `None` = no absolute form (an empty path).
++fn stored_form(path: &Path) -> Option<PathBuf> {
++    if path.as_os_str().is_empty() {
++        return None;
++    }
++    std::fs::canonicalize(path)
++        .ok()
++        .or_else(|| std::path::absolute(path).ok())
++        .filter(|p| p.is_absolute())
++}
++
++impl RecentFiles {
++    /// Empty lists with this cap (clamped to [`MAX_LIMIT`]).
++    #[must_use]
++    pub fn with_limit(limit: usize) -> Self {
++        Self { limit: limit.min(MAX_LIMIT), projects: Vec::new(), models: Vec::new() }
++    }
++
++    /// The cap each list keeps; 0 = recent files are off.
++    #[must_use]
++    pub fn limit(&self) -> usize {
++        self.limit
++    }
++
++    /// Change the cap; both lists drop what no longer fits.
++    pub fn set_limit(&mut self, limit: usize) {
++        self.limit = limit.min(MAX_LIMIT);
++        self.projects.truncate(self.limit);
++        self.models.truncate(self.limit);
++    }
++
++    /// One list, newest first.
++    #[must_use]
++    pub fn list(&self, kind: RecentKind) -> &[PathBuf] {
++        match kind {
++            RecentKind::Project => &self.projects,
++            RecentKind::Model => &self.models,
++        }
++    }
++
++    fn list_mut(&mut self, kind: RecentKind) -> &mut Vec<PathBuf> {
++        match kind {
++            RecentKind::Project => &mut self.projects,
++            RecentKind::Model => &mut self.models,
++        }
++    }
++
++    /// Put `path` at the top of its list: an earlier entry for the same
++    /// file (by canonical path) moves up rather than repeating, and the
++    /// oldest entry past the cap drops off. Returns whether the list
++    /// changed (false when the feature is off or the path is empty).
++    pub fn add(&mut self, kind: RecentKind, path: &Path) -> bool {
++        if self.limit == 0 {
++            return false;
++        }
++        let Some(entry) = stored_form(path) else {
++            return false;
++        };
++        let limit = self.limit;
++        let list = self.list_mut(kind);
++        if list.first() == Some(&entry) {
++            return false;
++        }
++        list.retain(|p| stored_form(p).as_ref() != Some(&entry) && *p != entry);
++        list.insert(0, entry);
++        list.truncate(limit);
++        true
++    }
++
++    /// Empty one list. Returns whether anything was removed.
++    pub fn clear(&mut self, kind: RecentKind) -> bool {
++        let list = self.list_mut(kind);
++        let had = !list.is_empty();
++        list.clear();
++        had
++    }
++
++    /// The file text: our own `camcraft-recent/1` JSON. A path that is
++    /// not valid UTF-8 cannot ride JSON text whole and is left out
++    /// rather than stored mangled.
++    #[must_use]
++    pub fn to_json(&self) -> String {
++        let text = |l: &[PathBuf]| l.iter().filter_map(|p| p.to_str().map(str::to_owned)).collect();
++        let disk = OnDisk {
++            format: FORMAT.to_owned(),
++            limit: self.limit,
++            projects: text(&self.projects),
++            models: text(&self.models),
++        };
++        serde_json::to_string_pretty(&disk).unwrap_or_else(|e| {
++            tracing::warn!("recent files not serialised: {e}");
++            String::new()
++        })
++    }
++
++    /// Read the file text. Entries that are empty or not absolute are
++    /// dropped, repeats keep their newest place, and each list is cut
++    /// to the cap - a hand-edited file can never grow a list past it.
++    pub fn from_json(text: &str) -> Result<Self, String> {
++        let disk: OnDisk = serde_json::from_str(text).map_err(|e| format!("not a recents file ({e})"))?;
++        if disk.format != FORMAT {
++            return Err(format!("format '{}' is not {FORMAT}", disk.format));
++        }
++        let mut out = Self::with_limit(disk.limit);
++        let read = |l: Vec<String>, limit: usize| -> Vec<PathBuf> {
++            let mut kept: Vec<PathBuf> = Vec::new();
++            for p in l.into_iter().map(PathBuf::from) {
++                if p.is_absolute() && !kept.contains(&p) {
++                    kept.push(p);
++                }
++            }
++            kept.truncate(limit);
++            kept
++        };
++        out.projects = read(disk.projects, out.limit);
++        out.models = read(disk.models, out.limit);
++        Ok(out)
++    }
++}
++
++/// One drop-down entry's facts: its file name, its full path (the
++/// hover text) and whether the file is gone.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct RecentEntry {
++    /// The file name alone (the full path when there is none).
++    pub name: String,
++    /// The stored absolute path.
++    pub path: PathBuf,
++    /// The file no longer exists (or is not a file): shown greyed,
++    /// refused by name on click.
++    pub missing: bool,
++}
++
++impl RecentEntry {
++    /// Probe one stored path.
++    #[must_use]
++    pub fn of(path: &Path) -> Self {
++        let name = path
++            .file_name()
++            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
++        Self { name, path: path.to_path_buf(), missing: !path.is_file() }
++    }
++
++    /// The refusal a click on a missing entry earns, naming the file.
++    #[must_use]
++    pub fn refusal(&self, kind: RecentKind) -> String {
++        format!("{} is missing - recent {} not opened ({})", self.name, kind.noun(), self.path.display())
++    }
++}
++
++/// The per-user config folder (`<platform config>/camcraft`) from an
++/// environment lookup, for the named platform (`std::env::consts::OS`).
++/// Pure, so the order is testable without the process environment.
++/// `None` = no home to keep one in: the lists then live for the session.
++#[must_use]
++pub fn config_dir_for(os: &str, get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
++    let abs = |k: &str| get(k).map(PathBuf::from).filter(|p| p.is_absolute());
++    if let Some(dir) = abs(ENV_VAR) {
++        return Some(dir);
++    }
++    let base = match os {
++        "windows" => abs("APPDATA"),
++        "macos" => abs("HOME").map(|h| h.join("Library").join("Application Support")),
++        _ => abs("XDG_CONFIG_HOME").or_else(|| abs("HOME").map(|h| h.join(".config"))),
++    }?;
++    Some(base.join("camcraft"))
++}
++
++/// This process's recents file, if a config folder resolves.
++#[must_use]
++pub fn store_path() -> Option<PathBuf> {
++    config_dir_for(std::env::consts::OS, |k| std::env::var_os(k)).map(|d| d.join(FILE_NAME))
++}
++
++/// Read the recents file. No file yet is a quiet empty start; an
++/// unreadable or corrupt one is an empty start too, with the reason
++/// logged and returned so the caller can show it - never a crash.
++pub fn load(path: &Path) -> (RecentFiles, Option<String>) {
++    let text = match std::fs::read_to_string(path) {
++        Ok(t) => t,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (RecentFiles::default(), None),
++        Err(e) => {
++            let why = format!("recent files not read ({}): {e} - starting empty", path.display());
++            tracing::warn!("{why}");
++            return (RecentFiles::default(), Some(why));
++        }
++    };
++    match RecentFiles::from_json(&text) {
++        Ok(r) => (r, None),
++        Err(e) => {
++            let why = format!("recent files ignored ({}): {e} - starting empty", path.display());
++            tracing::warn!("{why}");
++            (RecentFiles::default(), Some(why))
++        }
++    }
++}
++
++/// Write the recents file atomically (temp file, then rename): a crash
++/// mid-write leaves the previous file whole. A refusal is logged here
++/// and returned.
++pub fn save(path: &Path, recent: &RecentFiles) -> Result<(), String> {
++    crate::machine::store::write_atomic(path, &recent.to_json()).map_err(|e| {
++        let why = e.to_string();
++        tracing::warn!("recent files {why} ({})", path.display());
++        why
++    })
++}
+diff --git a/crates/app/tests/recent_files.rs b/crates/app/tests/recent_files.rs
+new file mode 100644
+index 000000000..24545e699
+--- /dev/null
++++ b/crates/app/tests/recent_files.rs
+@@ -0,0 +1,210 @@
++//! Recent files (issue #662): the two lists are newest first,
++//! de-duplicated by canonical path, capped (0 = off), survive a restart
++//! through the per-user file, and a corrupt or unreadable file starts
++//! empty with a reason - never a crash. Missing files stay listed and
++//! are flagged so the drop-down can grey and refuse them by name.
++//!
++//! Provenance: our own tests, specced from the issue's "Done means".
++//!
++//! Gate map (M4.4): covers app::recent.
++
++use std::ffi::OsString;
++use std::path::{Path, PathBuf};
++
++use camcraft_app::recent::{
++    self, RecentEntry, RecentFiles, RecentKind, DEFAULT_LIMIT, ENV_VAR, FILE_NAME, MAX_LIMIT,
++};
++
++/// A fresh, empty folder for one test.
++fn dir(tag: &str) -> PathBuf {
++    let d = std::env::temp_dir().join(format!("camcraft_recent_{tag}_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).expect("make the test folder");
++    // Canonical, so comparisons hold where temp is a symlink (macOS /var).
++    std::fs::canonicalize(&d).expect("canonical test folder")
++}
++
++/// A real file in `d`, returned as its canonical path.
++fn touch(d: &Path, name: &str) -> PathBuf {
++    let p = d.join(name);
++    std::fs::write(&p, b"x").expect("write a fixture file");
++    p
++}
++
++#[test]
++fn add_puts_the_newest_first_per_list() {
++    let d = dir("order");
++    let (a, b, m) = (touch(&d, "a.camproj"), touch(&d, "b.camproj"), touch(&d, "part.stl"));
++    let mut r = RecentFiles::default();
++    assert!(r.add(RecentKind::Project, &a));
++    assert!(r.add(RecentKind::Project, &b));
++    assert!(r.add(RecentKind::Model, &m));
++    assert_eq!(r.list(RecentKind::Project), &[b.clone(), a.clone()]);
++    assert_eq!(r.list(RecentKind::Model), &[m], "the model list is its own");
++    assert!(!r.add(RecentKind::Project, &b), "re-adding the top entry changes nothing");
++}
++
++#[test]
++fn a_repeat_moves_up_by_canonical_path() {
++    let d = dir("dedup");
++    std::fs::create_dir_all(d.join("sub")).expect("sub folder");
++    let (a, b) = (touch(&d, "a.stl"), touch(&d, "b.stl"));
++    let mut r = RecentFiles::default();
++    r.add(RecentKind::Model, &a);
++    r.add(RecentKind::Model, &b);
++    // The same file spelled through `sub/..` is the same entry.
++    r.add(RecentKind::Model, &d.join("sub").join("..").join("a.stl"));
++    assert_eq!(r.list(RecentKind::Model), &[a, b], "one entry per file, the repeat on top");
++}
++
++#[test]
++fn each_list_is_capped_and_a_smaller_cap_trims() {
++    let d = dir("cap");
++    let mut r = RecentFiles::default();
++    assert_eq!(r.limit(), DEFAULT_LIMIT);
++    for k in 0..DEFAULT_LIMIT + 3 {
++        r.add(RecentKind::Project, &touch(&d, &format!("p{k}.camproj")));
++    }
++    let list = r.list(RecentKind::Project);
++    assert_eq!(list.len(), DEFAULT_LIMIT, "capped at the default");
++    assert_eq!(list[0], d.join(format!("p{}.camproj", DEFAULT_LIMIT + 2)), "newest kept");
++    r.set_limit(3);
++    assert_eq!(r.list(RecentKind::Project).len(), 3);
++    assert_eq!(RecentFiles::with_limit(10_000).limit(), MAX_LIMIT, "a silly cap clamps");
++}
++
++#[test]
++fn a_zero_cap_turns_recent_files_off() {
++    let d = dir("off");
++    let mut r = RecentFiles::with_limit(0);
++    assert!(!r.add(RecentKind::Project, &touch(&d, "a.camproj")));
++    assert!(r.list(RecentKind::Project).is_empty());
++    assert!(!r.add(RecentKind::Model, Path::new("")), "an empty path is never an entry");
++}
++
++#[test]
++fn clear_empties_one_list_only() {
++    let d = dir("clear");
++    let mut r = RecentFiles::default();
++    r.add(RecentKind::Project, &touch(&d, "a.camproj"));
++    r.add(RecentKind::Model, &touch(&d, "a.stl"));
++    assert!(r.clear(RecentKind::Project));
++    assert!(r.list(RecentKind::Project).is_empty());
++    assert_eq!(r.list(RecentKind::Model).len(), 1, "the other list stays");
++    assert!(!r.clear(RecentKind::Project), "clearing an empty list changes nothing");
++}
++
++#[test]
++fn a_missing_file_is_flagged_by_name() {
++    let d = dir("missing");
++    let gone = touch(&d, "gone.camproj");
++    let mut r = RecentFiles::default();
++    r.add(RecentKind::Project, &gone);
++    std::fs::remove_file(&gone).expect("delete the fixture");
++    let e = RecentEntry::of(&r.list(RecentKind::Project)[0]);
++    assert!(e.missing, "a deleted file reads as missing");
++    assert_eq!(e.name, "gone.camproj");
++    let why = e.refusal(RecentKind::Project);
++    assert!(why.contains("gone.camproj") && why.contains("missing"), "{why}");
++    assert!(!RecentEntry::of(&touch(&d, "here.stl")).missing);
++}
++
++#[test]
++fn the_lists_survive_a_restart() {
++    let d = dir("restart");
++    let file = d.join("cfg").join(FILE_NAME);
++    let (p, m) = (touch(&d, "a.camproj"), touch(&d, "a.stl"));
++    let mut r = RecentFiles::with_limit(4);
++    r.add(RecentKind::Project, &p);
++    r.add(RecentKind::Model, &m);
++    recent::save(&file, &r).expect("atomic save makes the folder and writes");
++    // A "restart": a fresh read from disk only.
++    let (back, note) = recent::load(&file);
++    assert_eq!(note, None);
++    assert_eq!(back, r, "the lists and the cap round-trip");
++    let leftovers: Vec<_> = std::fs::read_dir(file.parent().expect("folder"))
++        .expect("list the folder")
++        .filter_map(Result::ok)
++        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
++        .collect();
++    assert!(leftovers.is_empty(), "the atomic write leaves no temp file");
++}
++
++#[test]
++fn no_file_yet_is_a_quiet_empty_start() {
++    let (r, note) = recent::load(&dir("none").join(FILE_NAME));
++    assert_eq!(r, RecentFiles::default());
++    assert_eq!(note, None);
++}
++
++#[test]
++fn a_corrupt_or_unreadable_file_starts_empty_with_a_reason() {
++    let d = dir("corrupt");
++    for (name, text) in [
++        ("junk.json", "{ this is not json"),
++        ("wrong.json", r#"{"format":"someone-else/9","projects":["/a"]}"#),
++        ("types.json", r#"{"format":"camcraft-recent/1","projects":42}"#),
++    ] {
++        let f = d.join(name);
++        std::fs::write(&f, text).expect("write the corrupt fixture");
++        let (r, note) = recent::load(&f);
++        assert_eq!(r, RecentFiles::default(), "{name}: starts empty");
++        let why = note.unwrap_or_default();
++        assert!(why.contains("starting empty"), "{name}: {why}");
++    }
++    // A folder where the file should be cannot be read as text.
++    let folder = d.join("is_a_dir.json");
++    std::fs::create_dir_all(&folder).expect("make the folder");
++    let (r, note) = recent::load(&folder);
++    assert_eq!(r, RecentFiles::default());
++    assert!(note.is_some_and(|w| w.contains("not read")));
++}
++
++#[test]
++fn a_hand_edited_file_is_cleaned_on_read() {
++    let root = if cfg!(windows) { "C:\\x" } else { "/x" };
++    let (a, b, c) = (Path::new(root).join("a.stl"), Path::new(root).join("b.stl"), Path::new(root).join("c.stl"));
++    let text = serde_json::json!({
++        "format": "camcraft-recent/1",
++        "limit": 2,
++        "projects": ["relative.camproj", ""],
++        "models": [a, a, b, c],
++        "future": true,
++    })
++    .to_string();
++    let r = RecentFiles::from_json(&text).expect("a readable file");
++    assert_eq!(r.limit(), 2);
++    assert!(r.list(RecentKind::Project).is_empty(), "relative and empty paths are dropped");
++    assert_eq!(r.list(RecentKind::Model), &[a, b], "repeats folded, then capped");
++    let no_limit = RecentFiles::from_json(r#"{"format":"camcraft-recent/1"}"#).expect("minimal file");
++    assert_eq!(no_limit.limit(), DEFAULT_LIMIT, "a missing limit is the default");
++}
++
++#[test]
++fn the_config_folder_resolves_per_platform() {
++    let env = |pairs: &'static [(&'static str, &'static str)]| {
++        move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(*v))
++    };
++    let home = if cfg!(windows) { "C:\\Users\\u" } else { "/home/u" };
++    let leak = |v: Vec<(&'static str, &'static str)>| -> &'static [(&'static str, &'static str)] {
++        Box::leak(v.into_boxed_slice())
++    };
++    let over = leak(vec![(ENV_VAR, home), ("HOME", "/elsewhere")]);
++    assert_eq!(recent::config_dir_for("linux", env(over)), Some(PathBuf::from(home)), "override wins");
++    let rel = leak(vec![(ENV_VAR, "rel/dir"), ("HOME", home)]);
++    assert_eq!(
++        recent::config_dir_for("linux", env(rel)),
++        Some(Path::new(home).join(".config").join("camcraft")),
++        "a relative override is ignored"
++    );
++    let mac = leak(vec![("HOME", home)]);
++    assert_eq!(
++        recent::config_dir_for("macos", env(mac)),
++        Some(Path::new(home).join("Library").join("Application Support").join("camcraft"))
++    );
++    let xdg = leak(vec![("HOME", home), ("XDG_CONFIG_HOME", home)]);
++    assert_eq!(recent::config_dir_for("linux", env(xdg)), Some(Path::new(home).join("camcraft")));
++    let win = leak(vec![("APPDATA", home)]);
++    assert_eq!(recent::config_dir_for("windows", env(win)), Some(Path::new(home).join("camcraft")));
++    assert_eq!(recent::config_dir_for("linux", env(leak(vec![]))), None, "no home, no file");
++}
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index ff7d95bd7..32b34e578 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -101,6 +101,7 @@ mod unsaved_prompt;
+ mod panes;
+ // #441: the ribbon's Theme door and its dropdown.
+ mod theme_drop;
++mod recent_drop;
+ // #343: the browser tree, split from panes (rows / pane / operation menu).
+ mod browser_tree;
+ // #155: Pause / Home entry rows and their menu.
+diff --git a/crates/ui/src/egui_app/panes.rs b/crates/ui/src/egui_app/panes.rs
+index 6e4994b58..bc3c59a01 100644
+--- a/crates/ui/src/egui_app/panes.rs
++++ b/crates/ui/src/egui_app/panes.rs
+@@ -572,6 +572,7 @@ pub(super) fn follow_gate(c: Cmd, state: &mut State) {
+             state.ribbon_more = None;
+             state.ribbon_view_open = false;
+             state.ribbon_theme_open = false;
++            state.ribbon_recent_open = None;
+             state.ribbon_mode_open = true;
+             state.status = format!("{why} - pick a workspace");
+         }
+@@ -601,6 +602,9 @@ pub(super) fn toggled(c: Cmd, state: &State) -> bool {
+         Cmd::Machine => state.ribbon_mode_open,
+         Cmd::View => state.ribbon_view_open,
+         Cmd::Theme => state.ribbon_theme_open,
++        Cmd::Model | Cmd::Project => {
++            state.ribbon_recent_open.is_some() && state.ribbon_recent_open == super::recent_drop::kind_of(c)
++        }
+         _ => false,
+     }
+ }
+@@ -754,8 +758,10 @@ pub(super) fn op_icon(kind: OpType) -> Icon {
+ fn run_cmd(c: Cmd, state: &mut State) {
+     match c {
+         Cmd::New => actions::new_document(state),
+-        Cmd::Model => actions::open_model_dialog(state),
+-        Cmd::Project => actions::open_project(state),
++        // #662: with recent files on hand the button opens its list
++        // (recent_drop.rs); with none it is the dialog, as before.
++        Cmd::Model => super::recent_drop::press(state, camcraft_app::recent::RecentKind::Model),
++        Cmd::Project => super::recent_drop::press(state, camcraft_app::recent::RecentKind::Project),
+         Cmd::Save => actions::save_project(state),
+         Cmd::SaveAs => actions::save_project_as(state),
+         Cmd::Post => actions::post_program(state),
+@@ -788,6 +794,7 @@ fn run_cmd(c: Cmd, state: &mut State) {
+         // a time: opening either closes the other.
+         Cmd::More(s) => {
+             state.ribbon_more = (state.ribbon_more != Some(s)).then_some(s);
++            state.ribbon_recent_open = None;
+             state.ribbon_mode_open = false;
+             state.ribbon_view_open = false;
+             state.ribbon_theme_open = false;
+@@ -795,6 +802,7 @@ fn run_cmd(c: Cmd, state: &mut State) {
+         Cmd::Machine => {
+             state.ribbon_mode_open = !state.ribbon_mode_open;
+             if state.ribbon_mode_open {
++                state.ribbon_recent_open = None;
+                 state.ribbon_more = None;
+                 state.ribbon_view_open = false;
+                 state.ribbon_theme_open = false;
+@@ -804,6 +812,7 @@ fn run_cmd(c: Cmd, state: &mut State) {
+         Cmd::View => {
+             state.ribbon_view_open = !state.ribbon_view_open;
+             if state.ribbon_view_open {
++                state.ribbon_recent_open = None;
+                 state.ribbon_more = None;
+                 state.ribbon_mode_open = false;
+                 state.ribbon_theme_open = false;
+@@ -812,6 +821,7 @@ fn run_cmd(c: Cmd, state: &mut State) {
+         Cmd::Theme => {
+             state.ribbon_theme_open = !state.ribbon_theme_open;
+             if state.ribbon_theme_open {
++                state.ribbon_recent_open = None;
+                 state.ribbon_more = None;
+                 state.ribbon_mode_open = false;
+                 state.ribbon_view_open = false;
+@@ -1356,6 +1366,8 @@ pub fn ribbon(
+             }
+         }
+     }
++    // The recent-files lists under Open and Model (#662): recent_drop.rs.
++    super::recent_drop::draw(ui, state, pal, base.with("recent-drop"), &cells, rect);
+     // The source/build label is the rightmost toolbar item. At small window
+     // widths it contracts to version plus source, then version alone; the
+     // full text remains available on hover.
+diff --git a/crates/ui/src/egui_app/recent_drop.rs b/crates/ui/src/egui_app/recent_drop.rs
+new file mode 100644
+index 000000000..038461087
+--- /dev/null
++++ b/crates/ui/src/egui_app/recent_drop.rs
+@@ -0,0 +1,209 @@
++//! The recent-files drop-downs (issue #662) under the ribbon's Open
++//! (projects) and Model (models) buttons. With a recent list on hand
++//! the button opens its list - the files newest first by name (full
++//! path on hover; a gone file greyed with "(missing)" and refused by
++//! name), "Clear recent", and "Browse…" for today's file dialog. With
++//! no recents (or the feature off) the button opens the dialog straight
++//! away, exactly as before. A pick queues `OpenRecent` / `ClearRecent`
++//! / the dialog command, so the unsaved-changes prompt and the import
++//! worker are Open's and Model's own; the door itself is view state.
++//! Provenance: our own code, the hand-drawn dropdown law of the Theme
++//! and View doors (theme_drop.rs, layout/mod.rs); no HSMWorks material.
++
++use camcraft_app::recent::{RecentEntry, RecentKind};
++use egui::{Rect, Sense, Ui, Vec2};
++
++use super::panes::{Cell, Cmd, DROP_GAP};
++use super::theme::Tokens;
++use crate::actions;
++use crate::state::{CommandKind, State};
++
++/// The list's width: wider than the other doors, file names run long.
++pub(super) const RECENT_W: f32 = 300.0;
++/// The bottom rows' captions (also their AccessKit labels).
++pub(super) const CLEAR: &str = "Clear recent";
++pub(super) const BROWSE: &str = "Browse…";
++
++/// One row of a recent-files list.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(super) enum RecentRow {
++    /// A remembered file.
++    Entry(RecentEntry),
++    /// Empty this list.
++    Clear,
++    /// Today's file dialog.
++    Browse,
++}
++
++impl RecentRow {
++    /// What the row reads (and its AccessKit label).
++    pub(super) fn label(&self) -> String {
++        match self {
++            RecentRow::Entry(e) if e.missing => format!("{} (missing)", e.name),
++            RecentRow::Entry(e) => e.name.clone(),
++            RecentRow::Clear => CLEAR.to_owned(),
++            RecentRow::Browse => BROWSE.to_owned(),
++        }
++    }
++
++    fn live(&self) -> bool {
++        !matches!(self, RecentRow::Entry(e) if e.missing)
++    }
++}
++
++/// Which list a ribbon cell carries.
++pub(super) fn kind_of(c: Cmd) -> Option<RecentKind> {
++    match c {
++        Cmd::Project => Some(RecentKind::Project),
++        Cmd::Model => Some(RecentKind::Model),
++        _ => None,
++    }
++}
++
++/// The cell a list hangs under.
++fn cmd_of(kind: RecentKind) -> Cmd {
++    match kind {
++        RecentKind::Project => Cmd::Project,
++        RecentKind::Model => Cmd::Model,
++    }
++}
++
++/// The dialog the Browse row (and an empty list's button) opens.
++fn browse(state: &mut State, kind: RecentKind) {
++    match kind {
++        RecentKind::Project => actions::open_project(state),
++        RecentKind::Model => actions::open_model_dialog(state),
++    }
++}
++
++/// The Open / Model button: toggle its list when it has entries, else
++/// the dialog as before. Opening a list closes every other door.
++pub(super) fn press(state: &mut State, kind: RecentKind) {
++    if state.recent.list(kind).is_empty() {
++        state.ribbon_recent_open = None;
++        browse(state, kind);
++        return;
++    }
++    if state.ribbon_recent_open == Some(kind) {
++        state.ribbon_recent_open = None;
++        return;
++    }
++    state.ribbon_recent_open = Some(kind);
++    state.ribbon_more = None;
++    state.ribbon_mode_open = false;
++    state.ribbon_view_open = false;
++    state.ribbon_theme_open = false;
++}
++
++/// The list's rows, pure geometry in the strip's global frame (the
++/// Theme door's law): hung under the button, pulled left so the list
++/// never runs off the strip's right edge. The tests click these rects.
++pub(super) fn rows_of(
++    state: &State,
++    kind: RecentKind,
++    button: Rect,
++    strip: Rect,
++    pal: &Tokens,
++) -> Vec<(RecentRow, Rect)> {
++    let mut rows: Vec<RecentRow> = state.recent_entries(kind).into_iter().map(RecentRow::Entry).collect();
++    rows.push(RecentRow::Clear);
++    rows.push(RecentRow::Browse);
++    let left = button.left().min(strip.right() - RECENT_W).max(strip.left());
++    rows.into_iter()
++        .enumerate()
++        .map(|(k, r)| {
++            let min = egui::Pos2::new(left, button.bottom() + DROP_GAP + k as f32 * pal.row_height);
++            (r, Rect::from_min_size(min, Vec2::new(RECENT_W, pal.row_height)))
++        })
++        .collect()
++}
++
++/// Draw the open list, if any, under its button in `cells`. A list
++/// whose button or entries are gone closes itself.
++pub(super) fn draw(ui: &mut Ui, state: &mut State, pal: &Tokens, id: egui::Id, cells: &[Cell], strip: Rect) {
++    let Some(kind) = state.ribbon_recent_open else { return };
++    let button = cells.iter().find(|c| c.cmd == cmd_of(kind)).map(|c| c.rect);
++    match button {
++        Some(button) if !state.recent.list(kind).is_empty() => {
++            let rows = rows_of(state, kind, button, strip, pal);
++            show(ui, state, kind, pal, id, button, &rows);
++        }
++        _ => state.ribbon_recent_open = None,
++    }
++}
++
++/// The open list: a foreground Area of rows. A press on a row acts and
++/// closes the list; an outside press closes it.
++fn show(
++    ui: &mut Ui,
++    state: &mut State,
++    kind: RecentKind,
++    pal: &Tokens,
++    id: egui::Id,
++    button: Rect,
++    rows: &[(RecentRow, Rect)],
++) {
++    let Some(top) = rows.first().map(|(_, r)| r.min) else {
++        state.ribbon_recent_open = None;
++        return;
++    };
++    let panel = Rect::from_min_size(top, Vec2::new(RECENT_W, rows.len() as f32 * pal.row_height));
++    let mut chose: Option<RecentRow> = None;
++    egui::Area::new(id)
++        .fixed_pos(panel.min)
++        .order(egui::Order::Foreground)
++        .movable(false)
++        .show(ui.ctx(), |ui| {
++            let p = ui.painter();
++            p.rect_filled(panel, pal.radius_menu, pal.ink);
++            p.rect_stroke(panel, pal.radius_menu, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Outside);
++            for (k, (row, r)) in rows.iter().enumerate() {
++                let resp = ui.interact(*r, id.with(("recent-row", k)), Sense::click());
++                let (label, live) = (row.label(), row.live());
++                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, live, &label));
++                if resp.hovered() && live {
++                    p.rect_filled(*r, 0.0, pal.field_hover);
++                }
++                if matches!(row, RecentRow::Clear) {
++                    p.hline(r.x_range(), r.top(), egui::Stroke::new(1.0, pal.border));
++                }
++                p.with_clip_rect(r.shrink2(Vec2::new(4.0, 0.0))).text(
++                    r.left_center() + Vec2::new(8.0, 0.0),
++                    egui::Align2::LEFT_CENTER,
++                    &label,
++                    egui::FontId::proportional(pal.font_row),
++                    if live { pal.text } else { pal.text_faint },
++                );
++                let clicked = resp.clicked();
++                if let RecentRow::Entry(e) = row {
++                    resp.on_hover_text(e.path.display().to_string());
++                }
++                if clicked {
++                    chose = Some(row.clone());
++                }
++            }
++        });
++    match chose {
++        Some(row) => {
++            state.ribbon_recent_open = None;
++            match row {
++                // Refused by name, never a crash: the file is gone.
++                RecentRow::Entry(e) if e.missing => state.status = e.refusal(kind),
++                RecentRow::Entry(e) => state.pending.push_back(CommandKind::OpenRecent(kind, e.path)),
++                RecentRow::Clear => state.pending.push_back(CommandKind::ClearRecent(kind)),
++                RecentRow::Browse => browse(state, kind),
++            }
++        }
++        None => {
++            let outside = ui.input(|i| {
++                i.pointer.button_pressed(egui::PointerButton::Primary)
++                    && i.pointer.interact_pos().is_none_or(|p| {
++                        !button.expand(DROP_GAP).contains(p) && !rows.iter().any(|(_, r)| r.contains(p))
++                    })
++            });
++            if outside {
++                state.ribbon_recent_open = None;
++            }
++        }
++    }
++}
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index 999b2577f..03845e940 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -175,7 +175,9 @@ impl Shell {
+         // File work is the real thing: New/Model/Project/Save/Save As on the ribbon
+         // queue the shared command kinds, rfd picks the path, State::run
+         // does the work - the machinery was never egui's to rebuild.
+-        let state = State::new();
++        let mut state = State::new();
++        // #662: the user's recent projects and models, read once.
++        state.load_recent();
+         let dock_state = build_dock();
+         Self {
+             window: None,
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 0e99f2d5d..a89ecbb1d 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -101,6 +101,7 @@ mod tool_body;
+ mod tool_profile;
+ // #441: the Theme ribbon door; the Stock page shows stock only.
+ mod theme_door;
++mod recent_door;
+ // #509: the Fixtures page rows fit the pane.
+ mod fixture_rows;
+ 
+diff --git a/crates/ui/src/egui_app/tests/recent_door.rs b/crates/ui/src/egui_app/tests/recent_door.rs
+new file mode 100644
+index 000000000..314bb662a
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/recent_door.rs
+@@ -0,0 +1,235 @@
++//! #662: recent projects and models on the ribbon's Open and Model
++//! buttons. A save / open / import fills the lists; with entries the
++//! button opens a list (AccessKit-labelled rows: the files by name,
++//! then "Clear recent" and "Browse…"); a click on an entry opens it
++//! through Open's own path (the unsaved prompt included); a missing
++//! file is greyed and refused by name; Clear recent empties the list;
++//! with no entries the button is the dialog, as before. The lists
++//! survive a restart through the per-user file.
++//! Provenance: our own tests over our own shell; no HSMWorks material.
++//!
++//! Gate map (M4.4): covers ui::egui_app::recent_drop, ui::state (state_recent), ui::unsaved.
++
++use std::path::PathBuf;
++
++use camcraft_app::recent::{RecentFiles, RecentKind};
++
++use super::super::recent_drop::{self, BROWSE, CLEAR, RecentRow};
++use super::*;
++use crate::unsaved::UnsavedChoice;
++
++fn click(h: &mut Harness<'static, ShellUi>, at: egui::Pos2) {
++    set_pos(h, at);
++    button_at(h, egui::PointerButton::Primary, at, true);
++    button_at(h, egui::PointerButton::Primary, at, false);
++    h.run_steps(2);
++}
++
++/// A fresh folder for one test, canonical (macOS temp is a symlink).
++fn temp_dir(tag: &str) -> PathBuf {
++    let d = std::env::temp_dir().join(format!("camcraft-recent-ui-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).expect("make the test folder");
++    std::fs::canonicalize(&d).expect("canonical folder")
++}
++
++fn cube_path() -> PathBuf {
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/cube.stl")
++}
++
++/// A saved copy of the seeded document at `path`, written by another
++/// State so the harness's own document stays as it is.
++fn saved_project(path: &std::path::Path) {
++    let mut other = State::new();
++    world::seed(&mut other);
++    other.save_project_path(path.to_path_buf());
++    assert!(path.is_file(), "fixture project saved: {}", other.status);
++}
++
++fn button(cmd: Cmd) -> egui::Rect {
++    let (cells, _) = mill_plan_at(1280.0);
++    cells.iter().find(|c| c.cmd == cmd).expect("the File cell stands on the bar").rect
++}
++
++fn rows(state: &State, kind: RecentKind) -> Vec<(RecentRow, egui::Rect)> {
++    let cmd = if kind == RecentKind::Project { Cmd::Project } else { Cmd::Model };
++    let strip =
++        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, super::super::shell::RIBBON_H));
++    recent_drop::rows_of(state, kind, button(cmd), strip, &theme::current())
++}
++
++fn row_rect(state: &State, kind: RecentKind, label: &str) -> egui::Rect {
++    rows(state, kind)
++        .into_iter()
++        .find(|(r, _)| r.label() == label)
++        .unwrap_or_else(|| panic!("the list has a '{label}' row"))
++        .1
++}
++
++#[test]
++fn the_door_lists_entries_then_clear_and_browse_with_accesskit_labels() {
++    let d = temp_dir("structural");
++    let (a, b) = (d.join("a.camproj"), d.join("b.camproj"));
++    saved_project(&a);
++    saved_project(&b);
++    let mut h = shell_harness();
++    {
++        let st = &mut h.state_mut().state;
++        st.recent.add(RecentKind::Project, &a);
++        st.recent.add(RecentKind::Project, &b);
++        st.recent.add(RecentKind::Project, &d.join("gone.camproj"));
++    }
++    h.run();
++    assert!(h.query_by_label(CLEAR).is_none(), "the list is closed until pressed");
++    click(&mut h, button(Cmd::Project).center());
++    assert_eq!(h.state().state.ribbon_recent_open, Some(RecentKind::Project));
++    let labels: Vec<String> = rows(&h.state().state, RecentKind::Project).iter().map(|(r, _)| r.label()).collect();
++    assert_eq!(labels, ["gone.camproj (missing)", "b.camproj", "a.camproj", CLEAR, BROWSE], "newest first");
++    for label in &labels {
++        h.get_by_label(label);
++    }
++    // The Model list is its own, and empty.
++    assert!(h.state().state.recent.list(RecentKind::Model).is_empty());
++}
++
++#[test]
++fn a_click_on_an_entry_opens_it_through_open() {
++    let d = temp_dir("open");
++    let path = d.join("job.camproj");
++    let mut h = shell_harness();
++    // Saving fills the list (Save / Save As are noted) and leaves the
++    // document clean, so the open needs no prompt.
++    h.state_mut().state.pending.push_back(CommandKind::SaveProjectFile(path.clone()));
++    h.run_steps(2);
++    assert_eq!(h.state().state.recent.list(RecentKind::Project), std::slice::from_ref(&path));
++    h.state_mut().state.pending.push_back(CommandKind::NewDocument);
++    h.run_steps(2);
++    assert_eq!(h.state().state.project_path, None);
++    click(&mut h, button(Cmd::Project).center());
++    let at = row_rect(&h.state().state, RecentKind::Project, "job.camproj").center();
++    click(&mut h, at);
++    h.run_steps(2);
++    let st = &h.state().state;
++    assert_eq!(st.ribbon_recent_open, None, "a choice closes the list");
++    assert_eq!(st.project_path.as_deref(), Some(path.as_path()), "status: {}", st.status);
++    assert!(st.status.starts_with("opened"), "{}", st.status);
++    assert!(model::find_by_name(&st.world, "Block").is_some(), "the saved document came back");
++}
++
++#[test]
++fn a_recent_project_over_unsaved_changes_takes_opens_prompt() {
++    let d = temp_dir("unsaved");
++    let path = d.join("other.camproj");
++    saved_project(&path);
++    let mut h = shell_harness();
++    assert!(h.state().state.history.is_dirty(), "the seed is unsaved work");
++    h.state_mut().state.recent.add(RecentKind::Project, &path);
++    click(&mut h, button(Cmd::Project).center());
++    let at = row_rect(&h.state().state, RecentKind::Project, "other.camproj").center();
++    click(&mut h, at);
++    assert!(h.state().state.unsaved_prompt.is_some(), "the open is held for the prompt");
++    h.get_by_label("Unsaved changes");
++    crate::actions::resolve_unsaved(&mut h.state_mut().state, UnsavedChoice::DontSave);
++    h.run_steps(2);
++    assert_eq!(h.state().state.project_path.as_deref(), Some(path.as_path()));
++}
++
++#[test]
++fn a_missing_entry_is_refused_by_name() {
++    let d = temp_dir("missing");
++    let gone = d.join("gone.camproj");
++    let mut h = shell_harness();
++    h.state_mut().state.recent.add(RecentKind::Project, &gone);
++    let dirty = h.state().state.history.is_dirty();
++    click(&mut h, button(Cmd::Project).center());
++    h.get_by_label("gone.camproj (missing)");
++    let at = row_rect(&h.state().state, RecentKind::Project, "gone.camproj (missing)").center();
++    click(&mut h, at);
++    h.run_steps(2);
++    let st = &h.state().state;
++    assert!(st.status.contains("gone.camproj is missing"), "refused by name: {}", st.status);
++    assert!(st.unsaved_prompt.is_none(), "a missing file asks nothing");
++    assert_eq!(st.project_path, None, "nothing opened");
++    assert_eq!(st.history.is_dirty(), dirty, "the document is untouched");
++    assert!(model::find_by_name(&st.world, "Block").is_some());
++    // The same refusal holds for a queued command (the file went
++    // between the frame that drew it and the click).
++    h.state_mut().state.pending.push_back(CommandKind::OpenRecent(RecentKind::Model, d.join("gone.stl")));
++    h.run_steps(2);
++    assert!(h.state().state.status.contains("gone.stl is missing"), "{}", h.state().state.status);
++}
++
++#[test]
++fn clear_recent_empties_the_list() {
++    let mut h = shell_harness();
++    h.state_mut().state.recent.add(RecentKind::Model, &cube_path());
++    click(&mut h, button(Cmd::Model).center());
++    assert_eq!(h.state().state.ribbon_recent_open, Some(RecentKind::Model));
++    let at = row_rect(&h.state().state, RecentKind::Model, CLEAR).center();
++    click(&mut h, at);
++    h.run_steps(2);
++    let st = &h.state().state;
++    assert!(st.recent.list(RecentKind::Model).is_empty(), "Clear recent empties it");
++    assert_eq!(st.ribbon_recent_open, None);
++    assert!(h.query_by_label(CLEAR).is_none(), "the list is gone");
++}
++
++#[test]
++fn a_recent_model_imports_through_the_worker_and_is_noted() {
++    let d = temp_dir("model");
++    let copy = d.join("bracket.stl");
++    std::fs::copy(cube_path(), &copy).expect("copy the cube fixture");
++    let mut h = shell_harness();
++    h.state_mut().state.recent.add(RecentKind::Model, &copy);
++    h.state_mut().state.recent.add(RecentKind::Model, &cube_path());
++    click(&mut h, button(Cmd::Model).center());
++    let at = row_rect(&h.state().state, RecentKind::Model, "bracket.stl").center();
++    click(&mut h, at);
++    h.state_mut().state.settle();
++    h.run_steps(2);
++    let st = &h.state().state;
++    assert!(model::find_by_name(&st.world, "bracket").is_some(), "status: {}", st.status);
++    assert_eq!(st.recent.list(RecentKind::Model).first(), Some(&copy), "the import moved it to the top");
++}
++
++#[test]
++fn an_empty_list_and_browse_open_todays_dialog() {
++    let mut h = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame_undrained, ShellUi::seeded());
++    h.run();
++    click(&mut h, button(Cmd::Project).center());
++    let queued = |h: &Harness<'static, ShellUi>| {
++        h.state().state.pending.iter().any(|c| matches!(c, CommandKind::OpenProjectDialog))
++    };
++    assert!(queued(&h), "no recents: the button is the dialog, as before");
++    assert_eq!(h.state().state.ribbon_recent_open, None);
++    h.state_mut().state.pending.clear();
++    h.state_mut().state.recent.add(RecentKind::Project, &cube_path());
++    click(&mut h, button(Cmd::Project).center());
++    assert!(!queued(&h), "with recents the button opens its list");
++    let at = row_rect(&h.state().state, RecentKind::Project, BROWSE).center();
++    click(&mut h, at);
++    assert!(queued(&h), "Browse… opens the dialog");
++    h.state_mut().state.pending.clear();
++}
++
++#[test]
++fn the_lists_survive_a_restart_and_a_corrupt_file_starts_empty() {
++    let d = temp_dir("restart");
++    let file = d.join("recent.json");
++    let project = d.join("kept.camproj");
++    let mut first = State::new();
++    world::seed(&mut first);
++    first.load_recent_from(file.clone());
++    first.save_project_path(project.clone());
++    // A "restart": a new State reading the same file.
++    let mut second = State::new();
++    second.load_recent_from(file.clone());
++    assert_eq!(second.recent.list(RecentKind::Project), &[project]);
++    std::fs::write(&file, "{ not json").expect("corrupt the file");
++    let mut third = State::new();
++    third.load_recent_from(file);
++    assert_eq!(third.recent, RecentFiles::default(), "a corrupt file starts empty");
++    assert!(third.status.contains("starting empty"), "and says so: {}", third.status);
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index f65e09c08..9eb8eafb9 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -51,6 +51,8 @@ mod tool_body_ui;
+ pub use tool_body_ui::{BodyDraft, BodyPickMode, ToolBodyUi, ZOOM_MAX, ZOOM_MIN, clamp_zoom};
+ #[path = "state_tool_profile.rs"]
+ mod tool_profile_ui;
++#[path = "state_recent.rs"]
++mod recent_ui;
+ pub use tool_profile_ui::{ToolColumn, ToolProfileUi, is_spun_kind, parametric_points};
+ use flecs_ecs::prelude::World;
+ 
+@@ -67,6 +69,11 @@ pub enum CommandKind {
+     SaveProjectDialog,
+     SaveProjectAsDialog,
+     SaveProjectFile(PathBuf),
++    /// One recent project or model (#662): the same open / import the
++    /// dialogs run, a missing file refused by name.
++    OpenRecent(camcraft_app::recent::RecentKind, PathBuf),
++    /// "Clear recent" (#662): empty one list (preference state, not undoable).
++    ClearRecent(camcraft_app::recent::RecentKind),
+     /// Post NC through the save-dialog law (M1.7b): path via rfd, gate
+     /// via `posting::post_setup`.
+     PostProgramDialog,
+@@ -1243,6 +1250,15 @@ pub struct State {
+     /// The Theme door's open flag (#441): the same dropdown law as
+     /// `ribbon_view_open` - a frame fact, one door open at a time.
+     pub ribbon_theme_open: bool,
++    /// The open recent-files drop-down (#662) under the Open (projects)
++    /// or Model (models) button - the same door law, one open at a time.
++    pub ribbon_recent_open: Option<camcraft_app::recent::RecentKind>,
++    /// The recent projects and models (#662): user preference state,
++    /// never document state and never on the history.
++    pub recent: camcraft_app::recent::RecentFiles,
++    /// Where the recents are written back; `None` (every headless
++    /// State) keeps them in memory only.
++    pub recent_store: Option<PathBuf>,
+     /// The dock's closable panels as of this frame (see [`PanelsOpen`]).
+     pub panels_open: PanelsOpen,
+     /// The View door's pending dock ask (see [`LayoutRequest`]).
+@@ -1528,6 +1544,9 @@ impl State {
+             ribbon_mode_open: false,
+             ribbon_view_open: false,
+             ribbon_theme_open: false,
++            ribbon_recent_open: None,
++            recent: camcraft_app::recent::RecentFiles::default(),
++            recent_store: None,
+             panels_open: PanelsOpen { browser: true, properties: true, machines: false },
+             layout_request: None,
+             tree_menu: None,
+@@ -2425,6 +2444,8 @@ impl State {
+                 }
+             }
+             CommandKind::SaveProjectFile(path) => self.save_project_path(path),
++            CommandKind::OpenRecent(kind, path) => self.open_recent(kind, path),
++            CommandKind::ClearRecent(kind) => self.clear_recent(kind),
+             CommandKind::PostProgramDialog => self.post_program_dialog(),
+             CommandKind::PostProgramFile(path) => self.post_program_path(path),
+             CommandKind::PostProgramFolder(dir) => self.post_program_folder(dir),
+@@ -3360,7 +3381,8 @@ impl State {
+     /// Called on this thread when a worker result arrives (or inline
+     /// fallback completes). Execution stays a normal history command.
+     fn finish_import(&mut self, result: Result<ImportModel, CommandError>) {
+-        self.import_file = None;
++        // #662: the file a landed import came from joins the recent models.
++        let file = self.import_file.take();
+         let secs = self
+             .import_started
+             .take()
+@@ -3393,6 +3415,7 @@ impl State {
+                             };
+                             self.history.execute(&self.world, cmd);
+                             self.doc_version += 1;
++                            self.note_recent_model(file.as_deref());
+                             self.status = match &binding {
+                                 Some(s) => format!("{verb}; marked as {s}'s fixture"),
+                                 None => format!("{verb}; marked as a fixture"),
+@@ -3408,6 +3431,7 @@ impl State {
+                             let summary = upd.changes().describe();
+                             self.history.execute(&self.world, upd);
+                             self.doc_version += 1;
++                            self.note_recent_model(file.as_deref());
+                             self.status = timed("updated", &format!(" ({summary})"));
+                         }
+                         Err(err) => self.status = format!("import refused: {err}"),
+@@ -3416,6 +3440,7 @@ impl State {
+                     // Fresh model: the spawn path, unchanged.
+                     self.history.execute(&self.world, command);
+                     self.doc_version += 1;
++                    self.note_recent_model(file.as_deref());
+                     self.status = timed("imported", "");
+                 }
+             }
+@@ -3655,6 +3680,7 @@ impl State {
+         match project::load_noted(&self.world, &path) {
+             Ok(notes) => {
+                 self.project_path = Some(path.clone());
++                self.note_recent(camcraft_app::recent::RecentKind::Project, &path);
+                 // The loaded document is the new clean point (#107).
+                 self.history.mark_clean();
+                 self.doc_version += 1;
+@@ -3675,6 +3701,7 @@ impl State {
+                 // What is on disk now matches the history position (#107).
+                 self.history.mark_clean();
+                 self.status = format!("saved {}", path.display());
++                self.note_recent(camcraft_app::recent::RecentKind::Project, &path);
+                 self.project_path = Some(path);
+             }
+             Err(err) => self.status = format!("save failed: {err}"),
+diff --git a/crates/ui/src/state_recent.rs b/crates/ui/src/state_recent.rs
+new file mode 100644
+index 000000000..f8ca98f24
+--- /dev/null
++++ b/crates/ui/src/state_recent.rs
+@@ -0,0 +1,90 @@
++//! Recent projects and models on the State (issue #662): the lists are
++//! `camcraft_app::recent` preference state - read once at startup from
++//! the per-user file, noted after a successful open / import / save,
++//! written back atomically. Opening an entry rides the same paths as the
++//! dialogs (`open_project_path`, `import_path`), so the unsaved-changes
++//! prompt, the import worker and every status line are the ones Open and
++//! Model already use; the lists themselves are outside the history.
++//! Provenance: our own wiring over our own `app::recent`; no HSMWorks
++//! material.
++
++use std::path::{Path, PathBuf};
++
++use camcraft_app::recent::{self, RecentEntry, RecentKind};
++
++use super::State;
++
++impl State {
++    /// Startup: the per-user recents file (the real window only - the
++    /// headless suites never touch the user's file). A corrupt or
++    /// unreadable file starts empty and says so on the status line.
++    pub(crate) fn load_recent(&mut self) {
++        let Some(path) = recent::store_path() else {
++            eprintln!("recent files: no config folder - the lists last for this session only");
++            return;
++        };
++        self.load_recent_from(path);
++    }
++
++    /// Read the recents from `path` and keep writing back there.
++    pub fn load_recent_from(&mut self, path: PathBuf) {
++        let (lists, note) = recent::load(&path);
++        self.recent = lists;
++        self.recent_store = Some(path);
++        if let Some(why) = note {
++            self.status = why;
++        }
++    }
++
++    /// The entries one drop-down lists, newest first, each probed for
++    /// a missing file.
++    #[must_use]
++    pub fn recent_entries(&self, kind: RecentKind) -> Vec<RecentEntry> {
++        self.recent.list(kind).iter().map(|p| RecentEntry::of(p)).collect()
++    }
++
++    /// Note a successful open / import / save. A failed write is
++    /// logged (by `recent::save`), never shown over the open's own
++    /// status line.
++    pub(crate) fn note_recent(&mut self, kind: RecentKind, path: &Path) {
++        if self.recent.add(kind, path) {
++            self.persist_recent();
++        }
++    }
++
++    /// A landed import's source file (none: an inline test import).
++    pub(crate) fn note_recent_model(&mut self, file: Option<&Path>) {
++        if let Some(path) = file {
++            self.note_recent(RecentKind::Model, path);
++        }
++    }
++
++    /// Open one entry through the dialog's own path. A file that is
++    /// gone is refused by name and nothing else changes.
++    pub(crate) fn open_recent(&mut self, kind: RecentKind, path: PathBuf) {
++        let entry = RecentEntry::of(&path);
++        if entry.missing {
++            self.status = entry.refusal(kind);
++            return;
++        }
++        match kind {
++            RecentKind::Project => self.open_project_path(path),
++            RecentKind::Model => self.import_path(path),
++        }
++    }
++
++    /// "Clear recent": empty one list and write it back.
++    pub(crate) fn clear_recent(&mut self, kind: RecentKind) {
++        if self.recent.clear(kind) {
++            self.persist_recent();
++        }
++        self.status = format!("recent {}s cleared", kind.noun());
++    }
++
++    fn persist_recent(&self) {
++        let Some(path) = &self.recent_store else { return };
++        // The refusal is logged where it happens (app::recent::save);
++        // the lists in memory stay right for this session either way.
++        let _ = recent::save(path, &self.recent);
++    }
++}
+diff --git a/crates/ui/src/unsaved.rs b/crates/ui/src/unsaved.rs
+index 19a77ff53..930da9935 100644
+--- a/crates/ui/src/unsaved.rs
++++ b/crates/ui/src/unsaved.rs
+@@ -7,6 +7,8 @@
+ //! Provenance: our own design, specced from common desktop-editor
+ //! save-on-close behavior; no HSMWorks material involved.
+ 
++use camcraft_app::recent::RecentKind;
++
+ use crate::state::{CommandKind, State, save_project_dialog};
+ 
+ /// The prompt's three answers.
+@@ -23,10 +25,13 @@ pub enum UnsavedChoice {
+ /// The user-facing actions that would throw the current document away.
+ /// The `*File` arms stay unguarded: they are the scripted/headless paths.
+ fn discards_document(action: &CommandKind) -> bool {
+-    matches!(
+-        action,
+-        CommandKind::NewDocument | CommandKind::OpenProjectDialog | CommandKind::Quit
+-    )
++    match action {
++        CommandKind::NewDocument | CommandKind::OpenProjectDialog | CommandKind::Quit => true,
++        // #662: a recent project replaces the document like Open does.
++        // A missing one is refused by name before anything is asked.
++        CommandKind::OpenRecent(RecentKind::Project, path) => path.is_file(),
++        _ => false,
++    }
+ }
+ 
+ /// What the prompt says the held action is about to do.
+@@ -34,7 +39,7 @@ fn discards_document(action: &CommandKind) -> bool {
+ pub fn held_verb(action: &CommandKind) -> &'static str {
+     match action {
+         CommandKind::NewDocument => "starting a new document",
+-        CommandKind::OpenProjectDialog => "opening another project",
++        CommandKind::OpenProjectDialog | CommandKind::OpenRecent(..) => "opening another project",
+         _ => "closing",
+     }
+ }
+diff --git a/docs/decisions/662-recent-files.md b/docs/decisions/662-recent-files.md
+new file mode 100644
+index 000000000..bb9666020
+--- /dev/null
++++ b/docs/decisions/662-recent-files.md
+@@ -0,0 +1,75 @@
++## #662 - Recent projects and models on Open and Model
++
++**Decided:**
++
++- **Where the logic lives.** The list logic and the file format are in
++  `camcraft_app::recent` (add / de-dup / cap / clear, load, atomic save,
++  the config-folder resolver). The UI keeps the lists on `State`
++  (`state_recent.rs`) and draws them (`egui_app/recent_drop.rs`). Panels
++  never touch the file.
++- **The button is a drop-down, not a split button.** Open and Model
++  open their recent list when it has entries. The list holds the files
++  newest first, then "Clear recent", then "Browse…" (today's dialog).
++  With an empty list, or with the feature off, the button goes straight
++  to the dialog as before, so nothing changes until a file has been
++  opened. Ctrl+O and Ctrl+Shift+O still go straight to the dialogs.
++  - Dropped: a split-button arrow. The ribbon's cells are painted
++    geometry (`ribbon_cells`), and a second hit zone per cell would mean
++    changing the layout every ribbon test pins. The drop-down uses the
++    same pattern as the Theme, View and machine doors.
++- **No File menu exists.** The menu bar retired with the imgui shell
++  (actions.rs), so there is no "Open Recent" submenu to add.
++- **Storage.** The file is `recent.json` (our own `camcraft-recent/1`
++  JSON). It lives in `<config>/camcraft/`:
++  - Windows: `%APPDATA%`.
++  - macOS: `~/Library/Application Support`.
++  - Linux and other platforms: `$XDG_CONFIG_HOME` or `~/.config`.
++
++  `CAMCRAFT_CONFIG_DIR` (an absolute folder) overrides it. On Windows
++  and macOS this is beside the user machines folder (`camcraft/machines`,
++  #287). On Linux the machines folder is the XDG *data* folder, but the
++  issue asked for the config folder, and preferences belong there under
++  the XDG spec.
++  - No new dependency. The resolver has the same shape as
++    `machine::store::user_dir_for`, and the write reuses
++    `machine::store::write_atomic` (temp file, then rename).
++- **The cap is a config key, not a Settings control.** The app has no
++  Settings dialog yet. The cap is the file's `limit` key: default 10,
++  0 turns recent files off (nothing is added and the buttons go straight
++  to the dialogs), and it is clamped at 50. A Settings page can edit
++  that same key later.
++- **What adds an entry.** A successful project open, a successful
++  project save (Save and Save As share one write path, so a plain Save
++  also moves its project to the top, which is harmless), and a landed
++  model import (a fresh model, an update, or an import as a fixture).
++  A failed or refused open adds nothing.
++- **Missing files.** A missing file stays listed, greyed, with
++  "(missing)". A click on it sets a status line that names it, and
++  nothing else changes. The file is checked again when the command
++  runs, because it can vanish between the draw and the click.
++  - A missing recent project skips the unsaved-changes prompt: there is
++    nothing to open, so there is nothing to ask about.
++  - Missing entries are not pruned automatically. The user may remount
++    a drive, and Clear recent covers the rest.
++- **Bad input.** A corrupt file or one with the wrong format, or one
++  that can't be read, starts both lists empty. The warning goes to the
++  log (`tracing::warn`) and the status line. A missing file is a quiet
++  empty start. On read, relative paths, empty paths and repeats are
++  dropped, and each list is cut to the cap.
++- **Headless States never touch the user's file.** Only the real window
++  (`Shell::new`) reads and writes the per-user file. `State::new()`
++  keeps the lists in memory, so the test suites can't overwrite a
++  developer's recents. The tests use `State::load_recent_from(<temp>)`.
++- **Not undoable.** `OpenRecent` runs the same open or import as the
++  dialog. The lists are preference state, and `ClearRecent` is outside
++  the history. A recent project goes through the same unsaved-changes
++  guard as Open.
++
++**Cost to change later:**
++
++- Adding a Settings UI for the cap means one numeric field that writes
++  `RecentFiles::set_limit` and then saves.
++- Moving to a split button means changing the ribbon geometry, with no
++  change to the list logic.
++- If two app instances run at once, the last one to write wins.
++  Accepted for a convenience list.

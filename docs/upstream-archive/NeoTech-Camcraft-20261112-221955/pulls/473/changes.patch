@@ -1,0 +1,3484 @@
+From e0219f1019dffbe5384e36b238090a5b2957ec31 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Sun, 8 Nov 2026 16:43:07 -0800
+Subject: [PATCH 1/5] feat(ui): import, place and pick a tool body in the tool
+ editor; draw it in the simulation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tool editor gains a Body column: Import body… (STEP/STL/OBJ) and
+Clear body, the axis (six presets or a picked face normal), the tip
+offset, Pick tip / Pick axis on an egui-painted orbitable 3D preview,
+a live placement note, and Apply body, which queues one SetToolBody
+(undoable; refusals land on the Tool pane by name). Picks and orbit are
+ephemeral. The profile preview overlays the placed body's envelope.
+
+While the simulation runs, the running tool's body is posed at the
+playhead and drawn as a model part; tools without a body add nothing.
+
+App helpers live in app::tool_body_view (load, presets, preview, pick,
+tip offset, posing, body of an operation's tool).
+
+Fixes #371
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/lib.rs                     |   2 +
+ crates/app/src/tool_body_view.rs          | 148 ++++++++++++
+ crates/app/tests/tool_body_view.rs        | 155 ++++++++++++
+ crates/ui/src/actions.rs                  |   2 +
+ crates/ui/src/egui_app/mod.rs             |   2 +
+ crates/ui/src/egui_app/pages.rs           |  34 ++-
+ crates/ui/src/egui_app/tests.rs           |   2 +
+ crates/ui/src/egui_app/tests/tool_body.rs | 198 +++++++++++++++
+ crates/ui/src/egui_app/tool_body_page.rs  | 280 ++++++++++++++++++++++
+ crates/ui/src/egui_app/world.rs           |  20 ++
+ crates/ui/src/state.rs                    |  15 ++
+ crates/ui/src/state_tool_body.rs          | 224 +++++++++++++++++
+ docs/decisions/371-tool-body-ui.md        |  76 ++++++
+ 13 files changed, 1153 insertions(+), 5 deletions(-)
+ create mode 100644 crates/app/src/tool_body_view.rs
+ create mode 100644 crates/app/tests/tool_body_view.rs
+ create mode 100644 crates/ui/src/egui_app/tests/tool_body.rs
+ create mode 100644 crates/ui/src/egui_app/tool_body_page.rs
+ create mode 100644 crates/ui/src/state_tool_body.rs
+ create mode 100644 docs/decisions/371-tool-body-ui.md
+
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 3b80f3eef..ce56ef837 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -57,6 +57,8 @@ pub mod tool_numbers;
+ pub use camcraft_tools::tools;
+ // #368: a tool's modelled body and the reads the judging laws take from it.
+ pub mod tool_body;
++// #371: the editor's placement preview and picks, the sim's posed body.
++pub mod tool_body_view;
+ pub mod units;
+ pub use camcraft_sim::verify;
+ pub mod world;
+diff --git a/crates/app/src/tool_body_view.rs b/crates/app/src/tool_body_view.rs
+new file mode 100644
+index 000000000..6a25f92aa
+--- /dev/null
++++ b/crates/app/src/tool_body_view.rs
+@@ -0,0 +1,148 @@
++//! Tool-body editing and display reads (#371): what the tool editor and
++//! the simulation need from a body without committing anything - the
++//! file read, the six axis presets, the placement preview (the same
++//! place-and-envelope `SetToolBody` runs), the tip/axis picks on the
++//! model-frame mesh, and the body posed at a tool position for drawing.
++//! Specced from plain linear algebra (Rodrigues' rotation formula, the
++//! ray/triangle crossing `pick::soup_hit` already uses); our own design,
++//! no vendor file or source consulted.
++//!
++//! Nothing here writes the world: picks and previews are ephemeral, and
++//! the one writer stays `SetToolBody` (AGENTS.md: everything is a
++//! command).
++
++use std::path::Path;
++
++use flecs_ecs::prelude::World;
++
++use crate::geometry::{Point3, Triangle};
++use crate::model;
++use crate::schema::ToolBody;
++use crate::tool_body;
++
++/// The six model directions the editor offers as the tool axis.
++pub const AXIS_CHOICES: [(&str, [f64; 3]); 6] = [
++    ("+Z", [0.0, 0.0, 1.0]),
++    ("-Z", [0.0, 0.0, -1.0]),
++    ("+X", [1.0, 0.0, 0.0]),
++    ("-X", [-1.0, 0.0, 0.0]),
++    ("+Y", [0.0, 1.0, 0.0]),
++    ("-Y", [0.0, -1.0, 0.0]),
++];
++
++/// The preset name of `axis`, if it is one of [`AXIS_CHOICES`] (within
++/// float dust after normalizing).
++#[must_use]
++pub fn axis_label(axis: [f64; 3]) -> Option<&'static str> {
++    let a = unit(axis)?;
++    AXIS_CHOICES.iter().find(|(_, d)| dot(a, *d) > 1.0 - 1e-9).map(|(n, _)| *n)
++}
++
++/// Read a STEP / STL / OBJ for a tool body: its file name and its
++/// model-frame facets. Refuses an unreadable or empty file by name.
++pub fn load(path: &Path) -> Result<(String, Vec<Triangle>), String> {
++    let mesh = crate::geometry::import::load_model(path).map_err(|e| e.to_string())?;
++    if mesh.facets.is_empty() {
++        return Err("the file holds no facets".into());
++    }
++    let source = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
++    Ok((source, mesh.facets.to_vec()))
++}
++
++/// The placement as `SetToolBody` would judge it, without landing it:
++/// the body placed in the tool frame with its envelope, or the refusal
++/// by name. (The tool-fit law is the command's; this sees the mesh.)
++pub fn preview(model: &[Triangle], axis: [f64; 3], offset: f64) -> Result<ToolBody, String> {
++    let placed = tool_body::place(model, axis, offset)?;
++    tool_body::build("preview", axis, offset, placed)
++}
++
++/// What a click on the model-frame body found: the facet, the hit
++/// point, the facet's corner nearest the hit, and its unit normal (`None`
++/// for a zero-area facet).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct BodyPick {
++    pub facet: usize,
++    pub hit: [f64; 3],
++    pub vertex: [f64; 3],
++    pub normal: Option<[f64; 3]>,
++}
++
++/// Cast `origin + t*dir` at the body's facets (model frame).
++#[must_use]
++pub fn pick(model: &[Triangle], origin: [f64; 3], dir: [f64; 3]) -> Option<BodyPick> {
++    let (facet, hit) = crate::pick::soup_hit(model, origin, dir)?;
++    let t = model.get(facet)?;
++    let corners = [t.a, t.b, t.c].map(|p| [p.x, p.y, p.z]);
++    let d2 = |q: [f64; 3]| {
++        let e = sub(q, hit);
++        dot(e, e)
++    };
++    let vertex = corners.into_iter().min_by(|a, b| d2(*a).total_cmp(&d2(*b)))?;
++    let normal = unit(cross(sub(corners[1], corners[0]), sub(corners[2], corners[0])));
++    Some(BodyPick { facet, hit, vertex, normal })
++}
++
++/// The tip offset that puts `point` (model frame) at the tool tip along
++/// `axis`: the placement maps height as `dot(q, axis) + offset`, so the
++/// tip (height 0) at `point` is `-dot(point, axis)`.
++#[must_use]
++pub fn tip_offset_at(point: [f64; 3], axis: [f64; 3]) -> Option<f64> {
++    let a = unit(axis)?;
++    let o = -dot(point, a);
++    o.is_finite().then_some(o)
++}
++
++/// Tool-frame facets (tip at the origin, +Z to the spindle) posed at a
++/// tool position: `tip` in world, `axis` the unit tip-to-spindle
++/// direction (`sim::Frame::axis`). +Z maps onto `axis` by the shortest
++/// rotation; the turn about the axis is free (the body is judged by its
++/// revolved envelope), and a vertical tool takes the identity.
++#[must_use]
++pub fn posed(facets: &[Triangle], tip: [f64; 3], axis: [f64; 3]) -> Vec<Triangle> {
++    let a = unit(axis).unwrap_or([0.0, 0.0, 1.0]);
++    let (c, k) = (a[2], cross([0.0, 0.0, 1.0], a));
++    let s = dot(k, k).sqrt();
++    let rot = |v: [f64; 3]| -> [f64; 3] {
++        if s < 1e-12 {
++            // Parallel: identity, or a half turn about X when flipped.
++            return if c >= 0.0 { v } else { [v[0], -v[1], -v[2]] };
++        }
++        // Rodrigues about the unit k by the angle whose cos is c, sin s.
++        let k = [k[0] / s, k[1] / s, k[2] / s];
++        let kv = cross(k, v);
++        let kd = dot(k, v) * (1.0 - c);
++        [v[0] * c + kv[0] * s + k[0] * kd, v[1] * c + kv[1] * s + k[1] * kd, v[2] * c + kv[2] * s + k[2] * kd]
++    };
++    let map = |p: Point3| {
++        let r = rot([p.x, p.y, p.z]);
++        Point3::new(r[0] + tip[0], r[1] + tip[1], r[2] + tip[2])
++    };
++    facets.iter().map(|t| Triangle::new(map(t.a), map(t.b), map(t.c))).collect()
++}
++
++/// The body on the tool operation `op` runs, if that tool has one.
++#[must_use]
++pub fn body_for_operation(world: &World, op: &str) -> Option<ToolBody> {
++    let e = model::find_by_name(world, op)?;
++    let tool = model::operation_of(world, &e)?.tool;
++    let te = model::find_by_name(world, &tool)?;
++    tool_body::body_of(world, &te)
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
++}
++
++fn unit(a: [f64; 3]) -> Option<[f64; 3]> {
++    let n = dot(a, a).sqrt();
++    (n.is_finite() && n > 1e-12).then(|| [a[0] / n, a[1] / n, a[2] / n])
++}
+diff --git a/crates/app/tests/tool_body_view.rs b/crates/app/tests/tool_body_view.rs
+new file mode 100644
+index 000000000..b06a35946
+--- /dev/null
++++ b/crates/app/tests/tool_body_view.rs
+@@ -0,0 +1,155 @@
++//! #371: the tool-body reads the editor and the simulation take - axis
++//! presets, the placement preview, tip and axis picks on the model-frame
++//! mesh, the body posed at a tool position, the body of an operation's
++//! tool, and the file read's refusals. Our own tests.
++//!
++//! Gate map (M4.4): covers app::tool_body_view, app::tool_body, app::pick.
++
++use camcraft_app::commands::{AddTool, CreateOperation, History, SetStock, SetToolBody, ToolBodySpec};
++use camcraft_app::geometry::{Point3, Triangle};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tool_body_view::{self as view, AXIS_CHOICES};
++use camcraft_app::tools::{catalog, Tool};
++use camcraft_app::world::new_world;
++
++const TOOL: &str = "EM-0400-2FL";
++
++fn catalog_tool(name: &str) -> Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog entry")
++}
++
++fn p(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++/// A closed `n`-gon prism of circumradius `r` about model Z over `[z0, z1]`.
++fn prism(r: f64, z0: f64, z1: f64, n: usize) -> Vec<Triangle> {
++    let q = |k: usize, z: f64| {
++        let a = std::f64::consts::TAU * k as f64 / n as f64;
++        p(r * a.cos(), r * a.sin(), z)
++    };
++    let mut v = Vec::new();
++    for k in 0..n {
++        let (a0, a1, b0, b1) = (q(k, z0), q(k + 1, z0), q(k, z1), q(k + 1, z1));
++        v.push(Triangle::new(a0, a1, b1));
++        v.push(Triangle::new(a0, b1, b0));
++        v.push(Triangle::new(p(0.0, 0.0, z0), a1, a0));
++        v.push(Triangle::new(p(0.0, 0.0, z1), b0, b1));
++    }
++    v
++}
++
++fn close(a: [f64; 3], b: [f64; 3]) -> bool {
++    (0..3).all(|i| (a[i] - b[i]).abs() < 1e-9)
++}
++
++#[test]
++fn the_six_presets_name_themselves_and_scaled_axes_still_match() {
++    for (name, d) in AXIS_CHOICES {
++        assert_eq!(view::axis_label(d), Some(name));
++    }
++    assert_eq!(view::axis_label([0.0, 0.0, 7.5]), Some("+Z"));
++    assert_eq!(view::axis_label([1.0, 1.0, 0.0]), None);
++    assert_eq!(view::axis_label([0.0, 0.0, 0.0]), None);
++}
++
++#[test]
++fn the_preview_is_the_placement_the_command_lands() {
++    let mesh = prism(20.0, 0.0, 30.0, 16);
++    let body = view::preview(&mesh, [0.0, 0.0, 1.0], 50.0).expect("a collar previews");
++    assert!((body.profile.bottom() - 50.0).abs() < 1e-6, "origin 50 above the tip puts the foot there");
++    assert!((body.profile.top() - 80.0).abs() < 1e-6);
++    // The command placing the same spec stores the same facets.
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(&world, AddTool::new(&world, TOOL, catalog_tool(TOOL)).expect("tool"));
++    let spec = ToolBodySpec { source: "c.stl".into(), facets: mesh.clone(), axis: [0.0, 0.0, 1.0], offset: 50.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    let e = camcraft_app::model::find_by_name(&world, TOOL).expect("tool entity");
++    let landed = camcraft_app::tool_body::body_of(&world, &e).expect("landed");
++    assert_eq!(&*landed.facets, &*body.facets);
++    // A placement that leaves the axis outside the body refuses by name.
++    // (z 5..30 along model Z, so the +X axis runs beside the body; the
++    // offset lifts its foot above the tip so the axis law is the one hit.)
++    let off = view::preview(&prism(20.0, 5.0, 30.0, 16), [1.0, 0.0, 0.0], 25.0).expect_err("X axis misses a Z collar's box");
++    assert!(off.contains("surround"), "{off}");
++}
++
++#[test]
++fn a_tip_pick_takes_the_hit_facets_nearest_corner_and_zeroes_it() {
++    let mesh = prism(20.0, 10.0, 40.0, 16);
++    // Straight down onto the top cap near the rim at +X.
++    let hit = view::pick(&mesh, [19.0, 0.5, 100.0], [0.0, 0.0, -1.0]).expect("the cap is hit");
++    assert!((hit.hit[2] - 40.0).abs() < 1e-9);
++    assert!(close(hit.vertex, [20.0, 0.0, 40.0]), "{:?}", hit.vertex);
++    let n = hit.normal.expect("cap facet has area");
++    assert!(n[2].abs() > 1.0 - 1e-9, "a cap normal is vertical: {n:?}");
++    // Up the bottom cap's normal side: a pick from below sees z = 10.
++    let low = view::pick(&mesh, [0.0, 1.0, -100.0], [0.0, 0.0, 1.0]).expect("bottom cap");
++    let off = view::tip_offset_at(low.hit, [0.0, 0.0, 1.0]).expect("finite");
++    assert!((off + 10.0).abs() < 1e-9, "the bottom at z 10 is the tip: offset -10, got {off}");
++    let body = view::preview(&mesh, [0.0, 0.0, 1.0], off).expect("placed");
++    assert!(body.profile.bottom().abs() < 1e-6, "the picked point lands on the tip");
++    assert!(view::pick(&mesh, [100.0, 100.0, 100.0], [0.0, 0.0, -1.0]).is_none(), "a miss is None");
++    assert!(view::tip_offset_at([1.0, 2.0, 3.0], [0.0, 0.0, 0.0]).is_none());
++}
++
++#[test]
++fn posing_maps_the_tool_frame_onto_the_tip_and_axis() {
++    let t = vec![Triangle::new(p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 0.0, 10.0))];
++    let up = view::posed(&t, [5.0, 6.0, 7.0], [0.0, 0.0, 1.0]);
++    assert!(close([up[0].b.x, up[0].b.y, up[0].b.z], [6.0, 6.0, 7.0]), "vertical is the identity plus the tip");
++    let side = view::posed(&t, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
++    assert!(close([side[0].c.x, side[0].c.y, side[0].c.z], [10.0, 0.0, 0.0]), "+Z lands on +X");
++    let down = view::posed(&t, [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
++    assert!(close([down[0].c.x, down[0].c.y, down[0].c.z], [0.0, 0.0, -10.0]), "a flipped axis flips");
++    let bad = view::posed(&t, [0.0, 0.0, 0.0], [f64::NAN, 0.0, 0.0]);
++    assert!(close([bad[0].c.x, bad[0].c.y, bad[0].c.z], [0.0, 0.0, 10.0]), "a bad axis falls back to vertical");
++}
++
++#[test]
++fn an_operation_reads_its_tools_body() {
++    let world = new_world();
++    let mut history = History::default();
++    history.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, Location::default()).expect("stock"),
++    );
++    history.execute(&world, AddTool::new(&world, TOOL, catalog_tool(TOOL)).expect("tool"));
++    let face = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(19.5),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    };
++    history.execute(&world, CreateOperation::new(&world, "Face1", TOOL, SrcRef::Stock, face).expect("op"));
++    assert!(view::body_for_operation(&world, "Face1").is_none(), "no body yet");
++    let t = catalog_tool(TOOL);
++    let z0 = t.flute_len + t.shank_len;
++    let spec = ToolBodySpec { source: "c.stl".into(), facets: prism(20.0, z0, z0 + 30.0, 16), axis: [0.0, 0.0, 1.0], offset: 0.0 };
++    history.execute(&world, SetToolBody::new(&world, TOOL, Some(spec)).expect("body"));
++    assert!(view::body_for_operation(&world, "Face1").is_some_and(|b| b.source == "c.stl"));
++    assert!(view::body_for_operation(&world, "Nope").is_none());
++}
++
++#[test]
++fn the_file_read_refuses_missing_and_unknown_files_by_name() {
++    let dir = std::env::temp_dir().join(format!("cc-371-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let missing = view::load(&dir.join("absent.stl")).expect_err("missing file");
++    assert!(!missing.is_empty());
++    let odd = dir.join("body.txt");
++    std::fs::write(&odd, "x").expect("write");
++    let e = view::load(&odd).expect_err("unknown extension");
++    assert!(e.contains("unsupported"), "{e}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/crates/ui/src/actions.rs b/crates/ui/src/actions.rs
+index c74d14db5..9a14f0661 100644
+--- a/crates/ui/src/actions.rs
++++ b/crates/ui/src/actions.rs
+@@ -335,6 +335,8 @@ pub(crate) fn open_tool_editor(state: &mut State, name: &str) {
+         state.sync_tool_ui();
+     }
+     state.tool_editor = Some(name.to_owned());
++    // #371: a fresh body draft per opening; it mirrors the tool's body.
++    state.tool_body_ui = crate::state::ToolBodyUi::default();
+ }
+ 
+ /// Quick-add an operation of `kind` (index into the registry the ribbon's
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index 4777ab05d..b59994a74 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -55,6 +55,8 @@ mod op_tabs;
+ mod painted;
+ mod tree_glyphs;
+ mod pages;
++// #371: the tool editor's Body section and its picking preview.
++mod tool_body_page;
+ mod setup_wcs_pick;
+ // #343: a setup's own node pages (settings, machine, post, fixtures, tools).
+ mod setup_pages;
+diff --git a/crates/ui/src/egui_app/pages.rs b/crates/ui/src/egui_app/pages.rs
+index 403d8e7ee..ec2e2f26b 100644
+--- a/crates/ui/src/egui_app/pages.rs
++++ b/crates/ui/src/egui_app/pages.rs
+@@ -1344,8 +1344,10 @@ pub(crate) fn tool_editor_window(ctx: &egui::Context, state: &mut State) {
+         .open(&mut open)
+         .collapsible(false)
+         .resizable(false)
++        // #371 widened the window by the Body column (~270 px); its
++        // default anchor moved left by as much, so it stays centred.
+         .default_pos([
+-            ctx.viewport_rect().center().x - 270.0,
++            ctx.viewport_rect().center().x - 520.0,
+             ctx.viewport_rect().center().y - 210.0,
+         ])
+         .show(ctx, |ui| {
+@@ -1536,7 +1538,13 @@ pub(crate) fn tool_editor_window(ctx: &egui::Context, state: &mut State) {
+                     ui.add(egui::DragValue::new(&mut state.tool_ui.number).range(0..=camcraft_app::tool_numbers::MAX));
+                 });
+                 ui.vertical(|ui| {
+-                    draw_tool_preview(ui, &preview_tool, u);
++                    // #371: the placed body's envelope rides the profile.
++                    let body = if exists { super::tool_body_page::envelope(state) } else { None };
++                    draw_tool_preview(ui, &preview_tool, u, body.as_deref());
++                });
++                ui.vertical(|ui| {
++                    ui.set_width(260.0);
++                    super::tool_body_page::body_section(ui, state, exists, u);
+                 });
+             });
+             ui.separator();
+@@ -1598,7 +1606,7 @@ fn push_number_if_changed(state: &mut State, name: &str) {
+ /// the fields beside it are editing. Tip at the bottom (z = 0 upward),
+ /// equal aspect both axes - "to scale" means to scale. A half-typed draft
+ /// renders a stub and a word, never a NaN.
+-fn draw_tool_preview(ui: &mut Ui, t: &tools::Tool, u: Unit) {
++fn draw_tool_preview(ui: &mut Ui, t: &tools::Tool, u: Unit, body: Option<&[(f64, f64, f64)]>) {
+     const SIDE: f32 = 260.0;
+     const PAD: f32 = 18.0;
+     let (resp, painter) = ui.allocate_painter(Vec2::splat(SIDE), Sense::hover());
+@@ -1606,8 +1614,10 @@ fn draw_tool_preview(ui: &mut Ui, t: &tools::Tool, u: Unit) {
+     let axis_x = rect.center().x;
+     painter.rect_filled(rect, 4.0, Color32::from_rgb(24, 26, 31));
+     let outline = t.profile();
+-    let r_max = outline.iter().map(|q| q.1).fold(0.0f64, f64::max);
+-    let z_max = outline.iter().map(|q| q.0).fold(0.0f64, f64::max);
++    // #371: a body's bands (above, len, r) widen the frame to hold them.
++    let bands = body.unwrap_or_default();
++    let r_max = outline.iter().map(|q| q.1).chain(bands.iter().map(|b| b.2)).fold(0.0f64, f64::max);
++    let z_max = outline.iter().map(|q| q.0).chain(bands.iter().map(|b| b.0 + b.1)).fold(0.0f64, f64::max);
+     if r_max <= 0.0 || z_max <= 0.0 || !r_max.is_finite() || !z_max.is_finite() {
+         painter.line_segment(
+             [
+@@ -1665,6 +1675,20 @@ fn draw_tool_preview(ui: &mut Ui, t: &tools::Tool, u: Unit) {
+             Stroke::NONE,
+         ));
+     }
++    // #371: the modelled body's revolved envelope, translucent amber over
++    // the cylinders it replaces in the judging laws.
++    for &(above, len, r) in bands {
++        if !(above.is_finite() && len.is_finite() && r.is_finite()) || len <= 0.0 || r <= 0.0 {
++            continue;
++        }
++        painter.rect(
++            egui::Rect::from_two_pos(at(above, -r), at(above + len, r)),
++            0.0,
++            Color32::from_rgba_unmultiplied(230, 160, 60, 70),
++            Stroke::new(1.0, Color32::from_rgb(230, 160, 60)),
++            egui::StrokeKind::Inside,
++        );
++    }
+     // The outline as one closed polyline (a stroke has no convexity rule):
+     // right side up, then the mirrored left side back down. Axis points
+     // (r = 0) appear on the right only - the mirror skips them so the tip
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index b533772fc..133d8d965 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -85,6 +85,8 @@ mod first_setup;
+ mod one_wcs;
+ // #343: the per-setup browser tree.
+ mod setup_tree;
++// #371: the tool editor's Body section.
++mod tool_body;
+ 
+ /// What the per-frame state of `Shell` is, minus the GPU half: the fields
+ /// `shell_layout` touches, so the harness exercises the window's real body.
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+new file mode 100644
+index 000000000..abd2f6cf3
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -0,0 +1,198 @@
++//! #371: the tool editor's Body section - Import body / Clear body show
++//! on an existing tool, Apply body lands one undoable `SetToolBody`, a
++//! degenerate placement is refused by name in the editor, and a pick
++//! only fills the draft. Provenance: our own page law; the test holder
++//! is our own geometry.
++
++use super::*;
++
++const TOOL: &str = "EM-0600-4FL";
++
++/// A closed `n`-gon prism about model Z over `[z0, z1]` as a binary STL.
++fn prism_stl(path: &std::path::Path, r: f32, z0: f32, z1: f32, n: usize) {
++    let q = |k: usize, z: f32| {
++        let a = std::f32::consts::TAU * k as f32 / n as f32;
++        [r * a.cos(), r * a.sin(), z]
++    };
++    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
++    for k in 0..n {
++        let (a0, a1, b0, b1) = (q(k, z0), q(k + 1, z0), q(k, z1), q(k + 1, z1));
++        tris.push([a0, a1, b1]);
++        tris.push([a0, b1, b0]);
++        tris.push([[0.0, 0.0, z0], a1, a0]);
++        tris.push([[0.0, 0.0, z1], b0, b1]);
++    }
++    let mut bytes = vec![0u8; 80];
++    bytes.extend_from_slice(&(tris.len() as u32).to_le_bytes());
++    for t in &tris {
++        bytes.extend_from_slice(&[0u8; 12]);
++        for v in t {
++            for c in v {
++                bytes.extend_from_slice(&c.to_le_bytes());
++            }
++        }
++        bytes.extend_from_slice(&[0u8; 2]);
++    }
++    std::fs::write(path, bytes).unwrap();
++}
++
++fn temp_stl(tag: &str) -> std::path::PathBuf {
++    let dir = std::env::temp_dir().join(format!("cc-371-ui-{}-{tag}", std::process::id()));
++    std::fs::create_dir_all(&dir).unwrap();
++    dir.join("holder.stl")
++}
++
++/// The seeded harness with the editor open on the catalog end mill.
++fn editor() -> Harness<'static, ShellUi> {
++    let mut harness = shell_harness();
++    harness.run();
++    crate::actions::open_tool_editor(&mut harness.state_mut().state, TOOL);
++    harness.run();
++    harness.run();
++    harness
++}
++
++fn shank_top(state: &State) -> f64 {
++    let t = model::find_by_name(&state.world, TOOL).and_then(|e| model::tool_of(&state.world, &e)).unwrap();
++    t.flute_len + t.shank_len
++}
++
++fn body_source(state: &State) -> Option<String> {
++    model::find_by_name(&state.world, TOOL)
++        .and_then(|e| camcraft_app::tool_body::body_of(&state.world, &e))
++        .map(|b| b.source)
++}
++
++#[test]
++fn the_editor_offers_import_and_clear_body() {
++    let harness = editor();
++    assert!(harness.query_by_label("Import body…").is_some(), "Import body… stands in the editor");
++    assert!(harness.query_by_label("Clear body").is_some(), "Clear body stands in the editor");
++    assert!(harness.query_by_label("Apply body").is_none(), "no draft, nothing to apply");
++}
++
++#[test]
++fn apply_body_lands_one_set_tool_body_and_undo_restores() {
++    let mut harness = editor();
++    let path = temp_stl("apply");
++    prism_stl(&path, 15.0, 0.0, 30.0, 24);
++    let top = shank_top(&harness.state().state);
++    {
++        let st = &mut harness.state_mut().state;
++        st.import_tool_body_from(&path);
++        // The model origin sits on the collar's foot: put it on the shank top.
++        st.tool_body_ui.offset = top;
++    }
++    harness.run();
++    assert!(body_source(&harness.state().state).is_none(), "importing alone never touches the world");
++    assert!(harness.query_by_label("Pick tip").is_some() && harness.query_by_label("Pick axis").is_some());
++    harness.get_by_label("Apply body").click();
++    harness.run();
++    harness.run();
++    let st = &harness.state().state;
++    assert_eq!(body_source(st).as_deref(), Some("holder.stl"), "status: {}", st.status);
++    harness.state_mut().state.pending.push_back(CommandKind::Undo);
++    harness.run();
++    assert!(body_source(&harness.state().state).is_none(), "one undo takes the body off - one step");
++    harness.state_mut().state.pending.push_back(CommandKind::Redo);
++    harness.run();
++    assert_eq!(body_source(&harness.state().state).as_deref(), Some("holder.stl"), "redo puts it back");
++    // Clear body is a command too, and undoes.
++    harness.get_by_label("Clear body").click();
++    harness.run();
++    harness.run();
++    assert!(body_source(&harness.state().state).is_none(), "cleared");
++    harness.state_mut().state.pending.push_back(CommandKind::Undo);
++    harness.run();
++    assert!(body_source(&harness.state().state).is_some(), "undo restores the cleared body");
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
++
++#[test]
++fn a_degenerate_placement_is_refused_by_name_in_the_editor() {
++    let mut harness = editor();
++    let path = temp_stl("refuse");
++    prism_stl(&path, 15.0, 5.0, 30.0, 24);
++    let top = shank_top(&harness.state().state);
++    {
++        let st = &mut harness.state_mut().state;
++        st.import_tool_body_from(&path);
++        // +X runs beside a collar standing on model Z: the axis misses it.
++        st.tool_body_ui.axis = [1.0, 0.0, 0.0];
++        st.tool_body_ui.offset = top + 20.0;
++    }
++    harness.run();
++    harness.get_by_label("Apply body").click();
++    harness.run();
++    harness.run();
++    assert!(body_source(&harness.state().state).is_none(), "nothing lands");
++    assert!(
++        harness.query_all_by_label_contains("tool body not set").next().is_some(),
++        "the refusal shows in the editor (status: {})",
++        harness.state().state.status
++    );
++    assert!(harness.query_all_by_label_contains("surround the tool axis").next().is_some(), "by name");
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
++
++#[test]
++fn a_tip_pick_fills_the_offset_and_queues_nothing() {
++    let mut harness = editor();
++    let path = temp_stl("pick");
++    prism_stl(&path, 15.0, 10.0, 30.0, 24);
++    harness.state_mut().state.import_tool_body_from(&path);
++    harness.run();
++    harness.get_by_label("Pick tip").click();
++    harness.run();
++    let st = &mut harness.state_mut().state;
++    assert_eq!(st.tool_body_ui.pick, crate::state::BodyPickMode::Tip);
++    let hit = camcraft_app::tool_body_view::pick(&st.tool_body_ui.facets, [0.0, 1.0, -100.0], [0.0, 0.0, 1.0])
++        .expect("the bottom cap is under the ray");
++    st.apply_body_pick(hit);
++    assert!((st.tool_body_ui.offset + 10.0).abs() < 1e-6, "the bottom corner at z 10 is the tip: {}", st.tool_body_ui.offset);
++    assert_eq!(st.tool_body_ui.pick, crate::state::BodyPickMode::Off, "one pick per arming");
++    assert!(st.pending.is_empty(), "a pick is not a command");
++    assert!(body_source(st).is_none());
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
++
++#[test]
++fn a_missing_file_is_refused_by_name() {
++    let mut harness = editor();
++    harness.state_mut().state.import_tool_body_from(std::path::Path::new("/nonexistent/holder.stl"));
++    harness.run();
++    assert!(harness.query_all_by_label_contains("tool body not imported").next().is_some());
++}
++
++#[test]
++fn the_simulation_draws_the_body_at_the_playhead_and_nothing_without_one() {
++    let mut harness = editor();
++    let st = &mut harness.state_mut().state;
++    st.sim = Some(crate::state::Sim { t: 0.0, playing: false, speed: 1.0 });
++    let sc = super::super::shell::cached_script(st);
++    assert!(!sc.is_empty(), "the seed's Contour1 runs");
++    let bare = world::collect(st).parts.len();
++    let path = temp_stl("sim");
++    prism_stl(&path, 15.0, 0.0, 30.0, 24);
++    let top = shank_top(st);
++    st.import_tool_body_from(&path);
++    st.tool_body_ui.offset = top;
++    st.queue_apply_tool_body();
++    st.drain_actions();
++    assert!(body_source(st).is_some(), "status: {}", st.status);
++    let sc = super::super::shell::cached_script(st);
++    let scene = world::collect(st);
++    assert_eq!(scene.parts.len(), bare + 1, "the body is one more part");
++    // Posed at the playhead: its lowest vertex sits the shank top above the tip.
++    let f = sc.at(0.0);
++    let body = scene
++        .parts
++        .iter()
++        .find(|p| !p.stock && !p.fill && p.verts.len() == 96 * 3)
++        .expect("the posed body part");
++    let zmin = body.verts.iter().map(|v| f64::from(v[2])).fold(f64::INFINITY, f64::min);
++    assert!((zmin - (f.pos.z + top)).abs() < 1e-3, "foot at tip + {top}: {zmin} vs {}", f.pos.z);
++    st.sim = None;
++    assert_eq!(world::collect(st).parts.len(), bare, "no transport, no body drawn");
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
+diff --git a/crates/ui/src/egui_app/tool_body_page.rs b/crates/ui/src/egui_app/tool_body_page.rs
+new file mode 100644
+index 000000000..1ed19e291
+--- /dev/null
++++ b/crates/ui/src/egui_app/tool_body_page.rs
+@@ -0,0 +1,280 @@
++//! The tool editor's Body section (#371): Import body… / Clear body, the
++//! placement (axis preset or picked face normal, tip offset), Pick tip /
++//! Pick axis on a small orbitable 3D preview of the mesh in its own
++//! frame, and Apply body - which queues the one `SetToolBody`. The
++//! preview is painted with egui (flat-shaded, depth-sorted triangles),
++//! so it needs no GPU and runs under the test harness. Picks and orbit
++//! are ephemeral; only Apply body / Clear body reach the history.
++//! Provenance: our own pane over `app::tool_body_view` (orthographic
++//! projection and ray casting from general graphics practice); no vendor
++//! material consulted.
++
++use egui::{Color32, ComboBox, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
++
++use camcraft_app::geometry::Triangle;
++use camcraft_app::tool_body_view::{self, AXIS_CHOICES};
++use camcraft_app::units::{self, Unit};
++
++use super::fields::{field, num};
++use crate::state::{BodyPickMode, State};
++
++/// The preview's side, logical px.
++const SIDE: Vec2 = Vec2::new(260.0, 200.0);
++/// Past this many facets the preview paints every n-th one (picking
++/// still reads them all) - a vendor STEP can carry 10^5+.
++const MAX_PAINTED: usize = 30_000;
++/// The default view: a three-quarter look from +X-Y, above.
++const YAW0: f32 = -0.9;
++const PITCH0: f32 = 0.45;
++
++/// The envelope bands of the draft's placed body, for the profile
++/// preview: `(above, len, r)` per band, or `None` with no usable draft.
++pub(super) fn envelope(state: &mut State) -> Option<Vec<(f64, f64, f64)>> {
++    match state.tool_body_preview()? {
++        Ok(b) => Some(b.profile.bands().iter().map(|q| (q.above, q.len, q.r)).collect()),
++        Err(_) => None,
++    }
++}
++
++/// The section, the editor's third column beside the profile preview. A new (unsaved) tool
++/// takes no body until it exists - the command names an existing tool.
++pub(super) fn body_section(ui: &mut Ui, state: &mut State, exists: bool, u: Unit) {
++    ui.strong("Tool body");
++    if !exists {
++        ui.label("Add the tool first, then import its holder or assembly.");
++        return;
++    }
++    state.sync_tool_body_ui();
++    let landed = state.editor_tool_body().map(|b| b.source);
++    let draft_src = state.tool_body_ui.source.clone();
++    let has_draft = !state.tool_body_ui.facets.is_empty();
++    ui.label(match (&landed, has_draft) {
++        (Some(src), _) if *src == draft_src => format!("body: {src}"),
++        (_, true) => format!("draft: {draft_src} (not applied)"),
++        _ => "none - the holder cylinder is judged".to_owned(),
++    });
++    let (import, clear) = ui
++        .horizontal(|ui| {
++            let import = ui
++                .button("Import body…")
++                .on_hover_text("read a STEP, STL or OBJ holder/assembly; place it, then Apply body")
++                .clicked();
++            let clear = ui
++                .add_enabled(landed.is_some() || has_draft, egui::Button::new("Clear body"))
++                .on_hover_text("remove the body - the holder cylinder is judged again (undoable)")
++                .clicked();
++            (import, clear)
++        })
++        .inner;
++    if import {
++        state.import_tool_body_dialog();
++    }
++    if clear {
++        state.clear_tool_body();
++    }
++    if state.tool_body_ui.facets.is_empty() {
++        return;
++    }
++    field(ui, "Tool axis (model direction, tip to spindle)");
++    axis_combo(ui, &mut state.tool_body_ui.axis);
++    field(ui, "Tip offset (model origin above the tip)");
++    num(ui, u, &mut state.tool_body_ui.offset);
++    let pick = state.tool_body_ui.pick;
++    ui.horizontal(|ui| {
++        if ui
++            .selectable_label(pick == BodyPickMode::Tip, "Pick tip")
++            .on_hover_text("click the body in the preview: the nearest corner becomes the tool tip")
++            .clicked()
++        {
++            state.tool_body_ui.pick = if pick == BodyPickMode::Tip { BodyPickMode::Off } else { BodyPickMode::Tip };
++        }
++        if ui
++            .selectable_label(pick == BodyPickMode::Axis, "Pick axis")
++            .on_hover_text("click a face that looks toward the spindle: its normal becomes the tool axis")
++            .clicked()
++        {
++            state.tool_body_ui.pick = if pick == BodyPickMode::Axis { BodyPickMode::Off } else { BodyPickMode::Axis };
++        }
++    });
++    preview_3d(ui, state);
++    let note = match state.tool_body_preview() {
++        Some(Ok(b)) => format!(
++            "placed: foot {} to top {} {} above the tip",
++            units::len(b.profile.bottom(), u, 1),
++            units::len(b.profile.top(), u, 1),
++            u.suffix()
++        ),
++        Some(Err(e)) => format!("placement: {e}"),
++        None => String::new(),
++    };
++    ui.label(note);
++    if ui.button("Apply body").on_hover_text("attach the body with this placement (one undo step)").clicked() {
++        state.queue_apply_tool_body();
++    }
++}
++
++fn axis_combo(ui: &mut Ui, axis: &mut [f64; 3]) {
++    let text = tool_body_view::axis_label(*axis)
++        .map_or_else(|| format!("picked ({:.2}, {:.2}, {:.2})", axis[0], axis[1], axis[2]), str::to_owned);
++    ComboBox::from_id_salt("tool_body_axis").selected_text(text).show_ui(ui, |ui| {
++        for (name, d) in AXIS_CHOICES {
++            if ui.selectable_label(tool_body_view::axis_label(*axis) == Some(name), name).clicked() {
++                *axis = d;
++            }
++        }
++    });
++}
++
++/// The orthographic view: a center, a scale, and the right/up/forward
++/// basis (forward points into the screen).
++struct View {
++    c: [f64; 3],
++    s: f64,
++    r: [f64; 3],
++    up: [f64; 3],
++    f: [f64; 3],
++    mid: Pos2,
++    reach: f64,
++}
++
++impl View {
++    fn new(tris: &[Triangle], rect: Rect, yaw: f32, pitch: f32) -> Option<Self> {
++        let mut lo = [f64::INFINITY; 3];
++        let mut hi = [f64::NEG_INFINITY; 3];
++        for t in tris {
++            for p in [t.a, t.b, t.c] {
++                for (i, v) in [p.x, p.y, p.z].into_iter().enumerate() {
++                    if v.is_finite() {
++                        lo[i] = lo[i].min(v);
++                        hi[i] = hi[i].max(v);
++                    }
++                }
++            }
++        }
++        // The model origin is always in view: the axis and tip live there.
++        for i in 0..3 {
++            lo[i] = lo[i].min(0.0);
++            hi[i] = hi[i].max(0.0);
++        }
++        let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
++        let reach = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() * 0.5;
++        if !(reach.is_finite() && reach > 1e-9) {
++            return None;
++        }
++        let (y, p) = (f64::from(YAW0 + yaw), f64::from((PITCH0 + pitch).clamp(-1.5, 1.5)));
++        let f = [-(p.cos() * y.cos()), -(p.cos() * y.sin()), -p.sin()];
++        let r = norm([f[1], -f[0], 0.0]).unwrap_or([1.0, 0.0, 0.0]);
++        let up = cross(r, f);
++        let s = f64::from(rect.width().min(rect.height())) * 0.45 / reach;
++        Some(Self { c, s, r, up, f, mid: rect.center(), reach })
++    }
++
++    fn screen(&self, q: [f64; 3]) -> Pos2 {
++        let d = [q[0] - self.c[0], q[1] - self.c[1], q[2] - self.c[2]];
++        Pos2::new(
++            self.mid.x + (dot(d, self.r) * self.s) as f32,
++            self.mid.y - (dot(d, self.up) * self.s) as f32,
++        )
++    }
++
++    fn depth(&self, q: [f64; 3]) -> f64 {
++        dot([q[0] - self.c[0], q[1] - self.c[1], q[2] - self.c[2]], self.f)
++    }
++
++    /// The ray under screen point `at`: from in front of the body, into it.
++    fn ray(&self, at: Pos2) -> ([f64; 3], [f64; 3]) {
++        let (dx, dy) = (f64::from(at.x - self.mid.x) / self.s, -f64::from(at.y - self.mid.y) / self.s);
++        let back = 4.0 * self.reach;
++        let o = [0, 1, 2].map(|i| self.c[i] + self.r[i] * dx + self.up[i] * dy - self.f[i] * back);
++        (o, self.f)
++    }
++}
++
++fn preview_3d(ui: &mut Ui, state: &mut State) {
++    let (resp, painter) = ui.allocate_painter(SIDE, Sense::click_and_drag());
++    let rect = resp.rect;
++    painter.rect_filled(rect, 4.0, Color32::from_rgb(24, 26, 31));
++    let d = &state.tool_body_ui;
++    let Some(view) = View::new(&d.facets, rect, d.yaw, d.pitch) else {
++        return;
++    };
++    // Painter's algorithm: far facets first, shaded by how squarely
++    // they face the eye.
++    let stride = d.facets.len().div_ceil(MAX_PAINTED).max(1);
++    let mut order: Vec<(f64, &Triangle)> = d
++        .facets
++        .iter()
++        .step_by(stride)
++        .map(|t| (view.depth(centroid(t)), t))
++        .filter(|(z, _)| z.is_finite())
++        .collect();
++    order.sort_by(|a, b| b.0.total_cmp(&a.0));
++    let mut mesh = Mesh::default();
++    for (_, t) in order {
++        let [a, b, c] = [t.a, t.b, t.c].map(|p| [p.x, p.y, p.z]);
++        let lit = norm(cross(sub(b, a), sub(c, a))).map_or(0.3, |n| dot(n, view.f).abs());
++        let g = (60.0 + 150.0 * lit).clamp(0.0, 255.0) as u8;
++        let col = Color32::from_rgb(g, g, g.saturating_add(12));
++        let base = mesh.vertices.len() as u32;
++        for q in [a, b, c] {
++            mesh.colored_vertex(view.screen(q), col);
++        }
++        mesh.add_triangle(base, base + 1, base + 2);
++    }
++    painter.add(Shape::mesh(mesh));
++    // The placement over it: the axis from the tip up, the tip, and the
++    // model origin.
++    if let Some(a) = norm(d.axis) {
++        let tip = [-d.offset * a[0], -d.offset * a[1], -d.offset * a[2]];
++        let top = [0, 1, 2].map(|i| tip[i] + a[i] * view.reach * 2.0);
++        painter.line_segment([view.screen(tip), view.screen(top)], Stroke::new(1.5, Color32::from_rgb(90, 200, 230)));
++        painter.circle_filled(view.screen(tip), 4.0, Color32::from_rgb(240, 150, 40));
++    }
++    painter.circle_stroke(view.screen([0.0; 3]), 3.0, Stroke::new(1.0, Color32::from_rgb(160, 160, 170)));
++    let mode = d.pick;
++    if mode != BodyPickMode::Off {
++        painter.text(
++            rect.min + Vec2::new(6.0, 6.0),
++            egui::Align2::LEFT_TOP,
++            if mode == BodyPickMode::Tip { "click the tip" } else { "click a spindle-facing face" },
++            egui::FontId::proportional(10.0),
++            Color32::from_rgb(240, 200, 120),
++        );
++    }
++    if resp.dragged() && mode == BodyPickMode::Off {
++        let dv = resp.drag_delta();
++        state.tool_body_ui.yaw -= dv.x * 0.01;
++        state.tool_body_ui.pitch = (state.tool_body_ui.pitch + dv.y * 0.01).clamp(-1.9, 1.0);
++    }
++    if resp.clicked()
++        && mode != BodyPickMode::Off
++        && let Some(at) = resp.interact_pointer_pos()
++    {
++        let (o, dir) = view.ray(at);
++        match tool_body_view::pick(&state.tool_body_ui.facets, o, dir) {
++            Some(hit) => state.apply_body_pick(hit),
++            None => state.status = "pick: no facet under the cursor".into(),
++        }
++    }
++}
++
++fn centroid(t: &Triangle) -> [f64; 3] {
++    [(t.a.x + t.b.x + t.c.x) / 3.0, (t.a.y + t.b.y + t.c.y) / 3.0, (t.a.z + t.b.z + t.c.z) / 3.0]
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
++    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
++}
++
++fn norm(a: [f64; 3]) -> Option<[f64; 3]> {
++    let n = dot(a, a).sqrt();
++    (n.is_finite() && n > 1e-12).then(|| [a[0] / n, a[1] / n, a[2] / n])
++}
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index aeae1e112..88fcd894b 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -210,6 +210,7 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+             classes: Vec::new(),
+         })
+         .collect();
++    parts.extend(sim_body_part(state));
+     if !state.active_stock_hidden() {
+         match (&state.program_sim, crate::machined::mesh(state)) {
+             // The machined stock's extracted mesh (M13.1 owed) takes the
+@@ -288,6 +289,25 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+     parts
+ }
+ 
++/// #371: the running tool's modelled body at the playhead, posed by the
++/// frame's tip and axis, drawn as a model part (depth-tested, shaded).
++/// Only while the transport is up and its timeline is this document's
++/// (`cached_script` refreshes it before the next frame); a tool without
++/// a body adds nothing, so every no-body scene is unchanged.
++fn sim_body_part(state: &State) -> Option<GpuPart> {
++    let sim = state.sim?;
++    let (version, sc) = state.sim_script_cache.as_ref()?;
++    if *version != state.doc_version || sc.is_empty() {
++        return None;
++    }
++    let f = sc.at(sim.t);
++    let op = sc.ops.get(f.op?)?;
++    let body = camcraft_app::tool_body_view::body_for_operation(&state.world, op)?;
++    let tris = camcraft_app::tool_body_view::posed(&body.facets, [f.pos.x, f.pos.y, f.pos.z], f.axis);
++    let verts = tris.iter().flat_map(|t| [t.a, t.b, t.c].map(|p| [ftoz(p.x), ftoz(p.y), ftoz(p.z)])).collect();
++    Some(GpuPart { verts, selected: false, stock: false, fill: false, classes: Vec::new() })
++}
++
+ // -------------------------------------------------------------- overlay
+ 
+ /// The overlay is the SHARED law since M-e: `crate::interact::collect_overlay`
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index b330232d3..4d4deb331 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -41,6 +41,9 @@ mod per_op;
+ mod tool_library_io;
+ #[path = "state_setup_mount.rs"]
+ mod setup_mount;
++#[path = "state_tool_body.rs"]
++mod tool_body_ui;
++pub use tool_body_ui::{BodyDraft, BodyPickMode, ToolBodyUi};
+ use flecs_ecs::prelude::World;
+ 
+ use crate::egui_app::{theme, theme_files};
+@@ -181,6 +184,12 @@ pub enum CommandKind {
+         number: Option<u32>,
+     },
+     DeleteTool(String),
++    /// #371: set (`Some`) or clear (`None`) a tool's modelled body - the
++    /// tool editor's Apply body / Clear body, one `SetToolBody`.
++    SetToolBody {
++        name: String,
++        body: Option<BodyDraft>,
++    },
+     /// The document's workpiece material (M13.2); `None` states none.
+     SetWorkMaterial(Option<camcraft_app::tools::WorkMaterial>),
+     /// The op page's "Apply suggestion" (M13.2): feed + spindle speed
+@@ -1268,6 +1277,9 @@ pub struct State {
+     /// when the named tool vanishes (the ghost law, mirrored from
+     /// [`State::pane_target`]).
+     pub tool_editor: Option<String>,
++    /// #371: the tool editor's body draft (imported mesh, placement,
++    /// pick mode). Ephemeral like `tool_ui`; Apply body is the command.
++    pub tool_body_ui: ToolBodyUi,
+     /// The machine editor window (M3.3 stage C): `None` closed. An
+     /// ephemeral draft like [`State::tool_editor`] - the numbers under
+     /// edit are a copy of the machine until Apply pushes `LoadMachine`,
+@@ -1484,6 +1496,7 @@ impl State {
+                 ..ToolUi::default()
+             },
+             tool_editor: None,
++            tool_body_ui: ToolBodyUi::default(),
+             machine_editor: None,
+             theme_cache: theme_files::Cache::new(),
+             // One walk per window, at construction: the switcher's file
+@@ -2174,6 +2187,7 @@ impl State {
+     pub(crate) fn close_tool_editor_window(&mut self) {
+         self.tool_editor = None;
+         self.tool_synced = (String::new(), self.doc_version);
++        self.tool_body_ui = ToolBodyUi::default();
+     }
+ 
+     pub(crate) fn copy_operation(&mut self, name: &str) {
+@@ -2629,6 +2643,7 @@ impl State {
+                     Err(err) => self.refuse(ErrorScope::Tool, format!("tool number not set: {err}")),
+                 }
+             }
++            CommandKind::SetToolBody { name, body } => self.run_set_tool_body(&name, body),
+             CommandKind::ChangeTool { name, tool } => {
+                 match ChangeTool::new(&self.world, &name, tool) {
+                     Ok(command) => {
+diff --git a/crates/ui/src/state_tool_body.rs b/crates/ui/src/state_tool_body.rs
+new file mode 100644
+index 000000000..96076c166
+--- /dev/null
++++ b/crates/ui/src/state_tool_body.rs
+@@ -0,0 +1,224 @@
++//! The tool editor's body draft (#371): an imported holder mesh in its
++//! own model frame, the numeric placement (axis preset or picked face
++//! normal, tip offset), the pick mode, and the one command Apply body
++//! queues. The draft is ephemeral pane state like `ToolUi`: picks and
++//! previews only fill it; `SetToolBody` (one undo step) is the only
++//! thing that reaches the world, and its refusal lands on the Tool pane
++//! by name. Provenance: our own pane state over `app::tool_body_view`;
++//! no vendor material consulted.
++
++use std::path::Path;
++use std::sync::Arc;
++
++use camcraft_app::commands::{SetToolBody, ToolBodySpec};
++use camcraft_app::geometry::Triangle;
++use camcraft_app::schema::ToolBody;
++use camcraft_app::tool_body_view::{self, BodyPick};
++use camcraft_app::{model, tool_body};
++
++use super::{CommandKind, ErrorScope, State};
++
++/// What the next click on the editor's body preview does.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum BodyPickMode {
++    /// Drag orbits; clicks do nothing.
++    #[default]
++    Off,
++    /// The click's nearest facet corner becomes the tool tip.
++    Tip,
++    /// The clicked facet's outward normal becomes the tool axis.
++    Axis,
++}
++
++/// The editor's body draft for the tool it is open on.
++#[derive(Clone, Default)]
++pub struct ToolBodyUi {
++    /// The tool the draft belongs to (the editor's `tool_ui.name`).
++    pub tool: String,
++    /// Where the mesh came from, for display.
++    pub source: String,
++    /// The mesh in its own frame: as imported, or a landed body's
++    /// tool-frame facets (tip at the origin, +Z up) when re-edited.
++    pub facets: Arc<[Triangle]>,
++    /// The model direction that is the tool axis (tip to spindle).
++    pub axis: [f64; 3],
++    /// The model origin's height above the tip, along `axis`.
++    pub offset: f64,
++    pub pick: BodyPickMode,
++    /// The preview's orbit, radians off its default view.
++    pub yaw: f32,
++    pub pitch: f32,
++    /// The world body the draft last mirrored (identity, not value):
++    /// a change there (Apply, Undo, Redo, Open) re-mirrors.
++    seen: Option<Arc<[Triangle]>>,
++    /// Placement preview, cached against the (mesh, axis, offset) it read.
++    preview: Option<(PreviewKey, Result<ToolBody, String>)>,
++}
++
++type PreviewKey = (usize, [u64; 4]);
++
++/// A body as Apply body states it, for the command queue. Debug prints
++/// the facet count, never the mesh.
++#[derive(Clone)]
++pub struct BodyDraft {
++    pub source: String,
++    pub facets: Arc<[Triangle]>,
++    pub axis: [f64; 3],
++    pub offset: f64,
++}
++
++impl std::fmt::Debug for BodyDraft {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("BodyDraft")
++            .field("source", &self.source)
++            .field("facets", &self.facets.len())
++            .field("axis", &self.axis)
++            .field("offset", &self.offset)
++            .finish()
++    }
++}
++
++fn same(a: Option<&Arc<[Triangle]>>, b: Option<&Arc<[Triangle]>>) -> bool {
++    match (a, b) {
++        (None, None) => true,
++        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
++        _ => false,
++    }
++}
++
++impl State {
++    /// The body landed on the editor's tool, if any.
++    pub(crate) fn editor_tool_body(&self) -> Option<ToolBody> {
++        let e = model::find_by_name(&self.world, &self.tool_ui.name)?;
++        tool_body::body_of(&self.world, &e)
++    }
++
++    /// Keep the draft on the editor's tool: a new tool, or a world body
++    /// that changed under it, re-mirrors (a landed body re-edits in its
++    /// tool frame: +Z, offset 0, which re-applies to the same facets).
++    /// An unapplied import survives unrelated document edits.
++    pub(crate) fn sync_tool_body_ui(&mut self) {
++        let world = self.editor_tool_body();
++        let facets = world.as_ref().map(|b| Arc::clone(&b.facets));
++        if self.tool_body_ui.tool == self.tool_ui.name && same(facets.as_ref(), self.tool_body_ui.seen.as_ref()) {
++            return;
++        }
++        let mut d = ToolBodyUi { tool: self.tool_ui.name.clone(), axis: [0.0, 0.0, 1.0], ..ToolBodyUi::default() };
++        if let Some(b) = world {
++            d.source = b.source;
++            d.facets = b.facets;
++        }
++        d.seen = facets;
++        self.tool_body_ui = d;
++    }
++
++    /// "Import body…": pick a mesh file, then read it into the draft.
++    pub(crate) fn import_tool_body_dialog(&mut self) {
++        if let Some(path) = super::pick_mesh_file() {
++            self.import_tool_body_from(&path);
++        }
++    }
++
++    /// Read a STEP / STL / OBJ into the draft (+Z axis, origin at the
++    /// tip until placed). Nothing reaches the world until Apply body.
++    pub(crate) fn import_tool_body_from(&mut self, path: &Path) {
++        self.sync_tool_body_ui();
++        match tool_body_view::load(path) {
++            Ok((source, facets)) => {
++                let d = &mut self.tool_body_ui;
++                self.status = format!(
++                    "body {source}: {} facets - set the axis and tip, then Apply body",
++                    facets.len()
++                );
++                d.source = source;
++                d.facets = Arc::from(facets);
++                d.axis = [0.0, 0.0, 1.0];
++                d.offset = 0.0;
++                d.pick = BodyPickMode::Off;
++                d.preview = None;
++            }
++            Err(err) => self.refuse(ErrorScope::Tool, format!("tool body not imported: {err}")),
++        }
++    }
++
++    /// The draft's placement as `SetToolBody` would read it, cached.
++    pub(crate) fn tool_body_preview(&mut self) -> Option<&Result<ToolBody, String>> {
++        let d = &mut self.tool_body_ui;
++        if d.facets.is_empty() {
++            return None;
++        }
++        let key: PreviewKey = (
++            d.facets.as_ptr() as usize,
++            [d.axis[0].to_bits(), d.axis[1].to_bits(), d.axis[2].to_bits(), d.offset.to_bits()],
++        );
++        if d.preview.as_ref().is_none_or(|(k, _)| *k != key) {
++            d.preview = Some((key, tool_body_view::preview(&d.facets, d.axis, d.offset)));
++        }
++        d.preview.as_ref().map(|(_, r)| r)
++    }
++
++    /// A click on the preview in a pick mode fills the numbers (ephemeral).
++    pub(crate) fn apply_body_pick(&mut self, hit: BodyPick) {
++        let d = &mut self.tool_body_ui;
++        match d.pick {
++            BodyPickMode::Off => return,
++            BodyPickMode::Tip => match tool_body_view::tip_offset_at(hit.vertex, d.axis) {
++                Some(o) => {
++                    d.offset = o;
++                    self.status = format!("tip picked: offset {o:.3} mm along the axis");
++                }
++                None => self.status = "tip not picked: set a usable axis first".into(),
++            },
++            BodyPickMode::Axis => match hit.normal {
++                Some(n) => {
++                    d.axis = n;
++                    self.status = format!(
++                        "axis picked: {}",
++                        tool_body_view::axis_label(n).map_or_else(|| format!("({:.3}, {:.3}, {:.3})", n[0], n[1], n[2]), str::to_owned)
++                    );
++                }
++                None => self.status = "axis not picked: that facet has no area".into(),
++            },
++        }
++        self.tool_body_ui.pick = BodyPickMode::Off;
++    }
++
++    /// "Apply body": queue the one `SetToolBody` for the draft.
++    pub(crate) fn queue_apply_tool_body(&mut self) {
++        let d = &self.tool_body_ui;
++        if d.facets.is_empty() {
++            return;
++        }
++        let body = BodyDraft { source: d.source.clone(), facets: Arc::clone(&d.facets), axis: d.axis, offset: d.offset };
++        self.pending.push_back(CommandKind::SetToolBody { name: self.tool_ui.name.clone(), body: Some(body) });
++    }
++
++    /// "Clear body": a landed body is cleared by command (undoable); an
++    /// unapplied import is only dropped from the draft.
++    pub(crate) fn clear_tool_body(&mut self) {
++        if self.editor_tool_body().is_some() {
++            self.pending.push_back(CommandKind::SetToolBody { name: self.tool_ui.name.clone(), body: None });
++        } else {
++            self.tool_body_ui = ToolBodyUi { tool: self.tool_ui.name.clone(), axis: [0.0, 0.0, 1.0], ..ToolBodyUi::default() };
++        }
++    }
++
++    /// The command handler: build (place, envelope, fit) now; a refusal
++    /// lands on the Tool pane by name and the draft stays for correction.
++    pub(crate) fn run_set_tool_body(&mut self, name: &str, body: Option<BodyDraft>) {
++        let clearing = body.is_none();
++        let spec = body.map(|b| ToolBodySpec { source: b.source, facets: b.facets.to_vec(), axis: b.axis, offset: b.offset });
++        match SetToolBody::new(&self.world, name, spec) {
++            Ok(command) => {
++                self.history.execute(&self.world, command);
++                self.doc_version += 1;
++                self.status = if clearing {
++                    format!("tool {name}: body cleared")
++                } else {
++                    format!("tool {name}: body set")
++                };
++            }
++            Err(err) => self.refuse(ErrorScope::Tool, format!("tool body not set: {err}")),
++        }
++    }
++}
+diff --git a/docs/decisions/371-tool-body-ui.md b/docs/decisions/371-tool-body-ui.md
+new file mode 100644
+index 000000000..5b446c26b
+--- /dev/null
++++ b/docs/decisions/371-tool-body-ui.md
+@@ -0,0 +1,76 @@
++## #371 - tool bodies in the tool editor, the viewport and the simulation (milling)
++
++- **Chosen: a Body column in the tool editor window** (third column,
++  beside the profile preview): Import body… / Clear body, the axis
++  (six model-direction presets, or a picked face normal shown as
++  "picked (x, y, z)"), the tip offset (the model origin's height above
++  the tip, the number `SetToolBody` takes), Pick tip / Pick axis, a
++  placement note, and Apply body. Why a column and not rows under the
++  preview: the fields column is already ~600 px tall, and stacking put
++  Apply body below a 720 px screen. The window's default anchor moved
++  left by the column's width so it stays centred (and clear of the
++  library pane's Delete button). Dropped: a separate body window (one
++  more floating surface to keep in sync with the editor's tool).
++- **Picking happens in a small 3D preview inside the editor**, painted
++  with egui (flat-shaded, depth-sorted triangles, orthographic, drag to
++  orbit), not in the main viewport. Why: the main viewport draws the
++  document in world space; picking a mesh that is not yet attached to
++  anything there would need a temporary scene part, a placement for it,
++  and a pick mode that competes with the face/edge/vertex picks. The
++  in-editor preview needs no GPU, runs under the test harness, and its
++  ray (`View::ray`) feeds the existing ray/triangle crossing
++  (`app::pick::soup_hit`). Over 30 000 facets it paints every n-th facet;
++  picks always read them all.
++- **Pick tip** takes the hit facet's corner nearest the click and sets
++  `offset = -dot(corner, axis)`, so that corner lands at height 0 (the
++  tip). Snapping to a corner, not the raw hit, gives a repeatable number
++  on a coarse mesh. **Pick axis** takes the clicked facet's outward
++  normal: the user clicks a face looking toward the spindle (the
++  holder's top). Dropped: snapping a picked normal to the nearest preset
++  - a vendor body modelled on a tilted frame would then be unalignable.
++- **Picks and orbit are ephemeral; Apply body is the one command.** The
++  draft (`ToolBodyUi`, `state_tool_body.rs`) is pane state like
++  `ToolUi`. Apply body queues `CommandKind::SetToolBody`, which builds
++  `SetToolBody` (place, envelope, tool fit) and either executes it (one
++  undo step) or refuses on the Tool pane by name ("tool body not set:
++  ..."), leaving the draft as it was for correction. Clear body on a
++  landed body is the same command with `None` (undoable); on an
++  unapplied import it only drops the draft. The draft re-mirrors when
++  the world body changes by identity (`Arc::ptr_eq` on the facets):
++  Apply, Undo, Redo or Open re-mirror, while an unrelated edit (Apply
++  on the tool numbers) keeps an unapplied import. A landed body
++  re-edits in its tool frame (+Z, offset 0), which re-applies to the
++  same facets; the original model frame is not stored (#368 stores the
++  placed facets only).
++- **Live placement note:** the draft's placement runs through
++  `tool_body_view::preview` (the same `place` + `build` the command
++  runs, cached on mesh/axis/offset) and the editor shows either "placed:
++  foot .. to top .." or the envelope's refusal before Apply. The profile
++  preview overlays the placed body's revolved envelope bands in amber
++  over the cylinders. A tool with no body draws exactly as before.
++- **Simulation:** while the transport is up, the running operation's
++  tool body is posed at the playhead (`tool_body_view::posed`: tool
++  frame to the frame's tip and axis by the shortest rotation, Rodrigues;
++  the turn about the axis is free because the body is judged by its
++  revolved envelope) and drawn as one more model part - depth-tested
++  and shaded by the existing GPU pipeline. It reads the cached timeline
++  only when it is this document version's, so it never re-walks the
++  program per frame. Without a body nothing is added. There are no
++  holder/shank cylinders drawn anywhere in the viewport today (the sim
++  draws an axis marker only), so "unchanged cylinders" means unchanged:
++  no body, no new geometry. Dropped: drawing the cylinder assembly for
++  body-less tools (a separate display feature).
++- **File read is synchronous** on the UI thread (`tool_body_view::load`,
++  the model importer). A holder file is small next to a part; the
++  worker-thread import path is wired to `ImportModel` and would need a
++  second result kind. Revisit if users import heavy assemblies.
++- **App seam:** everything the UI needs from a body lives in
++  `app::tool_body_view` (load, presets, preview, pick, tip offset,
++  posing, body of an operation's tool); the UI has no geometry of its
++  own beyond the preview's view math.
++- **Snapshot:** the tool editor's pixels change (the new column).
++  Pixel snapshots are release-lane (#255); `egui_tool_editor.png` is not
++  regenerated here. Structural tests pin the flow instead.
++- **Not in this slice:** lathe holders (#369), the spun holder-profile
++  editor (#93), ISO 13399 frames (#370), a rotation about the axis for
++  display, and drawing a body outside the simulation.
+
+From 9656e4c0c4c2bfba02d3635669db533a7286d884 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Sun, 8 Nov 2026 17:09:06 -0800
+Subject: [PATCH 2/5] fix(ui): draw the whole tool in the simulation when it
+ has a body, and frame it
+
+On a real document the body was posed a shank length above the tip
+with nothing below it, off the top of a part-framed view, so the
+simulation looked the same with and without it. A tool with a body now
+draws whole while simulating - cutter and shank revolved from its
+numbers up into the body (app::tool_body_view::assembly) - at every
+playhead, paused or playing, stale or fresh; Frame takes the posed
+assembly in. Tools without a body draw exactly as before.
+
+Pinned on the user's own document (step_block_371.camproj fixture).
+
+Refs #371
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/tool_body_view.rs              |   62 +
+ crates/app/tests/tool_body_view.rs            |   25 +
+ .../src/egui_app/tests/step_block_371.camproj | 1118 +++++++++++++++++
+ crates/ui/src/egui_app/tests/tool_body.rs     |   98 +-
+ crates/ui/src/egui_app/world.rs               |   23 +-
+ crates/ui/src/state.rs                        |   14 +
+ docs/decisions/371-tool-body-ui.md            |   13 +
+ 7 files changed, 1337 insertions(+), 16 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/tests/step_block_371.camproj
+
+diff --git a/crates/app/src/tool_body_view.rs b/crates/app/src/tool_body_view.rs
+index 6a25f92aa..ee42ad663 100644
+--- a/crates/app/src/tool_body_view.rs
++++ b/crates/app/src/tool_body_view.rs
+@@ -19,6 +19,7 @@ use crate::geometry::{Point3, Triangle};
+ use crate::model;
+ use crate::schema::ToolBody;
+ use crate::tool_body;
++use crate::tools::Tool;
+ 
+ /// The six model directions the editor offers as the tool axis.
+ pub const AXIS_CHOICES: [(&str, [f64; 3]); 6] = [
+@@ -121,6 +122,67 @@ pub fn posed(facets: &[Triangle], tip: [f64; 3], axis: [f64; 3]) -> Vec<Triangle
+     facets.iter().map(|t| Triangle::new(map(t.a), map(t.b), map(t.c))).collect()
+ }
+ 
++/// Facets around the axis per revolved display ring.
++const RING: usize = 32;
++
++/// The whole tool for display, tool frame (tip at the origin, +Z up):
++/// the cutter and shank revolved from `Tool::profile` up to the shank
++/// top - carried up to the body's foot when the body stands clear of it,
++/// the gap the fixture laws also fill with shank - and then the body's
++/// own facets in place of the holder cylinder. Without the steel below
++/// it a body floats a shank length above the tip, off the frame of a
++/// part-sized view (#371 feedback).
++#[must_use]
++pub fn assembly(tool: &Tool, body: &ToolBody) -> Vec<Triangle> {
++    let zs = tool.flute_len.max(0.0) + tool.shank_len.max(0.0);
++    let top = zs.max(body.profile.bottom());
++    let rs = tool.shank_d.max(0.0) * 0.5;
++    let mut prof: Vec<(f64, f64)> =
++        tool.profile().into_iter().filter(|&(z, r)| z.is_finite() && r.is_finite() && z < zs - 1e-9).collect();
++    prof.extend([(zs, rs), (top, rs), (top, 0.0)]);
++    let mut out = revolve(&prof);
++    out.extend(body.facets.iter().copied());
++    out
++}
++
++/// A `(z, r)` meridian spun about +Z into triangles; rings at r = 0
++/// close to a point, flat steps make annuli.
++fn revolve(prof: &[(f64, f64)]) -> Vec<Triangle> {
++    let at = |z: f64, r: f64, k: usize| {
++        let a = std::f64::consts::TAU * k as f64 / RING as f64;
++        Point3::new(r * a.cos(), r * a.sin(), z)
++    };
++    let mut out = Vec::new();
++    for w in prof.windows(2) {
++        let ((z0, r0), (z1, r1)) = (w[0], w[1]);
++        if (z0 - z1).abs() < 1e-12 && (r0 - r1).abs() < 1e-12 {
++            continue;
++        }
++        for k in 0..RING {
++            let (a, b, c, d) = (at(z0, r0, k), at(z0, r0, k + 1), at(z1, r1, k + 1), at(z1, r1, k));
++            if r0 > 1e-12 {
++                out.push(Triangle::new(a, b, c));
++            }
++            if r1 > 1e-12 {
++                out.push(Triangle::new(a, c, d));
++            }
++        }
++    }
++    out
++}
++
++/// The display assembly (`assembly`) of the tool operation `op` runs,
++/// tool frame - only when that tool has a body.
++#[must_use]
++pub fn assembly_for_operation(world: &World, op: &str) -> Option<Vec<Triangle>> {
++    let e = model::find_by_name(world, op)?;
++    let tool_name = model::operation_of(world, &e)?.tool;
++    let te = model::find_by_name(world, &tool_name)?;
++    let tool = model::tool_of(world, &te)?;
++    let body = tool_body::body_of(world, &te)?;
++    Some(assembly(&tool, &body))
++}
++
+ /// The body on the tool operation `op` runs, if that tool has one.
+ #[must_use]
+ pub fn body_for_operation(world: &World, op: &str) -> Option<ToolBody> {
+diff --git a/crates/app/tests/tool_body_view.rs b/crates/app/tests/tool_body_view.rs
+index b06a35946..ce87b7fb3 100644
+--- a/crates/app/tests/tool_body_view.rs
++++ b/crates/app/tests/tool_body_view.rs
+@@ -153,3 +153,28 @@ fn the_file_read_refuses_missing_and_unknown_files_by_name() {
+     assert!(e.contains("unsupported"), "{e}");
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++#[test]
++fn the_display_assembly_runs_from_the_tip_through_the_shank_into_the_body() {
++    let t = catalog_tool(TOOL);
++    let zs = t.flute_len + t.shank_len;
++    let zr = |tris: &[Triangle]| {
++        tris.iter().flat_map(|q| [q.a.z, q.b.z, q.c.z]).fold((f64::INFINITY, f64::NEG_INFINITY), |a, z| (a.0.min(z), a.1.max(z)))
++    };
++    let r_at = |tris: &[Triangle], z: f64| {
++        tris.iter().flat_map(|q| [q.a, q.b, q.c]).filter(|p| (p.z - z).abs() < 1e-9).map(|p| p.x.hypot(p.y)).fold(0.0, f64::max)
++    };
++    // Seated on the shank top.
++    let body = view::preview(&prism(20.0, 0.0, 30.0, 16), [0.0, 0.0, 1.0], zs).expect("seated");
++    let all = view::assembly(&t, &body);
++    assert_eq!(zr(&all), (0.0, zs + 30.0));
++    let steel = &all[..all.len() - body.facets.len()];
++    assert_eq!(zr(steel), (0.0, zs), "cutter and shank stop at the shank top");
++    assert!((r_at(steel, 0.0) - t.diameter * 0.5).abs() < 1e-9, "the cutter's radius at the tip");
++    assert!((r_at(steel, zs) - t.shank_d * 0.5).abs() < 1e-9, "the shank's radius at its top");
++    // Standing 10 mm clear: the shank is carried up to the body's foot.
++    let high = view::preview(&prism(20.0, 0.0, 30.0, 16), [0.0, 0.0, 1.0], zs + 10.0).expect("clear");
++    let all = view::assembly(&t, &high);
++    let steel = &all[..all.len() - high.facets.len()];
++    assert!((zr(steel).1 - (zs + 10.0)).abs() < 1e-9, "no floating body");
++}
+diff --git a/crates/ui/src/egui_app/tests/step_block_371.camproj b/crates/ui/src/egui_app/tests/step_block_371.camproj
+new file mode 100644
+index 000000000..488ecfcde
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/step_block_371.camproj
+@@ -0,0 +1,1118 @@
++{
++  "version": 56,
++  "entities": [
++    {
++      "name": "EM-0600-4FL",
++      "translation": [
++        0.0,
++        0.0,
++        0.0
++      ],
++      "rotation": [
++        0.0,
++        0.0,
++        0.0,
++        1.0
++      ],
++      "kind": "tool",
++      "tool": {
++        "kind": "end_mill",
++        "diameter": 6.0,
++        "corner_r": 0.0,
++        "tip_angle": 0.0,
++        "pitch": 0.0,
++        "nose_radius": 0.0,
++        "width": 0.0,
++        "flute_len": 15.0,
++        "shank_d": 8.0,
++        "shank_len": 40.0,
++        "holder_d": 44.0,
++        "holder_len": 35.0,
++        "material_group": "aluminum",
++        "rpm": 9500.0,
++        "feed": 1800.0,
++        "tool_material": "carbide",
++        "flutes": 4
++      }
++    },
++    {
++      "name": "Face1",
++      "translation": [
++        0.0,
++        0.0,
++        0.0
++      ],
++      "rotation": [
++        0.0,
++        0.0,
++        0.0,
++        1.0
++      ],
++      "kind": "operation",
++      "operation": {
++        "order": 0,
++        "tool": "EM-0600-4FL",
++        "src": "stock",
++        "params": {
++          "face": {
++            "stepover": 3.0,
++            "clearance_z": {
++              "reference": "top_of_stock",
++              "offset": 25.0
++            },
++            "cut_z": {
++              "reference": "top_of_stock",
++              "offset": -3.0
++            },
++            "feed": 1200.0,
++            "plunge_feed": 300.0,
++            "climb": true
++          }
++        },
++        "stamp": 584725828932569554,
++        "cache": {
++          "moves": [
++            {
++              "kind": "plunge",
++              "from": [
++                -48.0,
++                -32.0,
++                53.0
++              ],
++              "to": [
++                -48.0,
++                -32.0,
++                25.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -32.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -32.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -32.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -29.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -29.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -29.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -29.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -26.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -26.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -26.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -26.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -23.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -23.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -23.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -23.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -20.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -20.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -20.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -20.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -17.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -17.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -17.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -17.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -14.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -14.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -14.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -14.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -11.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -11.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -11.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -11.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -8.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -8.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -8.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -8.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -5.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -5.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -5.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -5.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                -2.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                -2.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                -2.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                -2.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                1.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                1.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                1.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                1.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                4.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                4.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                4.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                4.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                7.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                7.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                7.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                7.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                10.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                10.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                10.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                10.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                13.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                13.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                13.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                13.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                16.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                16.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                16.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                16.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                19.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                19.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                19.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                19.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                22.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                22.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                22.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                22.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                25.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                25.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                25.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                25.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                28.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                28.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                28.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                28.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                31.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                48.0,
++                31.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                31.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                31.0,
++                25.0
++              ],
++              "to": [
++                -48.0,
++                32.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "feed",
++              "from": [
++                -48.0,
++                32.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                32.0,
++                25.0
++              ],
++              "feed": 1200.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                48.0,
++                32.0,
++                25.0
++              ],
++              "to": [
++                48.0,
++                32.0,
++                53.0
++              ]
++            }
++          ],
++          "warnings": []
++        }
++      }
++    },
++    {
++      "name": "StepBlock",
++      "translation": [
++        0.0,
++        0.0,
++        0.0
++      ],
++      "rotation": [
++        0.0,
++        0.0,
++        0.0,
++        1.0
++      ],
++      "facets": [
++        [
++          [
++            -40.0,
++            -29.999999999999996,
++            0.0
++          ],
++          [
++            -40.0,
++            -29.999999999999996,
++            25.000000000000004
++          ],
++          [
++            10.0,
++            -29.999999999999996,
++            15.000000000000002
++          ]
++        ],
++        [
++          [
++            10.0,
++            -29.999999999999996,
++            25.000000000000004
++          ],
++          [
++            10.0,
++            -29.999999999999996,
++            15.000000000000002
++          ],
++          [
++            -40.0,
++            -29.999999999999996,
++            25.000000000000004
++          ]
++        ],
++        [
++          [
++            -40.0,
++            -29.999999999999996,
++            0.0
++          ],
++          [
++            10.0,
++            -29.999999999999996,
++            15.000000000000002
++          ],
++          [
++            40.0,
++            -29.999999999999996,
++            0.0
++          ]
++        ],
++        [
++          [
++            40.0,
++            -29.999999999999996,
++            15.000000000000002
++          ],
++          [
++            40.0,
++            -29.999999999999996,
++            0.0
++          ],
++          [
++            10.0,
++            -29.999999999999996,
++            15.000000000000002
++          ]
++        ],
++        [
++          [
++            40.0,
++            30.0,
++            0.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            0.0
++          ],
++          [
++            40.0,
++            -30.0,
++            0.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.0,
++            0.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            0.0
++          ],
++          [
++            40.0,
++            30.0,
++            0.0
++          ]
++        ],
++        [
++          [
++            40.0,
++            30.0,
++            15.0
++          ],
++          [
++            40.0,
++            -30.0,
++            0.0
++          ],
++          [
++            40.0,
++            -30.0,
++            15.0
++          ]
++        ],
++        [
++          [
++            40.0,
++            30.0,
++            0.0
++          ],
++          [
++            40.0,
++            -30.0,
++            0.0
++          ],
++          [
++            40.0,
++            30.0,
++            15.0
++          ]
++        ],
++        [
++          [
++            10.0,
++            30.0,
++            15.0
++          ],
++          [
++            40.0,
++            -30.0,
++            15.0
++          ],
++          [
++            10.0,
++            -30.0,
++            15.0
++          ]
++        ],
++        [
++          [
++            40.0,
++            30.0,
++            15.0
++          ],
++          [
++            40.0,
++            -30.0,
++            15.0
++          ],
++          [
++            10.0,
++            30.0,
++            15.0
++          ]
++        ],
++        [
++          [
++            10.0,
++            30.0,
++            25.0
++          ],
++          [
++            10.0,
++            -30.0,
++            15.0
++          ],
++          [
++            10.0,
++            -30.0,
++            25.0
++          ]
++        ],
++        [
++          [
++            10.0,
++            30.0,
++            15.0
++          ],
++          [
++            10.0,
++            -30.0,
++            15.0
++          ],
++          [
++            10.0,
++            30.0,
++            25.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.0,
++            25.0
++          ],
++          [
++            10.0,
++            -30.0,
++            25.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            25.0
++          ]
++        ],
++        [
++          [
++            10.0,
++            30.0,
++            25.0
++          ],
++          [
++            10.0,
++            -30.0,
++            25.0
++          ],
++          [
++            -40.0,
++            30.0,
++            25.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.0,
++            0.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            25.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            0.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.0,
++            25.0
++          ],
++          [
++            -40.0,
++            -30.0,
++            25.0
++          ],
++          [
++            -40.0,
++            30.0,
++            0.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.000000000000004,
++            0.0
++          ],
++          [
++            40.0,
++            30.000000000000004,
++            0.0
++          ],
++          [
++            10.0,
++            30.000000000000004,
++            15.000000000000002
++          ]
++        ],
++        [
++          [
++            40.0,
++            30.000000000000004,
++            15.000000000000002
++          ],
++          [
++            10.0,
++            30.000000000000004,
++            15.000000000000002
++          ],
++          [
++            40.0,
++            30.000000000000004,
++            0.0
++          ]
++        ],
++        [
++          [
++            -40.0,
++            30.000000000000004,
++            0.0
++          ],
++          [
++            10.0,
++            30.000000000000004,
++            15.000000000000002
++          ],
++          [
++            -40.0,
++            30.000000000000004,
++            25.000000000000004
++          ]
++        ],
++        [
++          [
++            10.0,
++            30.000000000000004,
++            25.000000000000004
++          ],
++          [
++            -40.0,
++            30.000000000000004,
++            25.000000000000004
++          ],
++          [
++            10.0,
++            30.000000000000004,
++            15.000000000000002
++          ]
++        ]
++      ],
++      "rev": 1
++    },
++    {
++      "name": "Stock",
++      "translation": [
++        0.0,
++        0.0,
++        0.0
++      ],
++      "rotation": [
++        0.0,
++        0.0,
++        0.0,
++        1.0
++      ],
++      "rev": 1,
++      "kind": "stock",
++      "stock": {
++        "box": {
++          "dx": 90.0,
++          "dy": 70.0,
++          "dz": 28.0
++        }
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index abd2f6cf3..3479e84f2 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -183,16 +183,98 @@ fn the_simulation_draws_the_body_at_the_playhead_and_nothing_without_one() {
+     let sc = super::super::shell::cached_script(st);
+     let scene = world::collect(st);
+     assert_eq!(scene.parts.len(), bare + 1, "the body is one more part");
+-    // Posed at the playhead: its lowest vertex sits the shank top above the tip.
++    // Posed at the playhead: the tool runs from its tip up through the
++    // body, whose foot sits the shank top above the tip.
+     let f = sc.at(0.0);
+-    let body = scene
+-        .parts
+-        .iter()
+-        .find(|p| !p.stock && !p.fill && p.verts.len() == 96 * 3)
+-        .expect("the posed body part");
+-    let zmin = body.verts.iter().map(|v| f64::from(v[2])).fold(f64::INFINITY, f64::min);
+-    assert!((zmin - (f.pos.z + top)).abs() < 1e-3, "foot at tip + {top}: {zmin} vs {}", f.pos.z);
++    let (verts, tip) = tool_part(st).expect("the posed tool part");
++    assert!((tip - f.pos.z).abs() < 1e-9);
++    let zmin = verts.iter().map(|v| f64::from(v[2])).fold(f64::INFINITY, f64::min);
++    let zmax = verts.iter().map(|v| f64::from(v[2])).fold(f64::NEG_INFINITY, f64::max);
++    assert!((zmin - f.pos.z).abs() < 1e-3, "tip at {}: {zmin}", f.pos.z);
++    assert!((zmax - (f.pos.z + top + 30.0)).abs() < 1e-3, "body top at tip + {top} + 30: {zmax}");
+     st.sim = None;
+     assert_eq!(world::collect(st).parts.len(), bare, "no transport, no body drawn");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
++
++/// The user's #371 hands-on document: StepBlock, 90x70x28 stock, the
++/// catalog end mill, Face1 generated (project v56, our own fixture).
++const STEP_BLOCK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/egui_app/tests/step_block_371.camproj");
++
++/// Is every vertex of `verts` inside the viewport image under the camera?
++fn on_screen(state: &State, verts: &[[f32; 3]]) -> usize {
++    let mvp = state.cam.mvp(1280.0 / 649.0);
++    verts
++        .iter()
++        .filter(|v| {
++            interact::project_uv(&mvp, [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])])
++                .is_some_and(|u| (0.0..=1.0).contains(&u[0]) && (0.0..=1.0).contains(&u[1]))
++        })
++        .count()
++}
++
++/// The posed tool part of the scene (the one model part that is no
++/// document model) and the frame's tip height.
++fn tool_part(state: &State) -> Option<(Vec<[f32; 3]>, f64)> {
++    let models = model::model_entities(&state.world).len();
++    let scene = world::collect(state);
++    let solids: Vec<_> = scene.parts.into_iter().filter(|p| !p.stock && !p.fill).collect();
++    let (_, sc) = state.sim_script_cache.as_ref()?;
++    let tip = sc.at(state.sim?.t).pos.z;
++    (solids.len() == models + 1).then(|| (solids.last().map(|p| p.verts.clone()).unwrap_or_default(), tip))
++}
++
++/// #371 feedback, bug 1: on the user's document the body was collected
++/// but posed a shank length (55 mm) above the tip with nothing below it,
++/// off the top of a part-sized view - "no difference with and without
++/// the body". The tool now draws whole (cutter and shank up into the
++/// body) at every playhead, stale or fresh, and Frame takes it in.
++#[test]
++fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document() {
++    let mut harness = shell_harness();
++    harness.run();
++    harness.state_mut().state.pending.push_back(CommandKind::OpenProjectFile(STEP_BLOCK.into()));
++    harness.run();
++    crate::actions::open_tool_editor(&mut harness.state_mut().state, TOOL);
++    harness.run();
++    let path = temp_stl("user");
++    prism_stl(&path, 20.0, 0.0, 50.0, 24);
++    harness.state_mut().state.import_tool_body_from(&path);
++    harness.state_mut().state.tool_body_ui.offset = 55.0;
++    harness.run();
++    harness.get_by_label("Apply body").click();
++    harness.run();
++    harness.run();
++    assert!(body_source(&harness.state().state).is_some(), "status: {}", harness.state().state.status);
++    harness.state_mut().state.close_tool_editor_window();
++    harness.state_mut().state.pending.push_back(CommandKind::Select(Some("Face1".into())));
++    // Paused at 0, as the user saw it.
++    harness.state_mut().state.sim = Some(crate::state::Sim { t: 0.0, playing: false, speed: 1.0 });
++    harness.run();
++    harness.run();
++    let check = |st: &State, when: &str| {
++        let (verts, tip) = tool_part(st).unwrap_or_else(|| panic!("{when}: no tool part in the scene"));
++        let zmin = verts.iter().map(|v| f64::from(v[2])).fold(f64::INFINITY, f64::min);
++        let zmax = verts.iter().map(|v| f64::from(v[2])).fold(f64::NEG_INFINITY, f64::max);
++        assert!((zmin - tip).abs() < 1e-3, "{when}: the tool starts at its tip ({zmin} vs {tip})");
++        assert!((zmax - (tip + 105.0)).abs() < 1e-3, "{when}: and ends at the body's top ({zmax})");
++    };
++    check(&harness.state().state, "t = 0, Face1 stale");
++    let total = harness.state().state.sim_script_cache.as_ref().map(|(_, s)| s.total).unwrap();
++    for t in [total * 0.5, total] {
++        harness.state_mut().state.sim.as_mut().unwrap().t = t;
++        harness.run();
++        check(&harness.state().state, &format!("t = {t:.1}"));
++    }
++    // Frame takes the assembly in: the whole tool is on screen.
++    harness.state_mut().state.pending.push_back(CommandKind::FrameAll);
++    harness.run();
++    let (verts, _) = tool_part(&harness.state().state).unwrap();
++    assert_eq!(on_screen(&harness.state().state, &verts), verts.len(), "Frame shows the whole tool");
++    // Regenerated (fresh), still drawn.
++    harness.state_mut().state.pending.push_back(CommandKind::GenerateOperation("Face1".into()));
++    harness.run();
++    harness.run();
++    check(&harness.state().state, "after regenerate");
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 88fcd894b..aefc02abb 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -289,12 +289,14 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+     parts
+ }
+ 
+-/// #371: the running tool's modelled body at the playhead, posed by the
+-/// frame's tip and axis, drawn as a model part (depth-tested, shaded).
+-/// Only while the transport is up and its timeline is this document's
+-/// (`cached_script` refreshes it before the next frame); a tool without
+-/// a body adds nothing, so every no-body scene is unchanged.
+-fn sim_body_part(state: &State) -> Option<GpuPart> {
++/// #371: the running tool's assembly at the playhead - cutter and shank
++/// revolved from its numbers, then its modelled body - posed by the
++/// frame's tip and axis, world space. Only while the transport is up and
++/// its timeline is this document's (`cached_script` refreshes it before
++/// the next frame), any playhead including 0 and the end, playing or
++/// paused, the op fresh or stale (display reads the cached path). A tool
++/// without a body yields nothing, so every no-body scene is unchanged.
++pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry::Triangle>> {
+     let sim = state.sim?;
+     let (version, sc) = state.sim_script_cache.as_ref()?;
+     if *version != state.doc_version || sc.is_empty() {
+@@ -302,8 +304,13 @@ fn sim_body_part(state: &State) -> Option<GpuPart> {
+     }
+     let f = sc.at(sim.t);
+     let op = sc.ops.get(f.op?)?;
+-    let body = camcraft_app::tool_body_view::body_for_operation(&state.world, op)?;
+-    let tris = camcraft_app::tool_body_view::posed(&body.facets, [f.pos.x, f.pos.y, f.pos.z], f.axis);
++    let tris = camcraft_app::tool_body_view::assembly_for_operation(&state.world, op)?;
++    Some(camcraft_app::tool_body_view::posed(&tris, [f.pos.x, f.pos.y, f.pos.z], f.axis))
++}
++
++/// [`sim_tool_tris`] as a model part (depth-tested, shaded).
++fn sim_body_part(state: &State) -> Option<GpuPart> {
++    let tris = sim_tool_tris(state)?;
+     let verts = tris.iter().flat_map(|t| [t.a, t.b, t.c].map(|p| [ftoz(p.x), ftoz(p.y), ftoz(p.z)])).collect();
+     Some(GpuPart { verts, selected: false, stock: false, fill: false, classes: Vec::new() })
+ }
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 4d4deb331..b108c2820 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -3215,6 +3215,20 @@ impl State {
+                 }
+             }
+         }
++        // #371: while simulating, the posed tool assembly is part of
++        // "all" - a holder rides a shank length above the part.
++        for t in crate::egui_app::world::sim_tool_tris(self).unwrap_or_default() {
++            for p in [t.a, t.b, t.c] {
++                for axis in 0..3 {
++                    let v = [p.x, p.y, p.z][axis];
++                    if v.is_finite() {
++                        min[axis] = min[axis].min(v);
++                        max[axis] = max[axis].max(v);
++                        any = true;
++                    }
++                }
++            }
++        }
+         // A work offset parked far from the parts is still "all": frame
+         // their origins even though they carry no geometry.
+         for (_, entity) in model::named_entities(&self.world) {
+diff --git a/docs/decisions/371-tool-body-ui.md b/docs/decisions/371-tool-body-ui.md
+index 5b446c26b..bd6964af8 100644
+--- a/docs/decisions/371-tool-body-ui.md
++++ b/docs/decisions/371-tool-body-ui.md
+@@ -60,6 +60,19 @@
+   draws an axis marker only), so "unchanged cylinders" means unchanged:
+   no body, no new geometry. Dropped: drawing the cylinder assembly for
+   body-less tools (a separate display feature).
++- **Hands-on fix: the simulation draws the whole tool when it has a
++  body.** The first cut drew the body alone. On a real document it sat
++  a shank length (55 mm for the catalog end mill) above the tip with
++  nothing below it, off the top of a part-framed view, and the user saw
++  no difference. Now, while simulating, a tool with a body is drawn
++  whole: cutter and shank revolved from `Tool::profile` up to the shank
++  top (carried up to the body's foot if it stands clear, the same gap
++  the fixture laws fill with shank), then the body. Frame takes the
++  posed assembly in while the transport is up. Not done: auto-framing
++  on Simulate (it would shrink the part to fit a tall holder for every
++  run); drawing cutter/shank for tools without a body (no-body scenes
++  stay unchanged); a static tool marker outside playback (none exists
++  to put a body on).
+ - **File read is synchronous** on the UI thread (`tool_body_view::load`,
+   the model importer). A holder file is small next to a part; the
+   worker-thread import path is wired to `ImportModel` and would need a
+
+From 11f522be14ef941b0d3a1c6d7b5e69388f722189 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Sun, 8 Nov 2026 17:11:16 -0800
+Subject: [PATCH 3/5] fix(ui): leave Frame's extent to the document while
+ simulating
+
+The previous commit also folded the posed tool assembly into Frame
+while the transport was up. On the user's word the view behaviour stays
+as it was (zoom out to see a tall holder); the whole-tool drawing of a
+tool with a body stays. The regression test keeps its whole-tool,
+every-playhead, stale-and-fresh checks.
+
+Refs #371
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/ui/src/egui_app/tests/tool_body.rs | 27 +++++------------------
+ crates/ui/src/state.rs                    | 14 ------------
+ 2 files changed, 5 insertions(+), 36 deletions(-)
+
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index 3479e84f2..64c50d888 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -201,18 +201,6 @@ fn the_simulation_draws_the_body_at_the_playhead_and_nothing_without_one() {
+ /// catalog end mill, Face1 generated (project v56, our own fixture).
+ const STEP_BLOCK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/egui_app/tests/step_block_371.camproj");
+ 
+-/// Is every vertex of `verts` inside the viewport image under the camera?
+-fn on_screen(state: &State, verts: &[[f32; 3]]) -> usize {
+-    let mvp = state.cam.mvp(1280.0 / 649.0);
+-    verts
+-        .iter()
+-        .filter(|v| {
+-            interact::project_uv(&mvp, [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])])
+-                .is_some_and(|u| (0.0..=1.0).contains(&u[0]) && (0.0..=1.0).contains(&u[1]))
+-        })
+-        .count()
+-}
+-
+ /// The posed tool part of the scene (the one model part that is no
+ /// document model) and the frame's tip height.
+ fn tool_part(state: &State) -> Option<(Vec<[f32; 3]>, f64)> {
+@@ -224,11 +212,10 @@ fn tool_part(state: &State) -> Option<(Vec<[f32; 3]>, f64)> {
+     (solids.len() == models + 1).then(|| (solids.last().map(|p| p.verts.clone()).unwrap_or_default(), tip))
+ }
+ 
+-/// #371 feedback, bug 1: on the user's document the body was collected
+-/// but posed a shank length (55 mm) above the tip with nothing below it,
+-/// off the top of a part-sized view - "no difference with and without
+-/// the body". The tool now draws whole (cutter and shank up into the
+-/// body) at every playhead, stale or fresh, and Frame takes it in.
++/// #371 feedback: on the user's document the collar floated a shank
++/// length (55 mm) above the axis marker with nothing below it. A tool
++/// with a body now draws whole in the simulation - cutter and shank up
++/// into the body - at every playhead, stale or fresh.
+ #[test]
+ fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document() {
+     let mut harness = shell_harness();
+@@ -266,11 +253,6 @@ fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document()
+         harness.run();
+         check(&harness.state().state, &format!("t = {t:.1}"));
+     }
+-    // Frame takes the assembly in: the whole tool is on screen.
+-    harness.state_mut().state.pending.push_back(CommandKind::FrameAll);
+-    harness.run();
+-    let (verts, _) = tool_part(&harness.state().state).unwrap();
+-    assert_eq!(on_screen(&harness.state().state, &verts), verts.len(), "Frame shows the whole tool");
+     // Regenerated (fresh), still drawn.
+     harness.state_mut().state.pending.push_back(CommandKind::GenerateOperation("Face1".into()));
+     harness.run();
+@@ -278,3 +260,4 @@ fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document()
+     check(&harness.state().state, "after regenerate");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
++
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index b108c2820..4d4deb331 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -3215,20 +3215,6 @@ impl State {
+                 }
+             }
+         }
+-        // #371: while simulating, the posed tool assembly is part of
+-        // "all" - a holder rides a shank length above the part.
+-        for t in crate::egui_app::world::sim_tool_tris(self).unwrap_or_default() {
+-            for p in [t.a, t.b, t.c] {
+-                for axis in 0..3 {
+-                    let v = [p.x, p.y, p.z][axis];
+-                    if v.is_finite() {
+-                        min[axis] = min[axis].min(v);
+-                        max[axis] = max[axis].max(v);
+-                        any = true;
+-                    }
+-                }
+-            }
+-        }
+         // A work offset parked far from the parts is still "all": frame
+         // their origins even though they carry no geometry.
+         for (_, entity) in model::named_entities(&self.world) {
+
+From 083762a82ad82316350cd7e4ba1f3f06b1439457 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Sun, 8 Nov 2026 17:11:16 -0800
+Subject: [PATCH 4/5] feat(ui): zoom and fit the tool editor's 3D body preview
+
+Wheel or pinch (Ctrl+wheel) over the preview zooms about the cursor,
+clamped to 1/4x..32x of the fit view; double-click or the new Fit
+button resets orbit, zoom and pan. Drag still orbits. View state only.
+The decision file records the zoom and the whole-tool simulation
+drawing.
+
+Refs #371
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/ui/src/egui_app/tests/tool_body.rs | 41 +++++++++++++++++++++++
+ crates/ui/src/egui_app/tool_body_page.rs  | 31 +++++++++++++++--
+ crates/ui/src/state.rs                    |  2 +-
+ crates/ui/src/state_tool_body.rs          | 40 ++++++++++++++++++++++
+ docs/decisions/371-tool-body-ui.md        | 30 ++++++++++-------
+ 5 files changed, 127 insertions(+), 17 deletions(-)
+
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index 64c50d888..bc6ce0a29 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -261,3 +261,44 @@ fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document()
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
+ 
++#[test]
++fn the_preview_zoom_clamps_and_fit_resets_it() {
++    use crate::state::{ZOOM_MAX, ZOOM_MIN, clamp_zoom};
++    assert_eq!(clamp_zoom(0.0, 1.0), 1.0);
++    assert_eq!(clamp_zoom(0.0, 100.0), ZOOM_MAX, "wheel in forever stops at the cap");
++    assert_eq!(clamp_zoom(0.0, -100.0), ZOOM_MIN, "and out");
++    assert_eq!(clamp_zoom(0.5, f32::NAN), 0.5, "non-finite input leaves it");
++    let mut harness = editor();
++    let path = temp_stl("zoom");
++    prism_stl(&path, 15.0, 0.0, 30.0, 24);
++    harness.state_mut().state.import_tool_body_from(&path);
++    harness.run();
++    // A wheel notch over the preview (just under the pick row) zooms in.
++    let row = harness.get_by_label("Pick tip").rect();
++    let over = egui::pos2(row.min.x + 100.0, row.max.y + 100.0);
++    harness.hover_at(over);
++    harness.run();
++    harness.input_mut().events.push(Event::MouseWheel {
++        unit: egui::MouseWheelUnit::Line,
++        delta: egui::vec2(0.0, 3.0),
++        phase: egui::TouchPhase::Move,
++        modifiers: Modifiers::NONE,
++    });
++    harness.run_steps(6);
++    let z = harness.state().state.tool_body_ui.zoom;
++    assert!(z > 0.0, "the wheel zooms in (zoom {z})");
++    assert!(harness.state().state.pending.is_empty(), "zoom is view state, never a command");
++    {
++        let st = &mut harness.state_mut().state;
++        st.zoom_body_preview(50.0, [3.0, -2.0]);
++        assert_eq!(st.tool_body_ui.zoom, ZOOM_MAX);
++        st.zoom_body_preview(-50.0, [3.0, -2.0]);
++        assert_eq!(st.tool_body_ui.zoom, ZOOM_MIN);
++        st.tool_body_ui.yaw = 1.0;
++    }
++    harness.get_by_label("Fit").click();
++    harness.run();
++    let d = &harness.state().state.tool_body_ui;
++    assert_eq!((d.zoom, d.pan, d.yaw, d.pitch), (0.0, [0.0; 2], 0.0, 0.0), "Fit restores the default view");
++    let _ = std::fs::remove_dir_all(path.parent().unwrap());
++}
+diff --git a/crates/ui/src/egui_app/tool_body_page.rs b/crates/ui/src/egui_app/tool_body_page.rs
+index 1ed19e291..3d72243cf 100644
+--- a/crates/ui/src/egui_app/tool_body_page.rs
++++ b/crates/ui/src/egui_app/tool_body_page.rs
+@@ -95,6 +95,9 @@ pub(super) fn body_section(ui: &mut Ui, state: &mut State, exists: bool, u: Unit
+         {
+             state.tool_body_ui.pick = if pick == BodyPickMode::Axis { BodyPickMode::Off } else { BodyPickMode::Axis };
+         }
++        if ui.button("Fit").on_hover_text("reset the preview's orbit and zoom (or double-click it)").clicked() {
++            state.fit_body_preview();
++        }
+     });
+     preview_3d(ui, state);
+     let note = match state.tool_body_preview() {
+@@ -138,7 +141,8 @@ struct View {
+ }
+ 
+ impl View {
+-    fn new(tris: &[Triangle], rect: Rect, yaw: f32, pitch: f32) -> Option<Self> {
++    fn new(tris: &[Triangle], rect: Rect, d: &crate::state::ToolBodyUi) -> Option<Self> {
++        let (yaw, pitch) = (d.yaw, d.pitch);
+         let mut lo = [f64::INFINITY; 3];
+         let mut hi = [f64::NEG_INFINITY; 3];
+         for t in tris {
+@@ -165,7 +169,10 @@ impl View {
+         let f = [-(p.cos() * y.cos()), -(p.cos() * y.sin()), -p.sin()];
+         let r = norm([f[1], -f[0], 0.0]).unwrap_or([1.0, 0.0, 0.0]);
+         let up = cross(r, f);
+-        let s = f64::from(rect.width().min(rect.height())) * 0.45 / reach;
++        let zoom = f64::from(crate::state::clamp_zoom(d.zoom, 0.0)).exp2();
++        let s = f64::from(rect.width().min(rect.height())) * 0.45 / reach * zoom;
++        let pan = if d.pan.iter().all(|v| v.is_finite()) { d.pan } else { [0.0; 2] };
++        let c = [0, 1, 2].map(|i| c[i] + r[i] * pan[0] + up[i] * pan[1]);
+         Some(Self { c, s, r, up, f, mid: rect.center(), reach })
+     }
+ 
+@@ -181,6 +188,11 @@ impl View {
+         dot([q[0] - self.c[0], q[1] - self.c[1], q[2] - self.c[2]], self.f)
+     }
+ 
++    /// Screen point `at` as view units (right, up) off the view centre.
++    fn offset(&self, at: Pos2) -> [f64; 2] {
++        [f64::from(at.x - self.mid.x) / self.s, -f64::from(at.y - self.mid.y) / self.s]
++    }
++
+     /// The ray under screen point `at`: from in front of the body, into it.
+     fn ray(&self, at: Pos2) -> ([f64; 3], [f64; 3]) {
+         let (dx, dy) = (f64::from(at.x - self.mid.x) / self.s, -f64::from(at.y - self.mid.y) / self.s);
+@@ -195,7 +207,7 @@ fn preview_3d(ui: &mut Ui, state: &mut State) {
+     let rect = resp.rect;
+     painter.rect_filled(rect, 4.0, Color32::from_rgb(24, 26, 31));
+     let d = &state.tool_body_ui;
+-    let Some(view) = View::new(&d.facets, rect, d.yaw, d.pitch) else {
++    let Some(view) = View::new(&d.facets, rect, d) else {
+         return;
+     };
+     // Painter's algorithm: far facets first, shaded by how squarely
+@@ -241,6 +253,19 @@ fn preview_3d(ui: &mut Ui, state: &mut State) {
+             Color32::from_rgb(240, 200, 120),
+         );
+     }
++    // Zoom: the wheel or a pinch (Ctrl+wheel too) while hovered, about
++    // the cursor; a double-click fits. View state only.
++    if resp.hovered() {
++        let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
++        let by = scroll * 0.004 + pinch.max(1e-3).log2();
++        if by.abs() > 1e-6 {
++            let about = resp.hover_pos().map_or([0.0; 2], |p| view.offset(p));
++            state.zoom_body_preview(by, about);
++        }
++    }
++    if resp.double_clicked() {
++        state.fit_body_preview();
++    }
+     if resp.dragged() && mode == BodyPickMode::Off {
+         let dv = resp.drag_delta();
+         state.tool_body_ui.yaw -= dv.x * 0.01;
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 4d4deb331..7c5987451 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -43,7 +43,7 @@ mod tool_library_io;
+ mod setup_mount;
+ #[path = "state_tool_body.rs"]
+ mod tool_body_ui;
+-pub use tool_body_ui::{BodyDraft, BodyPickMode, ToolBodyUi};
++pub use tool_body_ui::{BodyDraft, BodyPickMode, ToolBodyUi, ZOOM_MAX, ZOOM_MIN, clamp_zoom};
+ use flecs_ecs::prelude::World;
+ 
+ use crate::egui_app::{theme, theme_files};
+diff --git a/crates/ui/src/state_tool_body.rs b/crates/ui/src/state_tool_body.rs
+index 96076c166..33766a1e5 100644
+--- a/crates/ui/src/state_tool_body.rs
++++ b/crates/ui/src/state_tool_body.rs
+@@ -48,6 +48,12 @@ pub struct ToolBodyUi {
+     /// The preview's orbit, radians off its default view.
+     pub yaw: f32,
+     pub pitch: f32,
++    /// The preview's zoom, log2 of the magnification over the fit view
++    /// (0 = fit), clamped to [`ZOOM_MIN`, `ZOOM_MAX`].
++    pub zoom: f32,
++    /// The view centre's shift off the fit centre, view units (right,
++    /// up): what keeps the point under the cursor fixed while zooming.
++    pub pan: [f64; 2],
+     /// The world body the draft last mirrored (identity, not value):
+     /// a change there (Apply, Undo, Redo, Open) re-mirrors.
+     seen: Option<Arc<[Triangle]>>,
+@@ -57,6 +63,20 @@ pub struct ToolBodyUi {
+ 
+ type PreviewKey = (usize, [u64; 4]);
+ 
++/// The preview zoom's bounds, log2: a quarter of the fit view out to
++/// 32x in - far enough to pick a corner on a fine holder, never so far
++/// a wheel spin loses the body.
++pub const ZOOM_MIN: f32 = -2.0;
++pub const ZOOM_MAX: f32 = 5.0;
++
++/// The zoom law: `z` moved by `by` (log2), clamped; non-finite input
++/// leaves it where it was.
++#[must_use]
++pub fn clamp_zoom(z: f32, by: f32) -> f32 {
++    let next = z + by;
++    if next.is_finite() { next.clamp(ZOOM_MIN, ZOOM_MAX) } else { z.clamp(ZOOM_MIN, ZOOM_MAX) }
++}
++
+ /// A body as Apply body states it, for the command queue. Debug prints
+ /// the facet count, never the mesh.
+ #[derive(Clone)]
+@@ -183,6 +203,26 @@ impl State {
+         self.tool_body_ui.pick = BodyPickMode::Off;
+     }
+ 
++    /// Zoom the body preview by `by` (log2) about `about` - the cursor's
++    /// offset from the view centre in view units (right, up) at the
++    /// current zoom - so the point under it stays put. View state only.
++    pub(crate) fn zoom_body_preview(&mut self, by: f32, about: [f64; 2]) {
++        let d = &mut self.tool_body_ui;
++        let next = clamp_zoom(d.zoom, by);
++        let k = f64::from(next - d.zoom).exp2();
++        if k.is_finite() && k > 0.0 && about.iter().all(|v| v.is_finite()) {
++            d.pan[0] += about[0] * (1.0 - 1.0 / k);
++            d.pan[1] += about[1] * (1.0 - 1.0 / k);
++        }
++        d.zoom = next;
++    }
++
++    /// Fit: the default view again - orbit, zoom and pan reset.
++    pub(crate) fn fit_body_preview(&mut self) {
++        let d = &mut self.tool_body_ui;
++        (d.yaw, d.pitch, d.zoom, d.pan) = (0.0, 0.0, 0.0, [0.0; 2]);
++    }
++
+     /// "Apply body": queue the one `SetToolBody` for the draft.
+     pub(crate) fn queue_apply_tool_body(&mut self) {
+         let d = &self.tool_body_ui;
+diff --git a/docs/decisions/371-tool-body-ui.md b/docs/decisions/371-tool-body-ui.md
+index bd6964af8..b279fed58 100644
+--- a/docs/decisions/371-tool-body-ui.md
++++ b/docs/decisions/371-tool-body-ui.md
+@@ -60,19 +60,23 @@
+   draws an axis marker only), so "unchanged cylinders" means unchanged:
+   no body, no new geometry. Dropped: drawing the cylinder assembly for
+   body-less tools (a separate display feature).
+-- **Hands-on fix: the simulation draws the whole tool when it has a
+-  body.** The first cut drew the body alone. On a real document it sat
+-  a shank length (55 mm for the catalog end mill) above the tip with
+-  nothing below it, off the top of a part-framed view, and the user saw
+-  no difference. Now, while simulating, a tool with a body is drawn
+-  whole: cutter and shank revolved from `Tool::profile` up to the shank
+-  top (carried up to the body's foot if it stands clear, the same gap
+-  the fixture laws fill with shank), then the body. Frame takes the
+-  posed assembly in while the transport is up. Not done: auto-framing
+-  on Simulate (it would shrink the part to fit a tall holder for every
+-  run); drawing cutter/shank for tools without a body (no-body scenes
+-  stay unchanged); a static tool marker outside playback (none exists
+-  to put a body on).
++- **Hands-on follow-up: the simulation draws the whole tool when it
++  has a body.** The first cut drew the body alone; on the user's
++  document the collar floated a shank length (55 mm) above the axis
++  marker. Now a tool with a body is drawn whole while simulating:
++  cutter and shank revolved from `Tool::profile` up to the shank top
++  (carried up to the body's foot if it stands clear - the same gap the
++  fixture laws fill with shank), then the body, all posed by the same
++  function into the same part. Tools without a body draw exactly as
++  before (marker only). Briefly Frame also took the posed tool in;
++  that was reverted on the user's word (the view behaviour stays as
++  it was - zoom out to see a tall holder). Not done: auto-framing on
++  Simulate; a static tool marker outside playback (none exists).
++- **Preview zoom (user request):** wheel or pinch (Ctrl+wheel) over the
++  3D body preview zooms about the cursor (log2 zoom clamped to
++  [-2, 5], i.e. 1/4x to 32x of the fit view; the pan keeps the point
++  under the cursor fixed). Double-click or the Fit button resets orbit,
++  zoom and pan. View state only, never a command.
+ - **File read is synchronous** on the UI thread (`tool_body_view::load`,
+   the model importer). A holder file is small next to a part; the
+   worker-thread import path is wired to `ImportModel` and would need a
+
+From add3a8756244736ece964b7677de0fa49591c64f Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mikekinney@Mikes-MacBook-Pro.local>
+Date: Sun, 8 Nov 2026 17:18:48 -0800
+Subject: [PATCH 5/5] feat(ui): the simulation draws the tool and its holder
+ cylinder when it has no body
+
+The running tool is now always drawn at the playhead: cutter and shank
+revolved from Tool::profile, then the modelled body when it has one,
+else the holder cylinder from its own numbers (holder_d x holder_len on
+the shank top - the HolderStack::cylinder reading the collision laws
+judge). The lathe insert kinds keep the axis marker only: their profile
+is a stand-in envelope. Tests and the decision file follow.
+
+Refs #371
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/tool_body_view.rs          | 30 +++++++++++---
+ crates/app/tests/tool_body_view.rs        | 14 +++++++
+ crates/ui/src/egui_app/tests/tool_body.rs | 50 ++++++++++++++---------
+ crates/ui/src/egui_app/world.rs           | 13 +++---
+ docs/decisions/371-tool-body-ui.md        | 38 +++++++++--------
+ 5 files changed, 98 insertions(+), 47 deletions(-)
+
+diff --git a/crates/app/src/tool_body_view.rs b/crates/app/src/tool_body_view.rs
+index ee42ad663..0040b34f5 100644
+--- a/crates/app/src/tool_body_view.rs
++++ b/crates/app/src/tool_body_view.rs
+@@ -19,7 +19,7 @@ use crate::geometry::{Point3, Triangle};
+ use crate::model;
+ use crate::schema::ToolBody;
+ use crate::tool_body;
+-use crate::tools::Tool;
++use crate::tools::{Tool, ToolKind};
+ 
+ /// The six model directions the editor offers as the tool axis.
+ pub const AXIS_CHOICES: [(&str, [f64; 3]); 6] = [
+@@ -171,16 +171,36 @@ fn revolve(prof: &[(f64, f64)]) -> Vec<Triangle> {
+     out
+ }
+ 
+-/// The display assembly (`assembly`) of the tool operation `op` runs,
+-/// tool frame - only when that tool has a body.
++/// The tool with no body, for display, tool frame: its whole
++/// `Tool::profile` revolved - cutter, shank, and the holder cylinder
++/// (Ø holder_d × holder_len on the shank top), the very cylinder
++/// `HolderStack::cylinder` hands the collision laws. `None` for the
++/// lathe insert kinds: their profile is a stand-in envelope (the truth
++/// lives in the work's meridian), so drawing it spun would show a tool
++/// that is not there - they keep the axis marker only.
++#[must_use]
++pub fn bare_assembly(tool: &Tool) -> Option<Vec<Triangle>> {
++    if matches!(tool.kind, ToolKind::Turning | ToolKind::Groove | ToolKind::Thread | ToolKind::Form) {
++        return None;
++    }
++    let prof: Vec<(f64, f64)> = tool.profile().into_iter().filter(|&(z, r)| z.is_finite() && r.is_finite()).collect();
++    let tris = revolve(&prof);
++    (!tris.is_empty()).then_some(tris)
++}
++
++/// The display assembly of the tool operation `op` runs, tool frame:
++/// with a body, [`assembly`]; without one, [`bare_assembly`] (`None`
++/// for the lathe insert kinds, which keep the marker only).
+ #[must_use]
+ pub fn assembly_for_operation(world: &World, op: &str) -> Option<Vec<Triangle>> {
+     let e = model::find_by_name(world, op)?;
+     let tool_name = model::operation_of(world, &e)?.tool;
+     let te = model::find_by_name(world, &tool_name)?;
+     let tool = model::tool_of(world, &te)?;
+-    let body = tool_body::body_of(world, &te)?;
+-    Some(assembly(&tool, &body))
++    match tool_body::body_of(world, &te) {
++        Some(body) => Some(assembly(&tool, &body)),
++        None => bare_assembly(&tool),
++    }
+ }
+ 
+ /// The body on the tool operation `op` runs, if that tool has one.
+diff --git a/crates/app/tests/tool_body_view.rs b/crates/app/tests/tool_body_view.rs
+index ce87b7fb3..348f2b445 100644
+--- a/crates/app/tests/tool_body_view.rs
++++ b/crates/app/tests/tool_body_view.rs
+@@ -178,3 +178,17 @@ fn the_display_assembly_runs_from_the_tip_through_the_shank_into_the_body() {
+     let steel = &all[..all.len() - high.facets.len()];
+     assert!((zr(steel).1 - (zs + 10.0)).abs() < 1e-9, "no floating body");
+ }
++
++#[test]
++fn without_a_body_the_display_is_the_profile_with_its_holder_cylinder() {
++    let t = catalog_tool(TOOL);
++    let tris = view::bare_assembly(&t).expect("a mill draws");
++    let zh = t.flute_len + t.shank_len + t.holder_len;
++    let (lo, hi) = tris.iter().flat_map(|q| [q.a.z, q.b.z, q.c.z]).fold((f64::INFINITY, f64::NEG_INFINITY), |a, z| (a.0.min(z), a.1.max(z)));
++    assert_eq!((lo, hi), (0.0, zh), "tip to the holder's top");
++    let r_top = tris.iter().flat_map(|q| [q.a, q.b, q.c]).filter(|p| (p.z - zh).abs() < 1e-9).map(|p| p.x.hypot(p.y)).fold(0.0, f64::max);
++    assert!((r_top - t.holder_d * 0.5).abs() < 1e-9, "the holder cylinder's radius");
++    // The lathe insert kinds keep the marker only.
++    let insert = catalog().into_iter().map(|(_, t)| t).find(|t| t.kind == camcraft_app::tools::ToolKind::Turning).expect("a turning insert in the catalog");
++    assert!(view::bare_assembly(&insert).is_none());
++}
+diff --git a/crates/ui/src/egui_app/tests/tool_body.rs b/crates/ui/src/egui_app/tests/tool_body.rs
+index bc6ce0a29..45b4655fc 100644
+--- a/crates/ui/src/egui_app/tests/tool_body.rs
++++ b/crates/ui/src/egui_app/tests/tool_body.rs
+@@ -165,35 +165,47 @@ fn a_missing_file_is_refused_by_name() {
+ }
+ 
+ #[test]
+-fn the_simulation_draws_the_body_at_the_playhead_and_nothing_without_one() {
++fn the_simulation_draws_the_tool_with_its_holder_cylinder_or_its_body() {
+     let mut harness = editor();
+     let st = &mut harness.state_mut().state;
++    let tool = model::find_by_name(&st.world, TOOL).and_then(|e| model::tool_of(&st.world, &e)).unwrap();
+     st.sim = Some(crate::state::Sim { t: 0.0, playing: false, speed: 1.0 });
+     let sc = super::super::shell::cached_script(st);
+     assert!(!sc.is_empty(), "the seed's Contour1 runs");
+-    let bare = world::collect(st).parts.len();
++    let tip = sc.at(0.0).pos.z;
++    let zr = |v: &[[f32; 3]]| {
++        v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(f64::from(p[2])), a.1.max(f64::from(p[2]))))
++    };
++    let r_at = |v: &[[f32; 3]], z: f64| {
++        v.iter().filter(|p| (f64::from(p[2]) - z).abs() < 1e-3).map(|p| f64::from(p[0]).hypot(f64::from(p[1]))).fold(0.0, f64::max)
++    };
++    // No body: cutter, shank and the holder cylinder from the tool's own
++    // numbers, tip to shank top + holder length.
++    let top = shank_top(st);
++    let (verts, _) = tool_part(st).expect("the tool draws without a body");
++    let (lo, hi) = zr(&verts);
++    assert!((lo - tip).abs() < 1e-3, "starts at the tip: {lo} vs {tip}");
++    assert!((hi - (tip + top + tool.holder_len)).abs() < 1e-3, "ends on the holder's top: {hi}");
++    let f = sc.at(0.0);
++    let local: Vec<[f32; 3]> = verts.iter().map(|p| [p[0] - f.pos.x as f32, p[1] - f.pos.y as f32, p[2]]).collect();
++    assert!((r_at(&local, tip + top + tool.holder_len) - tool.holder_d * 0.5).abs() < 1e-3, "Ø holder_d at its top");
++    let parts_no_body = world::collect(st).parts.len();
++    // With a body: the same one part, now ending at the body's top.
+     let path = temp_stl("sim");
+     prism_stl(&path, 15.0, 0.0, 30.0, 24);
+-    let top = shank_top(st);
+     st.import_tool_body_from(&path);
+     st.tool_body_ui.offset = top;
+     st.queue_apply_tool_body();
+     st.drain_actions();
+     assert!(body_source(st).is_some(), "status: {}", st.status);
+-    let sc = super::super::shell::cached_script(st);
+-    let scene = world::collect(st);
+-    assert_eq!(scene.parts.len(), bare + 1, "the body is one more part");
+-    // Posed at the playhead: the tool runs from its tip up through the
+-    // body, whose foot sits the shank top above the tip.
+-    let f = sc.at(0.0);
+-    let (verts, tip) = tool_part(st).expect("the posed tool part");
+-    assert!((tip - f.pos.z).abs() < 1e-9);
+-    let zmin = verts.iter().map(|v| f64::from(v[2])).fold(f64::INFINITY, f64::min);
+-    let zmax = verts.iter().map(|v| f64::from(v[2])).fold(f64::NEG_INFINITY, f64::max);
+-    assert!((zmin - f.pos.z).abs() < 1e-3, "tip at {}: {zmin}", f.pos.z);
+-    assert!((zmax - (f.pos.z + top + 30.0)).abs() < 1e-3, "body top at tip + {top} + 30: {zmax}");
++    super::super::shell::cached_script(st);
++    assert_eq!(world::collect(st).parts.len(), parts_no_body, "the body replaces the holder, one part");
++    let (verts, _) = tool_part(st).expect("the posed tool part");
++    let (lo, hi) = zr(&verts);
++    assert!((lo - tip).abs() < 1e-3, "tip at {tip}: {lo}");
++    assert!((hi - (tip + top + 30.0)).abs() < 1e-3, "body top at tip + {top} + 30: {hi}");
+     st.sim = None;
+-    assert_eq!(world::collect(st).parts.len(), bare, "no transport, no body drawn");
++    assert_eq!(world::collect(st).parts.len(), parts_no_body - 1, "no transport, no tool drawn");
+     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+ }
+ 
+@@ -213,9 +225,9 @@ fn tool_part(state: &State) -> Option<(Vec<[f32; 3]>, f64)> {
+ }
+ 
+ /// #371 feedback: on the user's document the collar floated a shank
+-/// length (55 mm) above the axis marker with nothing below it. A tool
+-/// with a body now draws whole in the simulation - cutter and shank up
+-/// into the body - at every playhead, stale or fresh.
++/// length (55 mm) above the axis marker with nothing below it. The tool
++/// draws whole in the simulation - cutter and shank up into the body -
++/// at every playhead, stale or fresh.
+ #[test]
+ fn the_simulated_tool_reaches_from_its_tip_into_the_body_on_the_users_document() {
+     let mut harness = shell_harness();
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index aefc02abb..988335d70 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -290,12 +290,13 @@ fn collect_parts(state: &State) -> Vec<GpuPart> {
+ }
+ 
+ /// #371: the running tool's assembly at the playhead - cutter and shank
+-/// revolved from its numbers, then its modelled body - posed by the
+-/// frame's tip and axis, world space. Only while the transport is up and
+-/// its timeline is this document's (`cached_script` refreshes it before
+-/// the next frame), any playhead including 0 and the end, playing or
+-/// paused, the op fresh or stale (display reads the cached path). A tool
+-/// without a body yields nothing, so every no-body scene is unchanged.
++/// revolved from its numbers, then its modelled body, or without one the
++/// holder cylinder from its own numbers (what the collision laws judge),
++/// posed by the frame's tip and axis, world space. Only while the
++/// transport is up and its timeline is this document's (`cached_script`
++/// refreshes it before the next frame), any playhead including 0 and the
++/// end, playing or paused, the op fresh or stale (display reads the
++/// cached path). Lathe insert kinds yield nothing (marker only).
+ pub(crate) fn sim_tool_tris(state: &State) -> Option<Vec<camcraft_app::geometry::Triangle>> {
+     let sim = state.sim?;
+     let (version, sc) = state.sim_script_cache.as_ref()?;
+diff --git a/docs/decisions/371-tool-body-ui.md b/docs/decisions/371-tool-body-ui.md
+index b279fed58..43544a826 100644
+--- a/docs/decisions/371-tool-body-ui.md
++++ b/docs/decisions/371-tool-body-ui.md
+@@ -55,23 +55,27 @@
+   revolved envelope) and drawn as one more model part - depth-tested
+   and shaded by the existing GPU pipeline. It reads the cached timeline
+   only when it is this document version's, so it never re-walks the
+-  program per frame. Without a body nothing is added. There are no
+-  holder/shank cylinders drawn anywhere in the viewport today (the sim
+-  draws an axis marker only), so "unchanged cylinders" means unchanged:
+-  no body, no new geometry. Dropped: drawing the cylinder assembly for
+-  body-less tools (a separate display feature).
+-- **Hands-on follow-up: the simulation draws the whole tool when it
+-  has a body.** The first cut drew the body alone; on the user's
+-  document the collar floated a shank length (55 mm) above the axis
+-  marker. Now a tool with a body is drawn whole while simulating:
+-  cutter and shank revolved from `Tool::profile` up to the shank top
+-  (carried up to the body's foot if it stands clear - the same gap the
+-  fixture laws fill with shank), then the body, all posed by the same
+-  function into the same part. Tools without a body draw exactly as
+-  before (marker only). Briefly Frame also took the posed tool in;
+-  that was reverted on the user's word (the view behaviour stays as
+-  it was - zoom out to see a tall holder). Not done: auto-framing on
+-  Simulate; a static tool marker outside playback (none exists).
++  program per frame. (First cut: without a body nothing was added -
++  superseded by the follow-up below, which draws the tool and its
++  holder cylinder.)
++- **Hands-on follow-up: the simulation always draws the running
++  tool.** The first cut drew the body alone; on the user's document the
++  collar floated a shank length (55 mm) above the axis marker. Now the
++  tool at the playhead is drawn whole, posed by one function into one
++  part: cutter and shank revolved from `Tool::profile`, then
++  - with a body, the body (the shank carried up to its foot if it stands
++    clear - the same gap the fixture laws fill with shank);
++  - without a body (user re-check: "no body shows only the marker"),
++    the holder cylinder from the tool's own numbers, Ø holder_d ×
++    holder_len on the shank top - the `HolderStack::cylinder` reading
++    the collision laws judge, so the picture is the verdict's.
++  The lathe insert kinds (Turning, Groove, Thread, Form) keep the axis
++  marker only: their `profile` is a stand-in envelope (their truth is in
++  the work's meridian), and spinning it would draw a tool that is not
++  there. Briefly Frame also took the posed tool in; that was reverted on
++  the user's word (zoom out to see a tall holder). Not done:
++  auto-framing on Simulate; a static tool marker outside playback (none
++  exists).
+ - **Preview zoom (user request):** wheel or pinch (Ctrl+wheel) over the
+   3D body preview zooms about the cursor (log2 zoom clamped to
+   [-2, 5], i.e. 1/4x to 32x of the fit view; the pan keeps the point

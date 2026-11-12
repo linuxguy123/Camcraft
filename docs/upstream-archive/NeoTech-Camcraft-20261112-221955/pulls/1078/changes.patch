@@ -1,0 +1,1362 @@
+From 6716fad19583a9a8cfafe45826058a8e2754ef3b Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 11 Nov 2026 20:57:37 -0800
+Subject: [PATCH 1/2] feat(pick): box-select edge chains and faces into an
+ operation's picks
+
+Ctrl (or Shift) + left drag in the viewport, in Edge or Face mode with an
+operation open, draws a rubber band instead of orbiting. Its release adds
+every visible feature edge chain (Edge mode) or welded face (Face mode)
+in the box to the operation's picks as one SetOperationGeometry - one
+undo step. A drag to the right is a window (wholly inside), to the left
+a crossing box (inside or touching). The #692 one pick rule holds:
+feature chains only, and a candidate counts only if part of it is
+unoccluded from the eye (the click pick's own sight test); stock and
+fixtures are never candidates but still occlude.
+
+The rule is app::pick::box_pick (box_bodies / box_select /
+box_select_top); the gesture is ui::box_pick. MCP twin: pick_in_box, a
+world X/Y box seen from straight above.
+
+Decisions: docs/decisions/979-box-select-picks.md.
+
+Fixes #979
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/mcp/box_pick.rs             | 110 ++++++++
+ crates/app/src/mcp/mod.rs                  |   2 +
+ crates/app/src/mcp/pick.rs                 |   2 +-
+ crates/app/src/mcp/tools.rs                |   1 +
+ crates/app/src/pick.rs                     |   3 +
+ crates/app/src/pick/box_pick.rs            | 283 +++++++++++++++++++++
+ crates/app/src/pick/feature_pick.rs        |   4 +-
+ crates/app/tests/box_pick.rs               | 260 +++++++++++++++++++
+ crates/ui/src/box_pick.rs                  | 133 ++++++++++
+ crates/ui/src/egui_app/geo_page.rs         |   2 +-
+ crates/ui/src/egui_app/shell.rs            |  31 ++-
+ crates/ui/src/egui_app/tests.rs            |   2 +
+ crates/ui/src/egui_app/tests/box_select.rs | 167 ++++++++++++
+ crates/ui/src/lib.rs                       |   1 +
+ crates/ui/src/state.rs                     |   4 +
+ docs/decisions/979-box-select-picks.md     |  56 ++++
+ 16 files changed, 1053 insertions(+), 8 deletions(-)
+ create mode 100644 crates/app/src/mcp/box_pick.rs
+ create mode 100644 crates/app/src/pick/box_pick.rs
+ create mode 100644 crates/app/tests/box_pick.rs
+ create mode 100644 crates/ui/src/box_pick.rs
+ create mode 100644 crates/ui/src/egui_app/tests/box_select.rs
+ create mode 100644 docs/decisions/979-box-select-picks.md
+
+diff --git a/crates/app/src/mcp/box_pick.rs b/crates/app/src/mcp/box_pick.rs
+new file mode 100644
+index 000000000..04cd7cff8
+--- /dev/null
++++ b/crates/app/src/mcp/box_pick.rs
+@@ -0,0 +1,110 @@
++//! The MCP box pick (#979): the viewport's Ctrl+drag box select, headless.
++//! A world X/Y box seen from straight above picks every visible feature
++//! edge chain (or welded face) in it - window or crossing - and adds them
++//! to an operation's picks through `SetOperationGeometry`: one undo step,
++//! the #692 one pick rule (feature chains only, nothing hidden).
++//!
++//! Provenance: our own tool surface over this repo's pick commands.
++
++use serde_json::{Map, Value, json};
++
++use super::edit::find_op;
++use super::pick::{geometry_view, kind_door, picks_view};
++use super::tools::{Tool, opt_str, req_str};
++use crate::commands::SetOperationGeometry;
++use crate::model;
++use crate::operation::{GeoSel, SrcRef};
++use crate::pick::{BoxMode, PickKinds, box_select_top};
++use crate::script::Env;
++
++pub(super) const TOOLS: &[Tool] = &[Tool {
++    name: "pick_in_box",
++    description: "Box-select features into an operation's picks, seen from straight above (+Z, like the Top view): every visible feature edge chain (kind \"chains\", the default) or face (kind \"faces\") whose outline lies inside the world X/Y box (mode \"window\", the default) or touches it (mode \"crossing\"). Hidden edges (under the top face) and mesh triangulation edges are never taken. Adds to the current picks unless replace is true. One undo step.",
++    schema: s_pick_in_box,
++    run: pick_in_box,
++}];
++
++fn num(v: Option<&Value>, k: &str) -> Result<f64, String> {
++    v.and_then(Value::as_f64)
++        .filter(|x| x.is_finite())
++        .ok_or_else(|| format!("\"box\" needs a finite number \"{k}\" (mm)"))
++}
++
++fn pick_in_box(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let key = find_op(env, req_str(a, "operation")?)?;
++    let Some(Value::Object(b)) = a.get("box") else {
++        return Err(String::from("\"box\" is required: {\"x0\", \"y0\", \"x1\", \"y1\"} in mm"));
++    };
++    let corners = [[num(b.get("x0"), "x0")?, num(b.get("y0"), "y0")?], [num(b.get("x1"), "x1")?, num(b.get("y1"), "y1")?]];
++    if corners[0][0] == corners[1][0] || corners[0][1] == corners[1][1] {
++        return Err(String::from("the box has no area - give two opposite corners"));
++    }
++    let mode = match opt_str(a, "mode")?.unwrap_or("window") {
++        "window" => BoxMode::Window,
++        "crossing" => BoxMode::Crossing,
++        m => return Err(format!("unknown mode '{m}' - \"window\" or \"crossing\"")),
++    };
++    let (kinds, what) = match opt_str(a, "kind")?.unwrap_or("chains") {
++        "chains" => (PickKinds::EDGES, "edge chain"),
++        "faces" => (PickKinds::FACES, "face"),
++        k => return Err(format!("unknown kind '{k}' - \"chains\" or \"faces\"")),
++    };
++    let replace = match a.get("replace") {
++        None | Some(Value::Null) => false,
++        Some(Value::Bool(r)) => *r,
++        Some(v) => return Err(format!("\"replace\" must be true or false, got {v}")),
++    };
++    let found = box_select_top(&env.world, corners, mode, kinds);
++    if found.is_empty() {
++        return Err(format!("no visible {what} in the box - nothing picked, nothing changed"));
++    }
++    let e = model::find_by_name(&env.world, &key).ok_or_else(|| format!("no operation named '{key}'"))?;
++    let op = model::operation_of(&env.world, &e).ok_or_else(|| format!("'{key}' is not an operation"))?;
++    let mut items: Vec<GeoSel> = match (&op.src, replace) {
++        (SrcRef::Selection(items), false) => items.clone(),
++        _ => Vec::new(),
++    };
++    let before = items.len();
++    for g in &found {
++        if !items.contains(g) {
++            items.push(g.clone());
++        }
++    }
++    let added = items.len() - before;
++    if added == 0 && !replace {
++        return Err(format!("every {what} in the box is already picked in '{key}' - nothing changed"));
++    }
++    kind_door(op.params.kind().info().label, &op.params, &items)?;
++    let cmd = SetOperationGeometry::new(&env.world, &key, items).map_err(|e| e.to_string())?;
++    env.history.execute(&env.world, cmd);
++    let mut view = geometry_view(env, &key)?;
++    if let Value::Object(m) = &mut view {
++        m.insert("boxed".into(), json!(picks_view(&found)));
++        m.insert("added".into(), json!(added));
++    }
++    Ok(view)
++}
++
++fn s_pick_in_box() -> Value {
++    json!({
++        "type": "object",
++        "properties": {
++            "operation": { "type": "string", "description": "Operation name (key or label)." },
++            "box": {
++                "type": "object",
++                "description": "Two opposite corners of the box in world X/Y, mm, seen from above.",
++                "properties": {
++                    "x0": { "type": "number" }, "y0": { "type": "number" },
++                    "x1": { "type": "number" }, "y1": { "type": "number" }
++                },
++                "required": ["x0", "y0", "x1", "y1"],
++                "additionalProperties": false
++            },
++            "mode": { "type": "string", "enum": ["window", "crossing"], "description": "window: wholly inside (default); crossing: inside or touching." },
++            "kind": { "type": "string", "enum": ["chains", "faces"], "description": "What to pick: edge chains (default) or faces." },
++            "replace": { "type": "boolean", "description": "Replace the current picks instead of adding to them (default false)." }
++        },
++        "required": ["operation", "box"],
++        "additionalProperties": false
++    })
++}
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index f3762ab20..f5d69e79b 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -28,6 +28,8 @@ mod listen;
+ mod live;
+ mod model_tools;
+ mod pick;
++// #979: the box pick, the viewport's Ctrl+drag box select headless.
++mod box_pick;
+ mod pockets;
+ mod render;
+ mod setup_tools;
+diff --git a/crates/app/src/mcp/pick.rs b/crates/app/src/mcp/pick.rs
+index bd9144099..c0ca6f12b 100644
+--- a/crates/app/src/mcp/pick.rs
++++ b/crates/app/src/mcp/pick.rs
+@@ -94,7 +94,7 @@ pub(super) fn picks_view(items: &[GeoSel]) -> Vec<Value> {
+ 
+ /// The feature-kind door: refusals the generation walks make by name,
+ /// said at the pick instead, before anything lands in the History.
+-fn kind_door(label: &str, params: &OpParams, items: &[GeoSel]) -> Result<(), String> {
++pub(super) fn kind_door(label: &str, params: &OpParams, items: &[GeoSel]) -> Result<(), String> {
+     let first = |pred: fn(&FeatureSel) -> bool| items.iter().find(|g| pred(&g.feature));
+     if matches!(params, OpParams::MultiAxisContour { .. }) {
+         // Its picks ARE the path: curves only (selection's drive_chains).
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 737cdd85c..e2f542d43 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -63,6 +63,7 @@ fn all() -> impl Iterator<Item = &'static Tool> {
+         .chain(super::cutter_tools::TOOLS)
+         .chain(super::plate_tools::TOOLS)
+         .chain(super::modvise_tools::TOOLS)
++        .chain(super::box_pick::TOOLS)
+ }
+ 
+ /// The `tools/list` rows.
+diff --git a/crates/app/src/pick.rs b/crates/app/src/pick.rs
+index cb5a748a0..c2e66dc72 100644
+--- a/crates/app/src/pick.rs
++++ b/crates/app/src/pick.rs
+@@ -6,6 +6,8 @@
+ 
+ pub mod align;
+ pub mod axis;
++// #979: window / crossing box selection under the one pick rule.
++pub mod box_pick;
+ pub mod face;
+ pub mod feature_arc;
+ pub mod feature_graph;
+@@ -21,6 +23,7 @@ pub use align::{Alignment, align_321};
+ pub use axis::{AxisPick, InPlaneAxes, InPlaneAxis, in_plane_turn_deg, pick_coords, turn_in_plane};
+ pub use plane::{PlaneLay, lay_on_plane, plane_label, plane_side};
+ pub use points::{PointsLay, lay_on_points, points_side};
++pub use box_pick::{BoxMode, BoxQuery, box_bodies, box_select, box_select_top};
+ pub use face::{FaceOrigin, face_origin, facets_centroid};
+ pub use feature_arc::ArcCentre;
+ pub use feature_graph::{
+diff --git a/crates/app/src/pick/box_pick.rs b/crates/app/src/pick/box_pick.rs
+new file mode 100644
+index 000000000..204c471bc
+--- /dev/null
++++ b/crates/app/src/pick/box_pick.rs
+@@ -0,0 +1,283 @@
++//! Box selection under the one pick rule (#979, #692): every feature edge
++//! chain - or every welded face - whose projection falls in a screen
++//! rectangle, among the visible ones only. Window mode takes what lies
++//! wholly inside the box; crossing mode also takes what the box touches.
++//! Tessellation edges are never candidates (only feature chains are), and
++//! a candidate counts only if some part of it is unoccluded from the eye,
++//! by the same sight test the click pick runs - unless pick-through is on.
++//!
++//! Provenance: window/crossing rubber-band selection is the long-standing
++//! CAD convention (drag right = window, drag left = crossing, as public
++//! CAD user documentation describes it); the segment/rectangle clip is
++//! Liang-Barsky (Liang & Barsky, ACM TOG 1984). Our own code over our own
++//! pick API; no vendor material consulted.
++
++use flecs_ecs::prelude::World;
++
++use crate::model;
++use crate::operation::{FeatureSel, GeoSel};
++
++use super::feature_graph::FeatureGraph;
++use super::feature_pick::{PickBody, PickKinds, PickRay, Projection, occluded, pick_bodies_of, world_of};
++use super::feature_sel::is_feature_chain;
++
++/// Which side of the box rule a drag asks for.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum BoxMode {
++    /// Wholly inside the box (a drag to the right).
++    #[default]
++    Window,
++    /// Inside or crossing the box edge (a drag to the left).
++    Crossing,
++}
++
++impl BoxMode {
++    /// The CAD convention: a drag from left to right is a window, from
++    /// right to left a crossing box.
++    #[must_use]
++    pub fn of_drag(from_x: f64, to_x: f64) -> BoxMode {
++        if to_x < from_x { BoxMode::Crossing } else { BoxMode::Window }
++    }
++}
++
++/// One box selection request. `project` maps a world point to the 2D
++/// frame the box is drawn in (screen px in the viewport, world XY for a
++/// top-down MCP box); `None` means it does not draw (behind the eye).
++pub struct BoxQuery<'a> {
++    pub project: &'a dyn Fn([f64; 3]) -> Option<[f64; 2]>,
++    /// Two opposite corners of the box, any order.
++    pub corners: [[f64; 2]; 2],
++    pub mode: BoxMode,
++    /// Only `edges` (feature chains) and `faces` (welded faces) are read.
++    pub kinds: PickKinds,
++    /// The sight line used for occlusion: perspective `origin` is the
++    /// eye; orthographic `dir` is the view direction.
++    pub view: PickRay,
++    /// Ignore occlusion (an explicit pick-through mode only).
++    pub through: bool,
++}
++
++/// At most this many sight rays per candidate, spread along it: a long
++/// chain mostly hidden still costs a bounded number of rays.
++const SIGHT_SAMPLES: usize = 16;
++
++struct Rect {
++    lo: [f64; 2],
++    hi: [f64; 2],
++}
++
++impl Rect {
++    fn of(c: [[f64; 2]; 2]) -> Option<Rect> {
++        let ok = c.iter().flatten().all(|v| v.is_finite());
++        let lo = [c[0][0].min(c[1][0]), c[0][1].min(c[1][1])];
++        let hi = [c[0][0].max(c[1][0]), c[0][1].max(c[1][1])];
++        (ok && hi[0] > lo[0] && hi[1] > lo[1]).then_some(Rect { lo, hi })
++    }
++
++    fn holds(&self, p: [f64; 2]) -> bool {
++        p[0] >= self.lo[0] && p[0] <= self.hi[0] && p[1] >= self.lo[1] && p[1] <= self.hi[1]
++    }
++
++    /// Liang-Barsky: the parameter span of `a`-`b` inside the box, if any.
++    fn clip(&self, a: [f64; 2], b: [f64; 2]) -> Option<(f64, f64)> {
++        let d = [b[0] - a[0], b[1] - a[1]];
++        let (mut t0, mut t1) = (0.0f64, 1.0f64);
++        for (p, q) in [
++            (-d[0], a[0] - self.lo[0]),
++            (d[0], self.hi[0] - a[0]),
++            (-d[1], a[1] - self.lo[1]),
++            (d[1], self.hi[1] - a[1]),
++        ] {
++            if p == 0.0 {
++                if q < 0.0 {
++                    return None;
++                }
++            } else {
++                let r = q / p;
++                if p < 0.0 {
++                    t0 = t0.max(r);
++                } else {
++                    t1 = t1.min(r);
++                }
++            }
++        }
++        (t0 <= t1 && t0.is_finite() && t1.is_finite()).then_some((t0, t1))
++    }
++}
++
++fn lerp(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
++    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
++}
++
++/// Up to [`SIGHT_SAMPLES`] of `pts`, evenly spread.
++fn spread(pts: &[[f64; 3]]) -> impl Iterator<Item = [f64; 3]> + '_ {
++    let step = pts.len().div_ceil(SIGHT_SAMPLES).max(1);
++    pts.iter().step_by(step).copied()
++}
++
++struct Ctx<'a> {
++    bodies: &'a [PickBody],
++    q: &'a BoxQuery<'a>,
++    rect: Rect,
++    dir: [f64; 3],
++}
++
++impl Ctx<'_> {
++    fn seen(&self, own: usize, samples: &[[f64; 3]]) -> bool {
++        !samples.is_empty()
++            && (self.q.through || spread(samples).any(|p| !occluded(self.bodies, own, &self.q.view, self.dir, p)))
++    }
++
++    /// A feature chain's verdict: the sample points it offers the sight
++    /// test (world), or `None` when the box rule leaves it out.
++    fn chain_samples(&self, b: &PickBody, g: &FeatureGraph, edges: &[u32]) -> Option<Vec<[f64; 3]>> {
++        let mut samples = Vec::new();
++        for &ei in edges {
++            let (a, z) = g.edge_ends(ei)?;
++            let (wa, wz) = (world_of(b, a), world_of(b, z));
++            let (pa, pz) = ((self.q.project)(wa), (self.q.project)(wz));
++            match self.q.mode {
++                BoxMode::Window => {
++                    let (pa, pz) = (pa?, pz?);
++                    if !(self.rect.holds(pa) && self.rect.holds(pz)) {
++                        return None;
++                    }
++                    samples.push(lerp(wa, wz, 0.5));
++                }
++                BoxMode::Crossing => {
++                    if let (Some(pa), Some(pz)) = (pa, pz)
++                        && let Some((t0, t1)) = self.rect.clip(pa, pz)
++                    {
++                        samples.push(lerp(wa, wz, 0.5 * (t0 + t1)));
++                    }
++                }
++            }
++        }
++        (!samples.is_empty()).then_some(samples)
++    }
++
++    /// A welded face's sight samples (facet centroids in the box), or
++    /// `None` when the box rule leaves it out.
++    fn face_samples(&self, b: &PickBody, facets: &[u32]) -> Option<Vec<[f64; 3]>> {
++        let mut samples = Vec::new();
++        for &fi in facets {
++            let t = b.tris.get(fi as usize)?;
++            let w = [t.a, t.b, t.c].map(|p| world_of(b, [p.x, p.y, p.z]));
++            let px = w.map(|p| (self.q.project)(p));
++            let c = [
++                (w[0][0] + w[1][0] + w[2][0]) / 3.0,
++                (w[0][1] + w[1][1] + w[2][1]) / 3.0,
++                (w[0][2] + w[1][2] + w[2][2]) / 3.0,
++            ];
++            match self.q.mode {
++                BoxMode::Window => {
++                    if !px.iter().all(|p| p.is_some_and(|p| self.rect.holds(p))) {
++                        return None;
++                    }
++                    samples.push(c);
++                }
++                BoxMode::Crossing => {
++                    let [Some(a), Some(bb), Some(cc)] = px else { continue };
++                    if self.touches(a, bb, cc) {
++                        samples.push(c);
++                    }
++                }
++            }
++        }
++        (!samples.is_empty()).then_some(samples)
++    }
++
++    /// Does the projected triangle meet the box?
++    fn touches(&self, a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
++        if [a, b, c].iter().any(|p| self.rect.holds(*p)) || [(a, b), (b, c), (c, a)].iter().any(|(p, q)| self.rect.clip(*p, *q).is_some()) {
++            return true;
++        }
++        // The box wholly inside the triangle: its centre is.
++        let m = [(self.rect.lo[0] + self.rect.hi[0]) * 0.5, (self.rect.lo[1] + self.rect.hi[1]) * 0.5];
++        let side = |p: [f64; 2], q: [f64; 2]| (q[0] - p[0]) * (m[1] - p[1]) - (q[1] - p[1]) * (m[0] - p[0]);
++        let s = [side(a, b), side(b, c), side(c, a)];
++        s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
++    }
++}
++
++/// The box rule over explicit bodies: the selections the box takes, in
++/// body order, each once. `take` says which bodies offer candidates (a
++/// box picks part features, so the caller leaves out stock and fixtures);
++/// every body still occludes. Degenerate input (an empty or non-finite
++/// box, a zero view direction) takes nothing - never a panic.
++#[must_use]
++pub fn box_bodies(bodies: &[PickBody], q: &BoxQuery<'_>, take: impl Fn(&PickBody) -> bool) -> Vec<GeoSel> {
++    let Some(rect) = Rect::of(q.corners) else { return Vec::new() };
++    let d0 = q.view.dir;
++    let len = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2]).sqrt();
++    if !(len.is_finite() && len > 1e-12 && q.view.origin.iter().all(|v| v.is_finite())) {
++        return Vec::new();
++    }
++    let ctx = Ctx { bodies, q, rect, dir: [d0[0] / len, d0[1] / len, d0[2] / len] };
++    let mut out: Vec<GeoSel> = Vec::new();
++    let mut push = |entity: &str, feature: FeatureSel| {
++        if !out.iter().any(|g| g.entity == entity && g.feature == feature) {
++            out.push(GeoSel { entity: entity.to_string(), feature });
++        }
++    };
++    for (bi, b) in bodies.iter().enumerate() {
++        if !take(b) {
++            continue;
++        }
++        let g = &b.graph;
++        if q.kinds.edges {
++            for c in g.chains().iter().filter(|c| is_feature_chain(g, c)) {
++                if ctx.chain_samples(b, g, &c.edges).is_some_and(|s| ctx.seen(bi, &s)) {
++                    push(&b.name, FeatureSel::Chain(c.id));
++                }
++            }
++        }
++        if q.kinds.faces {
++            for f in &g.faces {
++                let Some(sel) = f.sel else { continue };
++                if ctx.face_samples(b, &f.facets).is_some_and(|s| ctx.seen(bi, &s)) {
++                    push(&b.name, sel);
++                }
++            }
++        }
++    }
++    out
++}
++
++/// The box rule over the world's pickable bodies ([`pick_bodies_of`]:
++/// what the viewport draws, less what `skip` hides). Candidates are the
++/// user's parts only - never stock, never a fixture - though both still
++/// hide what lies behind them.
++#[must_use]
++pub fn box_select(world: &World, q: &BoxQuery<'_>, skip: impl Fn(&str) -> bool) -> Vec<GeoSel> {
++    let bodies = pick_bodies_of(world, skip);
++    box_bodies(&bodies, q, |b| part_body(world, b))
++}
++
++fn part_body(world: &World, b: &PickBody) -> bool {
++    !b.stock
++        && model::find_by_name(world, &b.name).is_some_and(|e| model::is_model(world, &e) && !model::is_fixture(world, &e))
++}
++
++/// The box rule seen from straight above (+Z, orthographic): `corners`
++/// are world X/Y, mm. The headless twin of the viewport box (MCP
++/// `pick_in_box`), with the same visibility law - an edge under the top
++/// face is hidden from above, as it is in the Top view.
++#[must_use]
++pub fn box_select_top(world: &World, corners: [[f64; 2]; 2], mode: BoxMode, kinds: PickKinds) -> Vec<GeoSel> {
++    let bodies = pick_bodies_of(world, |_| false);
++    // The sight lines start just above everything drawn: a far eye would
++    // stretch the occlusion slack, which grows with the sight length.
++    let top = bodies
++        .iter()
++        .flat_map(|b| b.tris.iter().flat_map(move |t| [t.a, t.b, t.c].map(|p| world_of(b, [p.x, p.y, p.z])[2])))
++        .filter(|z| z.is_finite())
++        .fold(f64::NEG_INFINITY, f64::max);
++    if !top.is_finite() {
++        return Vec::new();
++    }
++    let project = |p: [f64; 3]| Some([p[0], p[1]]);
++    let view = PickRay { origin: [0.0, 0.0, top + 10.0], dir: [0.0, 0.0, -1.0], projection: Projection::Ortho };
++    let q = BoxQuery { project: &project, corners, mode, kinds, view, through: false };
++    box_bodies(&bodies, &q, |b| part_body(world, b))
++}
+diff --git a/crates/app/src/pick/feature_pick.rs b/crates/app/src/pick/feature_pick.rs
+index 32fe52f1f..e5946b5c3 100644
+--- a/crates/app/src/pick/feature_pick.rs
++++ b/crates/app/src/pick/feature_pick.rs
+@@ -161,7 +161,7 @@ fn along(o: [f64; 3], d: [f64; 3], t: f64) -> [f64; 3] {
+     [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t]
+ }
+ 
+-fn world_of(b: &PickBody, p: [f64; 3]) -> [f64; 3] {
++pub(super) fn world_of(b: &PickBody, p: [f64; 3]) -> [f64; 3] {
+     a3(transform_point(p3(p), b.pose.pos, b.pose.rot))
+ }
+ 
+@@ -187,7 +187,7 @@ fn segment_near_ray(o: [f64; 3], d: [f64; 3], a: [f64; 3], b: [f64; 3]) -> [f64;
+ 
+ /// Does any occluding facet cross the sight segment from `p` (world)
+ /// back to the viewer before reaching `p`?
+-fn occluded(bodies: &[PickBody], own: usize, ray: &PickRay, d: [f64; 3], p: [f64; 3]) -> bool {
++pub(super) fn occluded(bodies: &[PickBody], own: usize, ray: &PickRay, d: [f64; 3], p: [f64; 3]) -> bool {
+     let eye = match ray.projection {
+         Projection::Perspective => ray.origin,
+         Projection::Ortho => along(p, d, -dot(sub(p, ray.origin), d)),
+diff --git a/crates/app/tests/box_pick.rs b/crates/app/tests/box_pick.rs
+new file mode 100644
+index 000000000..7cdea6c7c
+--- /dev/null
++++ b/crates/app/tests/box_pick.rs
+@@ -0,0 +1,260 @@
++//! #979: box selection under the one pick rule (#692). A plate with two
++//! square through-cutouts, seen from straight above: a window box around
++//! one cutout takes exactly its four top-rim chains; a box around the
++//! whole plate takes every top rim chain and nothing under the top face;
++//! pick-through is what brings the hidden rims in; a crossing box takes
++//! what it touches; faces box the same way; degenerate boxes take
++//! nothing. Plus the MCP twin, `pick_in_box`: one undo step, undo
++//! restores, refusals by name.
++//!
++//! Gate map (#979): covers app::pick::box_pick, app::pick::feature_pick
++//! (occluded), app::mcp::box_pick, app::commands (SetOperationGeometry).
++
++use std::path::PathBuf;
++use std::sync::Arc;
++
++use camcraft_app::geometry::{Point3, Triangle};
++use camcraft_app::mcp::Server;
++use camcraft_app::operation::{FeatureSel, GeoSel};
++use camcraft_app::pick::{BoxMode, BoxQuery, PickBody, PickKinds, PickRay, Projection, box_bodies};
++use camcraft_app::schema::Location;
++use serde_json::{Value, json};
++
++type P = [f64; 3];
++
++const XS: [f64; 6] = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
++const YS: [f64; 4] = [0.0, 20.0, 40.0, 60.0];
++const TOP: f64 = 10.0;
++/// The cutouts: grid cells (1, 1) and (3, 1) - [20, 40] and [60, 80] in X,
++/// [20, 40] in Y.
++const HOLES: [(usize, usize); 2] = [(1, 1), (3, 1)];
++
++fn quad(out: &mut Vec<Triangle>, q: [P; 4], n: P) {
++    let p = |v: P| Point3::new(v[0], v[1], v[2]);
++    let c = (p(q[1]) - p(q[0])).cross(p(q[2]) - p(q[0]));
++    let q = if c.x * n[0] + c.y * n[1] + c.z * n[2] < 0.0 { [q[0], q[3], q[2], q[1]] } else { q };
++    out.push(Triangle::new(p(q[0]), p(q[1]), p(q[2])));
++    out.push(Triangle::new(p(q[0]), p(q[2]), p(q[3])));
++}
++
++/// A 100 x 60 x 10 plate on a 20 mm grid with the two cutouts: each solid
++/// cell is a top and a bottom quad, and every side it shares with a hole
++/// or the outside is a wall quad.
++fn plate() -> Vec<Triangle> {
++    let solid = |i: isize, j: isize| {
++        (0..5).contains(&i) && (0..3).contains(&j) && !HOLES.contains(&(i as usize, j as usize))
++    };
++    let mut t = Vec::new();
++    for i in 0..5isize {
++        for j in 0..3isize {
++            if !solid(i, j) {
++                continue;
++            }
++            let (x0, x1, y0, y1) = (XS[i as usize], XS[i as usize + 1], YS[j as usize], YS[j as usize + 1]);
++            let sq = |z: f64| [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]];
++            quad(&mut t, sq(TOP), [0.0, 0.0, 1.0]);
++            quad(&mut t, sq(0.0), [0.0, 0.0, -1.0]);
++            for (di, dj, a, b) in [(-1, 0, [x0, y0], [x0, y1]), (1, 0, [x1, y0], [x1, y1]), (0, -1, [x0, y0], [x1, y0]), (0, 1, [x0, y1], [x1, y1])] {
++                if !solid(i + di, j + dj) {
++                    let wall = [[a[0], a[1], 0.0], [b[0], b[1], 0.0], [b[0], b[1], TOP], [a[0], a[1], TOP]];
++                    quad(&mut t, wall, [di as f64, dj as f64, 0.0]);
++                }
++            }
++        }
++    }
++    t
++}
++
++fn body() -> PickBody {
++    PickBody::new("plate", Arc::from(plate()), Location::default())
++}
++
++/// The top-down view's 2D frame is world X/Y itself.
++fn top_xy(p: P) -> Option<[f64; 2]> {
++    Some([p[0], p[1]])
++}
++
++fn boxed(b: &PickBody, corners: [[f64; 2]; 2], mode: BoxMode, kinds: PickKinds, view: PickRay, through: bool) -> Vec<GeoSel> {
++    let q = BoxQuery { project: &top_xy, corners, mode, kinds, view, through };
++    box_bodies(std::slice::from_ref(b), &q, |_| true)
++}
++
++fn ortho() -> PickRay {
++    PickRay { origin: [50.0, 30.0, 40.0], dir: [0.0, 0.0, -1.0], projection: Projection::Ortho }
++}
++
++/// Every end point of a picked chain, local = world here.
++fn ends(b: &PickBody, g: &GeoSel) -> Vec<P> {
++    let FeatureSel::Chain(id) = g.feature else { panic!("not a chain: {g:?}") };
++    let c = b.graph.chains().iter().find(|c| c.id == id).expect("the chain is the plate's");
++    c.edges.iter().flat_map(|e| {
++        let (a, z) = b.graph.edge_ends(*e).expect("edge resolves");
++        [a, z]
++    }).collect()
++}
++
++fn in_rect(p: P, lo: [f64; 2], hi: [f64; 2]) -> bool {
++    p[0] >= lo[0] - 1e-9 && p[0] <= hi[0] + 1e-9 && p[1] >= lo[1] - 1e-9 && p[1] <= hi[1] + 1e-9
++}
++
++#[test]
++fn a_window_around_one_cutout_takes_exactly_its_top_rim() {
++    let b = body();
++    let picks = boxed(&b, [[15.0, 15.0], [45.0, 45.0]], BoxMode::Window, PickKinds::EDGES, ortho(), false);
++    assert_eq!(picks.len(), 4, "the cutout's four top-rim chains, nothing hidden: {picks:?}");
++    for g in &picks {
++        assert_eq!(g.entity, "plate");
++        for p in ends(&b, g) {
++            assert!((p[2] - TOP).abs() < 1e-9, "a rim under the top face was taken: {p:?}");
++            assert!(in_rect(p, [20.0, 20.0], [40.0, 40.0]), "a chain off the cutout: {p:?}");
++        }
++    }
++    // Visible means visible: an eye in perspective straight over the
++    // cutout looks down into it and sees its walls' corners and its
++    // bottom rim too - and still nothing of the rest of the plate.
++    let eye = PickRay { origin: [30.0, 30.0, 200.0], dir: [0.0, 0.0, -1.0], projection: Projection::Perspective };
++    let persp = boxed(&b, [[15.0, 15.0], [45.0, 45.0]], BoxMode::Window, PickKinds::EDGES, eye, false);
++    assert_eq!(persp.len(), 12, "top rim, vertical corners and bottom rim: {persp:?}");
++    assert!(picks.iter().all(|g| persp.contains(g)));
++    assert!(persp.iter().all(|g| ends(&b, g).iter().all(|p| in_rect(*p, [20.0, 20.0], [40.0, 40.0]))));
++}
++
++#[test]
++fn a_window_around_everything_takes_every_top_rim_chain_and_no_hidden_one() {
++    let b = body();
++    let all = [[-5.0, -5.0], [105.0, 65.0]];
++    let picks = boxed(&b, all, BoxMode::Window, PickKinds::EDGES, ortho(), false);
++    assert_eq!(picks.len(), 4 + 4 * HOLES.len(), "outer rim + each cutout's rim, top only: {picks:?}");
++    assert!(picks.iter().all(|g| ends(&b, g).iter().all(|p| (p[2] - TOP).abs() < 1e-9)), "a hidden chain was taken");
++    // The hidden rims and the vertical corner edges are there to take -
++    // only pick-through takes them.
++    let through = boxed(&b, all, BoxMode::Window, PickKinds::EDGES, ortho(), true);
++    assert_eq!(through.len(), 3 * (4 + 4 * HOLES.len()), "top rims, bottom rims and the vertical corners: {through:?}");
++    assert!(picks.iter().all(|g| through.contains(g)));
++    // Seen from below, the bottom rims are the visible ones.
++    let below = PickRay { origin: [50.0, 30.0, -40.0], dir: [0.0, 0.0, 1.0], projection: Projection::Ortho };
++    let under = boxed(&b, all, BoxMode::Window, PickKinds::EDGES, below, false);
++    assert_eq!(under.len(), picks.len());
++    assert!(under.iter().all(|g| ends(&b, g).iter().all(|p| p[2].abs() < 1e-9)), "from below only the bottom rims");
++}
++
++#[test]
++fn a_crossing_box_takes_what_it_touches_a_window_only_what_it_holds() {
++    let b = body();
++    // A sliver over the left side of the first cutout (x = 20, y 20..40).
++    let sliver = [[18.0, 25.0], [22.0, 35.0]];
++    assert!(boxed(&b, sliver, BoxMode::Window, PickKinds::EDGES, ortho(), false).is_empty(), "nothing lies wholly inside");
++    let picks = boxed(&b, sliver, BoxMode::Crossing, PickKinds::EDGES, ortho(), false);
++    assert_eq!(picks.len(), 1, "the one rim side it crosses: {picks:?}");
++    assert!(ends(&b, &picks[0]).iter().all(|p| (p[0] - 20.0).abs() < 1e-9 && (p[2] - TOP).abs() < 1e-9));
++    // The drag direction picks the convention.
++    assert_eq!(BoxMode::of_drag(10.0, 30.0), BoxMode::Window);
++    assert_eq!(BoxMode::of_drag(30.0, 10.0), BoxMode::Crossing);
++}
++
++#[test]
++fn faces_box_the_same_way_and_hidden_faces_stay_out() {
++    let b = body();
++    let picks = boxed(&b, [[-5.0, -5.0], [105.0, 65.0]], BoxMode::Window, PickKinds::FACES, ortho(), false);
++    assert_eq!(picks.len(), 1, "from above only the top face shows: {picks:?}");
++    assert!(matches!(picks[0].feature, FeatureSel::Face(_)));
++    let top = b.graph.faces.iter().find(|f| f.sel == Some(picks[0].feature)).expect("the face is the plate's");
++    let t = &b.tris[top.facets[0] as usize];
++    assert!((t.a.z - TOP).abs() < 1e-9, "the top face, not the bottom");
++    // A window over one cutout holds no whole face; a crossing box
++    // touches the top face (and its walls stay hidden).
++    let cut = [[15.0, 15.0], [45.0, 45.0]];
++    assert!(boxed(&b, cut, BoxMode::Window, PickKinds::FACES, ortho(), false).is_empty());
++    assert_eq!(boxed(&b, cut, BoxMode::Crossing, PickKinds::FACES, ortho(), false), picks);
++}
++
++#[test]
++fn degenerate_boxes_take_nothing() {
++    let b = body();
++    let k = PickKinds::EDGES;
++    assert!(boxed(&b, [[10.0, 10.0], [10.0, 50.0]], BoxMode::Window, k, ortho(), false).is_empty(), "zero width");
++    assert!(boxed(&b, [[f64::NAN, 0.0], [100.0, 60.0]], BoxMode::Crossing, k, ortho(), false).is_empty(), "NaN");
++    let bad = PickRay { origin: [0.0; 3], dir: [0.0; 3], projection: Projection::Ortho };
++    assert!(boxed(&b, [[-5.0, -5.0], [105.0, 65.0]], BoxMode::Window, k, bad, false).is_empty(), "no view direction");
++    // Nothing projects: nothing is taken, nothing panics.
++    let q = BoxQuery { project: &|_| None, corners: [[-5.0, -5.0], [105.0, 65.0]], mode: BoxMode::Crossing, kinds: PickKinds::ALL, view: ortho(), through: false };
++    assert!(box_bodies(std::slice::from_ref(&b), &q, |_| true).is_empty());
++}
++
++// ---- the MCP twin --------------------------------------------------------
++
++fn write_plate_stl() -> PathBuf {
++    let mut dir = std::env::temp_dir();
++    dir.push(format!("camcraft-box-pick-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let path = dir.join("plate.stl");
++    let mut s = String::from("solid plate\n");
++    for t in plate() {
++        s.push_str(" facet normal 0 0 0\n  outer loop\n");
++        for p in [t.a, t.b, t.c] {
++            s.push_str(&format!("   vertex {} {} {}\n", p.x, p.y, p.z));
++        }
++        s.push_str("  endloop\n endfacet\n");
++    }
++    s.push_str("endsolid plate\n");
++    std::fs::write(&path, s).expect("write stl");
++    path
++}
++
++fn call(server: &mut Server, id: i64, name: &str, args: Value) -> (bool, Value) {
++    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
++    let reply = server.handle(&msg).expect("a request gets a response");
++    let result = &reply["result"];
++    let err = result["isError"] == json!(true);
++    (err, if err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() })
++}
++
++#[test]
++fn mcp_pick_in_box_adds_the_rim_in_one_undo_step() {
++    let stl = write_plate_stl();
++    let mut s = Server::new();
++    let ok = |s: &mut Server, id: i64, name: &str, args: Value| {
++        let (err, body) = call(s, id, name, args);
++        assert!(!err, "{name} refused: {body}");
++        body
++    };
++    ok(&mut s, 1, "import_model", json!({ "path": stl.display().to_string() }));
++    ok(&mut s, 2, "set_stock", json!({ "box": { "dx": 100.0, "dy": 60.0, "dz": 10.0 } }));
++    ok(&mut s, 3, "add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    ok(&mut s, 4, "add_operation", json!({ "kind": "contour", "tool": "EM-0400-2FL", "name": "C1", "source": "plate" }));
++    let before = ok(&mut s, 5, "get_operation_geometry", json!({ "operation": "C1" }));
++
++    let one = ok(&mut s, 6, "pick_in_box", json!({ "operation": "C1", "box": { "x0": 15.0, "y0": 15.0, "x1": 45.0, "y1": 45.0 } }));
++    assert_eq!(one["added"], json!(4), "{one}");
++    assert_eq!(one["source"]["picks"].as_array().map(Vec::len), Some(4), "{one}");
++    // A second box adds the other cutout to the list.
++    let two = ok(&mut s, 7, "pick_in_box", json!({ "operation": "C1", "box": { "x0": 85.0, "y0": 45.0, "x1": 55.0, "y1": 15.0 } }));
++    assert_eq!(two["added"], json!(4), "{two}");
++    assert_eq!(two["source"]["picks"].as_array().map(Vec::len), Some(8), "{two}");
++    // The same box again changes nothing, and says so.
++    let (err, msg) = call(&mut s, 8, "pick_in_box", json!({ "operation": "C1", "box": { "x0": 85.0, "y0": 45.0, "x1": 55.0, "y1": 15.0 } }));
++    assert!(err && msg.as_str().is_some_and(|m| m.contains("already picked")), "{msg}");
++    // Undo takes one box back at a time.
++    ok(&mut s, 9, "undo", json!({}));
++    let back = ok(&mut s, 10, "get_operation_geometry", json!({ "operation": "C1" }));
++    assert_eq!(back["source"], one["source"], "one undo, one box");
++    ok(&mut s, 11, "undo", json!({}));
++    let first = ok(&mut s, 12, "get_operation_geometry", json!({ "operation": "C1" }));
++    assert_eq!(first["source"], before["source"], "undo restores the previous source");
++
++    // Everything, replacing: every top rim chain, nothing hidden.
++    let all = ok(&mut s, 13, "pick_in_box", json!({ "operation": "C1", "replace": true, "box": { "x0": -5.0, "y0": -5.0, "x1": 105.0, "y1": 65.0 } }));
++    assert_eq!(all["added"], json!(12), "{all}");
++    // Refusals by name, never a panic.
++    for (args, want) in [
++        (json!({ "operation": "C1", "box": { "x0": 1.0, "y0": 1.0, "x1": 2.0, "y1": 2.0 } }), "no visible edge chain"),
++        (json!({ "operation": "C1", "box": { "x0": 1.0, "y0": 1.0, "x1": 1.0, "y1": 9.0 } }), "no area"),
++        (json!({ "operation": "C1", "box": { "x0": 1.0, "y0": 1.0, "x1": 9.0 } }), "\"y1\""),
++        (json!({ "operation": "C1", "mode": "lasso", "box": { "x0": 0.0, "y0": 0.0, "x1": 9.0, "y1": 9.0 } }), "unknown mode"),
++        (json!({ "operation": "Nope", "box": { "x0": 0.0, "y0": 0.0, "x1": 9.0, "y1": 9.0 } }), "Nope"),
++    ] {
++        let (err, msg) = call(&mut s, 20, "pick_in_box", args);
++        assert!(err && msg.as_str().is_some_and(|m| m.contains(want)), "{want}: {msg}");
++    }
++}
+diff --git a/crates/ui/src/box_pick.rs b/crates/ui/src/box_pick.rs
+new file mode 100644
+index 000000000..94e609fdc
+--- /dev/null
++++ b/crates/ui/src/box_pick.rs
+@@ -0,0 +1,133 @@
++//! The viewport box select (#979): Ctrl (or Shift) + left drag in Edge or
++//! Face mode, with an operation open, draws a rubber band instead of
++//! orbiting; its release adds every visible feature edge chain (Edge
++//! mode) or welded face (Face mode) in the box to the operation's pick
++//! list as ONE `SetOperationGeometry` - one undo step. A drag to the
++//! right is a window (wholly inside), to the left a crossing box (inside
++//! or touching). The geometry rule is the app's (`pick::box_select`, the
++//! #692 one pick rule: feature chains only, nothing hidden); this module
++//! only arms the gesture and routes the answer.
++//!
++//! Provenance: rubber-band window/crossing selection as public CAD user
++//! documentation describes it; our own routing over our own pick API. No
++//! vendor material consulted.
++
++use camcraft_app::operation::{GeoSel, SrcRef};
++use camcraft_app::pick::{self, BoxMode, BoxQuery, PickKinds, PickRay, Projection};
++use camcraft_app::model;
++
++use crate::interact::{Mods, project_uv, ray_at};
++use crate::state::{CommandKind, GeoPick, State};
++use crate::viewport::ProjectionMode;
++
++/// Does a left drag with these modifiers draw a pick box rather than
++/// orbit? Only when it would add operation geometry: Ctrl or Shift held
++/// (the add-to-selection keys), Edge or Face mode, an operation open, and
++/// no other pick draft (boundary, locate, plane, axis, points) collecting.
++pub(crate) fn armed(state: &State, mods: Mods) -> bool {
++    (mods.ctrl || mods.shift)
++        && matches!(state.geo_pick, GeoPick::Edge | GeoPick::Face)
++        && !state.op_ui.name.is_empty()
++        && state.boundary_pick.is_none()
++        && state.locate_pick.is_none()
++        && state.points_pick.is_none()
++        && !crate::plane_pick::collecting(state)
++        && !crate::axis_pick::collecting(state)
++}
++
++/// Window or crossing, by the drag's direction.
++pub(crate) fn mode_of(b: [[f32; 2]; 2]) -> BoxMode {
++    BoxMode::of_drag(f64::from(b[0][0]), f64::from(b[1][0]))
++}
++
++/// What the box takes in the viewport: the visible feature chains (Edge
++/// mode) or welded faces (Face mode) in `b`, logical px.
++pub(crate) fn picks_in(state: &State, b: [[f32; 2]; 2]) -> Vec<GeoSel> {
++    let ([x0, y0], [x1, y1]) = state.viewport_rect;
++    let (w, h) = (x1 - x0, y1 - y0);
++    if w <= 1.0 || h <= 1.0 {
++        return Vec::new();
++    }
++    let kinds = match state.geo_pick {
++        GeoPick::Face => PickKinds::FACES,
++        _ => PickKinds::EDGES,
++    };
++    // The sight line the occlusion test runs back along: the eye in
++    // perspective, the view direction in orthographic.
++    let mid = [(b[0][0] + b[1][0]) * 0.5, (b[0][1] + b[1][1]) * 0.5];
++    let Some((origin, dir)) = ray_at(state, mid) else { return Vec::new() };
++    let projection = match state.cam.projection {
++        ProjectionMode::Orthographic => Projection::Ortho,
++        ProjectionMode::Perspective => Projection::Perspective,
++    };
++    let mvp = state.cam.mvp(f64::from(w / h));
++    let project = |p: [f64; 3]| {
++        project_uv(&mvp, p).map(|uv| [f64::from(x0 + uv[0] * w), f64::from(y0 + uv[1] * h)])
++    };
++    let corners = b.map(|p| [f64::from(p[0]), f64::from(p[1])]);
++    let q = BoxQuery {
++        project: &project,
++        corners,
++        mode: mode_of(b),
++        kinds,
++        view: PickRay { origin, dir, projection },
++        through: false, // pick-through is not offered (#692's decision record)
++    };
++    pick::box_select(&state.world, &q, |name| state.hidden_in_view(name))
++}
++
++/// The release of a pick box: add what it holds to the open operation's
++/// picks, as one command. Says what it did in the status, a miss too.
++pub(crate) fn finish(state: &mut State, b: [[f32; 2]; 2]) {
++    let name = state.op_ui.name.clone();
++    if name.is_empty() {
++        state.status = String::from("open an operation first - geometry picks fill the open one");
++        return;
++    }
++    let what = if state.geo_pick == GeoPick::Face { "face" } else { "edge chain" };
++    let how = match mode_of(b) {
++        BoxMode::Window => "inside",
++        BoxMode::Crossing => "touching",
++    };
++    let found = picks_in(state, b);
++    if found.is_empty() {
++        state.status = format!("no visible {what} {how} the box");
++        return;
++    }
++    let mut items: Vec<GeoSel> = model::find_by_name(&state.world, &name)
++        .and_then(|e| model::operation_of(&state.world, &e))
++        .map_or(Vec::new(), |op| match op.src {
++            SrcRef::Selection(items) => items,
++            _ => Vec::new(),
++        });
++    let before = items.len();
++    for g in found {
++        if !items.contains(&g) {
++            items.push(g);
++        }
++    }
++    let added = items.len() - before;
++    if added == 0 {
++        state.status = format!("every {what} {how} the box is already selected in {name}");
++        return;
++    }
++    state.status = format!("{added} {what}(s) {how} the box added to {name}");
++    state.pending.push_back(CommandKind::SetOperationGeometry { name, items });
++}
++
++/// Paint the rubber band: a window box solid with a light veil, a
++/// crossing box dashed - the two read apart at a glance.
++pub(crate) fn paint(painter: &egui::Painter, b: [[f32; 2]; 2], ink: egui::Color32) {
++    let r = egui::Rect::from_two_pos(egui::pos2(b[0][0], b[0][1]), egui::pos2(b[1][0], b[1][1]));
++    let stroke = egui::Stroke::new(1.0, ink);
++    match mode_of(b) {
++        BoxMode::Window => {
++            painter.rect_filled(r, 0.0, ink.gamma_multiply(0.12));
++            painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Inside);
++        }
++        BoxMode::Crossing => {
++            let c = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
++            painter.extend(egui::Shape::dashed_line(&c, stroke, 5.0, 4.0));
++        }
++    }
++}
+diff --git a/crates/ui/src/egui_app/geo_page.rs b/crates/ui/src/egui_app/geo_page.rs
+index 51a4f96b2..2eaac1155 100644
+--- a/crates/ui/src/egui_app/geo_page.rs
++++ b/crates/ui/src/egui_app/geo_page.rs
+@@ -27,7 +27,7 @@ fn body(ui: &mut Ui, state: &mut State, target: &str, live_setup: Option<&str>)
+     // Viewport pick mode - transient view state: the mode itself is not
+     // undoable; what a Face/Edge click changes is.
+     ui.horizontal_wrapped(|ui| {
+-        ui.label("Click selects:").on_hover_text("Click in the viewport - Ctrl adds; in Edge mode Shift takes the whole loop and Alt one edge.");
++        ui.label("Click selects:").on_hover_text("Click in the viewport - Ctrl adds; in Edge mode Shift takes the whole loop and Alt one edge. Ctrl+drag adds every visible edge (Edge) or face (Face) in a box: drag right for what lies inside it, left for what it touches.");
+         let mut pick_mode = match state.geo_pick {
+             GeoPick::Model => 0,
+             GeoPick::Face => 1,
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index bb8ca2af8..c288e3e20 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -259,7 +259,9 @@ impl TabViewer for ShellTabs<'_> {
+ /// The viewport tab: the 3D image, the pointer law, and the screen-space
+ /// overlays. M-e moved the law to `crate::interact`, where the retired
+ /// imgui shell had it first: a short LMB press picks (Ctrl adds, the
+-/// gesture table), an LMB drag past the click-travel threshold orbits, MMB
++/// gesture table), an LMB drag past the click-travel threshold orbits (a
++/// Ctrl/Shift drag in Edge/Face mode with an op open draws a pick box
++/// instead, #979 - `crate::box_pick`), MMB
+ /// orbits, RMB pans, wheel dollies toward the cursor. egui's press/drag
+ /// bookkeeping differs from winit's raw stream, so the gestures are read
+ /// off `ui.input` directly, the same CLICK_TRAVEL_PX law applied by hand;
+@@ -487,6 +489,13 @@ fn viewport_panel(
+         if state.drag == Some(DragMode::Orbit) {
+             state.drag = None;
+         }
++        // #979: a pick box's release adds what it holds, as one command.
++        if let Some(mut b) = state.pick_box.take() {
++            if let Some(p) = pos {
++                b[1] = parr(p);
++            }
++            crate::box_pick::finish(state, b);
++        }
+         if let (Some(q), Some(p)) = (press, pos)
+             && (p - egui::pos2(q[0], q[1])).length() <= interact::CLICK_TRAVEL_PX
+             && interact::inside_viewport(state, parr(p))
+@@ -507,11 +516,20 @@ fn viewport_panel(
+             Some(DragMode::Orbit) => state.cam.orbit(motion.x, motion.y),
+             Some(DragMode::Pan) => state.cam.pan(motion.x, motion.y),
+             None => {
+-                if let (Some(q), Some(p)) = (*left_press, pos)
++                if let Some(b) = state.pick_box.as_mut()
++                    && let Some(p) = pos
++                {
++                    b[1] = parr(p); // #979: the rubber band follows
++                } else if let (Some(q), Some(p)) = (*left_press, pos)
+                     && p.distance(egui::pos2(q[0], q[1])) > interact::CLICK_TRAVEL_PX
+                 {
+-                    state.drag = Some(DragMode::Orbit);
+-                    state.cam.orbit(motion.x, motion.y);
++                    // #979: Ctrl/Shift + drag in Edge/Face mode boxes picks.
++                    if crate::box_pick::armed(state, mods) {
++                        state.pick_box = Some([q, parr(p)]);
++                    } else {
++                        state.drag = Some(DragMode::Orbit);
++                        state.cam.orbit(motion.x, motion.y);
++                    }
+                 }
+             }
+         }
+@@ -567,6 +585,11 @@ fn viewport_panel(
+         for (a, b) in interact::hover_features(state, aspect) {
+             ui.painter().line_segment([to_px(a), to_px(b)], egui::Stroke::new(1.0, rgb8(super::ground_ink::overlay(super::ground_ink::Overlay::Hover))));
+         }
++        // #979: the pick box's rubber band - solid for a window, dashed
++        // for a crossing box.
++        if let Some(b) = state.pick_box {
++            crate::box_pick::paint(ui.painter(), b, rgb8(super::ground_ink::overlay(super::ground_ink::Overlay::Hover)));
++        }
+         // The machined mesh's hovered facet (#25): the hover ink's yellow,
+         // a veil over the class colour and its outline.
+         if let Some(tri) = crate::machined::hover_facet_uv(state, aspect) {
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 5d507801a..035248fb5 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -126,6 +126,8 @@ mod fixture_rows;
+ mod model_fidelity;
+ // #709 hand check: both points of a two-point axis stay marked.
+ mod two_point_marks;
++// #979: the viewport box select.
++mod box_select;
+ 
+ /// What the per-frame state of `Shell` is, minus the GPU half: the fields
+ /// `shell_layout` touches, so the harness exercises the window's real body.
+diff --git a/crates/ui/src/egui_app/tests/box_select.rs b/crates/ui/src/egui_app/tests/box_select.rs
+new file mode 100644
+index 000000000..532bb1e80
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/box_select.rs
+@@ -0,0 +1,167 @@
++//! #979's frame test: the viewport box select, through egui's own pointer
++//! events. A plate with two square through-cutouts beside the seed's
++//! block, seen from the Top in orthographic: a Ctrl + left drag (left to
++//! right: a window) around one cutout in Edge mode draws a rubber band
++//! instead of orbiting, and its release adds exactly that cutout's four
++//! top-rim chains to Contour1 as ONE `SetOperationGeometry` - one undo
++//! restores the seed's pick. A plain drag still orbits; a right-to-left
++//! drag over one rim side is a crossing box and takes that side alone.
++//! Provenance: our own gesture test over our own shell; no vendor
++//! material consulted.
++
++use camcraft_app::commands::ImportModel;
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::operation::GeoSel;
++
++use super::*;
++
++type P = [f64; 3];
++
++/// The plate's X offset: clear of the seed's 60 x 60 x 30 block.
++const X0: f64 = 200.0;
++const TOP: f64 = 10.0;
++
++fn quad(out: &mut Vec<Triangle>, q: [P; 4], n: P) {
++    let p = |v: P| Point3::new(v[0], v[1], v[2]);
++    let c = (p(q[1]) - p(q[0])).cross(p(q[2]) - p(q[0]));
++    let q = if c.x * n[0] + c.y * n[1] + c.z * n[2] < 0.0 { [q[0], q[3], q[2], q[1]] } else { q };
++    out.push(Triangle::new(p(q[0]), p(q[1]), p(q[2])));
++    out.push(Triangle::new(p(q[0]), p(q[2]), p(q[3])));
++}
++
++/// 100 x 60 x 10 on a 20 mm grid at X0, cutouts at cells (1, 1) and
++/// (3, 1) - the app suite's `box_pick` plate, moved aside.
++fn plate() -> Mesh {
++    let holes = [(1, 1), (3, 1)];
++    let solid = |i: i32, j: i32| (0..5).contains(&i) && (0..3).contains(&j) && !holes.contains(&(i, j));
++    let mut t = Vec::new();
++    for i in 0..5 {
++        for j in 0..3 {
++            if !solid(i, j) {
++                continue;
++            }
++            let (x0, x1) = (X0 + 20.0 * f64::from(i), X0 + 20.0 * f64::from(i + 1));
++            let (y0, y1) = (20.0 * f64::from(j), 20.0 * f64::from(j + 1));
++            let sq = |z: f64| [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]];
++            quad(&mut t, sq(TOP), [0.0, 0.0, 1.0]);
++            quad(&mut t, sq(0.0), [0.0, 0.0, -1.0]);
++            for (di, dj, a, b) in [(-1, 0, [x0, y0], [x0, y1]), (1, 0, [x1, y0], [x1, y1]), (0, -1, [x0, y0], [x1, y0]), (0, 1, [x0, y1], [x1, y1])] {
++                if !solid(i + di, j + dj) {
++                    let wall = [[a[0], a[1], 0.0], [b[0], b[1], 0.0], [b[0], b[1], TOP], [a[0], a[1], TOP]];
++                    quad(&mut t, wall, [f64::from(di), f64::from(dj), 0.0]);
++                }
++            }
++        }
++    }
++    Mesh::from_facets(t)
++}
++
++fn px_of(sh: &ShellUi, q: P) -> egui::Pos2 {
++    let ([x0, y0], [x1, y1]) = sh.state.viewport_rect;
++    let (w, hgt) = (x1 - x0, y1 - y0);
++    let uv = interact::project_uv(&sh.state.cam.mvp(f64::from(w / hgt)), q).expect("on screen");
++    egui::pos2(x0 + uv[0] * w, y0 + uv[1] * hgt)
++}
++
++/// The screen rect a world X/Y box at the top face draws as (the Top
++/// view may stand at any quarter-turn roll).
++fn screen_box(sh: &ShellUi, lo: [f64; 2], hi: [f64; 2]) -> egui::Rect {
++    let c = [[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]].map(|q| px_of(sh, [q[0], q[1], TOP]));
++    egui::Rect::from_points(&c)
++}
++
++fn press(h: &mut Harness<'static, ShellUi>, p: egui::Pos2, pressed: bool, m: Modifiers) {
++    h.input_mut().events.push(Event::ModifiersChanged(m));
++    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: m });
++    h.run();
++}
++
++fn move_to(h: &mut Harness<'static, ShellUi>, p: egui::Pos2, m: Modifiers) {
++    h.input_mut().events.push(Event::ModifiersChanged(m));
++    h.input_mut().events.push(Event::PointerMoved(p));
++    h.run();
++}
++
++/// The plate beside the block, Contour1 open in Edge mode, the Top view
++/// in orthographic framing the plate.
++fn plate_harness() -> Harness<'static, ShellUi> {
++    let mut harness = shell_harness();
++    {
++        let st = &mut harness.state_mut().state;
++        st.history.execute(&st.world, ImportModel::from_mesh("plate", plate()));
++        crate::actions::target(st, UiTarget::Operation("Contour1".into()));
++    }
++    harness.run();
++    let st = &mut harness.state_mut().state;
++    st.geo_pick = GeoPick::Edge;
++    let cam = crate::viewport::Camera::frame([X0 + 50.0, 30.0, 5.0], 60.0).toward([0.0, 0.0, 1.0]);
++    st.cam = crate::viewport::Camera { projection: crate::viewport::ProjectionMode::Orthographic, ..cam };
++    harness.run();
++    harness
++}
++
++fn contour1(h: &Harness<'static, ShellUi>) -> Vec<GeoSel> {
++    let st = &h.state().state;
++    let op = model::find_by_name(&st.world, "Contour1").expect("seed has Contour1");
++    match model::operation_of(&st.world, &op).map(|o| o.src) {
++        Some(SrcRef::Selection(items)) => items,
++        _ => Vec::new(),
++    }
++}
++
++/// A drag from `a` to `b` with `m` held, through a midpoint, then the
++/// frames that drain what it queued.
++fn drag(h: &mut Harness<'static, ShellUi>, a: egui::Pos2, b: egui::Pos2, m: Modifiers) {
++    move_to(h, a, m);
++    press(h, a, true, m);
++    move_to(h, a + (b - a) * 0.5, m);
++    move_to(h, b, m);
++    {
++        let st = &h.state().state;
++        if m.ctrl {
++            assert!(st.pick_box.is_some(), "Ctrl + drag draws a pick box");
++            assert_eq!(st.drag, None, "a pick box never orbits");
++        }
++    }
++    press(h, b, false, m);
++    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
++    h.run_steps(2);
++}
++
++#[test]
++fn a_ctrl_drag_window_around_one_cutout_adds_its_rim_in_one_undo_step() {
++    let mut harness = plate_harness();
++    let before = contour1(&harness);
++    // Left to right: a window around the first cutout, [220, 240] x [20, 40].
++    let r = screen_box(harness.state(), [X0 + 15.0, 15.0], [X0 + 45.0, 45.0]);
++    let (a, b) = (r.left_top(), r.right_bottom());
++    drag(&mut harness, a, b, Modifiers::CTRL);
++    let st = &harness.state().state;
++    assert_eq!(st.pick_box, None, "the release ends the box");
++    let after = contour1(&harness);
++    assert_eq!(&after[..before.len()], &before[..], "the box adds to the picks");
++    let added = &after[before.len()..];
++    assert_eq!(added.len(), 4, "the cutout's four top-rim chains, nothing hidden: {added:?}");
++    assert!(added.iter().all(|g| g.entity == "plate" && matches!(g.feature, FeatureSel::Chain(_))));
++    // One undo restores the seed's pick.
++    harness.state_mut().state.pending.push_back(CommandKind::Undo);
++    harness.run_steps(2);
++    assert_eq!(contour1(&harness), before, "undo takes the whole box back");
++}
++
++#[test]
++fn a_right_to_left_drag_is_a_crossing_box_and_a_plain_drag_still_orbits() {
++    let mut harness = plate_harness();
++    let before = contour1(&harness);
++    // Right to left over the first cutout's left side (x = 220).
++    let r = screen_box(harness.state(), [X0 + 17.0, 25.0], [X0 + 23.0, 35.0]);
++    let (a, b) = (r.right_top(), r.left_bottom());
++    drag(&mut harness, a, b, Modifiers::CTRL);
++    let after = contour1(&harness);
++    assert_eq!(after.len(), before.len() + 1, "the one rim side it crosses: {after:?}");
++    // Without Ctrl the same drag orbits and picks nothing.
++    let yaw0 = harness.state().state.cam.yaw;
++    drag(&mut harness, a, b, Modifiers::NONE);
++    assert_ne!(harness.state().state.cam.yaw, yaw0, "a plain drag orbits");
++    assert_eq!(contour1(&harness), after, "an orbit picks nothing");
++}
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index e8e8e8628..d6bcaf3b3 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -21,6 +21,7 @@ pub mod actions;
+ mod axis_note;
+ mod build_info;
+ pub mod boundary_draft;
++pub mod box_pick;
+ pub mod boundary_viz;
+ pub mod plate_viz;
+ pub mod boundary_summary;
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 90d267106..5ea8a0ada 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1315,6 +1315,9 @@ pub struct State {
+     pub viewport_rect: ([f32; 2], [f32; 2]),
+     /// Live viewport drag (orbit/pan), driven by the shell's pointer layer.
+     pub drag: Option<DragMode>,
++    /// #979: the live box-select rubber band (press point, current point),
++    /// logical px. View state like `drag` - its release queues one command.
++    pub pick_box: Option<[[f32; 2]; 2]>,
+     /// Facet currently under the cursor (`interact` refreshes it from the
+     /// shell's pointer events with a filtered raycast; it clears when the
+     /// pointer leaves the viewport). View state like the camera and the
+@@ -1749,6 +1752,7 @@ impl State {
+             selection_version: 0,
+             viewport_rect: ([0.0, 0.0], [0.0, 0.0]),
+             drag: None,
++            pick_box: None,
+             hover: None,
+             hover_mesh: None,
+             viewport_hot: false,
+diff --git a/docs/decisions/979-box-select-picks.md b/docs/decisions/979-box-select-picks.md
+new file mode 100644
+index 000000000..5ff7e9c67
+--- /dev/null
++++ b/docs/decisions/979-box-select-picks.md
+@@ -0,0 +1,56 @@
++## #979 - Viewport box select into an operation's picks
++
++**Decided.**
++
++- **Gesture: Ctrl (or Shift) + left drag**, in Edge or Face mode with an
++  operation open and no other pick draft collecting (boundary, locate,
++  plane, axis, three points). Ctrl and Shift are the keys that already
++  mean "add" to a feature click (`queue_feature_pick`), so the box adds
++  to the op's picks; it never replaces them. A plain left drag still
++  orbits, exactly as before - no existing gesture changes meaning.
++- **Window and crossing, by drag direction** (the long-standing CAD
++  convention): a drag to the right is a window and takes what lies
++  wholly inside the box; a drag to the left is a crossing box and also
++  takes what it touches. The rubber band shows which: solid with a light
++  veil for a window, dashed for a crossing box.
++- **What it takes follows the mode**: Edge mode takes feature edge
++  chains (the tangent chain, `EdgeUnit::Chain` - what an op's click pick
++  stores); Face mode takes welded faces. Vertex mode does not box
++  (no op takes a box of points today).
++- **The #692 one pick rule holds**: only feature chains are candidates
++  (never a facet seam), and a candidate counts only if some part of it is
++  unoccluded from the eye, by the click pick's own sight test
++  (`feature_pick::occluded`), up to 16 sight rays per candidate, spread
++  along it. Pick-through stays off (it is not offered, as for clicks).
++  "Visible" is literal: in perspective straight over a through-cutout
++  the eye sees down into it, so its walls' corners and bottom rim count;
++  from the Top view in orthographic they are hidden and stay out.
++- **Candidates are the user's parts only** - never stock, never a
++  fixture - though both still hide what lies behind them (stock is
++  translucent and never hides a model, as for clicks). A box is a part
++  feature gesture; stock edges inside a crossing box were noise.
++- **One command**: the release queues one `SetOperationGeometry` with the
++  applied picks plus every new one (duplicates dropped), so it is one
++  undo step. A box holding nothing new says so in the status and queues
++  nothing.
++- **MCP twin: `pick_in_box`** - a world X/Y box seen from straight above
++  (+Z, orthographic: the Top view), same modes and kinds, adds by default
++  (`replace: true` replaces), one undo step, refuses an empty, degenerate
++  or already-picked box by name. The headless surface has no camera, so
++  it takes the one view a 2.5D part is boxed from.
++
++**Considered and dropped.**
++
++- Plain left drag as the box (orbit moved to a modifier): changes the
++  viewport's oldest gesture; every user's muscle memory and the drag law
++  tests would move.
++- Alt + drag: Alt already narrows an Edge click to one segment.
++- Window only: crossing is the cheaper way to grab one side of a rim and
++  costs one drag-direction check.
++- Edge visibility by every sample (fully visible only): a rim chain half
++  hidden behind a boss would never box, while a click on its visible half
++  takes it - the box and the click would disagree.
++
++**Cost to change later.** Small: the gesture arm is `box_pick::armed`,
++the rule is `pick::box_bodies` (mode, kinds and the take filter are
++parameters).
+
+From ab27715e34beee3dde33fbc556852fd3e73bf38c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 13:38:46 -0800
+Subject: [PATCH 2/2] fix(pick): box-select uses Mods.command after main's
+ rename
+
+Tests drive Modifiers::COMMAND (egui's CTRL leaves command false).
+
+Refs #979
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/ui/src/box_pick.rs                  | 2 +-
+ crates/ui/src/egui_app/tests/box_select.rs | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/crates/ui/src/box_pick.rs b/crates/ui/src/box_pick.rs
+index 94e609fdc..46f9e8a71 100644
+--- a/crates/ui/src/box_pick.rs
++++ b/crates/ui/src/box_pick.rs
+@@ -25,7 +25,7 @@ use crate::viewport::ProjectionMode;
+ /// (the add-to-selection keys), Edge or Face mode, an operation open, and
+ /// no other pick draft (boundary, locate, plane, axis, points) collecting.
+ pub(crate) fn armed(state: &State, mods: Mods) -> bool {
+-    (mods.ctrl || mods.shift)
++    (mods.command || mods.shift)
+         && matches!(state.geo_pick, GeoPick::Edge | GeoPick::Face)
+         && !state.op_ui.name.is_empty()
+         && state.boundary_pick.is_none()
+diff --git a/crates/ui/src/egui_app/tests/box_select.rs b/crates/ui/src/egui_app/tests/box_select.rs
+index 532bb1e80..3bc2e38fd 100644
+--- a/crates/ui/src/egui_app/tests/box_select.rs
++++ b/crates/ui/src/egui_app/tests/box_select.rs
+@@ -118,7 +118,7 @@ fn drag(h: &mut Harness<'static, ShellUi>, a: egui::Pos2, b: egui::Pos2, m: Modi
+     move_to(h, b, m);
+     {
+         let st = &h.state().state;
+-        if m.ctrl {
++        if m.command {
+             assert!(st.pick_box.is_some(), "Ctrl + drag draws a pick box");
+             assert_eq!(st.drag, None, "a pick box never orbits");
+         }
+@@ -135,7 +135,7 @@ fn a_ctrl_drag_window_around_one_cutout_adds_its_rim_in_one_undo_step() {
+     // Left to right: a window around the first cutout, [220, 240] x [20, 40].
+     let r = screen_box(harness.state(), [X0 + 15.0, 15.0], [X0 + 45.0, 45.0]);
+     let (a, b) = (r.left_top(), r.right_bottom());
+-    drag(&mut harness, a, b, Modifiers::CTRL);
++    drag(&mut harness, a, b, Modifiers::COMMAND);
+     let st = &harness.state().state;
+     assert_eq!(st.pick_box, None, "the release ends the box");
+     let after = contour1(&harness);
+@@ -156,7 +156,7 @@ fn a_right_to_left_drag_is_a_crossing_box_and_a_plain_drag_still_orbits() {
+     // Right to left over the first cutout's left side (x = 220).
+     let r = screen_box(harness.state(), [X0 + 17.0, 25.0], [X0 + 23.0, 35.0]);
+     let (a, b) = (r.right_top(), r.left_bottom());
+-    drag(&mut harness, a, b, Modifiers::CTRL);
++    drag(&mut harness, a, b, Modifiers::COMMAND);
+     let after = contour1(&harness);
+     assert_eq!(after.len(), before.len() + 1, "the one rim side it crosses: {after:?}");
+     // Without Ctrl the same drag orbits and picks nothing.
