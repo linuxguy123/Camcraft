@@ -1,0 +1,1412 @@
+From 82bf9b54fd6b4f2a4a4e453b910392d4901c7adb Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 01:07:47 -0800
+Subject: [PATCH 1/3] feat(sim): wire EDM 2.5D verification - kerf, threading
+ and slug laws block the post
+
+A Wire Contour is judged at the post gate (posting_wire, beside the
+plasma clause) against the part and the stock through the whole height
+the vertical wire passes: a kerf nearer the product than wire radius +
+gap is a gouge naming its move; a missing start hole, a path that no
+longer starts at it, or a product within the kerf of the threading
+point is refused; the pieces the closed cut frees are found by region
+connectivity, and a die that drops the part or a punch that drops only
+waste - or a cut that frees nothing - is refused. The report line names
+what each cut frees. Decisions in docs/decisions/534-wire-verify.md.
+
+Fixes #534
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/machine/wire_edm.rs      |   2 +-
+ crates/app/src/operation/mod.rs         |   2 +
+ crates/app/src/operation/wire_verify.rs | 101 +++++++++
+ crates/app/src/posting.rs               |  13 +-
+ crates/app/src/posting_wire.rs          |  73 ++++++
+ crates/app/tests/wire_contour.rs        |   2 +-
+ crates/app/tests/wire_verify.rs         | 120 ++++++++++
+ crates/sim/src/verify/mod.rs            |   2 +
+ crates/sim/src/verify/wire/dist.rs      |  80 +++++++
+ crates/sim/src/verify/wire/mod.rs       | 282 ++++++++++++++++++++++++
+ crates/sim/src/verify/wire/slug.rs      | 131 +++++++++++
+ crates/sim/src/verify/wire/tests.rs     | 115 ++++++++++
+ docs/decisions/534-wire-verify.md       |  16 ++
+ 13 files changed, 936 insertions(+), 3 deletions(-)
+ create mode 100644 crates/app/src/operation/wire_verify.rs
+ create mode 100644 crates/app/src/posting_wire.rs
+ create mode 100644 crates/app/tests/wire_verify.rs
+ create mode 100644 crates/sim/src/verify/wire/dist.rs
+ create mode 100644 crates/sim/src/verify/wire/mod.rs
+ create mode 100644 crates/sim/src/verify/wire/slug.rs
+ create mode 100644 crates/sim/src/verify/wire/tests.rs
+ create mode 100644 docs/decisions/534-wire-verify.md
+
+diff --git a/crates/app/src/machine/wire_edm.rs b/crates/app/src/machine/wire_edm.rs
+index 194def0a7..de216cdc2 100644
+--- a/crates/app/src/machine/wire_edm.rs
++++ b/crates/app/src/machine/wire_edm.rs
+@@ -26,7 +26,7 @@ use crate::operation::Family;
+ pub(super) fn check_wire_ops(world: &World, machine: &Machine, ops: &[(String, Entity)]) -> Result<MachineCheck, String> {
+     let mut out = MachineCheck::default();
+     out.notes.push(format!(
+-        "{}: a wire EDM - only the X/Y travel is judged here; the wire's sweep against the part, the slug and the start hole are not (wire verification is not built yet)",
++        "{}: a wire EDM - only the X/Y travel is judged here; the wire's sweep against the part, the slug and the start hole are judged at the post by the wire laws (#534)",
+         machine.model
+     ));
+     out.notes.push(format!(
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 33cb529fe..6dd027ce4 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -99,6 +99,8 @@ pub mod probe_op;
+ // #670: the Plasma Profile's seed and generation glue.
+ pub mod plasma_op;
+ pub mod wire_op;
++// #534: the wire laws' inputs, read live at the post.
++pub mod wire_verify;
+ // #171: the Probe op seeded from one picked face, edge, vertex or round wall.
+ mod probe_pick;
+ mod probe_pick_round;
+diff --git a/crates/app/src/operation/wire_verify.rs b/crates/app/src/operation/wire_verify.rs
+new file mode 100644
+index 000000000..483453bd3
+--- /dev/null
++++ b/crates/app/src/operation/wire_verify.rs
+@@ -0,0 +1,101 @@
++//! The Wire Contour's verification inputs (#534, part of #290 D7): the
++//! op's cached path, its condition's kerf offset, its stated side and
++//! start hole, and the part's and stock's sections through the whole
++//! height the vertical wire passes - handed to `verify::wire::judge`.
++//! Provenance: our own glue over the sim crate's wire laws (whose
++//! module head cites the public sources) and the slicer; read live at
++//! the post, as the plasma clause reads its paths.
++
++use flecs_ecs::prelude::*;
++
++use crate::geo2d::Point2;
++use crate::geometry::{slice, Triangle};
++use crate::model;
++use crate::verify::wire::{judge, CutSide, WireFinding, WireJob, WireSection, WireVerdict};
++
++use super::types::{OpParams, WireSide};
++use super::SrcRef;
++
++/// The most heights the wire laws slice: both ends and the planes
++/// between them, about every 2 mm.
++const MAX_PLANES: usize = 9;
++const PLANE_STEP: f64 = 2.0;
++
++fn z_span(f: &[Triangle]) -> Option<(f64, f64)> {
++    f.iter().flat_map(|t| [t.a.z, t.b.z, t.c.z]).filter(|z| z.is_finite()).fold(None, |acc, z| match acc {
++        None => Some((z, z)),
++        Some((lo, hi)) => Some((lo.min(z), hi.max(z))),
++    })
++}
++
++/// The heights to judge across `lo..hi`: just inside both ends (a
++/// horizontal face is never sliced edge-on) and evenly between.
++fn planes(lo: f64, hi: f64) -> Vec<f64> {
++    let span = hi - lo;
++    if !(span.is_finite() && span > 0.0) {
++        return vec![lo];
++    }
++    let eps = (span * 0.01).min(1e-3);
++    let n = ((span / PLANE_STEP).ceil() as usize + 1).clamp(2, MAX_PLANES);
++    (0..n).map(|i| lo + eps + (span - 2.0 * eps) * i as f64 / (n - 1) as f64).collect()
++}
++
++/// Judge one Wire Contour against the world as it stands now: `None`
++/// for any other kind; `Err` names why the laws cannot run (no path, no
++/// condition, no part to judge against, a section that cannot be cut).
++///
++/// # Errors
++/// Each refusal by name; the gate blocks the post on it.
++pub fn wire_verdict(world: &World, e: &Entity) -> Option<Result<WireVerdict, String>> {
++    let op = model::operation_of(world, e)?;
++    let OpParams::WireContour(w) = &op.params else { return None };
++    Some((|| {
++        let setup = op.setup.as_deref();
++        // A cut with no start hole never generates; said by the law's
++        // own name, not as a missing path.
++        if w.start.is_none() {
++            return Ok(WireVerdict { findings: vec![WireFinding::NoStart], slugs: Vec::new() });
++        }
++        let cache = model::toolpath_of(world, e).ok_or("the wire laws have no toolpath to judge - generate it first")?;
++        let cond = super::wire_op::condition_of(world, setup, w)?;
++        if matches!(op.src, SrcRef::Stock) {
++            return Err("the wire laws judge the kerf against the part, and this cut is taken from the stock - cut it from the part model".into());
++        }
++        let material = super::material::material_of(world, setup, &op.src).map_err(|e| e.to_string())?;
++        let stock = model::find_by_name(world, &crate::setup::stock_entity_name(world, setup))
++            .and_then(|s| model::world_facets(world, &s))
++            .filter(|f| !f.is_empty());
++        let hs = super::resolve_params(world, setup, Some(&op.src), &op.params)?;
++        // The vertical wire cuts everything between its guides: the op's
++        // planes, the part and the stock, whichever reaches farther.
++        let mut lo = hs.bottom.unwrap_or(f64::INFINITY);
++        let mut hi = hs.top.unwrap_or(f64::NEG_INFINITY);
++        for (a, b) in [z_span(&material.facets), stock.as_deref().and_then(z_span)].into_iter().flatten() {
++            lo = lo.min(a);
++            hi = hi.max(b);
++        }
++        if !(lo.is_finite() && hi.is_finite()) {
++            return Err("the wire laws find no height to judge - neither the planes nor the part resolve".into());
++        }
++        let cut = |f: &[Triangle], z: f64, what: &str| {
++            slice::slice(f, z).map_err(|e| format!("the {what}'s section at Z{z:.3} cannot be cut: {e}"))
++        };
++        let mut sections = Vec::new();
++        for z in planes(lo, hi) {
++            let part = cut(&material.facets, z, "part")?;
++            let stock = stock.as_deref().map(|f| cut(f, z, "stock")).transpose()?;
++            sections.push(WireSection { z, part, stock });
++        }
++        let side = match w.side {
++            WireSide::Die => CutSide::Die,
++            WireSide::Punch => CutSide::Punch,
++        };
++        Ok(judge(&WireJob {
++            path: &cache.path,
++            kerf_offset: cond.wire_diameter * 0.5 + cond.gap,
++            side,
++            start: w.start.map(|[x, y]| Point2::new(x, y)),
++            sections,
++        }))
++    })())
++}
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index f4f940a75..b449bdd87 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -382,6 +382,9 @@ mod sim_clause_impl;
+ #[path = "posting_plasma.rs"]
+ mod plasma_clause_impl;
+ pub use plasma_clause_impl::{plasma_clause, PlasmaClause, PLASMA_VERDICT};
++#[path = "posting_wire.rs"]
++mod wire_clause_impl;
++pub use wire_clause_impl::{wire_clause, WireClause, WIRE_VERDICT};
+ #[path = "posting_per_op.rs"]
+ mod per_op;
+ #[path = "posting_suppressed.rs"]
+@@ -642,6 +645,10 @@ pub fn verification_report(world: &World) -> GateReport {
+     // not run for it, never a silent skip.
+     let plasma = plasma_clause(world);
+     problems.extend(plasma.problems);
++    // The wire clause (#534): likewise for a wire EDM cut - the 2.5D
++    // kerf, threading and slug laws, every finding binding.
++    let wire = wire_clause(world);
++    problems.extend(wire.problems);
+ 
+     // The suppression clause (#110 review B1): an op generated against
+     // a suppressed op's cut refuses by name - the cut it assumed is not
+@@ -685,7 +692,11 @@ pub fn verification_report(world: &World) -> GateReport {
+     // what came after it). The law and lines live in
+     // `operation::probe_problems`.
+     problems.extend(crate::operation::probe_problems(world));
+-    let not_judged = match (sim.not_judged, plasma.line) {
++    let plasma_line = match (plasma.line, wire.line) {
++        (Some(p), Some(w)) => Some(format!("{p}; {w}")),
++        (p, w) => p.or(w),
++    };
++    let not_judged = match (sim.not_judged, plasma_line) {
+         (Some(s), Some(p)) => Some(format!("{s}; {p}")),
+         (None, Some(p)) => Some(format!("{NOT_JUDGED}: {p}")),
+         (s, None) => s,
+diff --git a/crates/app/src/posting_wire.rs b/crates/app/src/posting_wire.rs
+new file mode 100644
+index 000000000..a160a1e36
+--- /dev/null
++++ b/crates/app/src/posting_wire.rs
+@@ -0,0 +1,73 @@
++//! The verification gate's wire EDM clause (#534, part of #290 D7):
++//! the 2.5D wire laws (`sim::verify::wire` - kerf, threading, slug) run
++//! over every Wire Contour's cached path against the part and stock as
++//! they stand now, made binding - every finding blocks the post, the
++//! way a located gouge does - and the not-judged line that says the 3D
++//! stock sim did not run for the wire, what judged it instead, and
++//! which piece each cut frees.
++//! Provenance: our own design, the plasma clause's (`posting_plasma`)
++//! read onto the wire; the laws cite their public sources in their own
++//! module.
++
++use crate::model;
++use crate::operation::wire_verify::wire_verdict;
++use crate::verify::wire::Slug;
++use flecs_ecs::prelude::*;
++
++/// The clause's own words on the not-judged line, said once.
++pub const WIRE_VERDICT: &str = "the 3D stock sim does not run for wire EDM";
++
++/// The wire clause's two outputs: the blocking problems, and the
++/// visible line naming the cuts judged and the pieces they free.
++#[derive(Debug, Default, Clone, PartialEq)]
++pub struct WireClause {
++    pub problems: Vec<String>,
++    pub line: Option<String>,
++}
++
++fn slugs(s: &[Slug]) -> String {
++    if s.is_empty() {
++        return "frees nothing".into();
++    }
++    s.iter()
++        .map(|g| {
++            format!(
++                "frees {:.2} mm² near X{:.3} Y{:.3} ({})",
++                g.area,
++                g.at.x,
++                g.at.y,
++                if g.product_area > crate::verify::wire::SLUG_AREA_TOL { "the part" } else { "waste" }
++            )
++        })
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++/// Judge every Wire Contour of the program (document order, suppressed
++/// ops left out - the same walk `program_ops` makes).
++#[must_use]
++pub fn wire_clause(world: &World) -> WireClause {
++    let mut out = WireClause::default();
++    let mut judged: Vec<String> = Vec::new();
++    for (name, e) in crate::setup::operation_order(world) {
++        let Some(op) = model::operation_of(world, &e) else { continue };
++        if op.suppressed {
++            continue;
++        }
++        let Some(verdict) = wire_verdict(world, &e) else { continue };
++        match verdict {
++            Err(why) => out.problems.push(format!("{name}: {why}")),
++            Ok(v) => {
++                out.problems.extend(v.findings.iter().map(|f| format!("{name}: wire {}", f.describe())));
++                judged.push(format!("{name} {}", slugs(&v.slugs)));
++            }
++        }
++    }
++    if !judged.is_empty() {
++        out.line = Some(format!(
++            "{WIRE_VERDICT} - judged by the 2.5D wire laws (kerf, threading, slug): {}",
++            judged.join("; ")
++        ));
++    }
++    out
++}
+diff --git a/crates/app/tests/wire_contour.rs b/crates/app/tests/wire_contour.rs
+index 5bfdc3b42..a0e154cbc 100644
+--- a/crates/app/tests/wire_contour.rs
++++ b/crates/app/tests/wire_contour.rs
+@@ -225,7 +225,7 @@ fn a_die_and_a_punch_on_one_profile_stand_apart_by_exactly_the_kerf() {
+     let (_, m) = machine::of_setup(&world, None);
+     let c = check_document(&world, &m.expect("the wire EDM")).expect("checks");
+     assert!(c.problems.is_empty(), "{:?}", c.problems);
+-    assert!(c.notes.iter().any(|n| n.contains("wire verification is not built yet")), "{:?}", c.notes);
++    assert!(c.notes.iter().any(|n| n.contains("judged at the post by the wire laws")), "{:?}", c.notes);
+     // No wire post exists yet: the program is refused by name, never posted.
+     let err = posting::op_streams(&world).expect_err("no wire post");
+     assert!(err.contains("Die1") && err.contains("wire EDM post"), "{err}");
+diff --git a/crates/app/tests/wire_verify.rs b/crates/app/tests/wire_verify.rs
+new file mode 100644
+index 000000000..6b368bed2
+--- /dev/null
++++ b/crates/app/tests/wire_verify.rs
+@@ -0,0 +1,120 @@
++//! #534 (part of #290 D7): the wire EDM laws at the post gate. A
++//! generated Wire Contour is judged in 2.5D against the part and the
++//! stock through the whole height the wire passes: a correct die and a
++//! correct punch pass and the report names the piece each frees (the
++//! die's waste slug, the punch itself); a kerf into the part and a
++//! missing start hole block the post by name.
++//!
++//! Gate map (#534): covers app::posting (posting_wire), app::operation
++//! (wire_verify), app::machine::wire_edm, sim::verify::wire.
++//! Provenance: our own fixtures. The condition is SYNTHETIC - invented
++//! numbers of a plausible size, from no machine's manual (#290 D4,
++//! D10); the laws cite their sources in `sim::verify::wire`.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SetStock};
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::machine::parse_mch;
++use camcraft_app::operation::{Height, OpParams, SrcRef, WireContourOp, WireSide};
++use camcraft_app::posting;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::world::new_world;
++
++const WIRE: &str = include_str!("edm/wire-edm.mch");
++/// Synthetic: wire 0.25, gap 0.04 - a kerf offset of 0.165.
++const TABLE: &str = r#"[{ "id": "C110", "name": "rough", "gap": 0.04, "wire_diameter": 0.25, "role": "rough" }]"#;
++
++/// A 40 x 20 outline with 2 mm corners in 3-degree facets, CCW.
++fn outline() -> Vec<(f64, f64)> {
++    let (r, hx, hy) = (2.0, 18.0, 8.0);
++    let mut pts = Vec::new();
++    for (cx, cy, a0) in [(hx, hy, 0.0_f64), (-hx, hy, 90.0), (-hx, -hy, 180.0), (hx, -hy, 270.0)] {
++        for s in 0..=30 {
++            let t = (a0 + 3.0 * f64::from(s)).to_radians();
++            pts.push((cx + r * t.cos(), cy + r * t.sin()));
++        }
++    }
++    pts
++}
++
++/// The outline extruded from z = 0 to z = 12.
++fn prism(pts: &[(f64, f64)]) -> Mesh {
++    let (z0, z1) = (0.0, 12.0);
++    let p = |(x, y): (f64, f64), z: f64| Point3::new(x, y, z);
++    let mut f = Vec::new();
++    for i in 0..pts.len() {
++        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
++        f.push(Triangle::new(Point3::new(0.0, 0.0, z1), p(a, z1), p(b, z1)));
++        f.push(Triangle::new(Point3::new(0.0, 0.0, z0), p(b, z0), p(a, z0)));
++        f.push(Triangle::new(p(a, z0), p(b, z0), p(b, z1)));
++        f.push(Triangle::new(p(a, z0), p(b, z1), p(a, z1)));
++    }
++    Mesh::from_facets(f)
++}
++
++/// A wire EDM document: the synthetic condition, the 40 x 20 prism and
++/// a 60 x 60 block of stock `dz` tall around it.
++fn doc(dz: f64) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    let mut v: serde_json::Value = serde_json::from_str(WIRE).expect("template json");
++    v["edm"]["conditions"] = serde_json::from_str(TABLE).expect("conditions json");
++    let m = parse_mch(&v.to_string()).expect("parses");
++    h.execute(&world, LoadMachine::new(&world, "wire.mch".into(), Some(m)).expect("mount"));
++    h.execute(&world, ImportModel::from_mesh("part", prism(&outline())));
++    let stock = SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz }, Location::default()).expect("stock");
++    h.execute(&world, stock);
++    (world, h)
++}
++
++fn cut(world: &World, h: &mut History, name: &str, side: WireSide, start: Option<[f64; 2]>) {
++    let op = WireContourOp { top_z: Height::fixed(12.0), bottom_z: Height::fixed(0.0), condition: "C110".into(), side, start };
++    let c = CreateOperation::new(world, name, "", SrcRef::Entity("part".into()), OpParams::WireContour(op)).expect("op");
++    h.execute(world, c);
++    if start.is_some() {
++        h.execute(world, GenerateOperation::new(world, name).expect("generates"));
++    }
++}
++
++/// Done means: a clean die and a clean punch pass, and the slug is
++/// identified for each - the die frees its waste, the punch frees itself.
++#[test]
++fn a_correct_die_and_a_correct_punch_pass_and_name_the_piece_they_free() {
++    let (world, mut h) = doc(12.0);
++    cut(&world, &mut h, "Die1", WireSide::Die, Some([0.0, 0.0]));
++    cut(&world, &mut h, "Punch1", WireSide::Punch, Some([-25.0, 0.0]));
++    let c = posting::wire_clause(&world);
++    assert!(c.problems.is_empty(), "{:?}", c.problems);
++    let line = c.line.expect("the judged line");
++    assert!(line.starts_with(posting::WIRE_VERDICT), "{line}");
++    let (die, punch) = line.split_once("; Punch1").expect("both judged");
++    assert!(die.contains("Die1 frees") && die.ends_with("(waste)"), "the die's slug is waste: {line}");
++    assert!(punch.contains("frees") && punch.ends_with("(the part)"), "the punch drops: {line}");
++    let report = posting::verification_report(&world);
++    assert!(report.problems.iter().all(|p| !p.contains("wire")), "{:?}", report.problems);
++    assert!(report.not_judged.is_some_and(|n| n.contains(posting::WIRE_VERDICT)), "said, not silent");
++}
++
++/// Done means: a cut that enters the part blocks the post by name. The
++/// die's model is its 12 mm opening, but the plate is 20 mm: above the
++/// opening the vertical wire burns the plate itself.
++#[test]
++fn a_kerf_into_the_part_blocks_the_post_naming_the_move() {
++    let (world, mut h) = doc(20.0);
++    cut(&world, &mut h, "Die1", WireSide::Die, Some([0.0, 0.0]));
++    let problems = posting::verification_gate(&world);
++    let gouge = problems.iter().find(|p| p.contains("gouge")).expect("blocked");
++    assert!(gouge.starts_with("Die1: wire gouge: the kerf of move 1 enters the part"), "{gouge}");
++    assert!(problems.iter().any(|p| p.contains("Die1") && p.contains("not clear for threading")), "{problems:?}");
++}
++
++/// Done means: a missing start hole is refused by name at the gate.
++#[test]
++fn a_missing_start_hole_blocks_the_post() {
++    let (world, mut h) = doc(12.0);
++    cut(&world, &mut h, "Die1", WireSide::Die, None);
++    let problems = posting::verification_gate(&world);
++    assert!(problems.iter().any(|p| p.starts_with("Die1: wire no start hole is stated")), "{problems:?}");
++}
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index bb30a536b..095132115 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -167,6 +167,8 @@ mod mesh_steel;
+ mod midpose;
+ // #672: the plasma through-cut laws (cut order, kerf crossing, tip-up).
+ pub mod plasma;
++// #534: the wire EDM 2.5D laws (kerf, threading, slug).
++pub mod wire;
+ mod posed_steel;
+ mod prior;
+ mod body_bands;
+diff --git a/crates/sim/src/verify/wire/dist.rs b/crates/sim/src/verify/wire/dist.rs
+new file mode 100644
+index 000000000..b36f1453e
+--- /dev/null
++++ b/crates/sim/src/verify/wire/dist.rs
+@@ -0,0 +1,80 @@
++//! Plain 2D distances for the wire laws: point to point, point to
++//! segment, segment to segment, and a move's clearance to the product.
++//! Provenance: textbook Euclidean geometry (closest points of segments).
++//! Our own code.
++
++use super::Product;
++use crate::geo2d::Point2;
++
++pub(super) fn pp(a: Point2, b: Point2) -> f64 {
++    (a.x - b.x).hypot(a.y - b.y)
++}
++
++/// The point of segment `a`-`b` nearest `p`.
++fn foot(p: Point2, a: Point2, b: Point2) -> Point2 {
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let l2 = dx * dx + dy * dy;
++    if l2.is_nan() || l2 <= 0.0 {
++        return a;
++    }
++    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0);
++    Point2::new(a.x + t * dx, a.y + t * dy)
++}
++
++fn cross(o: Point2, a: Point2, b: Point2) -> f64 {
++    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
++}
++
++/// Whether segments `a`-`b` and `c`-`d` cross or touch (proper or not).
++fn crosses(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
++    let (d1, d2) = (cross(c, d, a), cross(c, d, b));
++    let (d3, d4) = (cross(a, b, c), cross(a, b, d));
++    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
++}
++
++/// The distance between segments `a`-`b` and `c`-`d`, with the point of
++/// `c`-`d` nearest the first.
++pub(super) fn seg_seg(a: Point2, b: Point2, c: Point2, d: Point2) -> (f64, Point2) {
++    if crosses(a, b, c, d) {
++        let t = cross(c, d, a) / (cross(c, d, a) - cross(c, d, b));
++        return (0.0, Point2::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
++    }
++    let mut best = (f64::INFINITY, c);
++    for (p, q) in [(a, foot(a, c, d)), (b, foot(b, c, d))] {
++        let dd = pp(p, q);
++        if dd < best.0 {
++            best = (dd, q);
++        }
++    }
++    for q in [c, d] {
++        let dd = pp(q, foot(q, a, b));
++        if dd < best.0 {
++            best = (dd, q);
++        }
++    }
++    best
++}
++
++/// How far the wire's centre walking `a`-`b` stays from the product,
++/// and the product's point nearest it: 0 when the move stands in the
++/// product. An empty product is infinitely clear.
++pub(super) fn clearance(p: &Product<'_>, a: Point2, b: Point2) -> (f64, Point2) {
++    if p.contains(a) {
++        return (0.0, a);
++    }
++    if p.contains(b) {
++        return (0.0, b);
++    }
++    let mut best = (f64::INFINITY, a);
++    for l in p.boundary().loops() {
++        let pts = l.points();
++        for i in 0..pts.len() {
++            let (c, d) = (pts[i], pts[(i + 1) % pts.len()]);
++            let got = seg_seg(a, b, c, d);
++            if got.0 < best.0 {
++                best = got;
++            }
++        }
++    }
++    best
++}
+diff --git a/crates/sim/src/verify/wire/mod.rs b/crates/sim/src/verify/wire/mod.rs
+new file mode 100644
+index 000000000..e7717ece7
+--- /dev/null
++++ b/crates/sim/src/verify/wire/mod.rs
+@@ -0,0 +1,282 @@
++//! Wire EDM 2.5D verification (#534, part of #290 D7): a vertical
++//! 2-axis wire cut judged on the program plane against the part's
++//! sections through the whole height the wire passes.
++//!
++//! - **Kerf law.** The wire burns a slot of half-width `k` (wire radius
++//!   plus spark gap) along every move, through every height between its
++//!   guides. A move whose kerf comes nearer the product's section than
++//!   `k` - or stands in it - is a gouge, named by its move.
++//! - **Threading law.** The wire is threaded at the start hole through
++//!   the full height: the product must stand clear of the threading
++//!   point by `k` at every judged plane. A start hole that is not
++//!   stated, or that the path does not start from, is refused by name.
++//! - **Slug law.** The kerf region is subtracted from the material
++//!   section (stock and part); the connected pieces enclosed by the cut
++//!   are what drops free when the cut closes. A die keeps the material
++//!   outside the cut, so its freed piece must hold none of the product;
++//!   a punch's freed piece IS the product. A cut that frees nothing, or
++//!   frees the wrong side, is refused by name.
++//!
++//! The product's section by the stated side: a punch's product is the
++//! model. A die's product is the model too when the start hole stands
++//! outside it (the model is a die plate, the opening a hole in it); when
++//! the start hole stands IN the model, the model is the opening (the
++//! slug's shape, #532's whole-model die) and the product is the stock
++//! around it.
++//!
++//! Provenance: plain 2D distance and region geometry (point-segment
++//! distance, polygon booleans and the disc sweep of `geo2d`, clipper2)
++//! over the public wire EDM practice the umbrella #290 cites: the kerf
++//! is the wire diameter plus the gap on both sides, the wire is
++//! threaded through a start hole, and a closed cut frees the enclosed
++//! region (die slug or punch). Our own code; no vendor post, control
++//! manual or CAM product behaviour was consulted.
++
++mod dist;
++mod slug;
++#[cfg(test)]
++mod tests;
++
++use crate::cl::Toolpath;
++use crate::geo2d::{Point2, Region};
++
++pub use slug::Slug;
++
++/// How far (mm) the kerf may come under its offset to the product
++/// before the kerf law calls it a gouge: 0.1 um - the generator builds
++/// the path at the offset to 10 nm, the sections are facet-exact.
++pub const KERF_TOL: f64 = 1e-4;
++/// The least area (mm²) of product a freed piece may hold before the
++/// slug law reads it as holding product: a numerical sliver is not a
++/// part.
++pub const SLUG_AREA_TOL: f64 = 1e-3;
++
++/// Which side of the cut is kept - stated by the operation, never read
++/// from the geometry.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CutSide {
++    /// The opening is the product: the material outside the cut stays.
++    Die,
++    /// The enclosed piece is the product: it drops when the cut closes.
++    Punch,
++}
++
++impl CutSide {
++    #[must_use]
++    pub fn word(self) -> &'static str {
++        match self {
++            CutSide::Die => "die",
++            CutSide::Punch => "punch",
++        }
++    }
++}
++
++/// The material at one judged height: the part model's section and the
++/// stock's (when the setup has one).
++#[derive(Clone, Debug)]
++pub struct WireSection {
++    pub z: f64,
++    pub part: Region,
++    pub stock: Option<Region>,
++}
++
++/// One wire cut to judge.
++#[derive(Clone, Debug)]
++pub struct WireJob<'a> {
++    pub path: &'a Toolpath,
++    /// Wire radius plus spark gap (mm).
++    pub kerf_offset: f64,
++    pub side: CutSide,
++    /// The operation's stated start hole; `None` is not stated.
++    pub start: Option<Point2>,
++    /// The sections through the height the wire passes, low to high.
++    pub sections: Vec<WireSection>,
++}
++
++/// Every finding refuses: the wire laws have no warning tier.
++#[derive(Clone, Debug, PartialEq)]
++pub enum WireFinding {
++    /// The path cannot be read by these laws (an arc, a posed or
++    /// non-planar move, no moves, a bad offset).
++    Unreadable(String),
++    NoStart,
++    /// The path does not start at the stated start hole.
++    StartMoved { stated: Point2, path: Point2 },
++    /// The product stands nearer the threading point than the kerf.
++    Threading { z: f64, at: Point2, clear: f64, need: f64 },
++    /// The kerf of move `move_no` (1-based) enters the product.
++    Gouge { move_no: usize, z: f64, at: Point2, depth: f64, moves: usize },
++    /// The closed cut frees no material.
++    NothingFreed { z: f64 },
++    /// The piece freed is not the one the stated side drops.
++    WrongSlug { z: f64, side: CutSide, at: Point2, product_area: f64 },
++}
++
++impl WireFinding {
++    /// The finding in words, mm.
++    #[must_use]
++    pub fn describe(&self) -> String {
++        match self {
++            WireFinding::Unreadable(why) => format!("the wire laws cannot read the path - {why}"),
++            WireFinding::NoStart => {
++                "no start hole is stated - the wire cannot be threaded, nothing is judged clear".into()
++            }
++            WireFinding::StartMoved { stated, path } => format!(
++                "the path starts at X{:.3} Y{:.3}, not at the stated start hole X{:.3} Y{:.3} - regenerate it",
++                path.x, path.y, stated.x, stated.y
++            ),
++            WireFinding::Threading { z, at, clear, need } => format!(
++                "the start hole at X{:.3} Y{:.3} is not clear for threading at Z{z:.3}: the part stands {} - the wire and its gap need {need:.4} mm all round",
++                at.x,
++                at.y,
++                if *clear <= 0.0 { "at the threading point itself".to_owned() } else { format!("{clear:.4} mm from it") }
++            ),
++            WireFinding::Gouge { move_no, z, at, depth, moves } => format!(
++                "gouge: the kerf of move {move_no} enters the part by {depth:.4} mm near X{:.3} Y{:.3} at Z{z:.3} ({moves} move(s) gouge)",
++                at.x, at.y
++            ),
++            WireFinding::NothingFreed { z } => format!(
++                "the cut frees no material at Z{z:.3} - nothing drops when it closes (no closed cut, or no stock around the opening to judge the slug)"
++            ),
++            WireFinding::WrongSlug { z, side: CutSide::Die, at, product_area } => format!(
++                "slug: the piece freed near X{:.3} Y{:.3} at Z{z:.3} holds {product_area:.3} mm² of the part - a die keeps the material outside the cut, but here the part drops",
++                at.x, at.y
++            ),
++            WireFinding::WrongSlug { z, side: CutSide::Punch, at, .. } => format!(
++                "slug: the piece freed near X{:.3} Y{:.3} at Z{z:.3} holds none of the part - a punch's cut frees the punch, but here only waste drops and the part stays in the skeleton",
++                at.x, at.y
++            ),
++        }
++    }
++}
++
++/// The verdict: every refusal, and the pieces the cut frees at the
++/// lowest judged height that holds material (the report line's slug).
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct WireVerdict {
++    pub findings: Vec<WireFinding>,
++    pub slugs: Vec<Slug>,
++}
++
++/// The product's section at one height (module head): the model, or
++/// the stock around it when the model is a die's opening.
++pub(crate) enum Product<'a> {
++    Part(&'a Region),
++    /// Everything outside `opening`, within `stock` when there is one.
++    Around { opening: &'a Region, stock: Option<&'a Region> },
++}
++
++impl Product<'_> {
++    fn contains(&self, p: Point2) -> bool {
++        match self {
++            Product::Part(r) => r.contains(p),
++            Product::Around { opening, stock } => !opening.contains(p) && stock.is_none_or(|s| s.contains(p)),
++        }
++    }
++
++    fn boundary(&self) -> &Region {
++        match self {
++            Product::Part(r) => r,
++            Product::Around { opening, .. } => opening,
++        }
++    }
++}
++
++/// Judge one wire cut by the three laws.
++#[must_use]
++pub fn judge(job: &WireJob<'_>) -> WireVerdict {
++    let mut v = WireVerdict::default();
++    let k = job.kerf_offset;
++    if !(k.is_finite() && k > 0.0) {
++        v.findings.push(WireFinding::Unreadable(format!("the kerf offset {k} is not a positive number")));
++        return v;
++    }
++    let polyline = match polyline(job.path) {
++        Ok(p) => p,
++        Err(why) => {
++            v.findings.push(WireFinding::Unreadable(why));
++            return v;
++        }
++    };
++    let Some(start) = job.start else {
++        v.findings.push(WireFinding::NoStart);
++        return v;
++    };
++    let first = polyline[0];
++    if dist::pp(first, start) > 1e-6 {
++        v.findings.push(WireFinding::StartMoved { stated: start, path: first });
++    }
++    // The die's reading of the model (module head), decided once for
++    // the whole height: the start hole stands in the model at some plane.
++    let opening = job.side == CutSide::Die && job.sections.iter().any(|s| s.part.contains(start));
++    // The threading point's worst plane, and the first plane that gouges.
++    let mut worst: Option<(f64, f64)> = None;
++    let mut gouge: Option<WireFinding> = None;
++    for s in &job.sections {
++        let p = product(s, opening);
++        let (clear, _) = dist::clearance(&p, start, start);
++        if worst.is_none_or(|(c, _)| clear < c) {
++            worst = Some((clear, s.z));
++        }
++        if gouge.is_none() {
++            gouge = gouge_at(&p, &polyline, k, s.z);
++        }
++    }
++    if let Some((clear, z)) = worst.filter(|(c, _)| *c < k - KERF_TOL) {
++        v.findings.push(WireFinding::Threading { z, at: start, clear, need: k });
++    }
++    v.findings.extend(gouge);
++    slug::judge(job, &polyline, opening, &mut v);
++    v
++}
++
++fn product(s: &WireSection, opening: bool) -> Product<'_> {
++    if opening {
++        Product::Around { opening: &s.part, stock: s.stock.as_ref() }
++    } else {
++        Product::Part(&s.part)
++    }
++}
++
++/// The first move whose kerf enters the product at this height, with
++/// the count of moves that do.
++fn gouge_at(p: &Product<'_>, pts: &[Point2], k: f64, z: f64) -> Option<WireFinding> {
++    let mut first: Option<(usize, Point2, f64)> = None;
++    let mut moves = 0;
++    for (i, w) in pts.windows(2).enumerate() {
++        let (d, at) = dist::clearance(p, w[0], w[1]);
++        if d < k - KERF_TOL {
++            moves += 1;
++            if first.is_none() {
++                first = Some((i + 1, at, k - d));
++            }
++        }
++    }
++    first.map(|(move_no, at, depth)| WireFinding::Gouge { move_no, z, at, depth, moves })
++}
++
++/// The path as the polyline the wire's centre walks: straight, planar,
++/// unposed, contiguous moves only - anything else is not what these
++/// laws can read, and is refused by name.
++fn polyline(path: &Toolpath) -> Result<Vec<Point2>, String> {
++    let Some(m0) = path.moves.first() else {
++        return Err("the path has no moves".into());
++    };
++    let mut pts = vec![Point2::new(m0.from.x, m0.from.y)];
++    for (i, m) in path.moves.iter().enumerate() {
++        let n = i + 1;
++        if m.arc.is_some() || m.axis.is_some() {
++            return Err(format!("move {n} is an arc or states a pose - the 2-axis wire laws read straight vertical moves only"));
++        }
++        let finite = [m.from.x, m.from.y, m.from.z, m.to.x, m.to.y, m.to.z].iter().all(|c| c.is_finite());
++        if !finite || (m.from.z - m0.from.z).abs() > 1e-9 || (m.to.z - m0.from.z).abs() > 1e-9 {
++            return Err(format!("move {n} leaves the programmed plane"));
++        }
++        let from = Point2::new(m.from.x, m.from.y);
++        if pts.last().is_some_and(|l| dist::pp(*l, from) > 1e-6) {
++            return Err(format!("move {n} does not start where the move before it ended"));
++        }
++        pts.push(Point2::new(m.to.x, m.to.y));
++    }
++    Ok(pts)
++}
+diff --git a/crates/sim/src/verify/wire/slug.rs b/crates/sim/src/verify/wire/slug.rs
+new file mode 100644
+index 000000000..d278a6577
+--- /dev/null
++++ b/crates/sim/src/verify/wire/slug.rs
+@@ -0,0 +1,131 @@
++//! The slug law (#534, #290 D7): what drops free when the wire's cut
++//! closes, by region connectivity. The kerf region (the disc of the
++//! kerf offset swept along the wire path) is taken out of the material
++//! section; the connected pieces left that lie inside the cut's filled
++//! outline are freed, the rest stay held by the stock's outside.
++//! Provenance: polygon booleans and the disc sweep of `geo2d`
++//! (clipper2) over the public reading of a closed wire cut (the
++//! enclosed region is cut free: a die's slug, or the punch itself).
++//! Our own code.
++
++use super::{CutSide, WireFinding, WireJob, WireVerdict, SLUG_AREA_TOL};
++use crate::geo2d::{Loop, Point2, Region};
++
++/// A piece the closed cut frees at one height.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Slug {
++    pub z: f64,
++    /// The piece's area, mm².
++    pub area: f64,
++    /// The middle of the piece's bounds.
++    pub at: Point2,
++    /// How much of the product the piece holds, mm².
++    pub product_area: f64,
++}
++
++/// Each outer loop with the holes it carries, as its own region (a hole
++/// goes to the smallest outer loop that contains it).
++fn components(r: &Region) -> Result<Vec<Region>, String> {
++    let (outers, holes): (Vec<&Loop>, Vec<&Loop>) = r.loops().iter().partition(|l| l.area() > 0.0);
++    let mut groups: Vec<Vec<Loop>> = outers.iter().map(|o| vec![(*o).clone()]).collect();
++    for h in holes {
++        let Some(&p) = h.points().first() else { continue };
++        let mut best: Option<(usize, f64)> = None;
++        for (i, o) in outers.iter().enumerate() {
++            let inside = Region::new(vec![(*o).clone()]).map_err(|e| e.to_string())?.contains(p);
++            if inside && best.is_none_or(|(_, a)| o.area() < a) {
++                best = Some((i, o.area()));
++            }
++        }
++        if let Some((i, _)) = best
++            && let Some(g) = groups.get_mut(i)
++        {
++            g.push(h.clone());
++        }
++    }
++    groups.into_iter().map(|g| Region::new(g).map_err(|e| e.to_string())).collect()
++}
++
++fn centre(r: &Region) -> Point2 {
++    r.bounds().map_or(Point2::new(0.0, 0.0), |(a, b)| Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5))
++}
++
++/// The pieces freed at one height, or why they cannot be read.
++fn freed_at(
++    material: &Region,
++    product: &Region,
++    kerf: &Region,
++    fill: &Region,
++    z: f64,
++) -> Result<Vec<Slug>, String> {
++    let e = |e: crate::geo2d::GeoError| e.to_string();
++    let mut out = Vec::new();
++    for piece in components(&material.difference(kerf).map_err(e)?)? {
++        let area = piece.area();
++        if area <= SLUG_AREA_TOL || piece.difference(fill).map_err(e)?.area() > SLUG_AREA_TOL {
++            continue;
++        }
++        let product_area = piece.intersect(product).map_err(e)?.area();
++        out.push(Slug { z, area, at: centre(&piece), product_area });
++    }
++    Ok(out)
++}
++
++/// Run the slug law over every section; the first height that flags
++/// is named, and the lowest height holding material reports its slugs.
++pub(super) fn judge(job: &WireJob<'_>, pts: &[Point2], opening: bool, v: &mut WireVerdict) {
++    let unreadable = |why: String| WireFinding::Unreadable(format!("the slug cannot be judged - {why}"));
++    let kerf = match Region::sweep(&[pts.to_vec()], job.kerf_offset) {
++        Ok(r) => r,
++        Err(e) => return v.findings.push(unreadable(e.to_string())),
++    };
++    let fill = match Region::new(kerf.loops().iter().filter(|l| l.area() > 0.0).cloned().collect()) {
++        Ok(r) => r,
++        Err(e) => return v.findings.push(unreadable(e.to_string())),
++    };
++    let mut reported = false;
++    for s in &job.sections {
++        let material = match &s.stock {
++            Some(st) => s.part.union(st),
++            None => Ok(s.part.clone()),
++        };
++        let product = match (opening, &s.stock) {
++            (false, _) => Ok(s.part.clone()),
++            (true, Some(st)) => st.difference(&s.part),
++            (true, None) => Ok(Region::empty()),
++        };
++        if material.as_ref().is_ok_and(Region::is_empty) {
++            continue;
++        }
++        let freed = match (material, product) {
++            (Ok(m), Ok(p)) => freed_at(&m, &p, &kerf, &fill, s.z),
++            (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
++        };
++        let freed = match freed {
++            Ok(f) => f,
++            Err(why) => return v.findings.push(unreadable(why)),
++        };
++        if !reported {
++            v.slugs.clone_from(&freed);
++            reported = true;
++        }
++        let flag = match job.side {
++            _ if freed.is_empty() => Some(WireFinding::NothingFreed { z: s.z }),
++            CutSide::Die => freed.iter().find(|f| f.product_area > SLUG_AREA_TOL).map(|f| WireFinding::WrongSlug {
++                z: s.z,
++                side: CutSide::Die,
++                at: f.at,
++                product_area: f.product_area,
++            }),
++            CutSide::Punch => freed.iter().all(|f| f.product_area <= SLUG_AREA_TOL).then(|| WireFinding::WrongSlug {
++                z: s.z,
++                side: CutSide::Punch,
++                at: freed.first().map_or(Point2::new(0.0, 0.0), |f| f.at),
++                product_area: 0.0,
++            }),
++        };
++        if let Some(f) = flag {
++            return v.findings.push(f);
++        }
++    }
++}
+diff --git a/crates/sim/src/verify/wire/tests.rs b/crates/sim/src/verify/wire/tests.rs
+new file mode 100644
+index 000000000..1cb23d12b
+--- /dev/null
++++ b/crates/sim/src/verify/wire/tests.rs
+@@ -0,0 +1,115 @@
++//! The wire laws on synthetic squares (#534): a clean punch and die
++//! pass, a kerf into the part is a gouge naming its move, a missing or
++//! crowded start hole is refused, and the slug is read for each side.
++//! Provenance: our own fixtures.
++
++use super::*;
++use crate::cl::{MoveKind, PathBuilder};
++use crate::geo2d::Loop;
++use crate::geometry::Point3;
++
++const K: f64 = 0.2;
++
++fn square_loop(h: f64) -> Loop {
++    Loop::new(vec![Point2::new(-h, -h), Point2::new(h, -h), Point2::new(h, h), Point2::new(-h, h)]).expect("loop")
++}
++
++fn square(h: f64) -> Region {
++    Region::new(vec![square_loop(h)]).expect("region")
++}
++
++/// A closed square path of half-side `h` threaded from `start` by a
++/// straight lead to its left side's middle, out the same way.
++fn path(h: f64, start: Point2) -> Toolpath {
++    let p = |x: f64, y: f64| Point3::new(x, y, 0.0);
++    let mut b = PathBuilder::new(p(start.x, start.y));
++    for (x, y) in [(-h, 0.0), (-h, -h), (h, -h), (h, h), (-h, h), (-h, 0.0), (start.x, start.y)] {
++        b.push(MoveKind::Feed, p(x, y), None);
++    }
++    b.finish()
++}
++
++fn sections(part: &Region, stock: Option<&Region>) -> Vec<WireSection> {
++    [0.001, 6.0, 11.999].iter().map(|&z| WireSection { z, part: part.clone(), stock: stock.cloned() }).collect()
++}
++
++fn run(side: CutSide, tp: &Toolpath, start: Option<Point2>, part: &Region, stock: Option<&Region>) -> WireVerdict {
++    judge(&WireJob { path: tp, kerf_offset: K, side, start, sections: sections(part, stock) })
++}
++
++#[test]
++fn a_correct_punch_passes_and_drops_the_punch() {
++    let (part, stock) = (square(5.0), square(15.0));
++    let start = Point2::new(-10.0, 0.0);
++    let v = run(CutSide::Punch, &path(5.0 + K, start), Some(start), &part, Some(&stock));
++    assert!(v.findings.is_empty(), "{:?}", v.findings);
++    assert_eq!(v.slugs.len(), 1, "{:?}", v.slugs);
++    assert!((v.slugs[0].product_area - 100.0).abs() < 1e-3, "the punch drops: {:?}", v.slugs);
++}
++
++#[test]
++fn a_correct_die_passes_whether_the_model_is_the_opening_or_the_plate() {
++    let stock = square(15.0);
++    let start = Point2::new(0.0, 0.0);
++    let tp = path(5.0 - K, start);
++    // The model is the opening (#532's whole-model die): the product is the stock around it.
++    let v = run(CutSide::Die, &tp, Some(start), &square(5.0), Some(&stock));
++    assert!(v.findings.is_empty(), "{:?}", v.findings);
++    assert_eq!(v.slugs.len(), 1);
++    // The slug: the 9.2 mm square inside the kerf, less the lead-in's slot.
++    let a = v.slugs[0].area;
++    assert!(v.slugs[0].product_area < SLUG_AREA_TOL && a < 84.64 && a > 84.64 - 4.6 * 2.0 * K - 0.1, "{:?}", v.slugs);
++    // The model is a die plate with the opening as its hole.
++    let plate = Region::new(vec![square_loop(15.0), square_loop(5.0)]).expect("plate");
++    let v = run(CutSide::Die, &tp, Some(start), &plate, Some(&stock));
++    assert!(v.findings.is_empty(), "{:?}", v.findings);
++    assert!(v.slugs.len() == 1 && v.slugs[0].product_area < SLUG_AREA_TOL, "{:?}", v.slugs);
++}
++
++#[test]
++fn a_kerf_into_the_part_is_a_gouge_naming_the_move() {
++    let start = Point2::new(-10.0, 0.0);
++    // The path stands only half the kerf off the part.
++    let v = run(CutSide::Punch, &path(5.0 + K * 0.5, start), Some(start), &square(5.0), Some(&square(15.0)));
++    let g = v.findings.iter().find(|f| matches!(f, WireFinding::Gouge { .. })).expect("gouge");
++    let WireFinding::Gouge { move_no, depth, .. } = g else { unreachable!() };
++    assert_eq!(*move_no, 1, "the lead-in's end already burns the part");
++    assert!((depth - K * 0.5).abs() < 1e-9, "{depth}");
++    assert!(g.describe().contains("gouge: the kerf of move 1 enters the part"), "{}", g.describe());
++}
++
++#[test]
++fn a_missing_moved_or_crowded_start_hole_is_refused() {
++    let (part, stock) = (square(5.0), square(15.0));
++    let start = Point2::new(-10.0, 0.0);
++    let tp = path(5.0 + K, start);
++    let v = run(CutSide::Punch, &tp, None, &part, Some(&stock));
++    assert_eq!(v.findings, vec![WireFinding::NoStart]);
++    assert!(v.findings[0].describe().contains("no start hole is stated"));
++    let v = run(CutSide::Punch, &tp, Some(Point2::new(-11.0, 0.0)), &part, Some(&stock));
++    assert!(v.findings.iter().any(|f| matches!(f, WireFinding::StartMoved { .. })), "{:?}", v.findings);
++    // Threaded 0.1 mm off the part: the wire and its gap need 0.2.
++    let near = Point2::new(-5.1, 0.0);
++    let v = run(CutSide::Punch, &path(5.0 + K, near), Some(near), &part, Some(&stock));
++    let t = v.findings.iter().find(|f| matches!(f, WireFinding::Threading { .. })).expect("threading");
++    assert!(t.describe().contains("not clear for threading") && t.describe().contains("0.1000 mm from it"), "{}", t.describe());
++}
++
++#[test]
++fn the_slug_is_read_for_the_stated_side() {
++    let stock = square(15.0);
++    // A die plate's hole cut as a punch: only the waste slug drops.
++    let plate = Region::new(vec![square_loop(15.0), square_loop(5.0)]).expect("plate");
++    let start = Point2::new(0.0, 0.0);
++    let v = run(CutSide::Punch, &path(5.0 - K, start), Some(start), &plate, Some(&stock));
++    let f = v.findings.iter().find(|f| matches!(f, WireFinding::WrongSlug { .. })).expect("wrong slug");
++    assert!(f.describe().contains("holds none of the part"), "{}", f.describe());
++    // A punch's outline cut as a die (threaded outside the part): the part drops.
++    let out = Point2::new(-10.0, 0.0);
++    let v = run(CutSide::Die, &path(5.0 + K, out), Some(out), &square(5.0), Some(&stock));
++    let f = v.findings.iter().find(|f| matches!(f, WireFinding::WrongSlug { .. })).expect("wrong slug");
++    assert!(f.describe().contains("here the part drops"), "{}", f.describe());
++    // No stock around a die plate's hole: nothing drops, and that is said.
++    let v = run(CutSide::Die, &path(5.0 - K, start), Some(start), &plate, None);
++    assert!(v.findings.iter().any(|f| matches!(f, WireFinding::NothingFreed { .. })), "{:?}", v.findings);
++}
+diff --git a/docs/decisions/534-wire-verify.md b/docs/decisions/534-wire-verify.md
+new file mode 100644
+index 000000000..2e2d33bca
+--- /dev/null
++++ b/docs/decisions/534-wire-verify.md
+@@ -0,0 +1,16 @@
++## #534 - Wire EDM: verification of a 2-axis cut
++
++The umbrella (#290 D7) decided a 2.5D verify: the kerf region against the part section, the start hole's threading clearance through the full height, and slug analysis by region connectivity, every flag blocking the post. These are the points it left open.
++
++**Decided:**
++
++- **Judged at the post, live.** The laws (`sim::verify::wire`) run in the verification gate's own wire clause (`posting_wire.rs`), beside the plasma clause, over the cached path and the part and stock as they stand now. Every finding is a blocking problem; there is no warning tier. The not-judged line says the 3D stock sim did not run for the wire and names the piece each cut frees. *Dropped:* a generator-time verdict cached with the path - the plasma precedent and the live-gate law (fixtures, machine limits) judge what the room is now.
++- **The whole height the wire passes.** A vertical wire cuts everything between its guides, so the heights judged span the op's planes, the part and the stock, whichever reaches farther: both ends (1 um inside, so a horizontal face is never sliced edge-on) and about every 2 mm between, at most nine sections. *Dropped:* the two programmed planes only - a part taller than the planes, or a step between them, would pass unseen.
++- **The kerf law is exact distance, not area.** A move gouges when its segment comes nearer the product's section than the kerf offset (less 0.1 um) or stands in it; the first such move is named with its depth, the spot and the count. *Dropped:* a swept-capsule boolean with an area threshold - a 10 um intrusion along a 1 mm move falls under any sensible sliver area.
++- **What "the part" is, by the stated side.** A punch's product is the model. A die's product is the model when the start hole stands outside it (a die plate: the opening is its hole); when the start hole stands in the model, the model is the opening itself (#532's whole-model die, where the model's silhouette is the profile) and the product is the stock around it. The start hole is stated and the generator already refuses it on the product's side, so this reads a stated fact, not the geometry's guess. *Dropped:* refusing the whole-model die - #532 ships it as the way a die is cut from a model.
++- **Threading clearance = the kerf offset.** The op states a threading point, not a hole diameter (#532), so "too small" is read as: the product stands nearer the threading point than wire radius + gap at some height. A start hole not stated, or a path that no longer starts at it, is refused by name. A pre-drilled hole's diameter is not modelled.
++- **The slug, by connectivity.** The kerf (the disc of the offset swept along the whole path) is taken out of the material section (stock and part); a piece left inside the kerf's filled outline is freed. A die's freed piece must hold none of the product (else "the part drops"); a punch's freed pieces must hold some (else "only waste drops"); a cut that frees nothing is refused (no stock around a die plate's hole means the slug cannot be judged - said, not passed).
++- **No capture or tab law yet.** D6 says an unsupported slug is refused unless a tab or capture is set; tabs are #539 and no capture parameter exists. This PR flags only a slug on the wrong side and a cut that frees nothing; a correct die or punch passes, and the report names what drops so the operator can catch it. When #539 lands it adds the capture law here.
++- **No part, no verdict.** A wire cut taken from the stock has no part to judge the kerf against and is refused at the gate by name.
++
++**Cost to change later:** the laws are pure functions of a path, an offset, a side, a start and a list of sections; adding the taper (#536) means a section pair per move and the ruled surface between, without changing the gate seam.
+
+From 3e852d68c09fc2f3bd52c150f8e161969caffb29 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 01:24:41 -0800
+Subject: [PATCH 2/3] test(app): the wire laws stand between a wire cut and its
+ NC text
+
+On the combined #533/#534 head the wire post is real, so the wire
+clause now gates actual NC text: a clean punch is judged by the wire
+laws and posts wire-iso.cps's golden byte-for-byte (the program is
+written, the not-judged line names the wire verdict); a die whose kerf
+burns the plate above its 12 mm opening streams like any wire cut but
+post_script refuses it by name ("Die1: wire gouge: the kerf of move
+...") and writes no NC file.
+
+Refs #534
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/wire_post.rs | 86 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 83 insertions(+), 3 deletions(-)
+
+diff --git a/crates/app/tests/wire_post.rs b/crates/app/tests/wire_post.rs
+index 768e27bbe..89cc05b3e 100644
+--- a/crates/app/tests/wire_post.rs
++++ b/crates/app/tests/wire_post.rs
+@@ -5,22 +5,27 @@
+ //! lands; every code the post needs, removed, refuses the post by its
+ //! name; a mill machine, and a cutting post on the wire section, are
+ //! refused by name; the registry offers the post for wire EDMs only.
++//! The wire laws (#534) gate it: a clean cut posts its golden, a
++//! gouging one is refused by name with no NC text written.
+ //! Not exercised on a real EDM control (D10).
+ //!
+ //! Gate map (#533): covers app::posting (posting_wire, WIRE_POSTS,
+ //! post_serves, default_post_for, op_streams' wire branch), post::engine
+ //! (the wireEdm door), post::machine (edm codes mirror, edm_codes), and
+-//! the wire-iso.cps script.
++//! the wire-iso.cps script, and the wire clause's place in the post
++//! gate (posting_wire's wire_clause before NC text, #534).
+ //! Provenance: our own tests over our own synthetic fixture.
+ 
+ use flecs_ecs::prelude::World;
+ 
+-use camcraft_app::commands::{CreateOperation, GenerateOperation, History, ImportModel, LoadMachine};
++use camcraft_app::commands::{CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SetStock};
+ use camcraft_app::geometry::{Mesh, Point3, Triangle};
+ use camcraft_app::machine::{parse_mch, Kind};
+ use camcraft_app::operation::{Height, OpParams, SrcRef, WireContourOp, WireSide};
+ use camcraft_app::post::{self, cnc};
+ use camcraft_app::posting::{self, BUILTINS, WIRE_POSTS};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
+ use camcraft_app::world::new_world;
+ 
+ const FIXTURE: &str = include_str!("edm/wire-iso-fixture.mch");
+@@ -33,7 +38,25 @@ fn cps(name: &str) -> &'static str {
+ 
+ /// A sharp 40 x 20 slug from z = 0 to 12, centred on the origin.
+ fn slug() -> Mesh {
+-    let pts = [(20.0, 10.0), (-20.0, 10.0), (-20.0, -10.0), (20.0, -10.0)];
++    prism(&[(20.0, 10.0), (-20.0, 10.0), (-20.0, -10.0), (20.0, -10.0)])
++}
++
++/// A 40 x 20 die opening with 2 mm corners (3-degree facets) from z = 0
++/// to 12 - a die cannot cut a sharp inside corner.
++fn opening() -> Mesh {
++    let (r, hx, hy) = (2.0, 18.0, 8.0);
++    let mut pts = Vec::new();
++    for (cx, cy, a0) in [(hx, hy, 0.0_f64), (-hx, hy, 90.0), (-hx, -hy, 180.0), (hx, -hy, 270.0)] {
++        for s in 0..=30 {
++            let t = (a0 + 3.0 * f64::from(s)).to_radians();
++            pts.push((cx + r * t.cos(), cy + r * t.sin()));
++        }
++    }
++    prism(&pts)
++}
++
++/// The CCW outline `pts` extruded from z = 0 to 12.
++fn prism(pts: &[(f64, f64)]) -> Mesh {
+     let p = |(x, y): (f64, f64), z: f64| Point3::new(x, y, z);
+     let mut f = Vec::new();
+     for i in 0..pts.len() {
+@@ -67,6 +90,29 @@ fn punch_doc(machine_text: &str) -> World {
+     world
+ }
+ 
++/// A die cut through the 12 mm deep opening in a 60 x 60 x 20 plate - the
++/// wire's kerf enters the plate above the opening. Generated: the generator does not judge the plate; the laws do.
++fn gouging_die() -> World {
++    let world = new_world();
++    let mut h = History::default();
++    let m = parse_mch(FIXTURE).expect("the fixture parses");
++    h.execute(&world, LoadMachine::new(&world, "wire-iso.mch".into(), Some(m)).expect("mount"));
++    h.execute(&world, ImportModel::from_mesh("opening", opening()));
++    let stock = SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, Location::default()).expect("stock");
++    h.execute(&world, stock);
++    let op = WireContourOp {
++        top_z: Height::fixed(12.0),
++        bottom_z: Height::fixed(0.0),
++        condition: "C110".into(),
++        side: WireSide::Die,
++        start: Some([0.0, 0.0]),
++    };
++    let c = CreateOperation::new(&world, "Die1", "", SrcRef::Entity("opening".into()), OpParams::WireContour(op)).expect("op");
++    h.execute(&world, c);
++    h.execute(&world, GenerateOperation::new(&world, "Die1").expect("generates"));
++    world
++}
++
+ fn stream_text(world: &World) -> String {
+     cnc::serialize(&posting::stream_records(world).expect("the wire section streams"))
+ }
+@@ -111,6 +157,40 @@ fn the_punch_contour_posts_its_golden_through_the_gate() {
+     }
+ }
+ 
++/// Done means (#534 over #533): the wire laws stand between a checked
++/// cut and its NC text. The clean punch is judged by them and posts its
++/// golden; a die whose kerf burns the plate above its opening streams
++/// like any wire cut but is refused by name at the gate, and no NC file
++/// is written.
++#[test]
++fn the_wire_laws_stand_between_the_cut_and_its_nc_text() {
++    let world = punch_doc(FIXTURE);
++    let clause = posting::wire_clause(&world);
++    assert!(clause.problems.is_empty(), "{:?}", clause.problems);
++    let line = clause.line.expect("the clean punch is judged, not skipped");
++    assert!(line.contains("Punch1 frees") && line.ends_with("(the part)"), "{line}");
++    let out = std::env::temp_dir().join(format!("camcraft-wire-laws-ok-{}.nc", std::process::id()));
++    let posted = posting::post_script(&world, &out, cps(WIRE)).expect("the judged punch posts");
++    let written = std::fs::read_to_string(&out);
++    let _ = std::fs::remove_file(&out);
++    assert_eq!(written.ok().as_deref(), Some(posted.program.as_str()), "the program is written");
++    assert_eq!(posted.program, std::fs::read_to_string(GOLDEN).expect("golden present"), "the golden holds");
++    assert!(posted.not_judged.is_some_and(|n| n.contains(posting::WIRE_VERDICT)), "said, not silent");
++
++    // A die through a 12 mm deep opening in a 20 mm plate: above
++    // the opening the vertical wire burns the plate itself (#534's own
++    // gouge), now in front of a real wire post.
++    let world = gouging_die();
++    posting::op_streams(&world).expect("the gouging cut still streams - the laws, not the stream, refuse it");
++    let out = std::env::temp_dir().join(format!("camcraft-wire-laws-gouge-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&out);
++    let err = posting::post_script(&world, &out, cps(WIRE)).expect_err("a gouging wire cut never posts");
++    let wrote = out.exists();
++    let _ = std::fs::remove_file(&out);
++    assert!(err.starts_with("post blocked") && err.contains("Die1: wire gouge: the kerf of move"), "{err}");
++    assert!(!wrote, "no NC text is written for a refused wire cut");
++}
++
+ /// Done means: removing any required code refuses by name.
+ #[test]
+ fn each_required_code_removed_refuses_the_post_by_name() {
+
+From af7008a9d9d9344cd79f424af02562ecfc16063c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 10:11:37 -0800
+Subject: [PATCH 3/3] test(app): the wire punch golden is judged by the wire
+ laws, not UNJUDGED
+
+The posted-golden guard now judges wire_contour_punch through
+verify::wire::judge (kerf, threading, slug) - the laws the wire post
+clause runs - regenerated as golden_cl makes it and proved
+byte-identical to its CL golden, so the UNJUDGED entry citing #534 is
+dropped.
+
+Refs #534
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/posted_gates/mod.rs  |  5 +++
+ crates/app/tests/posted_gates/wire.rs | 51 +++++++++++++++++++++++++++
+ crates/app/tests/solid_law_goldens.rs | 18 +++++-----
+ 3 files changed, 66 insertions(+), 8 deletions(-)
+ create mode 100644 crates/app/tests/posted_gates/wire.rs
+
+diff --git a/crates/app/tests/posted_gates/mod.rs b/crates/app/tests/posted_gates/mod.rs
+index d3fd79fc1..a37b573ba 100644
+--- a/crates/app/tests/posted_gates/mod.rs
++++ b/crates/app/tests/posted_gates/mod.rs
+@@ -9,8 +9,13 @@
+ //! warnings ride the verdict line). Every program is first proved
+ //! byte-identical to its committed CL golden.
+ //!
++//! The wire punch rides `wire` (#534): the wire laws its post runs.
++//!
+ //! Provenance: our own harness over our own goldens; no vendor material.
+ 
++mod wire;
++pub use wire::{wire_findings, wire_verdict};
++
+ use flecs_ecs::prelude::World;
+ 
+ use crate::common::gen_to_cltext;
+diff --git a/crates/app/tests/posted_gates/wire.rs b/crates/app/tests/posted_gates/wire.rs
+new file mode 100644
+index 000000000..8354ce64f
+--- /dev/null
++++ b/crates/app/tests/posted_gates/wire.rs
+@@ -0,0 +1,51 @@
++//! The wire punch's CL golden judged by the laws its post runs (#534):
++//! `verify::wire::judge` - kerf, threading, slug, every finding binding -
++//! as `posting_wire::wire_clause` hands it a cut. The program is
++//! regenerated as golden_cl makes it (the 40 x 20 profile with 2 mm
++//! corners, cut as a punch from (-30, 0) on its SYNTHETIC condition,
++//! wire 0.25 and gap 0.04, from no machine's manual), proved byte-
++//! identical to `wire_contour_punch.cl` and judged at full precision
++//! (the CL text's micron grid is coarser than the kerf law's 0.1 um); its
++//! product is that same profile through the 12 mm the wire passes, in a
++//! 80 x 80 plate. (The posted `wire-iso/wire_contour_punch.nc` is the
++//! document route's: `wire_post.rs` posts it through the gate itself.)
++//!
++//! Provenance: our own harness over our own goldens; no vendor material.
++
++use camcraft_app::geo2d::{Loop, Point2, Region};
++use camcraft_app::wire_edm::{wire_contour, WireParams, WireSide};
++use camcraft_app::verify::wire::{judge, CutSide, WireFinding, WireJob, WireSection, WireVerdict};
++
++use super::golden;
++use crate::common::gen_to_cltext;
++use crate::common::solid_part::{rect, region};
++
++/// golden_cl's profile: 40 x 20 with 2 mm corners in 3-degree facets, CCW.
++fn outline() -> Loop {
++    let (r, hx, hy) = (2.0, 18.0, 8.0);
++    let mut pts = Vec::new();
++    for (cx, cy, a0) in [(hx, hy, 0.0_f64), (-hx, hy, 90.0), (-hx, -hy, 180.0), (hx, -hy, 270.0)] {
++        for s in 0..=30 {
++            let t = (a0 + 3.0 * f64::from(s)).to_radians();
++            pts.push(Point2::new(cx + r * t.cos(), cy + r * t.sin()));
++        }
++    }
++    Loop::new(pts).expect("the profile loop")
++}
++
++/// The wire laws' verdict on the punch golden.
++pub fn wire_verdict() -> WireVerdict {
++    let start = Point2::new(-30.0, 0.0);
++    let p = WireParams { wire_diameter: 0.25, gap: 0.04, condition: "C110".into(), side: WireSide::Punch, start: Some(start), plane_z: 0.0 };
++    let t = wire_contour(&[outline()], &[], &p).expect("the punch generates");
++    assert_eq!(gen_to_cltext(&t), golden("wire_contour_punch.cl"), "wire_contour_punch.cl: the regenerated program is the golden");
++    let part = Region::new(vec![outline()]).expect("the profile region");
++    let stock = region(&[rect(-40.0, -40.0, 40.0, 40.0)]);
++    let sections = [0.01, 6.0, 11.99].into_iter().map(|z| WireSection { z, part: part.clone(), stock: Some(stock.clone()) }).collect();
++    judge(&WireJob { path: &t, kerf_offset: 0.25 * 0.5 + 0.04, side: CutSide::Punch, start: Some(start), sections })
++}
++
++/// The punch golden's findings at the wire laws, each one blocking.
++pub fn wire_findings() -> Vec<WireFinding> {
++    wire_verdict().findings
++}
+diff --git a/crates/app/tests/solid_law_goldens.rs b/crates/app/tests/solid_law_goldens.rs
+index 75275d224..749826455 100644
+--- a/crates/app/tests/solid_law_goldens.rs
++++ b/crates/app/tests/solid_law_goldens.rs
+@@ -21,13 +21,14 @@
+ //! Gate map (solid law): covers sim::verify (engine b2, solid_hits, the
+ //! crossing law), the posted goldens under tests/golden/nc/,
+ //! motion::machining2d (contour, face, pocket, slot, trochoid, trace),
+-//! motion::drilling (drill), app::operation (region_of), sim::verify::plasma.
++//! motion::drilling (drill), app::operation (region_of), sim::verify::plasma,
++//! sim::verify::wire and app::posting (posting_wire's wire_clause, #534).
+ 
+ mod common;
+ mod posted_gates;
+ 
+ use common::gen_to_cltext;
+-use posted_gates::{narrowed_slot_verdict, plasma_findings, region_verdicts};
++use posted_gates::{narrowed_slot_verdict, plasma_findings, region_verdicts, wire_findings, wire_verdict};
+ use common::solid_part::{cap, circle, mill, plate, plate_cell, rect, region, walls};
+ 
+ use camcraft_app::cl::Toolpath;
+@@ -306,18 +307,13 @@ const REFUSED_HEADER: &str = "refused program, posted for syntax conformance";
+ /// guard below makes every other posted golden's program pass the gate
+ /// its kind's post runs, so a new one is either judged or named here.
+ /// The slot, trochoid, trace and plasma goldens are judged since #1000
+-/// (`posted_gates`).
++/// (`posted_gates`), the wire punch since #534 (its wire laws).
+ const UNJUDGED: &[(&str, &str)] = &[
+     (
+         "arc_planes",
+         "a hand-built posting fixture (arc_planes.rs): no operation kind, part, region or tool record makes it, \
+          so no gate a user's post runs can judge it - #1093",
+     ),
+-    (
+-        "wire_contour_punch",
+-        "the wire ISO post's golden (wire_post.rs, #533): a tool-less wire cut, and wire verification \
+-         (the wire's sweep, start hole, slug) is not built yet - #534",
+-    ),
+ ];
+ 
+ #[test]
+@@ -331,6 +327,11 @@ fn the_slot_trace_and_plasma_goldens_pass_their_gates() {
+         assert_eq!(w, Vec::new(), "{name}");
+     }
+     assert_eq!(plasma_findings(), Vec::new(), "plasma_plate_with_holes.cl: the plasma laws find nothing");
++    // #534: the wire punch through the wire laws - clean, and judged,
++    // not skipped: the piece its closed cut frees is the part.
++    let wire = wire_verdict();
++    assert_eq!(wire.findings, Vec::new(), "wire_contour_punch.cl: the wire laws find nothing");
++    assert!(wire.slugs.iter().any(|s| s.product_area > 0.0), "the punch frees the part: {:?}", wire.slugs);
+ }
+ 
+ #[test]
+@@ -355,6 +356,7 @@ fn every_posted_golden_is_a_program_the_gate_passes() {
+     let mut judged: Vec<(&str, Vec<String>)> = verdicts().into_iter().chain(region_verdicts()).map(|(n, w)| (n, blocking(w))).collect();
+     let plasma = plasma_findings().iter().filter(|f| f.refuses()).map(|f| f.describe()).collect();
+     judged.push(("plasma_plate_with_holes.cl", plasma));
++    judged.push(("wire_contour_punch.cl", wire_findings().iter().map(|f| f.describe()).collect()));
+     let mut dirs = vec![root.join("nc")];
+     let mut posted = 0;
+     while let Some(dir) = dirs.pop() {

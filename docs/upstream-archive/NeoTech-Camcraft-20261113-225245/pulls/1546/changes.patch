@@ -1,0 +1,1070 @@
+From d569372feac245a25ff7b991b59e9c10f02a880d Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 13 Nov 2026 13:25:14 -0800
+Subject: [PATCH] fix(import): refuse a STEP face whose tessellation never
+ converges
+
+truck's surface subdivision recurses forever on a B-spline or NURBS face
+that is not continuous (one seam stays "far" at every depth), inside a
+rayon task nothing can interrupt, and with no facet produced the facet
+budget never fires: the import hung (#1536, a 62-face filleted cube ran
+for 19 CPU-minutes).
+
+Every face is now wrapped in a metered surface (step_guard). B-spline and
+NURBS faces are divided by truck's own generic parameter_division called
+on the wrapper - the same algorithm, so the same mesh - and past
+FACE_EVAL_CAP evaluations in one pass the wrapper answers with a fixed
+point (the subdivision stops within one sweep) and an empty division (no
+runaway grid is triangulated). The import is then refused naming the
+face's STEP entity, index, kind and shell. No thread is spawned, nothing
+outlives the call.
+
+Pinned by import_step_guard (a discontinuous B-spline face refused by
+name inside a hard time limit, at the default and a lowered cap; a smooth
+B-spline dome still imports at its volume; degenerate knot variants end
+cleanly) and step_guard's unit tests (division identical to truck's on a
+smooth surface, bounded and tripped on a discontinuous one, no work left
+running after a refused pass).
+
+Fixes #1536
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/geometry/import/mod.rs        |   1 +
+ crates/app/src/geometry/import/step.rs       |  50 ++-
+ crates/app/src/geometry/import/step_guard.rs | 336 +++++++++++++++++++
+ crates/app/tests/import_step_guard.rs        | 112 +++++++
+ docs/decisions/1536-step-tess-guard.md       |  64 ++++
+ testdata/models/bspline_discontinuous.step   | 183 ++++++++++
+ testdata/models/bspline_dome.step            | 184 ++++++++++
+ 7 files changed, 926 insertions(+), 4 deletions(-)
+ create mode 100644 crates/app/src/geometry/import/step_guard.rs
+ create mode 100644 crates/app/tests/import_step_guard.rs
+ create mode 100644 docs/decisions/1536-step-tess-guard.md
+ create mode 100644 testdata/models/bspline_discontinuous.step
+ create mode 100644 testdata/models/bspline_dome.step
+
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index 60706363e..126902f27 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -10,6 +10,7 @@ pub mod step;
+ pub mod step_budget;
+ pub mod step_csys;
+ mod step_diag;
++mod step_guard;
+ pub mod step_depth;
+ mod step_refine;
+ mod step_units;
+diff --git a/crates/app/src/geometry/import/step.rs b/crates/app/src/geometry/import/step.rs
+index 993f087f2..6704c0b95 100644
+--- a/crates/app/src/geometry/import/step.rs
++++ b/crates/app/src/geometry/import/step.rs
+@@ -15,6 +15,9 @@
+ //!   being thrown away.
+ //! - Facet collection is capped per shell while extracting, as a last line of
+ //!   defense on top of the tolerance schedule.
++//! - Every face's surface evaluations are metered per pass (`step_guard`,
++//!   #1536): a face whose subdivision never converges is refused by name
++//!   instead of hanging inside truck, where nothing else can stop it.
+ 
+ use std::panic::AssertUnwindSafe;
+ 
+@@ -69,6 +72,27 @@ pub fn with_facet_budget<R>(budget: usize, f: impl FnOnce() -> R) -> R {
+     out
+ }
+ 
++thread_local! {
++    /// Test-only override of the per-face evaluation cap (#1536's pins
++    /// trip it on a small fixture in well under a second).
++    static EVAL_CAP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
++}
++
++/// Run `f` with the per-face evaluation cap lowered to `cap` on this
++/// thread. Never raises it. For tests; cleared on return.
++#[doc(hidden)]
++pub fn with_face_eval_cap<R>(cap: u64, f: impl FnOnce() -> R) -> R {
++    EVAL_CAP_OVERRIDE.with(|c| c.set(Some(cap)));
++    let out = f();
++    EVAL_CAP_OVERRIDE.with(|c| c.set(None));
++    out
++}
++
++fn face_eval_cap() -> u64 {
++    let cap = super::step_guard::FACE_EVAL_CAP;
++    EVAL_CAP_OVERRIDE.with(std::cell::Cell::get).map_or(cap, |c| c.min(cap))
++}
++
+ fn facet_budget(asked: usize) -> usize {
+     BUDGET_OVERRIDE.with(std::cell::Cell::get).map_or(asked, |b| b.min(asked))
+ }
+@@ -121,7 +145,7 @@ pub fn parse_with_chord_budget(data: &[u8], budget: usize) -> Result<(Mesh, f64)
+     let max_facets = facet_budget(budget);
+     let mut facets: Vec<Triangle> = Vec::new();
+     let mut chord = 0.0f64;
+-    for shell in table.shell.values() {
++    for (shell_id, shell) in &table.shell {
+         if facets.len() >= max_facets {
+             return Err(ImportError::TooLarge);
+         }
+@@ -131,7 +155,7 @@ pub fn parse_with_chord_budget(data: &[u8], budget: usize) -> Result<(Mesh, f64)
+         // AssertUnwindSafe holds for our purposes: on a panic we discard all
+         // outputs and abort the import.
+         let per_shell = std::panic::catch_unwind(AssertUnwindSafe(|| {
+-            shell_facets(&table, shell, budget, mm_per_unit.unwrap_or(1.0))
++            shell_facets(&table, (*shell_id, shell), budget, mm_per_unit.unwrap_or(1.0))
+         }));
+         let (tris, tol) = match per_shell {
+             Err(_) => {
+@@ -171,13 +195,19 @@ pub fn parse_with_chord_budget(data: &[u8], budget: usize) -> Result<(Mesh, f64)
+ /// Runs inside `catch_unwind`; returns `Err` only for reasons we control.
+ fn shell_facets(
+     table: &Table,
+-    shell: &truck_stepio::r#in::ShellHolder,
++    (shell_id, shell): (u64, &truck_stepio::r#in::ShellHolder),
+     budget: usize,
+     mm_per_unit: f64,
+ ) -> Result<(Vec<Triangle>, f64), ImportError> {
+     let cshell = table
+         .to_compressed_shell(shell)
+         .map_err(|e| ImportError::Step(format!("shell conversion failed: {e}")))?;
++    // #1536: every face metered, so one whose subdivision never converges
++    // is refused by name instead of hanging the import.
++    let face_ids = super::step_guard::face_entities(shell, cshell.faces.len());
++    let cap = face_eval_cap();
++    let guarded = super::step_guard::Guarded::new(cshell, cap);
++    let cshell = &guarded.shell;
+     let mut extent = 0.0f64;
+     for p in cshell.vertices.iter() {
+         for c in [p.x, p.y, p.z] {
+@@ -192,7 +222,19 @@ fn shell_facets(
+     // closure so the heavily-aliased CompressedShell type is inferred
+     // instead of spelled out.
+     let triangulate = |tol: f64| -> Result<Vec<Triangle>, ImportError> {
+-        let meshed = cshell.robust_triangulation(tol).to_polygon();
++        guarded.reset();
++        // A panic is held until the meters are read: a face that ran past
++        // its cap is the cause worth naming, not the panic it led to.
++        let meshed = std::panic::catch_unwind(AssertUnwindSafe(|| cshell.robust_triangulation(tol).to_polygon()));
++        if let Some((i, kind)) = guarded.tripped() {
++            // Refused even when a coarser pass met: a surface that jumps
++            // converges at any tolerance wider than its gap, and keeping
++            // that mesh would smear the gap into a wall that is not there.
++            tracing::error!("step: face {} of shell #{shell_id} ({kind}) did not converge within {cap} evaluations", i + 1);
++            let entity = face_ids.as_ref().and_then(|ids| ids.as_slice().get(i).copied());
++            return Err(super::step_guard::refusal(i, kind, cshell.faces.len(), entity, Some(shell_id), cap));
++        }
++        let meshed = meshed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+         let positions = meshed.positions();
+         let mut facets: Vec<Triangle> = Vec::new();
+         for face in meshed.face_iter() {
+diff --git a/crates/app/src/geometry/import/step_guard.rs b/crates/app/src/geometry/import/step_guard.rs
+new file mode 100644
+index 000000000..6ae059c2b
+--- /dev/null
++++ b/crates/app/src/geometry/import/step_guard.rs
+@@ -0,0 +1,336 @@
++//! A metered wrapper around the STEP importer's surfaces, so one face whose
++//! tessellation never converges ends in a refusal by name instead of a
++//! hang (#1536).
++//!
++//! Provenance: our own design (an evaluation budget on a parametric
++//! surface); the subdivision it meters is truck's published
++//! `parameter_division` (ricosjp, Apache-2.0), called unchanged. Nothing
++//! from any CAM vendor.
++//!
++//! Why it is needed: truck's surface subdivision splits every parameter
++//! cell whose midpoint stands off the bilinear patch of its corners by more
++//! than the tolerance, and recurses until no cell splits. A B-spline that is
++//! not continuous - an interior knot repeated past its degree, a degenerate
++//! corner blend - keeps one cell "far" at every depth, so the recursion
++//! never ends (it outlives the float resolution: a split at an unchanged
++//! midpoint still grows the list). It runs inside a rayon task we cannot
++//! interrupt, and no facet is ever produced, so the facet budget never
++//! fires.
++//!
++//! How it is bounded: each face's surface is wrapped in [`Metered`], which
++//! counts every point truck evaluates on it during one tessellation pass.
++//! B-spline and NURBS faces are subdivided by truck's own generic algorithm
++//! called on the wrapper (exactly what their own `parameter_division` runs,
++//! so the evaluations - and the mesh - are identical); other surface kinds
++//! keep their specialised division. Past the cap the wrapper answers every
++//! evaluation with one fixed point: no cell is then "far", the subdivision
++//! ends within one more sweep, and the importer refuses the model naming
++//! the face. No thread is spawned and none is left behind.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::Arc;
++
++use truck_stepio::r#in::alias::{
++    algo, ParameterDivision2D, ParametricSurface, ParametricSurface3D, ParameterRange, Point3,
++    SPHint2D, SearchNearestParameter, SearchParameter, Surface, Vector3, D2,
++};
++use truck_topology::compress::{CompressedFace, CompressedShell};
++
++use super::ImportError;
++
++/// Surface evaluations one face may spend in one tessellation pass. A
++/// healthy face at the finest chord the importer asks for needs a few
++/// million (a 1000 x 1000 grid is ~7M with the subdivision's own probes);
++/// a face that never converges reaches it in seconds and is refused.
++pub const FACE_EVAL_CAP: u64 = 25_000_000;
++
++/// One face's evaluation count for the current pass.
++#[derive(Debug)]
++pub(super) struct Meter {
++    used: AtomicU64,
++    cap: u64,
++}
++
++impl Meter {
++    fn new(cap: u64) -> Self {
++        Self { used: AtomicU64::new(0), cap }
++    }
++    /// Count one evaluation; `false` once the cap is spent.
++    fn spend(&self) -> bool {
++        self.used.fetch_add(1, Ordering::Relaxed) < self.cap
++    }
++    fn tripped(&self) -> bool {
++        self.used.load(Ordering::Relaxed) > self.cap
++    }
++    fn reset(&self) {
++        self.used.store(0, Ordering::Relaxed);
++    }
++}
++
++/// A STEP surface whose evaluations are counted against a [`Meter`].
++#[derive(Clone, Debug)]
++pub(super) struct Metered {
++    inner: Surface,
++    meter: Arc<Meter>,
++}
++
++impl Metered {
++    pub(super) fn new(inner: Surface, cap: u64) -> Self {
++        Self { inner, meter: Arc::new(Meter::new(cap)) }
++    }
++}
++
++/// The surface kind, for a refusal a user can act on.
++pub(super) fn kind(s: &Surface) -> &'static str {
++    match s {
++        Surface::ElementarySurface(_) => "elementary surface",
++        Surface::SweptCurve(_) => "swept surface",
++        Surface::BSplineSurface(_) => "B-spline surface",
++        Surface::NurbsSurface(_) => "NURBS surface",
++    }
++}
++
++impl ParametricSurface for Metered {
++    type Point = Point3;
++    type Vector = Vector3;
++    fn subs(&self, u: f64, v: f64) -> Point3 {
++        // Past the cap every point is the same point: the subdivision then
++        // sees no cell off its patch and stops. The pass is refused after.
++        if self.meter.spend() {
++            self.inner.subs(u, v)
++        } else {
++            Point3::new(0.0, 0.0, 0.0)
++        }
++    }
++    fn uder(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.uder(u, v)
++    }
++    fn vder(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.vder(u, v)
++    }
++    fn uuder(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.uuder(u, v)
++    }
++    fn uvder(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.uvder(u, v)
++    }
++    fn vvder(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.vvder(u, v)
++    }
++    fn parameter_range(&self) -> (ParameterRange, ParameterRange) {
++        self.inner.parameter_range()
++    }
++    fn u_period(&self) -> Option<f64> {
++        self.inner.u_period()
++    }
++    fn v_period(&self) -> Option<f64> {
++        self.inner.v_period()
++    }
++}
++
++impl ParametricSurface3D for Metered {
++    fn normal(&self, u: f64, v: f64) -> Vector3 {
++        self.inner.normal(u, v)
++    }
++}
++
++impl ParameterDivision2D for Metered {
++    fn parameter_division(&self, range: ((f64, f64), (f64, f64)), tol: f64) -> (Vec<f64>, Vec<f64>) {
++        match &self.inner {
++            // truck's B-spline and NURBS surfaces divide with exactly this
++            // generic algorithm; running it on the wrapper routes every
++            // probe through the meter and changes nothing else.
++            Surface::BSplineSurface(_) | Surface::NurbsSurface(_) => {
++                let division = algo::surface::parameter_division(self, range, tol);
++                // A tripped face is refused after the pass; handing truck
++                // the grid it grew (millions of points down the runaway
++                // seam) would only make it triangulate them first.
++                if self.meter.tripped() {
++                    let ((u0, u1), (v0, v1)) = range;
++                    return (vec![u0, u1], vec![v0, v1]);
++                }
++                division
++            }
++            other => other.parameter_division(range, tol),
++        }
++    }
++}
++
++impl SearchParameter<D2> for Metered {
++    type Point = Point3;
++    fn search_parameter<H: Into<SPHint2D>>(&self, point: Point3, hint: H, trials: usize) -> Option<(f64, f64)> {
++        self.inner.search_parameter(point, hint, trials)
++    }
++}
++
++impl SearchNearestParameter<D2> for Metered {
++    type Point = Point3;
++    fn search_nearest_parameter<H: Into<SPHint2D>>(
++        &self,
++        point: Point3,
++        hint: H,
++        trials: usize,
++    ) -> Option<(f64, f64)> {
++        self.inner.search_nearest_parameter(point, hint, trials)
++    }
++}
++
++type StepShell<S> = CompressedShell<Point3, truck_stepio::r#in::alias::Curve3D, S>;
++
++/// A shell with every face metered, and the meters in face order.
++pub(super) struct Guarded {
++    pub shell: StepShell<Metered>,
++    meters: Vec<Arc<Meter>>,
++    kinds: Vec<&'static str>,
++}
++
++impl Guarded {
++    pub(super) fn new(shell: StepShell<Surface>, cap: u64) -> Self {
++        let mut meters = Vec::with_capacity(shell.faces.len());
++        let mut kinds = Vec::with_capacity(shell.faces.len());
++        let faces = shell
++            .faces
++            .into_iter()
++            .map(|f| {
++                kinds.push(kind(&f.surface));
++                let surface = Metered::new(f.surface, cap);
++                meters.push(Arc::clone(&surface.meter));
++                CompressedFace { boundaries: f.boundaries, orientation: f.orientation, surface }
++            })
++            .collect();
++        Self { shell: CompressedShell { vertices: shell.vertices, edges: shell.edges, faces }, meters, kinds }
++    }
++
++    /// Start a new pass: every face gets its whole budget again.
++    pub(super) fn reset(&self) {
++        self.meters.iter().for_each(|m| m.reset());
++    }
++
++    /// The first face (index, kind) whose pass ran past the cap.
++    pub(super) fn tripped(&self) -> Option<(usize, &'static str)> {
++        let i = self.meters.iter().position(|m| m.tripped())?;
++        Some((i, self.kinds.get(i).copied().unwrap_or("surface")))
++    }
++}
++
++/// The STEP entity number of each face of `shell`, in the order truck
++/// converts them - or `None` when the counts differ (truck drops a face it
++/// cannot convert, and the numbering would then name the wrong face).
++pub(super) fn face_entities(shell: &truck_stepio::r#in::ShellHolder, faces: usize) -> Option<Vec<u64>> {
++    use truck_stepio::r#in::ruststep::{ast::Name, tables::PlaceHolder};
++    let ids: Option<Vec<u64>> = shell
++        .cfs_faces
++        .iter()
++        .map(|f| match f {
++            PlaceHolder::Ref(Name::Entity(id)) => Some(*id),
++            _ => None,
++        })
++        .collect();
++    ids.filter(|ids| ids.len() == faces)
++}
++
++/// The refusal for face `index` (0-based) of a shell of `faces` faces,
++/// naming its STEP entity when the file's face list maps one-to-one.
++pub(super) fn refusal(
++    index: usize,
++    kind: &str,
++    faces: usize,
++    entity: Option<u64>,
++    shell: Option<u64>,
++    cap: u64,
++) -> ImportError {
++    let face = match entity {
++        Some(id) => format!("face #{id} ({kind}, face {} of {faces}", index + 1),
++        None => format!("face {} of {faces} ({kind}", index + 1),
++    };
++    let shell = shell.map(|s| format!(" in shell #{s}")).unwrap_or_default();
++    ImportError::Step(format!(
++        "{face}{shell}) could not be tessellated: its surface subdivision did not converge within {cap} evaluations \
++         (a discontinuous or degenerate surface) - re-export the model, or import an STL"
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use truck_stepio::r#in::alias::{BSplineSurface, KnotVec};
++
++    /// Degree 1 in u with the knot 1.0 repeated twice: the left half sits
++    /// at z = 0, the right half at z = 1, so the surface jumps at u = 1.
++    fn discontinuous() -> Surface {
++        let uk = KnotVec::from(vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
++        let vk = KnotVec::bezier_knot(1);
++        let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
++        let cps = vec![
++            vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.0)],
++            vec![p(1.0, 0.0, 0.0), p(1.0, 1.0, 0.0)],
++            vec![p(1.0, 0.0, 1.0), p(1.0, 1.0, 1.0)],
++            vec![p(2.0, 0.0, 1.0), p(2.0, 1.0, 1.0)],
++        ];
++        Surface::BSplineSurface(Box::new(BSplineSurface::new((uk, vk), cps)))
++    }
++
++    fn smooth() -> Surface {
++        let k = KnotVec::bezier_knot(2);
++        let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
++        let cps = vec![
++            vec![p(0.0, 0.0, 0.0), p(0.0, 1.0, 0.5), p(0.0, 2.0, 0.0)],
++            vec![p(1.0, 0.0, 0.5), p(1.0, 1.0, 2.0), p(1.0, 2.0, 0.5)],
++            vec![p(2.0, 0.0, 0.0), p(2.0, 1.0, 0.5), p(2.0, 2.0, 0.0)],
++        ];
++        Surface::BSplineSurface(Box::new(BSplineSurface::new((k.clone(), k), cps)))
++    }
++
++    #[test]
++    fn a_discontinuous_bspline_division_stops_at_the_cap_and_trips_the_meter() {
++        let m = Metered::new(discontinuous(), 200_000);
++        let started = std::time::Instant::now();
++        let (u, v) = m.parameter_division(((0.0, 2.0), (0.0, 1.0)), 1e-3);
++        assert!(m.meter.tripped(), "the meter must report the runaway face");
++        assert_eq!((u, v), (vec![0.0, 2.0], vec![0.0, 1.0]), "a tripped face hands truck no grid to triangulate");
++        assert!(started.elapsed().as_secs() < 10, "bounded: {:?}", started.elapsed());
++    }
++
++    #[test]
++    fn a_smooth_bspline_divides_exactly_as_truck_does_and_does_not_trip() {
++        let s = smooth();
++        let m = Metered::new(s.clone(), FACE_EVAL_CAP);
++        let range = ((0.0, 1.0), (0.0, 1.0));
++        for tol in [0.1, 1e-2, 1e-3] {
++            m.meter.reset();
++            assert_eq!(m.parameter_division(range, tol), s.parameter_division(range, tol), "tol {tol}");
++            assert!(!m.meter.tripped());
++        }
++    }
++
++    /// No work outlives a refused pass: truck's rayon tasks are joined
++    /// before `robust_triangulation` returns, no thread is spawned, so the
++    /// runaway face's meter is still once the call is back.
++    #[test]
++    fn nothing_keeps_running_after_a_refused_pass() {
++        use truck_meshalgo::prelude::RobustMeshableShape;
++        let text = include_str!("../../../../../testdata/models/bspline_discontinuous.step");
++        let exchange = truck_stepio::r#in::ruststep::parser::parse(text).expect("fixture parses");
++        let table = truck_stepio::r#in::Table::from_data_section(&exchange.data[0]);
++        let shell = table.shell.values().next().expect("one shell");
++        let cshell = table.to_compressed_shell(shell).expect("converts");
++        // A cap large enough that the pass takes a while: work left running
++        // in the background would still be counting when we look.
++        let g = Guarded::new(cshell, 2_000_000);
++        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.shell.robust_triangulation(0.01)));
++        assert_eq!(g.tripped(), Some((5, "B-spline surface")));
++        let spent = |g: &Guarded| g.meters.iter().map(|m| m.used.load(Ordering::Relaxed)).sum::<u64>();
++        let before = spent(&g);
++        std::thread::sleep(std::time::Duration::from_millis(300));
++        assert_eq!(spent(&g), before, "a tessellation is still evaluating after the call returned");
++    }
++
++    #[test]
++    fn the_refusal_names_the_face_its_kind_and_the_cap() {
++        let e = refusal(36, "NURBS surface", 62, Some(1234), Some(17), 99).to_string();
++        assert!(e.contains("face #1234 (NURBS surface, face 37 of 62 in shell #17)"), "{e}");
++        assert!(e.contains("within 99 evaluations"), "{e}");
++        let e = refusal(0, "B-spline surface", 1, None, None, 5).to_string();
++        assert!(e.contains("face 1 of 1 (B-spline surface)"), "{e}");
++    }
++}
+diff --git a/crates/app/tests/import_step_guard.rs b/crates/app/tests/import_step_guard.rs
+new file mode 100644
+index 000000000..a34882ddc
+--- /dev/null
++++ b/crates/app/tests/import_step_guard.rs
+@@ -0,0 +1,112 @@
++//! #1536: a STEP face whose tessellation never converges is refused by
++//! name inside a bounded time, never a hang; smooth B-spline faces still
++//! import; degenerate B-spline input still ends cleanly.
++//!
++//! Fixtures (testdata/models/): `bspline_discontinuous.step` is box.step
++//! with its top face a degree-1 B-spline whose interior knot is repeated
++//! past its degree, so the surface jumps at u = 0.5 and truck's
++//! subdivision recurses for ever; `bspline_dome.step` is box.step with a
++//! smooth biquadratic dome on top.
++//!
++//! Gate map (M4.4): covers app::geometry::import::step,
++//! app::geometry::import::step_guard.
++
++use std::path::{Path, PathBuf};
++use std::sync::mpsc;
++use std::time::{Duration, Instant};
++
++use camcraft_app::geometry::import::{self, step};
++use camcraft_app::geometry::{Mesh, Point3};
++
++fn testdata(name: &str) -> PathBuf {
++    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models").join(name)
++}
++
++/// Run `f` on its own thread and fail the test - instead of hanging the
++/// suite - when it has not answered within `limit`.
++fn within<R: Send + 'static>(limit: Duration, f: impl FnOnce() -> R + Send + 'static) -> R {
++    let (tx, rx) = mpsc::channel();
++    std::thread::spawn(move || {
++        let _ = tx.send(f());
++    });
++    match rx.recv_timeout(limit) {
++        Ok(r) => r,
++        Err(_) => panic!("import did not finish within {limit:?} - the hang is back"),
++    }
++}
++
++fn volume(m: &Mesh) -> f64 {
++    m.facets
++        .iter()
++        .map(|t| {
++            let (a, b, c) = (t.a, t.b, t.c);
++            (a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x) + a.z * (b.x * c.y - b.y * c.x)) / 6.0
++        })
++        .sum()
++}
++
++#[test]
++fn a_face_that_never_converges_is_refused_by_name_within_the_budget() {
++    // The default cap, as a user's import runs it: bounded, and named.
++    let started = Instant::now();
++    let r = within(Duration::from_secs(120), || import::load_model(&testdata("bspline_discontinuous.step")));
++    let err = r.expect_err("a surface that never tessellates must be refused").to_string();
++    assert!(
++        err.contains("face #53 (B-spline surface, face 6 of 6 in shell #17)"),
++        "the refusal names the face, its kind and its shell: {err}"
++    );
++    assert!(err.contains("did not converge"), "{err}");
++    assert!(err.contains("import an STL"), "the refusal says what to do: {err}");
++    eprintln!("refused in {:?}", started.elapsed());
++}
++
++#[test]
++fn a_lowered_cap_refuses_the_same_face_at_once() {
++    let r = within(Duration::from_secs(30), || {
++        step::with_face_eval_cap(100_000, || import::load_model(&testdata("bspline_discontinuous.step")))
++    });
++    let err = r.expect_err("refused").to_string();
++    assert!(err.contains("face #53") && err.contains("within 100000 evaluations"), "{err}");
++}
++
++#[test]
++fn a_smooth_bspline_face_still_imports_closed_at_its_volume() {
++    let m = within(Duration::from_secs(60), || import::load_model(&testdata("bspline_dome.step")))
++        .expect("a smooth B-spline face imports");
++    let b = m.bounds().expect("non-empty");
++    // The dome's crown: 1 + 0.2 * (2 * 0.5 * 0.5)^2 = 1.05 at u = v = 0.5.
++    assert!((b.max.z - 1.05).abs() < 5e-3, "dome crown at {}", b.max.z);
++    let want = 1.0 + 0.2 / 9.0;
++    let got = volume(&m);
++    assert!((got - want).abs() < 2e-3, "volume {got}, want {want}");
++    assert!(b.min.x.abs() < 1e-9 && (b.max.x - 1.0).abs() < 1e-9, "{b:?}");
++}
++
++#[test]
++fn degenerate_bspline_variants_end_cleanly_and_bounded() {
++    // Knots, multiplicities and points bent into nonsense: each must come
++    // back - an import or a refusal - never a hang or a crash.
++    let text = std::fs::read_to_string(testdata("bspline_discontinuous.step")).expect("fixture");
++    let knots = "(2, 2, 2), (2, 2), (0.0, 0.5, 1.0), (0.0, 1.0)";
++    assert!(text.contains(knots), "fixture layout changed");
++    let variants = [
++        "(2, 2, 2), (2, 2), (0.0, 0.0, 1.0), (0.0, 1.0)",
++        "(2, 2, 2), (2, 2), (0.0, 0.5, 0.5), (0.0, 1.0)",
++        "(2, 2, 2), (2, 2), (1.0, 0.5, 0.0), (0.0, 1.0)",
++        "(2, 2, 2), (2, 2), (0.0, 0.5, 1.0), (1.0, 1.0)",
++        "(3, 3, 3), (2, 2), (0.0, 0.5, 1.0), (0.0, 1.0)",
++        "(1, 1, 1), (2, 2), (0.0, 0.5, 1.0), (0.0, 1.0)",
++        "(2, 2, 2), (2, 2), (0.0, 0.5, 1.0E300), (0.0, 1.0)",
++    ];
++    for v in variants {
++        let data = text.replace(knots, v).into_bytes();
++        let started = Instant::now();
++        let r = within(Duration::from_secs(60), move || {
++            step::with_face_eval_cap(200_000, || import::parse_model(&data, import::Format::Step))
++        });
++        if let Ok(m) = &r {
++            assert!(m.facets.iter().all(|t| [t.a, t.b, t.c].iter().all(|p: &Point3| p.is_finite())), "{v}");
++        }
++        eprintln!("{v}: {} in {:?}", r.map(|m| format!("{} facets", m.len())).unwrap_or_else(|e| e.to_string()), started.elapsed());
++    }
++}
+diff --git a/docs/decisions/1536-step-tess-guard.md b/docs/decisions/1536-step-tess-guard.md
+new file mode 100644
+index 000000000..c9f860fa0
+--- /dev/null
++++ b/docs/decisions/1536-step-tess-guard.md
+@@ -0,0 +1,64 @@
++## #1536 - A STEP face whose tessellation never converges is refused by name, not hung on
++
++**Decided.** Every face of a STEP shell is wrapped in a metered surface
++(`crates/app/src/geometry/import/step_guard.rs`) before truck tessellates it.
++The wrapper counts the points truck evaluates on that face in one pass. B-spline
++and NURBS faces are divided by truck's own generic `parameter_division`, called
++on the wrapper. That is the same algorithm their own impls run, so the division
++and the mesh do not change. Other surface kinds keep their specialised
++division. When a face spends more than `FACE_EVAL_CAP` (25,000,000)
++evaluations in one pass, the wrapper does two things. It answers every
++further evaluation with one fixed point, so no cell is "far" and the
++subdivision ends within one sweep. It also hands truck the bare range as
++the division, so truck does not triangulate the millions of grid points the
++runaway grew. The import is then refused with the face's STEP entity number,
++its index and kind, its shell, the cap and what to do: "re-export the model,
++or import an STL". A trip refuses even when a coarser pass of the same
++shell had met, because a surface that jumps converges at any tolerance
++wider than its gap, and keeping that mesh would smear the gap into a wall
++that is not there.
++
++**Why.** truck's subdivision splits every cell whose midpoint stands off the
++bilinear patch of its corners and recurses until nothing splits. A surface
++that is not continuous keeps one seam "far" at every depth. An example is an
++interior knot repeated past its degree, which the pinning fixture uses. The
++recursion then never ends: past float resolution a split at an unchanged
++midpoint still grows the list. It runs inside a rayon task we cannot
++interrupt, and it produces no facet, so the facet budget never fires. The
++issue's sample matches this shape: the stack is `sub_parameter_division` over
++`NurbsSurface<Vector4>`, and memory grows slowly. Metering the evaluations
++bounds the loop without a thread, a timer or a patch to truck. It is
++deterministic, so the pin is a plain test. The cap was measured. A
++400 mm doubly curved bicubic patch at the 0.0025 mm chord cap needs 1.5 M
++evaluations (a 475 x 475 grid). A discontinuous face reaches 25 M in about
++1.7 s (release) or 4.5 s (debug, the whole import). A face needing 25 M
++would be a ~3.7 M-point grid, or ~7 M facets from one face.
++
++**Considered and dropped.**
++- *Worker thread with a deadline (option c).* A thread inside truck cannot be
++  killed. The stranded one keeps a core busy and its memory keeps growing (the
++  issue measured 175 -> 322 MB in 4 min). That is a leak to cap and document,
++  where the meter leaves nothing running. It would also make the refusal
++  depend on wall-clock time and machine speed.
++- *Tessellate face by face and skip the bad face (option b).* This gives a
++  partial model, which must be marked incomplete. It also still needs (a) or
++  (c) to stop the bad face. A refusal is the Prime Directive's default, and
++  the user has the STL workaround.
++- *Patch or vendor truck's `sub_parameter_division`.* This would be a
++  new-dependency-shaped change that needs the maintainer. The wrapper reaches
++  the same bound from outside.
++- *Keep the coarser mesh when only a finer pass trips (as the facet budget
++  does).* Tried, then dropped: on the pinning fixture it imported the jump as
++  a 0.31-tolerance smear with no refusal.
++- *A wall-clock budget per import.* Not deterministic, and a large healthy
++  model can legitimately take longer than any fixed limit.
++
++**Limits, and the cost to change later.** Only B-spline and NURBS surface
++divisions are metered. Elementary and swept surfaces keep truck's own
++division, and edge curves are divided unmetered, so a runaway in those
++(none is known) would still hang. Covering them means a metered curve
++wrapper and a decision on swept surfaces, which is filed as a follow-up.
++The cap is one constant. Raising it costs only time on a broken face.
++The real `sc_logo.step` was not available to this worker. The fix is pinned
++on a synthetic face with the same failure mode, not on the user's file, so
++the issue's own repro should be re-run on a build with this change.
+diff --git a/testdata/models/bspline_discontinuous.step b/testdata/models/bspline_discontinuous.step
+new file mode 100644
+index 000000000..e4cee3bd8
+--- /dev/null
++++ b/testdata/models/bspline_discontinuous.step
+@@ -0,0 +1,183 @@
++ISO-10303-21;
++HEADER;
++FILE_DESCRIPTION(('CamCraft #1536 fixture: box.step with its top face a B-spline that jumps at u = 0.5 (interior knot repeated past its degree); truck subdivision never converges on it'), '2;1');
++FILE_NAME('', '2026-10-12 16:04:52.104157700', (('')), (('')), 'truck', '', '');
++FILE_SCHEMA(('ISO-10303-042'));
++ENDSEC;
++DATA;
++#1 = APPLICATION_PROTOCOL_DEFINITION('international standard', 'automotive_design', 2000, #2);
++#2 = APPLICATION_CONTEXT('core data for automotive mechanical design processes');
++#3 = SHAPE_DEFINITION_REPRESENTATION(#4, #10);
++#4 = PRODUCT_DEFINITION_SHAPE('','', #5);
++#5 = PRODUCT_DEFINITION('design','', #6, #9);
++#6 = PRODUCT_DEFINITION_FORMATION('','', #7);
++#7 = PRODUCT('','','', (#8));
++#8 = PRODUCT_CONTEXT('', #2, 'mechanical');
++#9 = PRODUCT_DEFINITION_CONTEXT('part definition', #2, 'design');
++#10 = ADVANCED_BREP_SHAPE_REPRESENTATION('', (#16), #11);
++#11 = (
++    GEOMETRIC_REPRESENTATION_CONTEXT(3) 
++    GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#15))
++    GLOBAL_UNIT_ASSIGNED_CONTEXT((#12, #13, #14))
++    REPRESENTATION_CONTEXT('Context #1', '3D Context with UNIT and UNCERTAINTY')
++);
++#12 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );
++#13 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );
++#14 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );
++#15 = UNCERTAINTY_MEASURE_WITH_UNIT(1.0E-6, #12, 'distance_accuracy_value','confusion accuracy');
++#16 = MANIFOLD_SOLID_BREP('', #17);
++#17 = CLOSED_SHELL('', (#18, #25, #32, #39, #46, #53));
++#18 = FACE_SURFACE('', (#19), #80, .F.);
++#19 = FACE_BOUND('', #20, .F.);
++#20 = EDGE_LOOP('', (#21, #22, #23, #24));
++#21 = ORIENTED_EDGE('', *, *, #60, .T.);
++#22 = ORIENTED_EDGE('', *, *, #61, .T.);
++#23 = ORIENTED_EDGE('', *, *, #62, .T.);
++#24 = ORIENTED_EDGE('', *, *, #63, .T.);
++#25 = FACE_SURFACE('', (#26), #85, .T.);
++#26 = FACE_BOUND('', #27, .T.);
++#27 = EDGE_LOOP('', (#28, #29, #30, #31));
++#28 = ORIENTED_EDGE('', *, *, #60, .T.);
++#29 = ORIENTED_EDGE('', *, *, #64, .T.);
++#30 = ORIENTED_EDGE('', *, *, #65, .F.);
++#31 = ORIENTED_EDGE('', *, *, #66, .F.);
++#32 = FACE_SURFACE('', (#33), #90, .T.);
++#33 = FACE_BOUND('', #34, .T.);
++#34 = EDGE_LOOP('', (#35, #36, #37, #38));
++#35 = ORIENTED_EDGE('', *, *, #61, .T.);
++#36 = ORIENTED_EDGE('', *, *, #67, .T.);
++#37 = ORIENTED_EDGE('', *, *, #68, .F.);
++#38 = ORIENTED_EDGE('', *, *, #64, .F.);
++#39 = FACE_SURFACE('', (#40), #95, .T.);
++#40 = FACE_BOUND('', #41, .T.);
++#41 = EDGE_LOOP('', (#42, #43, #44, #45));
++#42 = ORIENTED_EDGE('', *, *, #62, .T.);
++#43 = ORIENTED_EDGE('', *, *, #69, .T.);
++#44 = ORIENTED_EDGE('', *, *, #70, .F.);
++#45 = ORIENTED_EDGE('', *, *, #67, .F.);
++#46 = FACE_SURFACE('', (#47), #100, .T.);
++#47 = FACE_BOUND('', #48, .T.);
++#48 = EDGE_LOOP('', (#49, #50, #51, #52));
++#49 = ORIENTED_EDGE('', *, *, #63, .T.);
++#50 = ORIENTED_EDGE('', *, *, #66, .T.);
++#51 = ORIENTED_EDGE('', *, *, #71, .F.);
++#52 = ORIENTED_EDGE('', *, *, #69, .F.);
++#53 = FACE_SURFACE('', (#54), #105, .T.);
++#54 = FACE_BOUND('', #55, .T.);
++#55 = EDGE_LOOP('', (#56, #57, #58, #59));
++#56 = ORIENTED_EDGE('', *, *, #65, .T.);
++#57 = ORIENTED_EDGE('', *, *, #68, .T.);
++#58 = ORIENTED_EDGE('', *, *, #70, .T.);
++#59 = ORIENTED_EDGE('', *, *, #71, .T.);
++#60 = EDGE_CURVE('', #72, #73, #110, .T.);
++#61 = EDGE_CURVE('', #73, #74, #114, .T.);
++#62 = EDGE_CURVE('', #74, #75, #118, .T.);
++#63 = EDGE_CURVE('', #75, #72, #122, .T.);
++#64 = EDGE_CURVE('', #73, #76, #126, .T.);
++#65 = EDGE_CURVE('', #77, #76, #130, .T.);
++#66 = EDGE_CURVE('', #72, #77, #134, .T.);
++#67 = EDGE_CURVE('', #74, #78, #138, .T.);
++#68 = EDGE_CURVE('', #76, #78, #142, .T.);
++#69 = EDGE_CURVE('', #75, #79, #146, .T.);
++#70 = EDGE_CURVE('', #78, #79, #150, .T.);
++#71 = EDGE_CURVE('', #79, #77, #154, .T.);
++#72 = VERTEX_POINT('', #158);
++#73 = VERTEX_POINT('', #159);
++#74 = VERTEX_POINT('', #160);
++#75 = VERTEX_POINT('', #161);
++#76 = VERTEX_POINT('', #162);
++#77 = VERTEX_POINT('', #163);
++#78 = VERTEX_POINT('', #164);
++#79 = VERTEX_POINT('', #165);
++#80 = PLANE('', #81);
++#81 = AXIS2_PLACEMENT_3D('', #82, #83, #84);
++#82 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#83 = DIRECTION('', (0.0, 0.0, 1.0));
++#84 = DIRECTION('', (-1.0, 0.0, 0.0));
++#85 = PLANE('', #86);
++#86 = AXIS2_PLACEMENT_3D('', #87, #88, #89);
++#87 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#88 = DIRECTION('', (0.0, -1.0, 0.0));
++#89 = DIRECTION('', (1.0, 0.0, 0.0));
++#90 = PLANE('', #91);
++#91 = AXIS2_PLACEMENT_3D('', #92, #93, #94);
++#92 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#93 = DIRECTION('', (1.0, 0.0, 0.0));
++#94 = DIRECTION('', (0.0, 1.0, 0.0));
++#95 = PLANE('', #96);
++#96 = AXIS2_PLACEMENT_3D('', #97, #98, #99);
++#97 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#98 = DIRECTION('', (0.0, 1.0, -0.0));
++#99 = DIRECTION('', (-1.0, 0.0, 0.0));
++#100 = PLANE('', #101);
++#101 = AXIS2_PLACEMENT_3D('', #102, #103, #104);
++#102 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#103 = DIRECTION('', (-1.0, 0.0, 0.0));
++#104 = DIRECTION('', (0.0, -1.0, 0.0));
++#105 = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#106, #107), (#108, #109), (#166, #167), (#168, #169)), .UNSPECIFIED., .F., .F., .F., (2, 2, 2), (2, 2), (0.0, 0.5, 1.0), (0.0, 1.0), .UNSPECIFIED.);
++#106 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#107 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#108 = CARTESIAN_POINT('', (0.5, 0.0, 1.0));
++#109 = CARTESIAN_POINT('', (0.5, 1.0, 1.0));
++#110 = LINE('', #111, #112);
++#111 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#112 = VECTOR('', #113, 1.0);
++#113 = DIRECTION('', (1.0, 0.0, 0.0));
++#114 = LINE('', #115, #116);
++#115 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#116 = VECTOR('', #117, 1.0);
++#117 = DIRECTION('', (0.0, 1.0, 0.0));
++#118 = LINE('', #119, #120);
++#119 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#120 = VECTOR('', #121, 1.0);
++#121 = DIRECTION('', (-1.0, 0.0, 0.0));
++#122 = LINE('', #123, #124);
++#123 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#124 = VECTOR('', #125, 1.0);
++#125 = DIRECTION('', (0.0, -1.0, 0.0));
++#126 = LINE('', #127, #128);
++#127 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#128 = VECTOR('', #129, 1.0);
++#129 = DIRECTION('', (0.0, 0.0, 1.0));
++#130 = LINE('', #131, #132);
++#131 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#132 = VECTOR('', #133, 1.0);
++#133 = DIRECTION('', (1.0, 0.0, 0.0));
++#134 = LINE('', #135, #136);
++#135 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#136 = VECTOR('', #137, 1.0);
++#137 = DIRECTION('', (0.0, 0.0, 1.0));
++#138 = LINE('', #139, #140);
++#139 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#140 = VECTOR('', #141, 1.0);
++#141 = DIRECTION('', (0.0, 0.0, 1.0));
++#142 = LINE('', #143, #144);
++#143 = CARTESIAN_POINT('', (1.0, 0.0, 1.0));
++#144 = VECTOR('', #145, 1.0);
++#145 = DIRECTION('', (0.0, 1.0, 0.0));
++#146 = LINE('', #147, #148);
++#147 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#148 = VECTOR('', #149, 1.0);
++#149 = DIRECTION('', (0.0, 0.0, 1.0));
++#150 = LINE('', #151, #152);
++#151 = CARTESIAN_POINT('', (1.0, 1.0, 1.0));
++#152 = VECTOR('', #153, 1.0);
++#153 = DIRECTION('', (-1.0, 0.0, 0.0));
++#154 = LINE('', #155, #156);
++#155 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#156 = VECTOR('', #157, 1.0);
++#157 = DIRECTION('', (0.0, -1.0, 0.0));
++#158 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#159 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#160 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#161 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#162 = CARTESIAN_POINT('', (1.0, 0.0, 1.0));
++#163 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#164 = CARTESIAN_POINT('', (1.0, 1.0, 1.0));
++#165 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#166 = CARTESIAN_POINT('', (0.5, 0.0, 1.25));
++#167 = CARTESIAN_POINT('', (0.5, 1.0, 1.25));
++#168 = CARTESIAN_POINT('', (1.0, 0.0, 1.25));
++#169 = CARTESIAN_POINT('', (1.0, 1.0, 1.25));
++ENDSEC;
++END-ISO-10303-21;
+diff --git a/testdata/models/bspline_dome.step b/testdata/models/bspline_dome.step
+new file mode 100644
+index 000000000..e34079cbc
+--- /dev/null
++++ b/testdata/models/bspline_dome.step
+@@ -0,0 +1,184 @@
++ISO-10303-21;
++HEADER;
++FILE_DESCRIPTION(('CamCraft #1536 fixture: box.step with its top face a smooth biquadratic B-spline dome (centre raised 0.2); volume 1 + 0.2/9'), '2;1');
++FILE_NAME('', '2026-10-12 16:04:52.104157700', (('')), (('')), 'truck', '', '');
++FILE_SCHEMA(('ISO-10303-042'));
++ENDSEC;
++DATA;
++#1 = APPLICATION_PROTOCOL_DEFINITION('international standard', 'automotive_design', 2000, #2);
++#2 = APPLICATION_CONTEXT('core data for automotive mechanical design processes');
++#3 = SHAPE_DEFINITION_REPRESENTATION(#4, #10);
++#4 = PRODUCT_DEFINITION_SHAPE('','', #5);
++#5 = PRODUCT_DEFINITION('design','', #6, #9);
++#6 = PRODUCT_DEFINITION_FORMATION('','', #7);
++#7 = PRODUCT('','','', (#8));
++#8 = PRODUCT_CONTEXT('', #2, 'mechanical');
++#9 = PRODUCT_DEFINITION_CONTEXT('part definition', #2, 'design');
++#10 = ADVANCED_BREP_SHAPE_REPRESENTATION('', (#16), #11);
++#11 = (
++    GEOMETRIC_REPRESENTATION_CONTEXT(3) 
++    GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#15))
++    GLOBAL_UNIT_ASSIGNED_CONTEXT((#12, #13, #14))
++    REPRESENTATION_CONTEXT('Context #1', '3D Context with UNIT and UNCERTAINTY')
++);
++#12 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );
++#13 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );
++#14 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );
++#15 = UNCERTAINTY_MEASURE_WITH_UNIT(1.0E-6, #12, 'distance_accuracy_value','confusion accuracy');
++#16 = MANIFOLD_SOLID_BREP('', #17);
++#17 = CLOSED_SHELL('', (#18, #25, #32, #39, #46, #53));
++#18 = FACE_SURFACE('', (#19), #80, .F.);
++#19 = FACE_BOUND('', #20, .F.);
++#20 = EDGE_LOOP('', (#21, #22, #23, #24));
++#21 = ORIENTED_EDGE('', *, *, #60, .T.);
++#22 = ORIENTED_EDGE('', *, *, #61, .T.);
++#23 = ORIENTED_EDGE('', *, *, #62, .T.);
++#24 = ORIENTED_EDGE('', *, *, #63, .T.);
++#25 = FACE_SURFACE('', (#26), #85, .T.);
++#26 = FACE_BOUND('', #27, .T.);
++#27 = EDGE_LOOP('', (#28, #29, #30, #31));
++#28 = ORIENTED_EDGE('', *, *, #60, .T.);
++#29 = ORIENTED_EDGE('', *, *, #64, .T.);
++#30 = ORIENTED_EDGE('', *, *, #65, .F.);
++#31 = ORIENTED_EDGE('', *, *, #66, .F.);
++#32 = FACE_SURFACE('', (#33), #90, .T.);
++#33 = FACE_BOUND('', #34, .T.);
++#34 = EDGE_LOOP('', (#35, #36, #37, #38));
++#35 = ORIENTED_EDGE('', *, *, #61, .T.);
++#36 = ORIENTED_EDGE('', *, *, #67, .T.);
++#37 = ORIENTED_EDGE('', *, *, #68, .F.);
++#38 = ORIENTED_EDGE('', *, *, #64, .F.);
++#39 = FACE_SURFACE('', (#40), #95, .T.);
++#40 = FACE_BOUND('', #41, .T.);
++#41 = EDGE_LOOP('', (#42, #43, #44, #45));
++#42 = ORIENTED_EDGE('', *, *, #62, .T.);
++#43 = ORIENTED_EDGE('', *, *, #69, .T.);
++#44 = ORIENTED_EDGE('', *, *, #70, .F.);
++#45 = ORIENTED_EDGE('', *, *, #67, .F.);
++#46 = FACE_SURFACE('', (#47), #100, .T.);
++#47 = FACE_BOUND('', #48, .T.);
++#48 = EDGE_LOOP('', (#49, #50, #51, #52));
++#49 = ORIENTED_EDGE('', *, *, #63, .T.);
++#50 = ORIENTED_EDGE('', *, *, #66, .T.);
++#51 = ORIENTED_EDGE('', *, *, #71, .F.);
++#52 = ORIENTED_EDGE('', *, *, #69, .F.);
++#53 = FACE_SURFACE('', (#54), #105, .T.);
++#54 = FACE_BOUND('', #55, .T.);
++#55 = EDGE_LOOP('', (#56, #57, #58, #59));
++#56 = ORIENTED_EDGE('', *, *, #65, .T.);
++#57 = ORIENTED_EDGE('', *, *, #68, .T.);
++#58 = ORIENTED_EDGE('', *, *, #70, .T.);
++#59 = ORIENTED_EDGE('', *, *, #71, .T.);
++#60 = EDGE_CURVE('', #72, #73, #110, .T.);
++#61 = EDGE_CURVE('', #73, #74, #114, .T.);
++#62 = EDGE_CURVE('', #74, #75, #118, .T.);
++#63 = EDGE_CURVE('', #75, #72, #122, .T.);
++#64 = EDGE_CURVE('', #73, #76, #126, .T.);
++#65 = EDGE_CURVE('', #77, #76, #130, .T.);
++#66 = EDGE_CURVE('', #72, #77, #134, .T.);
++#67 = EDGE_CURVE('', #74, #78, #138, .T.);
++#68 = EDGE_CURVE('', #76, #78, #142, .T.);
++#69 = EDGE_CURVE('', #75, #79, #146, .T.);
++#70 = EDGE_CURVE('', #78, #79, #150, .T.);
++#71 = EDGE_CURVE('', #79, #77, #154, .T.);
++#72 = VERTEX_POINT('', #158);
++#73 = VERTEX_POINT('', #159);
++#74 = VERTEX_POINT('', #160);
++#75 = VERTEX_POINT('', #161);
++#76 = VERTEX_POINT('', #162);
++#77 = VERTEX_POINT('', #163);
++#78 = VERTEX_POINT('', #164);
++#79 = VERTEX_POINT('', #165);
++#80 = PLANE('', #81);
++#81 = AXIS2_PLACEMENT_3D('', #82, #83, #84);
++#82 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#83 = DIRECTION('', (0.0, 0.0, 1.0));
++#84 = DIRECTION('', (-1.0, 0.0, 0.0));
++#85 = PLANE('', #86);
++#86 = AXIS2_PLACEMENT_3D('', #87, #88, #89);
++#87 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#88 = DIRECTION('', (0.0, -1.0, 0.0));
++#89 = DIRECTION('', (1.0, 0.0, 0.0));
++#90 = PLANE('', #91);
++#91 = AXIS2_PLACEMENT_3D('', #92, #93, #94);
++#92 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#93 = DIRECTION('', (1.0, 0.0, 0.0));
++#94 = DIRECTION('', (0.0, 1.0, 0.0));
++#95 = PLANE('', #96);
++#96 = AXIS2_PLACEMENT_3D('', #97, #98, #99);
++#97 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#98 = DIRECTION('', (0.0, 1.0, -0.0));
++#99 = DIRECTION('', (-1.0, 0.0, 0.0));
++#100 = PLANE('', #101);
++#101 = AXIS2_PLACEMENT_3D('', #102, #103, #104);
++#102 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#103 = DIRECTION('', (-1.0, 0.0, 0.0));
++#104 = DIRECTION('', (0.0, -1.0, 0.0));
++#105 = B_SPLINE_SURFACE_WITH_KNOTS('', 2, 2, ((#106, #107, #108), (#109, #166, #167), (#168, #169, #170)), .UNSPECIFIED., .F., .F., .F., (3, 3), (3, 3), (0.0, 1.0), (0.0, 1.0), .UNSPECIFIED.);
++#106 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#107 = CARTESIAN_POINT('', (0.0, 0.5, 1.0));
++#108 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#109 = CARTESIAN_POINT('', (0.5, 0.0, 1.0));
++#110 = LINE('', #111, #112);
++#111 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#112 = VECTOR('', #113, 1.0);
++#113 = DIRECTION('', (1.0, 0.0, 0.0));
++#114 = LINE('', #115, #116);
++#115 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#116 = VECTOR('', #117, 1.0);
++#117 = DIRECTION('', (0.0, 1.0, 0.0));
++#118 = LINE('', #119, #120);
++#119 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#120 = VECTOR('', #121, 1.0);
++#121 = DIRECTION('', (-1.0, 0.0, 0.0));
++#122 = LINE('', #123, #124);
++#123 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#124 = VECTOR('', #125, 1.0);
++#125 = DIRECTION('', (0.0, -1.0, 0.0));
++#126 = LINE('', #127, #128);
++#127 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#128 = VECTOR('', #129, 1.0);
++#129 = DIRECTION('', (0.0, 0.0, 1.0));
++#130 = LINE('', #131, #132);
++#131 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#132 = VECTOR('', #133, 1.0);
++#133 = DIRECTION('', (1.0, 0.0, 0.0));
++#134 = LINE('', #135, #136);
++#135 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#136 = VECTOR('', #137, 1.0);
++#137 = DIRECTION('', (0.0, 0.0, 1.0));
++#138 = LINE('', #139, #140);
++#139 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#140 = VECTOR('', #141, 1.0);
++#141 = DIRECTION('', (0.0, 0.0, 1.0));
++#142 = LINE('', #143, #144);
++#143 = CARTESIAN_POINT('', (1.0, 0.0, 1.0));
++#144 = VECTOR('', #145, 1.0);
++#145 = DIRECTION('', (0.0, 1.0, 0.0));
++#146 = LINE('', #147, #148);
++#147 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#148 = VECTOR('', #149, 1.0);
++#149 = DIRECTION('', (0.0, 0.0, 1.0));
++#150 = LINE('', #151, #152);
++#151 = CARTESIAN_POINT('', (1.0, 1.0, 1.0));
++#152 = VECTOR('', #153, 1.0);
++#153 = DIRECTION('', (-1.0, 0.0, 0.0));
++#154 = LINE('', #155, #156);
++#155 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#156 = VECTOR('', #157, 1.0);
++#157 = DIRECTION('', (0.0, -1.0, 0.0));
++#158 = CARTESIAN_POINT('', (0.0, 0.0, 0.0));
++#159 = CARTESIAN_POINT('', (1.0, 0.0, 0.0));
++#160 = CARTESIAN_POINT('', (1.0, 1.0, 0.0));
++#161 = CARTESIAN_POINT('', (0.0, 1.0, 0.0));
++#162 = CARTESIAN_POINT('', (1.0, 0.0, 1.0));
++#163 = CARTESIAN_POINT('', (0.0, 0.0, 1.0));
++#164 = CARTESIAN_POINT('', (1.0, 1.0, 1.0));
++#165 = CARTESIAN_POINT('', (0.0, 1.0, 1.0));
++#166 = CARTESIAN_POINT('', (0.5, 0.5, 1.2));
++#167 = CARTESIAN_POINT('', (0.5, 1.0, 1.0));
++#168 = CARTESIAN_POINT('', (1.0, 0.0, 1.0));
++#169 = CARTESIAN_POINT('', (1.0, 0.5, 1.0));
++#170 = CARTESIAN_POINT('', (1.0, 1.0, 1.0));
++ENDSEC;
++END-ISO-10303-21;

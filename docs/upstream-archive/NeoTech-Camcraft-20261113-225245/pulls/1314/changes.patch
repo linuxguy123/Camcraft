@@ -1,0 +1,942 @@
+From 15816fe1cbbb7f84f6a53ae0617b3189b3be1fd0 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 12:58:54 -0800
+Subject: [PATCH] feat(ui,app): an async file picker opens models and projects
+ in the browser
+
+The browser build (wasm32) had no way to open anything: every picker
+answered "cancelled". File > Open model and Open project now ask a
+browser <input type=file> (ui::file_pick) and return at once; the file's
+name and bytes reach an inbox that State::drain_actions takes each frame
+as CommandKind::OpenPicked. A model lands through the new
+ImportModel::from_bytes (the path import's laws - IGES/unknown extension,
+size cap, STEP budget bounds, finite-mesh gate - shared through
+checked_budget) and finish_import, so it is one undo step; a project
+through project::open_noted. A failed read, a file over the 256 MiB
+browser read limit, a refused import or a non-text project is said on the
+status line by name. Native builds keep rfd's synchronous dialogs; their
+inbox stays empty.
+
+Refs #31
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAgjpiZbXSvmXLvdmL
+---
+ crates/app/src/commands/import_model.rs |  75 +++++---
+ crates/app/src/geometry/import/mod.rs   |   4 +-
+ crates/app/tests/import_bytes.rs        |  58 +++++++
+ crates/ui/src/egui_app/shell_web.rs     |   2 +
+ crates/ui/src/file_dialog.rs            |   5 +-
+ crates/ui/src/file_pick.rs              | 220 ++++++++++++++++++++++++
+ crates/ui/src/file_pick_tests.rs        | 123 +++++++++++++
+ crates/ui/src/lib.rs                    |   3 +
+ crates/ui/src/state.rs                  |  72 ++++----
+ crates/ui/src/state_picked.rs           | 110 ++++++++++++
+ docs/decisions/31-wasm-file-picker.md   |  57 ++++++
+ 11 files changed, 671 insertions(+), 58 deletions(-)
+ create mode 100644 crates/app/tests/import_bytes.rs
+ create mode 100644 crates/ui/src/file_pick.rs
+ create mode 100644 crates/ui/src/file_pick_tests.rs
+ create mode 100644 crates/ui/src/state_picked.rs
+ create mode 100644 docs/decisions/31-wasm-file-picker.md
+
+diff --git a/crates/app/src/commands/import_model.rs b/crates/app/src/commands/import_model.rs
+index 057eb6d4f..604c2c6aa 100644
+--- a/crates/app/src/commands/import_model.rs
++++ b/crates/app/src/commands/import_model.rs
+@@ -34,29 +34,30 @@ impl ImportModel {
+     /// file that is not STEP (its mesh is the file; nothing would honour
+     /// it), is refused by name here, before any parsing.
+     pub fn within(path: &Path, facet_budget: Option<u64>) -> Result<Self, CommandError> {
+-        // IGES needs a translation kernel we do not have; refuse by
+-        // extension, not by a failed read, so the user gets the honest
+-        // diagnostic. STEP imports via the truck tessellator (mesh only).
+-        match path.extension().and_then(|e| e.to_str()) {
+-            Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "iges" | "igs") => {
+-                return Err(CommandError::UnsupportedType(ext.to_ascii_uppercase()));
+-            }
+-            _ => {}
+-        }
+-        let budget = match facet_budget {
+-            None => import::MAX_FACETS,
+-            Some(b) => {
+-                if !matches!(import::format_from_path(path), Ok(import::Format::Step)) {
+-                    return Err(CommandError::Invalid(format!(
+-                        "a {} applies to STEP files only, not {}",
+-                        step_budget::NAME,
+-                        path.display()
+-                    )));
+-                }
+-                step_budget::check(b).map_err(CommandError::Invalid)?
+-            }
+-        };
++        let budget = checked_budget(path, facet_budget)?;
+         let graded = import::load_model_graded_within(path, budget)?;
++        Ok(Self::graded(path, graded, facet_budget))
++    }
++
++    /// [`ImportModel::within`] over bytes already in hand, named by the
++    /// file they came from (#31): a browser's file picker hands over a
++    /// name and its contents, never a path the importer could open. The
++    /// same laws run - IGES and an unknown extension refused by name, the
++    /// file-size cap, the STEP budget's bounds, the finite-mesh gate - so
++    /// a picked file lands exactly as the same file opened from disk.
++    pub fn from_bytes(file_name: &str, data: &[u8], facet_budget: Option<u64>) -> Result<Self, CommandError> {
++        let path = Path::new(file_name);
++        let budget = checked_budget(path, facet_budget)?;
++        let format = import::format_from_path(path)?;
++        if u64::try_from(data.len()).unwrap_or(u64::MAX) > import::MAX_FILE_BYTES {
++            return Err(import::ImportError::TooLarge.into());
++        }
++        let graded = import::parse_model_graded_within(data, format, budget)?;
++        Ok(Self::graded(path, graded, facet_budget))
++    }
++
++    /// The command for a graded mesh, named by its file's stem.
++    fn graded(path: &Path, graded: import::Graded, facet_budget: Option<u64>) -> Self {
+         let name = path
+             .file_stem()
+             .and_then(|s| s.to_str())
+@@ -64,7 +65,7 @@ impl ImportModel {
+             .to_string();
+         let mut cmd = Self::from_mesh(&name, graded.mesh).with_fidelity(graded.coarse_mm);
+         cmd.facet_budget = step_budget::recorded(facet_budget);
+-        Ok(cmd)
++        cmd
+     }
+ 
+     pub fn from_mesh(name: &str, mesh: Mesh) -> Self {
+@@ -90,6 +91,34 @@ impl ImportModel {
+     }
+ }
+ 
++/// The facet budget an import runs under, checked before any parsing.
++/// IGES needs a translation kernel we do not have; refuse it by extension,
++/// not by a failed read, so the user gets the honest diagnostic. STEP
++/// imports via the truck tessellator (mesh only). A budget outside
++/// `step_budget`'s bounds, or one given for a file that is not STEP (its
++/// mesh is the file; nothing would honour it), is refused by name.
++fn checked_budget(path: &Path, facet_budget: Option<u64>) -> Result<usize, CommandError> {
++    match path.extension().and_then(|e| e.to_str()) {
++        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "iges" | "igs") => {
++            return Err(CommandError::UnsupportedType(ext.to_ascii_uppercase()));
++        }
++        _ => {}
++    }
++    match facet_budget {
++        None => Ok(import::MAX_FACETS),
++        Some(b) => {
++            if !matches!(import::format_from_path(path), Ok(import::Format::Step)) {
++                return Err(CommandError::Invalid(format!(
++                    "a {} applies to STEP files only, not {}",
++                    step_budget::NAME,
++                    path.display()
++                )));
++            }
++            step_budget::check(b).map_err(CommandError::Invalid)
++        }
++    }
++}
++
+ impl Command for ImportModel {
+     fn apply(&self, world: &World) {
+         if model::find_by_name(world, &self.name).is_some() {
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index 60706363e..d5ed41754 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -109,7 +109,9 @@ pub fn parse_model_graded(data: &[u8], format: Format) -> Result<Graded, ImportE
+     parse_model_graded_within(data, format, MAX_FACETS)
+ }
+ 
+-fn parse_model_graded_within(data: &[u8], format: Format, budget: usize) -> Result<Graded, ImportError> {
++/// [`parse_model_graded`] with a STEP model tessellated inside `budget`
++/// facets - the bytes twin of [`load_model_graded_within`] (#31).
++pub fn parse_model_graded_within(data: &[u8], format: Format, budget: usize) -> Result<Graded, ImportError> {
+     let (mesh, coarse_mm) = match format {
+         Format::Stl => (stl::parse(data)?, None),
+         Format::Obj => (obj::parse(data)?, None),
+diff --git a/crates/app/tests/import_bytes.rs b/crates/app/tests/import_bytes.rs
+new file mode 100644
+index 000000000..d6be4856d
+--- /dev/null
++++ b/crates/app/tests/import_bytes.rs
+@@ -0,0 +1,58 @@
++//! #31: a model imported from bytes in hand (what the browser's file
++//! picker hands over: a name and the file's contents) lands exactly like
++//! the same file opened from disk, and every refusal the path import makes
++//! is made here too, by name - never a panic.
++//!
++//! Gate map (M4.4): covers app::commands::import_model, app::geometry.
++
++use std::path::{Path, PathBuf};
++
++use camcraft_app::commands::{CommandError, ImportModel};
++use camcraft_app::geometry::import::ImportError;
++
++fn testdata(name: &str) -> PathBuf {
++    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models").join(name)
++}
++
++fn read(name: &str) -> Vec<u8> {
++    std::fs::read(testdata(name)).expect("test model present")
++}
++
++#[test]
++fn picked_bytes_import_like_the_same_file_from_disk() {
++    for file in ["cube.stl", "box.obj", "box.step"] {
++        let from_disk = ImportModel::new(&testdata(file)).expect("disk import");
++        let picked = ImportModel::from_bytes(file, &read(file), None).expect("bytes import");
++        assert_eq!(picked.name, from_disk.name, "{file}: named by its stem");
++        assert_eq!(picked.mesh, from_disk.mesh, "{file}: the same mesh");
++        assert_eq!(picked.coarse_mm, from_disk.coarse_mm, "{file}: the same fidelity");
++        assert_eq!(picked.facet_budget, None);
++    }
++    let cube = ImportModel::from_bytes("cube.stl", &read("cube.stl"), None).expect("cube");
++    assert_eq!(cube.name, "cube");
++    assert_eq!(cube.mesh.len(), 12);
++}
++
++#[test]
++fn picked_bytes_are_refused_by_name_never_a_panic() {
++    // IGES: refused by extension, before any parsing.
++    let iges = ImportModel::from_bytes("part.igs", b"anything", None).err();
++    assert!(matches!(iges, Some(CommandError::UnsupportedType(ref t)) if t == "IGS"), "{iges:?}");
++    // An extension no importer reads.
++    let txt = ImportModel::from_bytes("notes.txt", b"hello", None).err();
++    assert!(matches!(txt, Some(CommandError::Import(ImportError::Unsupported(_)))), "{txt:?}");
++    // No extension at all (a browser can hand over any name).
++    let bare = ImportModel::from_bytes("model", b"solid x", None).err();
++    assert!(matches!(bare, Some(CommandError::Import(ImportError::Unsupported(_)))), "{bare:?}");
++    // An empty and a corrupt file of each format.
++    for name in ["e.stl", "e.obj", "e.step"] {
++        assert!(ImportModel::from_bytes(name, b"", None).is_err(), "empty {name} must be refused");
++        assert!(
++            ImportModel::from_bytes(name, &[0xff; 97], None).is_err(),
++            "corrupt {name} must be refused"
++        );
++    }
++    // A STEP facet budget given for a mesh format is refused, as on disk.
++    let budget = ImportModel::from_bytes("cube.stl", &read("cube.stl"), Some(100_000)).err();
++    assert!(matches!(budget, Some(CommandError::Invalid(_))), "{budget:?}");
++}
+diff --git a/crates/ui/src/egui_app/shell_web.rs b/crates/ui/src/egui_app/shell_web.rs
+index 47c01f7d7..c8647ffa4 100644
+--- a/crates/ui/src/egui_app/shell_web.rs
++++ b/crates/ui/src/egui_app/shell_web.rs
+@@ -147,6 +147,8 @@ impl WebShell {
+                 .write()
+                 .register_native_texture(&rs.device, view.color_view(), wgpu::FilterMode::Linear);
+         theme::apply(&cc.egui_ctx);
++        // A file the async picker reads wakes the next frame to land it.
++        crate::file_pick::set_repaint(&cc.egui_ctx);
+ 
+         // The traced-stock eye: awaited on the event loop, not blocked on.
+         // Until it lands (or if the device refuses it) the sheet stands.
+diff --git a/crates/ui/src/file_dialog.rs b/crates/ui/src/file_dialog.rs
+index b144011c4..966d86f6f 100644
+--- a/crates/ui/src/file_dialog.rs
++++ b/crates/ui/src/file_dialog.rs
+@@ -3,8 +3,9 @@
+ //! Native builds forward to rfd's synchronous dialog, unchanged. A
+ //! wasm32 build has no synchronous dialog (the browser only offers an
+ //! async `<input type=file>`), so there the pickers answer `None` - the
+-//! same "cancelled" the user gets from closing the dialog - and log why,
+-//! until the browser shell brings an async picker.
++//! same "cancelled" the user gets from closing the dialog - and log why.
++//! Open model and Open project do not come here in a browser: they ask
++//! `crate::file_pick`'s async picker instead (#31).
+ //! Provenance: our own seam; rfd's builder API from its public docs.
+ 
+ use std::path::{Path, PathBuf};
+diff --git a/crates/ui/src/file_pick.rs b/crates/ui/src/file_pick.rs
+new file mode 100644
+index 000000000..5ecdae2ec
+--- /dev/null
++++ b/crates/ui/src/file_pick.rs
+@@ -0,0 +1,220 @@
++//! The browser's file picker (#31): opening a model or a project where no
++//! blocking native dialog exists. A browser only offers an async
++//! `<input type=file>`: the shell asks for a file, returns at once, and the
++//! file's name and bytes arrive frames later. They land in an inbox here;
++//! `State::drain_actions` takes them each frame and runs them through the
++//! same commands an import or open from disk runs (`state_picked`).
++//!
++//! The inbox and the `accept` filter are plain Rust on every target, so the
++//! bytes-to-document path is pinned by native tests. Only `open` (the DOM
++//! input and the awaited read) is wasm32. Native builds never fill the
++//! inbox: their dialogs stay rfd's synchronous ones (`file_dialog`).
++//! Provenance: our own seam; the DOM API (`HTMLInputElement.files`,
++//! `accept`, `Blob.arrayBuffer`) from the WHATWG HTML and File API specs.
++
++use std::cell::RefCell;
++use std::collections::VecDeque;
++
++use crate::file_dialog::FileDialog;
++
++/// The largest file the browser build reads into memory, in bytes. A wasm32
++/// module has at most 4 GiB of memory and an import needs several times
++/// its file, so a bigger file is refused by name before it is read - an
++/// allocation that fails in wasm aborts the tab.
++pub const BROWSER_READ_LIMIT: u64 = 256 << 20;
++
++/// What a picker was opened for; its answer is routed by it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PickFor {
++    /// A mesh to import (STL, OBJ, STEP) - the Open model dialog.
++    Model,
++    /// A `.camproj` to open in place of the document.
++    Project,
++}
++
++/// One file the picker answered with: its name and contents, or why the
++/// browser could not read it.
++pub struct PickedFile {
++    pub purpose: PickFor,
++    /// The file's name as the browser gives it (no folder).
++    pub name: String,
++    pub bytes: Result<Vec<u8>, String>,
++}
++
++impl std::fmt::Debug for PickedFile {
++    // The bytes can be hundreds of megabytes: say their length only.
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let bytes = match &self.bytes {
++            Ok(b) => format!("{} bytes", b.len()),
++            Err(why) => format!("unread: {why}"),
++        };
++        f.debug_struct("PickedFile")
++            .field("purpose", &self.purpose)
++            .field("name", &self.name)
++            .field("bytes", &bytes)
++            .finish()
++    }
++}
++
++thread_local! {
++    // The browser runs the shell on one thread; a native test thread has
++    // its own inbox, so tests never see each other's files.
++    static INBOX: RefCell<VecDeque<PickedFile>> = const { RefCell::new(VecDeque::new()) };
++}
++
++/// Hand one picked file to the shell; the next frame takes it.
++pub fn deliver(file: PickedFile) {
++    INBOX.with(|inbox| match inbox.try_borrow_mut() {
++        Ok(mut inbox) => inbox.push_back(file),
++        // Only a re-entrant call could hold it; say so, never drop silently.
++        Err(_) => diag_warn!("file picker: {} arrived while the inbox was busy - pick it again", file.name),
++    });
++}
++
++/// Every file picked since the last call, oldest first.
++#[must_use]
++pub fn take_picked() -> Vec<PickedFile> {
++    INBOX.with(|inbox| inbox.try_borrow_mut().map(|mut i| i.drain(..).collect()).unwrap_or_default())
++}
++
++/// The `<input accept>` value for a dialog's filters: every extension,
++/// dotted and lower-case, in filter order without repeats
++/// (".stl,.obj,.step,.stp"). Empty when the dialog has no filter, which
++/// the browser reads as "any file".
++#[must_use]
++pub fn accept_attr(dialog: &FileDialog) -> String {
++    let mut seen: Vec<String> = Vec::new();
++    for ext in dialog.filters.iter().flat_map(|(_, exts)| exts) {
++        let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
++        if !ext.is_empty() && !seen.iter().any(|s| s.strip_prefix('.') == Some(ext.as_str())) {
++            seen.push(format!(".{ext}"));
++        }
++    }
++    seen.join(",")
++}
++
++/// Why a file of `size` bytes is not read, or `None` when it may be.
++#[must_use]
++pub fn too_big(name: &str, size: f64) -> Option<String> {
++    // 256 MiB is exact in an f64.
++    let limit = BROWSER_READ_LIMIT as f64;
++    (!size.is_finite() || size > limit).then(|| {
++        format!(
++            "{name} is {:.0} MiB, over the browser build's {} MiB read limit - open it in the desktop app",
++            size / 1_048_576.0,
++            BROWSER_READ_LIMIT >> 20
++        )
++    })
++}
++
++#[cfg(target_arch = "wasm32")]
++pub use web::{open, set_repaint};
++
++#[cfg(target_arch = "wasm32")]
++mod web {
++    use std::cell::RefCell;
++
++    use eframe::web_sys;
++    use wasm_bindgen::closure::Closure;
++    use wasm_bindgen::{JsCast as _, JsValue};
++
++    use super::{PickFor, PickedFile, accept_attr, deliver, too_big};
++    use crate::file_dialog::FileDialog;
++
++    /// The open picker: its input and the change handler the input calls.
++    /// Held, never leaked: a cancelled picker never fires, so it stays
++    /// here until the next `open` replaces it - at most one at a time.
++    struct Pending {
++        _input: web_sys::HtmlInputElement,
++        _on_change: Closure<dyn FnMut()>,
++    }
++
++    thread_local! {
++        static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
++        static REPAINT: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
++    }
++
++    /// The shell's egui context: a file that arrives wakes the next frame.
++    pub fn set_repaint(ctx: &egui::Context) {
++        REPAINT.with(|r| {
++            if let Ok(mut r) = r.try_borrow_mut() {
++                *r = Some(ctx.clone());
++            }
++        });
++    }
++
++    fn repaint() {
++        REPAINT.with(|r| {
++            if let Ok(r) = r.try_borrow()
++                && let Some(ctx) = r.as_ref()
++            {
++                ctx.request_repaint();
++            }
++        });
++    }
++
++    /// Ask the browser for one file; returns at once. The file (or why it
++    /// could not be read) reaches the inbox when the user has chosen;
++    /// a cancelled picker delivers nothing, as a cancelled dialog does.
++    pub fn open(dialog: &FileDialog, purpose: PickFor) {
++        if let Err(why) = try_open(dialog, purpose) {
++            let name = dialog.title.clone().unwrap_or_else(|| "the file".to_string());
++            diag_warn!("file picker: {why}");
++            deliver(PickedFile { purpose, name, bytes: Err(why) });
++            repaint();
++        }
++    }
++
++    fn try_open(dialog: &FileDialog, purpose: PickFor) -> Result<(), String> {
++        let document = web_sys::window()
++            .and_then(|w| w.document())
++            .ok_or_else(|| "this page has no document to open a file picker in".to_string())?;
++        let input = document
++            .create_element("input")
++            .map_err(|e| said("the page would not make a file input", &e))?
++            .dyn_into::<web_sys::HtmlInputElement>()
++            .map_err(|_| "the page's <input> is not an input element".to_string())?;
++        input.set_type("file");
++        input.set_accept(&accept_attr(dialog));
++        let held = input.clone();
++        let on_change = Closure::<dyn FnMut()>::new(move || {
++            if let Some(file) = held.files().and_then(|list| list.get(0)) {
++                wasm_bindgen_futures::spawn_local(read(file, purpose));
++            }
++        });
++        input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
++        let parked = PENDING.with(|p| match p.try_borrow_mut() {
++            Ok(mut p) => {
++                // Replacing an earlier (cancelled) picker frees its handler.
++                *p = Some(Pending { _input: input.clone(), _on_change: on_change });
++                true
++            }
++            Err(_) => false,
++        });
++        if !parked {
++            return Err("a file picker is already being set up - try again".to_string());
++        }
++        input.click();
++        Ok(())
++    }
++
++    async fn read(file: web_sys::File, purpose: PickFor) {
++        let name = file.name();
++        let bytes = match too_big(&name, file.size()) {
++            Some(why) => Err(why),
++            None => wasm_bindgen_futures::JsFuture::from(file.array_buffer())
++                .await
++                .map(|buf| web_sys::js_sys::Uint8Array::new(&buf).to_vec())
++                .map_err(|e| said("the browser could not read it", &e)),
++        };
++        if let Err(why) = &bytes {
++            diag_warn!("file picker: {name}: {why}");
++        }
++        deliver(PickedFile { purpose, name, bytes });
++        repaint();
++    }
++
++    fn said(what: &str, err: &JsValue) -> String {
++        format!("{what} ({})", err.as_string().unwrap_or_else(|| format!("{err:?}")))
++    }
++}
+diff --git a/crates/ui/src/file_pick_tests.rs b/crates/ui/src/file_pick_tests.rs
+new file mode 100644
+index 000000000..11694251d
+--- /dev/null
++++ b/crates/ui/src/file_pick_tests.rs
+@@ -0,0 +1,123 @@
++//! #31: what the browser's async file picker hands over - a name and the
++//! file's bytes - lands through the same commands as a file opened from
++//! disk, and a failed read or a refused file is said by name. Run natively:
++//! the picker's DOM half is wasm32-only, but everything after the bytes
++//! arrive is this shared code.
++//!
++//! Gate map (M4.4): covers ui::file_pick, ui::state (state_picked).
++//! Provenance: our own tests.
++
++use std::path::{Path, PathBuf};
++
++use camcraft_app::{model, project};
++
++use crate::file_dialog::FileDialog;
++use crate::file_pick::{self, PickFor, PickedFile};
++use crate::state::{CommandKind, State};
++
++fn testdata(name: &str) -> PathBuf {
++    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models").join(name)
++}
++
++fn picked(purpose: PickFor, name: &str, bytes: Result<Vec<u8>, String>) -> PickedFile {
++    PickedFile { purpose, name: name.to_string(), bytes }
++}
++
++fn has_model(state: &State, name: &str) -> bool {
++    model::find_by_name(&state.world, name).is_some()
++}
++
++#[test]
++fn a_picked_model_imports_through_the_undoable_command() {
++    let mut state = State::new();
++    let bytes = std::fs::read(testdata("cube.stl")).expect("cube.stl");
++    file_pick::deliver(picked(PickFor::Model, "cube.stl", Ok(bytes)));
++    state.drain_actions();
++    assert!(has_model(&state, "cube"), "status: {}", state.status);
++    assert!(state.status.starts_with("imported cube"), "status: {}", state.status);
++    assert!(file_pick::take_picked().is_empty(), "the inbox is drained");
++    // One undo step takes it away, like an import from disk.
++    state.run(CommandKind::Undo);
++    assert!(!has_model(&state, "cube"));
++    state.run(CommandKind::Redo);
++    assert!(has_model(&state, "cube"));
++}
++
++#[test]
++fn a_picked_file_that_cannot_be_used_is_refused_by_name() {
++    let mut state = State::new();
++    file_pick::deliver(picked(PickFor::Model, "big.stl", Err("over the limit".into())));
++    state.drain_actions();
++    assert_eq!(state.status, "import refused: big.stl could not be read: over the limit");
++    file_pick::deliver(picked(PickFor::Model, "part.igs", Ok(b"anything".to_vec())));
++    state.drain_actions();
++    assert!(state.status.starts_with("import refused:") && state.status.contains("IGS"), "{}", state.status);
++    file_pick::deliver(picked(PickFor::Model, "bad.stl", Ok(vec![0xff; 97])));
++    state.drain_actions();
++    assert!(state.status.starts_with("import refused:"), "{}", state.status);
++    file_pick::deliver(picked(PickFor::Project, "p.camproj", Err("the browser could not read it".into())));
++    state.drain_actions();
++    assert_eq!(state.status, "open failed: p.camproj could not be read: the browser could not read it");
++    assert!(model::find_by_name(&state.world, "big").is_none());
++    assert!(!state.history.is_dirty(), "nothing reached the history");
++}
++
++#[test]
++fn a_picked_project_opens_in_place_of_the_document() {
++    // A saved project with one model in it.
++    let mut author = State::new();
++    author.run(CommandKind::ImportFile(testdata("cube.stl")));
++    while author.import_in_progress() {
++        author.drain_actions();
++        std::thread::yield_now();
++    }
++    assert!(has_model(&author, "cube"), "{}", author.status);
++    let dir = std::env::temp_dir().join(format!("camcraft-pick-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let file = dir.join("job.camproj");
++    project::save(&author.world, &file).expect("save");
++    let bytes = std::fs::read(&file).expect("read back");
++    let _ = std::fs::remove_dir_all(&dir);
++
++    let mut state = State::new();
++    let other = std::fs::read(testdata("box.obj")).expect("box.obj");
++    file_pick::deliver(picked(PickFor::Model, "box.obj", Ok(other)));
++    state.drain_actions();
++    assert!(has_model(&state, "box"));
++    file_pick::deliver(picked(PickFor::Project, "job.camproj", Ok(bytes)));
++    state.drain_actions();
++    assert_eq!(state.status, "opened job.camproj");
++    assert!(has_model(&state, "cube"), "the project's model is there");
++    assert!(!has_model(&state, "box"), "the old document is gone");
++    assert!(!state.history.is_dirty(), "an opened project is the clean point");
++
++    // Not text, and text that is no project: refused by name.
++    file_pick::deliver(picked(PickFor::Project, "x.camproj", Ok(vec![0xff, 0xfe, 0x00])));
++    state.drain_actions();
++    assert_eq!(state.status, "open failed: x.camproj is not a CamCraft project (not text)");
++    assert!(has_model(&state, "cube"), "a non-text file changes nothing");
++    file_pick::deliver(picked(PickFor::Project, "y.camproj", Ok(b"{ not json".to_vec())));
++    state.drain_actions();
++    assert!(state.status.starts_with("open failed: y.camproj:"), "{}", state.status);
++}
++
++#[test]
++fn the_browser_picker_accepts_the_dialogs_extensions() {
++    let mesh = FileDialog::new().add_filter("Mesh", &["stl", "obj", "step", "stp"]);
++    assert_eq!(file_pick::accept_attr(&mesh), ".stl,.obj,.step,.stp");
++    let messy = FileDialog::new().add_filter("A", &[".STL", "obj"]).add_filter("B", &["stl", " "]);
++    assert_eq!(file_pick::accept_attr(&messy), ".stl,.obj");
++    assert_eq!(file_pick::accept_attr(&FileDialog::new()), "");
++}
++
++#[test]
++fn a_file_over_the_browser_read_limit_is_refused_before_it_is_read() {
++    let limit = (file_pick::BROWSER_READ_LIMIT) as f64;
++    assert_eq!(file_pick::too_big("ok.stl", limit), None);
++    let why = file_pick::too_big("huge.step", limit + 1.0).expect("refused");
++    assert!(why.starts_with("huge.step is 256 MiB, over the browser build's 256 MiB read limit"), "{why}");
++    assert!(file_pick::too_big("nan.stl", f64::NAN).is_some());
++    // The inbox's Debug never prints the bytes themselves.
++    let shown = format!("{:?}", picked(PickFor::Model, "m.stl", Ok(vec![7; 1000])));
++    assert!(shown.contains("1000 bytes") && !shown.contains("7, 7"), "{shown}");
++}
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 7a59254ac..37c3289f2 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -30,6 +30,7 @@ pub mod feature_click;
+ pub mod egui_app;
+ pub mod feedback;
+ pub mod file_dialog;
++pub mod file_pick;
+ pub mod incoming_view;
+ pub mod headless_gpu;
+ pub mod interact;
+@@ -51,6 +52,8 @@ pub mod unsaved;
+ pub mod vertex_pick;
+ pub mod viewport;
+ 
++#[cfg(test)]
++mod file_pick_tests;
+ #[cfg(test)]
+ mod law_tests;
+ #[cfg(test)]
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 384eb22d4..f394c282a 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -38,6 +38,8 @@ use camcraft_app::{machine, model, posting, project, world::new_world};
+ 
+ #[path = "state_per_op.rs"]
+ mod per_op;
++#[path = "state_picked.rs"]
++mod picked;
+ #[path = "state_tool_library.rs"]
+ mod tool_library_io;
+ #[path = "state_setup_mount.rs"]
+@@ -102,6 +104,9 @@ pub enum CommandKind {
+     NewDocument,
+     OpenProjectDialog,
+     OpenProjectFile(PathBuf),
++    /// A model or project the browser's async picker read (#31): its
++    /// name and bytes, landed through the same import / open laws.
++    OpenPicked(crate::file_pick::PickedFile),
+     SaveProjectDialog,
+     SaveProjectAsDialog,
+     SaveProjectFile(PathBuf),
+@@ -2680,6 +2685,8 @@ impl State {
+         // #183: an agent's live calls, after the user's own clicks.
+         crate::mcp_host::pump(self);
+         self.poll_import();
++        // #31: a file the browser's picker has read since the last frame.
++        self.take_picked_files();
+         // A refusal that no longer describes the page retires, with its
+         // status-strip mirror (crate::feedback).
+         self.retire_stale_feedback();
+@@ -2730,11 +2737,7 @@ impl State {
+             return;
+         };
+         match action {
+-            CommandKind::OpenModelDialog => {
+-                if let Some(path) = pick_mesh_file() {
+-                    self.import_path(path);
+-                }
+-            }
++            CommandKind::OpenModelDialog => self.open_model_dialog(),
+             CommandKind::ImportFile(path) => self.import_path(path),
+             CommandKind::NewDocument => {
+                 self.abandon_imports();
+@@ -2768,12 +2771,9 @@ impl State {
+                 self.doc_version += 1;
+                 self.status = String::from("new document");
+             }
+-            CommandKind::OpenProjectDialog => {
+-                if let Some(path) = pick_project_file() {
+-                    self.open_project_path(path);
+-                }
+-            }
++            CommandKind::OpenProjectDialog => self.open_project_dialog(),
+             CommandKind::OpenProjectFile(path) => self.open_project_path(path),
++            CommandKind::OpenPicked(file) => self.open_picked(file),
+             CommandKind::SaveProjectDialog => {
+                 if let Some(path) = self.project_path.clone().or_else(|| save_project_dialog(None)) {
+                     self.save_project_path(path);
+@@ -4066,21 +4066,7 @@ impl State {
+     }
+ 
+     fn open_project_path(&mut self, path: PathBuf) {
+-        self.abandon_imports();
+-        self.project_path = None;
+-        self.hidden_stocks.clear();
+-        self.hidden_offsets.clear();
+-        model::clear_named(&self.world);
+-        self.history.clear();
+-        self.post_view = None; // the old document's program is not this one's
+-        self.post_refusal = None; // nor its refused post
+-        self.program_sim = None; // and neither is its stock verdict
+-        self.field_view = None; // nor its traced stock
+-        self.field_play = None; // nor its playback
+-        self.stock_mesh.clear(); // nor the mesh extracted from it
+-        self.machine_editor = None; // nor a draft over its machine's numbers
+-        self.rename_draft = None;
+-        self.dragging_op = None;
++        self.reset_for_open();
+         match project::load_noted(&self.world, &path) {
+             Ok(notes) => {
+                 self.project_path = Some(path.clone());
+@@ -4099,6 +4085,26 @@ impl State {
+         }
+     }
+ 
++    /// Retire the old document before a project replaces it (from disk,
++    /// or from bytes the browser's picker read, #31).
++    fn reset_for_open(&mut self) {
++        self.abandon_imports();
++        self.project_path = None;
++        self.hidden_stocks.clear();
++        self.hidden_offsets.clear();
++        model::clear_named(&self.world);
++        self.history.clear();
++        self.post_view = None; // the old document's program is not this one's
++        self.post_refusal = None; // nor its refused post
++        self.program_sim = None; // and neither is its stock verdict
++        self.field_view = None; // nor its traced stock
++        self.field_play = None; // nor its playback
++        self.stock_mesh.clear(); // nor the mesh extracted from it
++        self.machine_editor = None; // nor a draft over its machine's numbers
++        self.rename_draft = None;
++        self.dragging_op = None;
++    }
++
+     pub(crate) fn save_project_path(&mut self, path: PathBuf) {
+         match project::save(&self.world, &path) {
+             Ok(()) => {
+@@ -4257,16 +4263,18 @@ impl Default for State {
+ }
+ 
+ fn pick_mesh_file() -> Option<PathBuf> {
++    mesh_dialog().pick_file()
++}
++
++/// The model picker's filters - the native dialog and the browser's
++/// async picker (#31) ask with the same one.
++fn mesh_dialog() -> crate::file_dialog::FileDialog {
+     // STEP arrives tessellated through truck (mesh, not B-rep).
+-    crate::file_dialog::FileDialog::new()
+-        .add_filter("Mesh", &["stl", "obj", "step", "stp"])
+-        .pick_file()
++    crate::file_dialog::FileDialog::new().add_filter("Mesh", &["stl", "obj", "step", "stp"])
+ }
+ 
+-fn pick_project_file() -> Option<PathBuf> {
+-    crate::file_dialog::FileDialog::new()
+-        .add_filter("CamCraft Project", &["camproj"])
+-        .pick_file()
++fn project_dialog() -> crate::file_dialog::FileDialog {
++    crate::file_dialog::FileDialog::new().add_filter("CamCraft Project", &["camproj"])
+ }
+ 
+ fn pick_machine_file() -> Option<PathBuf> {
+diff --git a/crates/ui/src/state_picked.rs b/crates/ui/src/state_picked.rs
+new file mode 100644
+index 000000000..36d1bf747
+--- /dev/null
++++ b/crates/ui/src/state_picked.rs
+@@ -0,0 +1,110 @@
++//! Open model / Open project where the file arrives as bytes (#31): the
++//! browser's async picker (`crate::file_pick`) delivers a name and the
++//! file's contents, and they run through the same commands a file opened
++//! from disk runs - `ImportModel` (one undo step) for a model, the project
++//! loader for a `.camproj`. A file the browser could not read, or one the
++//! importer refuses, is said on the status line by name; nothing changes.
++//! Native builds keep their synchronous dialogs; the inbox they drain each
++//! frame stays empty there.
++//! Provenance: our own routing over the app's import and project laws.
++
++use std::path::Path;
++
++use camcraft_app::clock::Instant;
++use camcraft_app::commands::ImportModel;
++use camcraft_app::project;
++
++use super::{CommandKind, State};
++use crate::file_pick::{PickFor, PickedFile};
++
++impl State {
++    /// File > Open model: rfd's dialog natively; in a browser, the async
++    /// picker - its answer comes back through [`State::take_picked_files`].
++    pub(crate) fn open_model_dialog(&mut self) {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(path) = super::mesh_dialog().pick_file() {
++            self.import_path(path);
++        }
++        #[cfg(target_arch = "wasm32")]
++        {
++            crate::file_pick::open(&super::mesh_dialog(), PickFor::Model);
++            self.status = String::from("choose a model to import…");
++        }
++    }
++
++    /// File > Open project, after the unsaved-changes prompt: as above.
++    pub(crate) fn open_project_dialog(&mut self) {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(path) = super::project_dialog().pick_file() {
++            self.open_project_path(path);
++        }
++        #[cfg(target_arch = "wasm32")]
++        {
++            crate::file_pick::open(&super::project_dialog(), PickFor::Project);
++            self.status = String::from("choose a project to open…");
++        }
++    }
++
++    /// Queue every file the picker delivered since the last frame as one
++    /// `OpenPicked` command each, so it runs where every action runs.
++    pub(crate) fn take_picked_files(&mut self) {
++        for file in crate::file_pick::take_picked() {
++            self.run(CommandKind::OpenPicked(file));
++        }
++    }
++
++    /// Land one picked file, or refuse it by name.
++    pub(crate) fn open_picked(&mut self, file: PickedFile) {
++        let PickedFile { purpose, name, bytes } = file;
++        let data = match bytes {
++            Ok(data) => data,
++            Err(why) => {
++                self.status = match purpose {
++                    PickFor::Model => format!("import refused: {name} could not be read: {why}"),
++                    PickFor::Project => format!("open failed: {name} could not be read: {why}"),
++                };
++                return;
++            }
++        };
++        match purpose {
++            PickFor::Model => self.import_bytes(&name, &data),
++            PickFor::Project => self.open_project_bytes(&name, &data),
++        }
++    }
++
++    /// The bytes twin of `import_path`: parsed here, on this thread (a
++    /// browser has no worker to hand it to), then landed by
++    /// `finish_import` like any import - fresh, update or refusal.
++    fn import_bytes(&mut self, name: &str, data: &[u8]) {
++        let budget = self.step_budget_for(Path::new(name));
++        let result = ImportModel::from_bytes(name, data, budget);
++        // A disk import may be in flight on native: its file, clock and
++        // fixture binding are its own, so they are set aside around ours.
++        let held = (self.import_file.take(), self.import_started.take(), self.import_as_fixture.take());
++        self.import_started = Some(Instant::now());
++        self.finish_import(result);
++        (self.import_file, self.import_started, self.import_as_fixture) = held;
++    }
++
++    /// The bytes twin of `open_project_path`. The document has no path
++    /// afterwards (a browser file has none), so Save asks where.
++    fn open_project_bytes(&mut self, name: &str, data: &[u8]) {
++        let Ok(text) = std::str::from_utf8(data) else {
++            self.status = format!("open failed: {name} is not a CamCraft project (not text)");
++            return;
++        };
++        self.reset_for_open();
++        match project::open_noted(&self.world, text) {
++            Ok(notes) => {
++                self.history.mark_clean();
++                self.doc_version += 1;
++                self.status = if notes.is_empty() {
++                    format!("opened {name}")
++                } else {
++                    format!("opened {name} - {}", notes.join("; "))
++                };
++            }
++            Err(err) => self.status = format!("open failed: {name}: {err}"),
++        }
++    }
++}
+diff --git a/docs/decisions/31-wasm-file-picker.md b/docs/decisions/31-wasm-file-picker.md
+new file mode 100644
+index 000000000..7724f7d8a
+--- /dev/null
++++ b/docs/decisions/31-wasm-file-picker.md
+@@ -0,0 +1,57 @@
++## #31 - an async file picker for the browser build (Open model, Open project)
++
++**Decided.** In the browser (wasm32), File > Open model and Open project
++open an `<input type=file>` (`crates/ui/src/file_pick.rs`) and return at
++once. When the user has chosen, the file's name and bytes go into an
++inbox. `State::drain_actions` takes them on the next frame and runs each
++one as a `CommandKind::OpenPicked`. A model lands through
++`ImportModel::from_bytes` and `finish_import`, so it is one undo step,
++and a same-named model is an update, as before. A project lands through
++`project::open_noted`. A failed read, a refused file or a non-text
++project is said on the status line, using the same "import refused:" and
++"open failed:" wording as a file opened from disk. Native builds keep
++rfd's synchronous dialogs, and their inbox is never filled.
++
++**Why.**
++- Bytes are what a browser hands over, so the app takes bytes.
++  `ImportModel::from_bytes` shares the path import's checks
++  (`checked_budget`: IGES and unknown extensions, STEP budget bounds),
++  plus the file-size cap and the finite-mesh gate. A picked file lands
++  exactly as the same file from disk; `import_bytes` pins this.
++- The inbox is plain Rust on every target, so everything after the bytes
++  arrive is tested natively. Only the DOM input and the awaited read are
++  wasm32.
++- The picker uses `eframe::web_sys` and `wasm_bindgen` features that
++  eframe already enables (`HtmlInputElement`, `File`, `FileList`,
++  `Blob`). No dependency line was added.
++- The read is capped at 256 MiB (`BROWSER_READ_LIMIT`) and refused by
++  name before it starts. A wasm32 module has at most 4 GiB of memory, an
++  import needs several times its file, and an allocation that fails in
++  wasm aborts the tab.
++- The `<input>` and its change handler are held in one slot until the
++  next pick replaces them, rather than `Closure::forget`. A cancelled
++  picker never fires, so a forgotten closure would leak once per cancel.
++  The slot holds at most one picker.
++
++**Considered and dropped.**
++- rfd's `AsyncFileDialog` on wasm32: it is already a native dependency,
++  but its web backend adds its own overlay and button, and it would take
++  rfd onto the wasm32 dependency list.
++- Writing the bytes into a virtual file system so that `import_path`
++  could open them: more shim, and nothing gained over a bytes entry
++  point.
++- Running the bytes import on a worker thread: wasm32-unknown-unknown has
++  no threads. The import runs inline, which is what the path import
++  already falls back to when a spawn fails.
++
++**Owed (still on #31).**
++- Save and Save As, and Post, in the browser. These need a download, not
++  a picker. A project opened from bytes has no path, so Save asks where,
++  and in a browser that answer is "cancelled".
++- The other pickers (fixture import, machine, post, theme, tool library)
++  still answer "cancelled" on wasm32.
++- Dropped files: eframe hands over dropped files' bytes on the web.
++- A browser hand check of the picker, which was not run here.
++
++**Cost to change later.** Low. Other pickers join by adding a `PickFor`
++variant and a route in `open_picked`.
