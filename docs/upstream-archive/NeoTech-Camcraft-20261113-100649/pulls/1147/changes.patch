@@ -1,0 +1,1814 @@
+From d69f28691dd1632a161628366783a2a9ad179731 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 01:08:08 -0800
+Subject: [PATCH 1/5] feat(edm): wire contour cuts an open run from the stock's
+ edge
+
+The Wire Contour op accepts one open run (a cut-off, a slot, a relief)
+entered from the stock's edge: the kerf stated left or right of travel,
+the wire threaded and run out along the run's own ends the kerf offset
+plus a stated clearance off the stock, no start hole. Refused by name:
+die/punch on an open run (no kerf side stated), left/right on a closed
+profile, no stock, an end that stops inside the stock, a run that never
+enters it, a self-crossing or doubling-back run, several runs, a corner
+tighter than the wire, a run-out that would cut the stock. Closed
+profiles and their goldens are unchanged.
+
+Fixes #1109
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/generate.rs        |  14 +-
+ crates/app/src/operation/types/mod.rs       |   2 +-
+ crates/app/src/operation/types/wire_edm.rs  |  14 +-
+ crates/app/src/operation/wire_op.rs         |  21 +-
+ crates/app/src/project/wire_edm_dto.rs      |  23 ++
+ crates/app/tests/golden/wire_open_cutoff.cl |   5 +
+ crates/app/tests/golden_cl.rs               |  28 ++
+ crates/app/tests/wire_contour.rs            |  30 ++
+ crates/motion/src/wire_edm/laws.rs          |  51 ++-
+ crates/motion/src/wire_edm/mod.rs           |  56 ++-
+ crates/motion/src/wire_edm/open.rs          | 356 ++++++++++++++++++++
+ crates/motion/src/wire_edm/open_tests.rs    | 120 +++++++
+ crates/motion/src/wire_edm/ring.rs          |  14 +-
+ crates/motion/src/wire_edm/tests.rs         |   2 +
+ crates/ui/src/egui_app/wire_page.rs         |  16 +-
+ docs/decisions/1109-wire-open-profile.md    |  16 +
+ 16 files changed, 737 insertions(+), 31 deletions(-)
+ create mode 100644 crates/app/tests/golden/wire_open_cutoff.cl
+ create mode 100644 crates/motion/src/wire_edm/open.rs
+ create mode 100644 crates/motion/src/wire_edm/open_tests.rs
+ create mode 100644 docs/decisions/1109-wire-open-profile.md
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 28006d5a2..e4e3d43fe 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -142,9 +142,17 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // the generator certifies its kerf and corner laws (#534 verifies).
+     if let OpParams::WireContour(op) = &params {
+         let picks = contour_sel.take().transpose()?.map(|(loops, chains, _)| (loops, chains));
+-        return super::wire_op::generate_wire(op, wire.ok_or_else(|| unreached("wire condition")), &hs, picks, || {
+-            region_for_job(&mut picked_region, &mut section_z, &src, &params, &material, None)
+-        });
++        // #1109: an open run is entered from the stock's edge - the
++        // setup's stock outline, read only when a run is picked.
++        let stock = || stock_facets.as_deref().and_then(|f| slice::project(f, FOOTPRINT_SAMPLES).ok()).filter(|r| !r.is_empty());
++        return super::wire_op::generate_wire(
++            op,
++            wire.ok_or_else(|| unreached("wire condition")),
++            &hs,
++            picks,
++            || region_for_job(&mut picked_region, &mut section_z, &src, &params, &material, None),
++            stock,
++        );
+     }
+     // The program ahead, cut only when a law asks (#89, #96 review).
+     let mut verify_prior = super::drill_prior::PriorCell::new(verify_prior);
+diff --git a/crates/app/src/operation/types/mod.rs b/crates/app/src/operation/types/mod.rs
+index f9d2a75e7..16493cd96 100644
+--- a/crates/app/src/operation/types/mod.rs
++++ b/crates/app/src/operation/types/mod.rs
+@@ -33,5 +33,5 @@ pub use camcraft_post::post::AfterOperation;
+ pub use height::{Height, HeightReference};
+ pub use params::{OpParams, Tilt};
+ pub use plasma::{PlasmaComp, PlasmaOp};
+-pub use wire_edm::{WireContourOp, WireSide, CONDITION_ID_MAX};
++pub use wire_edm::{WireContourOp, WireSide, CONDITION_ID_MAX, DEFAULT_CLEARANCE};
+ pub use sel::{FeatureSel, GenStamp, GeoSel, OpStatus, OpType, SrcRef, WCS_SLOTS};
+diff --git a/crates/app/src/operation/types/wire_edm.rs b/crates/app/src/operation/types/wire_edm.rs
+index 4df098327..7934e1c4e 100644
+--- a/crates/app/src/operation/types/wire_edm.rs
++++ b/crates/app/src/operation/types/wire_edm.rs
+@@ -13,6 +13,11 @@ use super::height::Height;
+ 
+ pub use crate::wire_edm::WireSide;
+ 
++/// The run-out clearance (mm) a new wire cut is seeded with (#1109): an
++/// open run is threaded and run out this far clear of the stock's edge,
++/// past the kerf. A closed profile never reads it.
++pub const DEFAULT_CLEARANCE: f64 = 1.0;
++
+ /// The longest condition id an operation stores (a control's selector
+ /// is a short word; this only bounds a hand-edited file).
+ pub const CONDITION_ID_MAX: usize = 64;
+@@ -30,11 +35,16 @@ pub struct WireContourOp {
+     /// empty word is "none chosen", refused at the command door.
+     pub condition: String,
+     /// Which side of the profile is the product - stated by the user,
+-    /// never inferred from the geometry (#290 D8).
++    /// never inferred from the geometry (#290 D8): die / punch for a
++    /// closed profile, the kerf's left / right of travel for an open
++    /// run (#1109).
+     pub side: WireSide,
+     /// The start hole / threading point, world XY mm; `None` is not
+     /// stated, and a closed profile is refused at generation without it.
+     pub start: Option<[f64; 2]>,
++    /// An open run's threading and run-out clearance past the kerf, mm
++    /// (#1109); unread for a closed profile.
++    pub clearance: f64,
+ }
+ 
+ impl WireContourOp {
+@@ -47,6 +57,8 @@ impl WireContourOp {
+         self.top_z.is_sane()
+             && self.bottom_z.is_sane()
+             && self.start.is_none_or(|s| s.iter().all(|v| v.is_finite() && v.abs() < 1e9))
++            && self.clearance.is_finite()
++            && (0.0..=crate::wire_edm::CLEARANCE_MAX).contains(&self.clearance)
+             && self.condition.len() <= CONDITION_ID_MAX
+             && !self.condition.chars().any(char::is_control)
+     }
+diff --git a/crates/app/src/operation/wire_op.rs b/crates/app/src/operation/wire_op.rs
+index d85581a8f..6bcdc26e1 100644
+--- a/crates/app/src/operation/wire_op.rs
++++ b/crates/app/src/operation/wire_op.rs
+@@ -32,6 +32,7 @@ pub(super) fn seed_wire_contour(c: &Carried) -> OpParams {
+         condition: String::new(),
+         side: WireSide::Die,
+         start: None,
++        clearance: super::types::DEFAULT_CLEARANCE,
+     })
+ }
+ 
+@@ -142,12 +143,18 @@ pub fn conditions_of(world: &World, setup: Option<&str>) -> Vec<String> {
+ }
+ 
+ /// The generator's numbers from the op's, the condition's and the
+-/// world's.
++/// world's. `stock` is the setup's stock outline in XY - the edge an
++/// open run is entered from (#1109).
+ ///
+ /// # Errors
+ /// A workpiece top or bottom that does not resolve, or a bottom that
+ /// does not stand below the top.
+-pub fn wire_params(op: &WireContourOp, cond: &WireCondition, hs: &ResolvedHeights) -> Result<WireParams, GenError> {
++pub fn wire_params(
++    op: &WireContourOp,
++    cond: &WireCondition,
++    hs: &ResolvedHeights,
++    stock: Option<Region>,
++) -> Result<WireParams, GenError> {
+     let (Some(top), Some(bottom)) = (hs.top, hs.bottom) else {
+         return Err(GenError::Invalid("wire contour: the workpiece's top and bottom must both resolve".into()));
+     };
+@@ -163,12 +170,15 @@ pub fn wire_params(op: &WireContourOp, cond: &WireCondition, hs: &ResolvedHeight
+         side: op.side,
+         start: op.start.map(|[x, y]| Point2::new(x, y)),
+         plane_z: bottom,
++        stock,
++        clearance: op.clearance,
+     })
+ }
+ 
+ /// Generate: `picks` is the picked profile (closed rings, open runs)
+ /// when the source is a selection; otherwise `base` - the model's
+-/// through-silhouette - is the profile. No verification runs yet (the
++/// through-silhouette - is the profile. `stock` is read only for an
++/// open run (#1109). No verification runs yet (the
+ /// wire sweep against the part is #534), and the path's notes say so.
+ pub(super) fn generate_wire(
+     op: &WireContourOp,
+@@ -176,12 +186,15 @@ pub(super) fn generate_wire(
+     hs: &ResolvedHeights,
+     picks: Option<(Vec<Loop>, Vec<Vec<Point2>>)>,
+     base: impl FnOnce() -> Result<Region, GenError>,
++    stock: impl FnOnce() -> Option<Region>,
+ ) -> Result<(Toolpath, Vec<Warning>), GenError> {
+-    let p = wire_params(op, &cond?, hs)?;
++    let cond = cond?;
+     let (loops, chains) = match picks {
+         Some(geom) => geom,
+         None => (base()?.loops().to_vec(), Vec::new()),
+     };
++    let stock = if chains.is_empty() { None } else { stock() };
++    let p = wire_params(op, &cond, hs, stock)?;
+     let path = wire_contour(&loops, &chains, &p)?;
+     Ok((path, Vec::new()))
+ }
+diff --git a/crates/app/src/project/wire_edm_dto.rs b/crates/app/src/project/wire_edm_dto.rs
+index f171c5908..8dc8046a3 100644
+--- a/crates/app/src/project/wire_edm_dto.rs
++++ b/crates/app/src/project/wire_edm_dto.rs
+@@ -15,6 +15,19 @@ use crate::operation::{WireContourOp, WireSide};
+ pub enum WireSideDto {
+     Die,
+     Punch,
++    /// An open run's kerf, left of travel (#1109).
++    Left,
++    /// An open run's kerf, right of travel (#1109).
++    Right,
++}
++
++fn default_clearance() -> f64 {
++    crate::operation::DEFAULT_CLEARANCE
++}
++
++#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip predicate takes a reference
++fn is_default_clearance(c: &f64) -> bool {
++    c.to_bits() == default_clearance().to_bits()
+ }
+ 
+ #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+@@ -29,6 +42,10 @@ pub struct WireContourDto {
+     /// stated.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub start: Option<[f64; 2]>,
++    /// An open run's run-out clearance, mm (#1109); absent is the
++    /// seed's, so a closed cut's file reads and writes as before.
++    #[serde(default = "default_clearance", skip_serializing_if = "is_default_clearance")]
++    pub clearance: f64,
+ }
+ 
+ impl WireContourDto {
+@@ -40,8 +57,11 @@ impl WireContourDto {
+             side: match p.side {
+                 WireSide::Die => WireSideDto::Die,
+                 WireSide::Punch => WireSideDto::Punch,
++                WireSide::Left => WireSideDto::Left,
++                WireSide::Right => WireSideDto::Right,
+             },
+             start: p.start,
++            clearance: p.clearance,
+         }
+     }
+ 
+@@ -53,8 +73,11 @@ impl WireContourDto {
+             side: match self.side {
+                 WireSideDto::Die => WireSide::Die,
+                 WireSideDto::Punch => WireSide::Punch,
++                WireSideDto::Left => WireSide::Left,
++                WireSideDto::Right => WireSide::Right,
+             },
+             start: self.start,
++            clearance: self.clearance,
+         })
+     }
+ }
+diff --git a/crates/app/tests/golden/wire_open_cutoff.cl b/crates/app/tests/golden/wire_open_cutoff.cl
+new file mode 100644
+index 000000000..f6f323bf5
+--- /dev/null
++++ b/crates/app/tests/golden/wire_open_cutoff.cl
+@@ -0,0 +1,5 @@
++; HSMW-CL v1 scale=0.001mm moves=3
++START 60165 -1165 0
++Feed 60165 0 0
++Feed 60165 50000 0
++Feed 60165 51165 0
+diff --git a/crates/app/tests/golden_cl.rs b/crates/app/tests/golden_cl.rs
+index 584cb4f4b..547e690c6 100644
+--- a/crates/app/tests/golden_cl.rs
++++ b/crates/app/tests/golden_cl.rs
+@@ -1082,6 +1082,8 @@ fn wire_contour_die_and_punch_match_golden() {
+             side,
+             start: Some(start),
+             plane_z: 0.0,
++            stock: None,
++            clearance: 1.0,
+         };
+         let path = wire_contour(std::slice::from_ref(&profile), &[], &p).unwrap();
+         assert!(path.is_prismatic() && path.moves.iter().all(|m| m.kind == MoveKind::Feed && m.feed.is_none()));
+@@ -1093,3 +1095,29 @@ fn wire_contour_die_and_punch_match_golden() {
+         write_golden(file, &text);
+     }
+ }
++
++/// #1109: an open wire run - a cut-off across a 100 x 50 plate at
++/// x = 60, kerf right of travel, SYNTHETIC condition (wire 0.25 mm, gap
++/// 0.04 mm): the wire stands 0.165 mm right of the line, threaded 1 mm
++/// past the kerf below the plate and run out 1 mm past it above.
++#[test]
++fn wire_open_cutoff_matches_golden() {
++    use camcraft_app::wire_edm::{wire_contour, WireParams, WireSide};
++    let plate = vec![Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), Point2::new(100.0, 50.0), Point2::new(0.0, 50.0)];
++    let p = WireParams {
++        wire_diameter: 0.25,
++        gap: 0.04,
++        condition: "C110".into(),
++        side: WireSide::Right,
++        start: None,
++        plane_z: 0.0,
++        stock: Some(Region::new(vec![Loop::new(plate).unwrap()]).unwrap()),
++        clearance: 1.0,
++    };
++    let line = vec![Point2::new(60.0, 0.0), Point2::new(60.0, 50.0)];
++    let path = wire_contour(&[], &[line], &p).unwrap();
++    assert!(path.is_prismatic() && path.moves.iter().all(|m| m.kind == MoveKind::Feed && m.feed.is_none()));
++    let text = gen_to_cltext(&path);
++    assert_eq!(camcraft_app::cl::text::to_text(&path).unwrap(), text);
++    write_golden("wire_open_cutoff.cl", &text);
++}
+diff --git a/crates/app/tests/wire_contour.rs b/crates/app/tests/wire_contour.rs
+index 5bfdc3b42..6f6fb8c82 100644
+--- a/crates/app/tests/wire_contour.rs
++++ b/crates/app/tests/wire_contour.rs
+@@ -95,6 +95,7 @@ fn wire_op(side: WireSide, start: Option<[f64; 2]>) -> WireContourOp {
+         condition: "C110".into(),
+         side,
+         start,
++        clearance: operation::DEFAULT_CLEARANCE,
+     }
+ }
+ 
+@@ -331,3 +332,32 @@ fn the_op_round_trips_and_its_side_is_never_defaulted() {
+     };
+     assert_eq!(w.start, None);
+ }
++
++/// #1109: the open run's fields - the kerf side left / right of travel
++/// and the run-out clearance - ride EditOperationParams (undoable) and
++/// the JSON door the file and the MCP patch share; a closed profile
++/// with a left / right side is refused by name at generation, and an
++/// insane clearance at the command door.
++#[test]
++fn the_open_run_fields_ride_the_commands_and_the_json_door() {
++    let (world, mut h) = wire_doc();
++    let p0 = wire_op(WireSide::Die, Some([0.0, 0.0]));
++    h.execute(&world, create(&world, "W", "slug", p0.clone()).expect("op"));
++    let p1 = WireContourOp { side: WireSide::Right, clearance: 2.5, ..p0.clone() };
++    h.execute(&world, EditOperationParams::new(&world, "W", OpParams::WireContour(p1.clone())).expect("edit"));
++    let params = |w: &World| model::find_by_name(w, "W").and_then(|e| model::operation_of(w, &e)).map(|o| o.params);
++    assert_eq!(params(&world), Some(OpParams::WireContour(p1.clone())));
++    let why = GenerateOperation::new(&world, "W").err().expect("refused").to_string();
++    assert!(why.contains("profile is closed") && why.contains("die or punch"), "{why}");
++    assert!(h.undo(&world));
++    assert_eq!(params(&world), Some(OpParams::WireContour(p0.clone())));
++    let bad = WireContourOp { clearance: f64::NAN, ..p1.clone() };
++    assert!(EditOperationParams::new(&world, "W", OpParams::WireContour(bad)).is_err(), "a NaN clearance is refused");
++    let json = project::params_to_json(&OpParams::WireContour(p1.clone()));
++    assert_eq!(json["wire_contour"]["side"], "right");
++    assert_eq!(json["wire_contour"]["clearance"], 2.5);
++    assert_eq!(project::params_from_json(&json).expect("reads back"), OpParams::WireContour(p1));
++    // A closed cut's file names no clearance: it reads and writes as before.
++    let closed = project::params_to_json(&OpParams::WireContour(p0));
++    assert!(closed["wire_contour"].get("clearance").is_none(), "{closed}");
++}
+diff --git a/crates/motion/src/wire_edm/laws.rs b/crates/motion/src/wire_edm/laws.rs
+index dedde8b35..26bf64f2f 100644
+--- a/crates/motion/src/wire_edm/laws.rs
++++ b/crates/motion/src/wire_edm/laws.rs
+@@ -24,7 +24,7 @@ use crate::geo2d::Point2;
+ use crate::geometry::Point3;
+ use crate::machining2d::GenError;
+ 
+-use super::ring::{dist, pt_ring};
++use super::ring::{dist, pt_poly, pt_ring};
+ use super::{WireParams, COVER_TOL, PATH_TOL};
+ 
+ /// The most samples either law reads along the profile or the path.
+@@ -37,27 +37,53 @@ fn step_for(k: f64, total: f64) -> f64 {
+     (k * 0.5).max(total / MAX_SAMPLES).max(1e-4)
+ }
+ 
+-fn perimeter(ring: &[Point2]) -> f64 {
+-    let n = ring.len();
+-    (0..n).map(|i| dist(ring[i], ring[(i + 1) % n])).sum()
++/// The segments of `pts` as index pairs: closing back to the first
++/// point for a ring, not for an open run (#1109).
++fn segs(n: usize, closed: bool) -> impl Iterator<Item = (usize, usize)> {
++    let m = if closed { n } else { n.saturating_sub(1) };
++    (0..m).map(move |i| (i, (i + 1) % n.max(1)))
++}
++
++fn perimeter(pts: &[Point2], closed: bool) -> f64 {
++    segs(pts.len(), closed).map(|(i, j)| dist(pts[i], pts[j])).sum()
++}
++
++/// Distance from `q` to `pts`, a ring or an open run.
++fn to(q: Point2, pts: &[Point2], closed: bool) -> f64 {
++    if closed {
++        pt_ring(q, pts)
++    } else {
++        pt_poly(q, pts)
++    }
+ }
+ 
+ /// The corner minimum: every point of the profile `given` lies within
+ /// the kerf offset of the wire-centre `path_ring`.
+ pub(super) fn cover(given: &[Point2], path_ring: &[Point2], p: &WireParams) -> Result<(), GenError> {
++    cover_run(given, true, path_ring, true, p)
++}
++
++/// [`cover`] over a ring or an open run (#1109): `given_closed` and
++/// `path_closed` say which each polyline is.
++pub(super) fn cover_run(
++    given: &[Point2],
++    given_closed: bool,
++    path: &[Point2],
++    path_closed: bool,
++    p: &WireParams,
++) -> Result<(), GenError> {
+     let k = p.kerf_offset();
+     let reach = k + COVER_TOL;
+-    let step = step_for(k, perimeter(given));
+-    let n = given.len();
++    let step = step_for(k, perimeter(given, given_closed));
+     let mut worst: Option<(f64, Point2)> = None;
+-    for i in 0..n {
+-        let (a, b) = (given[i], given[(i + 1) % n]);
++    for (i, j) in segs(given.len(), given_closed) {
++        let (a, b) = (given[i], given[j]);
+         let len = dist(a, b);
+         let steps = (len / step).ceil().clamp(1.0, 65_536.0) as u32;
+         for j in 0..steps {
+             let f = f64::from(j) / f64::from(steps);
+             let q = Point2::new(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f);
+-            let d = pt_ring(q, path_ring);
++            let d = to(q, path, path_closed);
+             // A NaN distance is never "covered".
+             if d.is_nan() {
+                 return Err(GenError::Invalid(
+@@ -87,8 +113,9 @@ pub(super) fn cover(given: &[Point2], path_ring: &[Point2], p: &WireParams) -> R
+ }
+ 
+ /// The certificate: no move of `path` brings the wire's centre nearer
+-/// the profile `given` than the kerf offset `k`.
+-pub(super) fn kerf(path: &Toolpath, given: &[Point2], k: f64, z: f64) -> Result<(), GenError> {
++/// the profile `given` (a ring, or an open run when `!given_closed`,
++/// #1109) than the kerf offset `k`.
++pub(super) fn kerf(path: &Toolpath, given: &[Point2], given_closed: bool, k: f64, z: f64) -> Result<(), GenError> {
+     let total: f64 = path.moves.iter().map(|m| (m.to.x - m.from.x).hypot(m.to.y - m.from.y)).sum();
+     let step = step_for(k, total);
+     let floor = k - PATH_TOL;
+@@ -98,7 +125,7 @@ pub(super) fn kerf(path: &Toolpath, given: &[Point2], k: f64, z: f64) -> Result<
+         for j in 0..=steps {
+             let f = f64::from(j) / f64::from(steps);
+             let q = Point2::new(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f);
+-            let d = pt_ring(q, given);
++            let d = to(q, given, given_closed);
+             if d.is_nan() || d < floor {
+                 return Err(GenError::invalid_at(
+                     format!(
+diff --git a/crates/motion/src/wire_edm/mod.rs b/crates/motion/src/wire_edm/mod.rs
+index c48269840..090301541 100644
+--- a/crates/motion/src/wire_edm/mod.rs
++++ b/crates/motion/src/wire_edm/mod.rs
+@@ -26,14 +26,22 @@
+ //! missing or misplaced start hole, an inside corner or a neck the wire
+ //! cannot cut - each is refused by name, never trimmed or rounded.
+ //!
++//! An OPEN run (#1109) - a cut-off line, a slot or a relief entered
++//! from the stock's edge - is cut by `open`: the kerf on the stated
++//! left or right of the run's travel, threaded outside the stock (no
++//! start hole), see that module's head.
++//!
+ //! Seams left for the family (built by none of this): the wire post
+ //! (#533) reads the feed moves between the threading point's visits;
+ //! verification (#534), taper as a pose per move (#536), skims as
+ //! further offsets (#538) and tabs (#539) stand on this path.
+ 
+ mod laws;
++mod open;
+ mod ring;
+ 
++pub use open::{CLEARANCE_MAX, EDGE_TOL};
++
+ use crate::cl::{MoveKind, PathBuilder, Toolpath};
+ use crate::geo2d::{Loop, Point2, Region};
+ use crate::geometry::Point3;
+@@ -60,6 +68,12 @@ pub enum WireSide {
+     Die,
+     /// The profile is the product: the wire runs OUTSIDE it.
+     Punch,
++    /// An open run (#1109): the wire runs on the LEFT of the run's
++    /// travel (its point order); the right side is kept.
++    Left,
++    /// An open run (#1109): the wire runs on the RIGHT of the run's
++    /// travel; the left side is kept.
++    Right,
+ }
+ 
+ impl WireSide {
+@@ -69,8 +83,17 @@ impl WireSide {
+         match self {
+             WireSide::Die => "die",
+             WireSide::Punch => "punch",
++            WireSide::Left => "left",
++            WireSide::Right => "right",
+         }
+     }
++
++    /// Whether the side is an open run's (left / right of travel) rather
++    /// than a closed profile's (die / punch).
++    #[must_use]
++    pub fn is_open_side(self) -> bool {
++        matches!(self, WireSide::Left | WireSide::Right)
++    }
+ }
+ 
+ /// Everything the generator reads, resolved to plain numbers (mm).
+@@ -88,6 +111,14 @@ pub struct WireParams {
+     pub start: Option<Point2>,
+     /// The lower programmed plane the moves ride.
+     pub plane_z: f64,
++    /// The stock's outline in XY - the edge an open run is entered
++    /// from (#1109). A closed profile never reads it.
++    pub stock: Option<Region>,
++    /// How far (mm) clear of the stock's edge an open run's kerf is
++    /// threaded and run out (#1109): the wire's centre stands at least
++    /// the kerf offset plus this off the stock. A closed profile never
++    /// reads it.
++    pub clearance: f64,
+ }
+ 
+ fn invalid(why: String) -> GenError {
+@@ -139,15 +170,24 @@ impl WireParams {
+     }
+ }
+ 
+-/// Cut the one closed profile in `loops` with the wire. `chains` are
+-/// open runs: this operation cuts none (an open profile has no punch
+-/// or die side) and refuses them by name.
++/// Cut the one closed profile in `loops` with the wire - or, when
++/// `chains` holds an open run, that run from the stock's edge (#1109,
++/// [`open`]).
+ ///
+ /// # Errors
+ /// Every refusal the module head lists, by name; none is a panic.
+ pub fn wire_contour(loops: &[Loop], chains: &[Vec<Point2>], p: &WireParams) -> Result<Toolpath, GenError> {
+     p.door()?;
++    if !chains.is_empty() {
++        return open::wire_open(loops, chains, p);
++    }
+     let (given, profile) = ring::profile(loops, chains)?;
++    if p.side.is_open_side() {
++        return Err(invalid(format!(
++            "the side is {} of travel, but the profile is closed - a closed profile states its die or punch side (left / right is an open run's kerf side)",
++            p.side.word()
++        )));
++    }
+     let k = p.kerf_offset();
+     let path_ring = ring::wire_ring(&profile, p.side, k)?;
+     // The corner minimum (#290 D8): every point of the profile must be
+@@ -159,7 +199,7 @@ pub fn wire_contour(loops: &[Loop], chains: &[Vec<Point2>], p: &WireParams) -> R
+             "no start hole is stated - a closed profile is cut from a threading point ({}); the wire cannot be threaded through solid material",
+             match p.side {
+                 WireSide::Die => "a start hole in the slug, inside the profile",
+-                WireSide::Punch => "a start hole or the stock's edge, outside the profile",
++                WireSide::Punch | WireSide::Left | WireSide::Right => "a start hole or the stock's edge, outside the profile",
+             }
+         )));
+     };
+@@ -186,7 +226,7 @@ pub fn wire_contour(loops: &[Loop], chains: &[Vec<Point2>], p: &WireParams) -> R
+         return Err(invalid("the wire path lays down no cut".into()));
+     }
+     // The certificate: no move brings the kerf into the product.
+-    laws::kerf(&path, &given, k, p.plane_z)?;
++    laws::kerf(&path, &given, true, k, p.plane_z)?;
+     path.notes.extend(notes(p, start, lead));
+     Ok(path)
+ }
+@@ -199,6 +239,9 @@ fn start_side(profile: &Region, path_ring: &[Point2], start: Point2, p: &WirePar
+     let inside_path = Region::new(vec![Loop::new(path_ring.to_vec())?])?.contains(start);
+     let inside_profile = profile.contains(start);
+     let why = match (p.side, inside_path, inside_profile) {
++        (WireSide::Left | WireSide::Right, _, _) => {
++            format!("the side is {} of travel - a closed profile states die or punch", p.side.word())
++        }
+         (WireSide::Die, true, _) | (WireSide::Punch, false, _) => return Ok(()),
+         (WireSide::Die, false, true) | (WireSide::Punch, true, false) => format!(
+             "the start hole at X{:.3} Y{:.3} stands closer to the profile than the kerf offset ({k:.4} mm) - the wire would burn the {} there; move it away from the profile",
+@@ -229,6 +272,7 @@ fn notes(p: &WireParams, start: Point2, lead: f64) -> Vec<String> {
+             match p.side {
+                 WireSide::Die => "inside",
+                 WireSide::Punch => "outside",
++                WireSide::Left | WireSide::Right => "beside",
+             },
+             p.kerf_offset(),
+             p.wire_diameter * 0.5,
+@@ -243,5 +287,7 @@ fn notes(p: &WireParams, start: Point2, lead: f64) -> Vec<String> {
+     ]
+ }
+ 
++#[cfg(test)]
++mod open_tests;
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/motion/src/wire_edm/open.rs b/crates/motion/src/wire_edm/open.rs
+new file mode 100644
+index 000000000..3e93004c1
+--- /dev/null
++++ b/crates/motion/src/wire_edm/open.rs
+@@ -0,0 +1,356 @@
++//! The wire's OPEN run (#1109, part of #290): a cut-off line, a slot or
++//! a relief entered from the stock's edge. An open run encloses
++//! nothing, so punch and die mean nothing; the kerf side is stated
++//! instead as LEFT or RIGHT of the run's travel (its point order) -
++//! never inferred, the same law as punch / die (#290 D8). The kept side
++//! is the other one.
++//!
++//! - The wire-centre path is the run's one-sided parallel at the kerf
++//!   offset (wire radius + spark gap), its joins mitred: where the wire
++//!   rides outside a turn the kept corner stays sharp; where it rides
++//!   inside one, the corner minimum holds as for a closed profile.
++//! - No start hole: both ends of the run must reach (or pass) the
++//!   stock's edge, and the path is extended along the run's own end
++//!   directions until the wire stands the kerf offset plus the stated
++//!   clearance off the stock - threaded there, in the air, and run out
++//!   the same way at the far end (the wire leaves the cut; no return).
++//! - Refused by name: a side of die / punch (no kerf side stated), no
++//!   stock to read the edge from, an end that stops inside the stock, a
++//!   run that never enters it, a run that crosses or doubles back on
++//!   itself, several runs or a run mixed with closed profiles, a corner
++//!   tighter than the wire, and a run-out that would cut the stock.
++//!
++//! Provenance: general wire EDM practice as the umbrella cites it
++//! (#290: an open cut is threaded outside the work and runs off its
++//! edge; the kerf is wire radius + gap per side; the inside-corner
++//! minimum) and plain 2D geometry (one-sided polyline offset with
++//! mitred joins, segment intersection). Our own code; no vendor post,
++//! control manual or CAM product behaviour was consulted.
++
++use crate::cl::{MoveKind, PathBuilder, Toolpath};
++use crate::geo2d::{Loop, Point2, Region};
++use crate::geometry::Point3;
++use crate::machining2d::GenError;
++
++use super::ring::{dist, pt_ring};
++use super::{laws, WireParams, WireSide, MIN_LEAD};
++
++/// How far (mm) inside the stock's edge a run's end may stand and still
++/// count as reaching it: 1 µm, a picked edge drawn on the stock's face.
++pub const EDGE_TOL: f64 = 1e-3;
++/// The largest clearance (mm) an op may state - bounds a hand-edited
++/// file, nothing a cut would ask.
++pub const CLEARANCE_MAX: f64 = 1000.0;
++/// The most points an open run may carry (the crossing test is a sweep).
++const MAX_POINTS: usize = 100_000;
++
++fn invalid(why: String) -> GenError {
++    GenError::Invalid(format!("wire contour: {why}"))
++}
++
++fn at(why: String, q: Point2, z: f64) -> GenError {
++    GenError::invalid_at(format!("wire contour: {why}"), Point3::new(q.x, q.y, z))
++}
++
++/// How deep `q` stands inside the stock: positive inside, negative
++/// outside, the distance to the nearest edge either way.
++fn depth(stock: &Region, q: Point2) -> f64 {
++    let d = stock.loops().iter().map(|l| pt_ring(q, l.points())).fold(f64::INFINITY, f64::min);
++    if stock.contains(q) {
++        d
++    } else {
++        -d
++    }
++}
++
++/// Cut the one open run in `chains` with the kerf on the stated side.
++///
++/// # Errors
++/// Every refusal the module head lists, by name; none is a panic.
++pub(super) fn wire_open(loops: &[Loop], chains: &[Vec<Point2>], p: &WireParams) -> Result<Toolpath, GenError> {
++    let sign = match p.side {
++        WireSide::Left => 1.0,
++        WireSide::Right => -1.0,
++        WireSide::Die | WireSide::Punch => {
++            return Err(invalid(format!(
++                "the profile is open and its side is {} - an open profile has no punch or die side; state the kerf side: left or right of the run's travel",
++                p.side.word()
++            )));
++        }
++    };
++    if !loops.is_empty() || chains.len() != 1 {
++        return Err(invalid(format!(
++            "{} open run(s) and {} closed profile(s) are given - one operation cuts one open run from the stock's edge; give each its own operation",
++            chains.len(),
++            loops.len()
++        )));
++    }
++    if !(p.clearance.is_finite() && (0.0..=CLEARANCE_MAX).contains(&p.clearance)) {
++        return Err(invalid(format!(
++            "the run-out clearance must be between 0 and {CLEARANCE_MAX} mm (it states {})",
++            p.clearance
++        )));
++    }
++    let Some(stock) = p.stock.as_ref().filter(|s| !s.is_empty()) else {
++        return Err(invalid(
++            "an open run is entered from the stock's edge, and the setup states no stock to read that edge from".into(),
++        ));
++    };
++    let run = clean(chains.first().map_or(&[][..], Vec::as_slice))?;
++    let z = p.plane_z;
++    crossing(&run, z)?;
++    reaches_edge(stock, &run, z)?;
++    let k = p.kerf_offset();
++    let ride = offset(&run, sign * k, z)?;
++    let (Some(&first), Some(&last)) = (ride.first(), ride.last()) else {
++        return Err(invalid("the open run lays down no cut".into()));
++    };
++    let target = k + p.clearance;
++    let back = unit(run[0], run[1]);
++    let fwd = unit(run[run.len() - 2], run[run.len() - 1]);
++    let t0 = run_out(stock, first, Point2::new(-back.x, -back.y), target, k, z)?;
++    let t1 = run_out(stock, last, fwd, target, k, z)?;
++    let mut b = PathBuilder::new(Point3::new(t0.x, t0.y, z));
++    let mut prev = t0;
++    for q in ride.iter().copied().chain(std::iter::once(t1)) {
++        if dist(prev, q) > MIN_LEAD {
++            b.push(MoveKind::Feed, Point3::new(q.x, q.y, z), None);
++            prev = q;
++        }
++    }
++    let mut path = b.finish();
++    if path.moves.is_empty() {
++        return Err(invalid("the open run lays down no cut".into()));
++    }
++    let wire: Vec<Point2> = std::iter::once(t0).chain(ride.iter().copied()).chain(std::iter::once(t1)).collect();
++    laws::cover_run(&run, false, &wire, false, p)?;
++    laws::kerf(&path, &run, false, k, z)?;
++    path.notes.extend(notes(p, t0, t1));
++    Ok(path)
++}
++
++/// The run's points, finite, with coincident neighbours dropped.
++fn clean(raw: &[Point2]) -> Result<Vec<Point2>, GenError> {
++    if raw.len() > MAX_POINTS {
++        return Err(invalid(format!("the open run has {} points - more than {MAX_POINTS}", raw.len())));
++    }
++    if raw.iter().any(|q| !(q.x.is_finite() && q.y.is_finite())) {
++        return Err(invalid("the open run has a point that is not finite".into()));
++    }
++    let mut out: Vec<Point2> = Vec::with_capacity(raw.len());
++    for &q in raw {
++        if out.last().is_none_or(|l| dist(*l, q) > MIN_LEAD) {
++            out.push(q);
++        }
++    }
++    if out.len() < 2 {
++        return Err(invalid("the open run has no length - there is nothing to cut along".into()));
++    }
++    Ok(out)
++}
++
++fn unit(a: Point2, b: Point2) -> Point2 {
++    let l = dist(a, b);
++    Point2::new((b.x - a.x) / l, (b.y - a.y) / l)
++}
++
++fn cross(o: Point2, a: Point2, b: Point2) -> f64 {
++    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
++}
++
++/// Whether segments a-b and c-d touch (collinear overlaps included).
++fn touch(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
++    const E: f64 = 1e-12;
++    let (d1, d2, d3, d4) = (cross(c, d, a), cross(c, d, b), cross(a, b, c), cross(a, b, d));
++    let on = |p: Point2, q: Point2, r: Point2| {
++        r.x >= p.x.min(q.x) - E && r.x <= p.x.max(q.x) + E && r.y >= p.y.min(q.y) - E && r.y <= p.y.max(q.y) + E
++    };
++    if ((d1 > E && d2 < -E) || (d1 < -E && d2 > E)) && ((d3 > E && d4 < -E) || (d3 < -E && d4 > E)) {
++        return true;
++    }
++    (d1.abs() <= E && on(c, d, a))
++        || (d2.abs() <= E && on(c, d, b))
++        || (d3.abs() <= E && on(a, b, c))
++        || (d4.abs() <= E && on(a, b, d))
++}
++
++/// A run that crosses or touches itself (other than at a shared vertex
++/// of neighbouring segments) is refused: its kerf would cut its own
++/// kept side. A sweep over the segments sorted by their left end.
++fn crossing(run: &[Point2], z: f64) -> Result<(), GenError> {
++    let n = run.len() - 1;
++    let mut order: Vec<usize> = (0..n).collect();
++    let lo = |i: usize| run[i].x.min(run[i + 1].x);
++    let hi = |i: usize| run[i].x.max(run[i + 1].x);
++    order.sort_by(|&a, &b| lo(a).total_cmp(&lo(b)));
++    for (oi, &i) in order.iter().enumerate() {
++        for &j in &order[oi + 1..] {
++            if lo(j) > hi(i) {
++                break;
++            }
++            if i.abs_diff(j) > 1 && touch(run[i], run[i + 1], run[j], run[j + 1]) {
++                let q = run[i.min(j) + 1];
++                return Err(at(
++                    format!(
++                        "the open run crosses itself (segments {} and {}, near X{:.3} Y{:.3}) - a wire path cannot cross its own kerf",
++                        i.min(j),
++                        i.max(j),
++                        q.x,
++                        q.y
++                    ),
++                    q,
++                    z,
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Both ends reach the stock's edge (on it or past it), and the run
++/// enters the stock somewhere - an open run is threaded outside.
++fn reaches_edge(stock: &Region, run: &[Point2], z: f64) -> Result<(), GenError> {
++    let ends = [("start", run[0]), ("end", run[run.len() - 1])];
++    for (name, q) in ends {
++        let d = depth(stock, q);
++        if d.is_nan() || d > EDGE_TOL {
++            return Err(at(
++                format!(
++                    "the open run's {name} at X{:.3} Y{:.3} stops {d:.3} mm inside the stock - an open run has no start hole and must reach the stock's edge at both ends; extend it to the edge (or cut it as a closed profile from a start hole)",
++                    q.x, q.y
++                ),
++                q,
++                z,
++            ));
++        }
++    }
++    let enters = run.windows(2).any(|w| {
++        (0..=16).any(|j| {
++            let f = f64::from(j) / 16.0;
++            depth(stock, Point2::new(w[0].x + (w[1].x - w[0].x) * f, w[0].y + (w[1].y - w[0].y) * f)) > EDGE_TOL
++        })
++    });
++    if !enters {
++        return Err(invalid("the open run never enters the stock - it cuts nothing".into()));
++    }
++    Ok(())
++}
++
++/// The run's one-sided parallel at signed offset `s` (positive: left of
++/// travel), its joins mitred. A run that doubles back, or a turn the
++/// wire's side folds over, is refused by name.
++fn offset(run: &[Point2], s: f64, z: f64) -> Result<Vec<Point2>, GenError> {
++    let n = run.len();
++    let normal = |i: usize| {
++        let u = unit(run[i], run[i + 1]);
++        Point2::new(-u.y, u.x)
++    };
++    let mut out = Vec::with_capacity(n);
++    let n0 = normal(0);
++    out.push(Point2::new(run[0].x + s * n0.x, run[0].y + s * n0.y));
++    for i in 1..n - 1 {
++        let (a, b) = (normal(i - 1), normal(i));
++        let c = 1.0 + a.x * b.x + a.y * b.y;
++        if !(c.is_finite() && c > 1e-3) {
++            let q = run[i];
++            return Err(at(
++                format!("the open run doubles back on itself at X{:.3} Y{:.3} - the wire cannot turn back along its own kerf", q.x, q.y),
++                q,
++                z,
++            ));
++        }
++        out.push(Point2::new(run[i].x + s * (a.x + b.x) / c, run[i].y + s * (a.y + b.y) / c));
++    }
++    let nl = normal(n - 2);
++    out.push(Point2::new(run[n - 1].x + s * nl.x, run[n - 1].y + s * nl.y));
++    // The wire's side of a turn folds over itself when the turn is
++    // tighter than the offset: the parallel then runs backwards.
++    for i in 0..n - 1 {
++        let (u, w) = (unit(run[i], run[i + 1]), (out[i + 1].x - out[i].x, out[i + 1].y - out[i].y));
++        if u.x * w.0 + u.y * w.1 <= 0.0 {
++            let q = run[i + 1];
++            return Err(at(
++                format!(
++                    "a corner of the open run near X{:.3} Y{:.3} is tighter than the wire can follow on its {} side - the minimum inside radius is the kerf offset ({:.4} mm)",
++                    q.x,
++                    q.y,
++                    if s > 0.0 { "left" } else { "right" },
++                    s.abs()
++                ),
++                q,
++                z,
++            ));
++        }
++    }
++    Ok(out)
++}
++
++/// Where the wire is threaded (or leaves): from the path's end `from`
++/// along `dir` until it stands `target` (kerf offset + clearance) off
++/// the stock. The run-out may not cut the stock deeper than the kerf
++/// offset `k` it already stands in at the run's end.
++fn run_out(stock: &Region, from: Point2, dir: Point2, target: f64, k: f64, z: f64) -> Result<Point2, GenError> {
++    let along = |e: f64| Point2::new(from.x + dir.x * e, from.y + dir.y * e);
++    let ok = |e: f64| -depth(stock, along(e)) >= target;
++    let span = stock.bounds().map_or(0.0, |(a, b)| dist(a, b)) + 100.0 * target + 1.0;
++    let steps = 8192u32;
++    let step = span / f64::from(steps);
++    let found = (0..=steps).map(|j| f64::from(j) * step).find(|&e| ok(e));
++    let Some(hi) = found else {
++        return Err(at(
++            format!(
++                "the open run's end near X{:.3} Y{:.3} never runs clear of the stock along its own direction - extend the run straight out past the edge",
++                from.x, from.y
++            ),
++            from,
++            z,
++        ));
++    };
++    // The shortest run-out: bisect down from the first clear step.
++    let (mut lo, mut hi) = ((hi - step).max(0.0), hi);
++    if hi > 0.0 {
++        for _ in 0..40 {
++            let mid = 0.5 * (lo + hi);
++            if ok(mid) {
++                hi = mid;
++            } else {
++                lo = mid;
++            }
++        }
++    }
++    let samples = 256u32;
++    for j in 0..=samples {
++        let q = along(hi * f64::from(j) / f64::from(samples));
++        if depth(stock, q) > k + EDGE_TOL {
++            return Err(at(
++                format!(
++                    "the wire's run-out near X{:.3} Y{:.3} would cut into the stock past the run's end - extend the run straight out past the stock's edge",
++                    q.x, q.y
++                ),
++                q,
++                z,
++            ));
++        }
++    }
++    Ok(along(hi))
++}
++
++fn notes(p: &WireParams, t0: Point2, t1: Point2) -> Vec<String> {
++    let cond = if p.condition.is_empty() { String::new() } else { format!(", condition {}", p.condition) };
++    vec![
++        format!(
++            "wire EDM: open run, kerf on the {} of travel - the wire runs {:.4} mm off the line (wire radius {:.4} + spark gap {:.4}{cond}); kerf width {:.4} mm, the {} side kept",
++            p.side.word(),
++            p.kerf_offset(),
++            p.wire_diameter * 0.5,
++            p.gap,
++            p.kerf_width(),
++            if p.side == WireSide::Left { "right" } else { "left" }
++        ),
++        format!(
++            "wire EDM: threaded outside the stock at X{:.3} Y{:.3} and run out at X{:.3} Y{:.3}, each {:.3} mm clear of the stock's edge past the kerf; no start hole, no return",
++            t0.x, t0.y, t1.x, t1.y, p.clearance
++        ),
++        "wire EDM: a vertical cut - the moves state no pose (XY only) and no feed (the control's generator sets the rate); not verified here (no wire sweep against the part yet)".into(),
++    ]
++}
+diff --git a/crates/motion/src/wire_edm/open_tests.rs b/crates/motion/src/wire_edm/open_tests.rs
+new file mode 100644
+index 000000000..7e3769019
+--- /dev/null
++++ b/crates/motion/src/wire_edm/open_tests.rs
+@@ -0,0 +1,120 @@
++//! The wire's open run (#1109): a cut-off across a plate and a slot
++//! from the stock's edge stand exactly the kerf offset off the run on
++//! the stated side, threaded outside the stock by the clearance; each
++//! refusal is named. The wire and gap are SYNTHETIC - a plausible
++//! size, from no machine's manual (#290 D4, D10).
++
++use super::ring::pt_poly;
++use super::*;
++
++const K: f64 = 0.165;
++
++fn plate() -> Region {
++    let pts = vec![Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), Point2::new(100.0, 50.0), Point2::new(0.0, 50.0)];
++    Region::new(vec![Loop::new(pts).unwrap()]).unwrap()
++}
++
++fn params(side: WireSide) -> WireParams {
++    WireParams {
++        wire_diameter: 0.25,
++        gap: 0.04,
++        condition: "C110".into(),
++        side,
++        start: None,
++        plane_z: -12.0,
++        stock: Some(plate()),
++        clearance: 1.0,
++    }
++}
++
++fn run(pts: &[(f64, f64)]) -> Vec<Vec<Point2>> {
++    vec![pts.iter().map(|&(x, y)| Point2::new(x, y)).collect()]
++}
++
++fn refusal(chains: &[Vec<Point2>], p: &WireParams) -> String {
++    wire_contour(&[], chains, p).expect_err("refused").to_string()
++}
++
++fn pts(path: &Toolpath) -> Vec<Point2> {
++    let mut v = vec![Point2::new(path.moves[0].from.x, path.moves[0].from.y)];
++    v.extend(path.moves.iter().map(|m| Point2::new(m.to.x, m.to.y)));
++    v
++}
++
++/// Done means: a cut-off across the plate stands exactly the kerf offset
++/// off the line on the stated side, threaded and run out the clearance
++/// past the kerf outside the stock; left and right stand a kerf apart.
++#[test]
++fn a_cut_off_across_a_plate_stands_the_kerf_offset_on_the_stated_side() {
++    let line = run(&[(60.0, 0.0), (60.0, 50.0)]);
++    let right = wire_contour(&[], &line, &params(WireSide::Right)).unwrap();
++    let left = wire_contour(&[], &line, &params(WireSide::Left)).unwrap();
++    for (path, x) in [(&right, 60.0 + K), (&left, 60.0 - K)] {
++        let v = pts(path);
++        assert!(v.iter().all(|q| (q.x - x).abs() < 1e-9), "{v:?}");
++        assert!((v[0].y + (K + 1.0)).abs() < 1e-6, "threaded {:?}", v[0]);
++        assert!((v[v.len() - 1].y - (50.0 + K + 1.0)).abs() < 1e-6, "run out {:?}", v[v.len() - 1]);
++        assert!(path.moves.iter().all(|m| m.kind == MoveKind::Feed && m.feed.is_none() && m.to.z == -12.0));
++        assert!(path.notes.iter().any(|n| n.contains("open run, kerf on the")) && path.notes.iter().any(|n| n.contains("no start hole")));
++    }
++    assert!((right.moves[0].from.x - left.moves[0].from.x - params(WireSide::Left).kerf_width()).abs() < 1e-9);
++}
++
++/// A slot entered from the stock's edge (2 mm inside corners, the kerf
++/// inside the U): every wire point stands at least the offset off the
++/// run, and the ride along it exactly at it.
++#[test]
++fn a_slot_from_the_edge_rides_inside_at_the_kerf_offset() {
++    let mut u = vec![Point2::new(0.0, 10.0)];
++    for (cx, cy, a0) in [(28.0, 12.0, -90.0_f64), (28.0, 18.0, 0.0)] {
++        for s in 0..=30 {
++            let t = (a0 + 3.0 * f64::from(s)).to_radians();
++            u.push(Point2::new(cx + 2.0 * t.cos(), cy + 2.0 * t.sin()));
++        }
++    }
++    u.push(Point2::new(0.0, 20.0));
++    let path = wire_contour(&[], std::slice::from_ref(&u), &params(WireSide::Left)).unwrap();
++    let v = pts(&path);
++    let ride = &v[1..v.len() - 1];
++    for q in ride {
++        assert!((pt_poly(*q, &u) - K).abs() < 1e-6, "{q:?} stands {}", pt_poly(*q, &u));
++        assert!(q.y > 10.0 && q.y < 20.0 && q.x < 30.0, "{q:?} left the slot");
++    }
++    assert!((v[0].x + K + 1.0).abs() < 1e-6 && (v[v.len() - 1].x + K + 1.0).abs() < 1e-6, "{:?}", (v[0], v[v.len() - 1]));
++    // The same U with a sharp corner is refused by name on the wire's
++    // inside; the kerf outside the U mitres it and cuts.
++    let sharp = run(&[(0.0, 10.0), (30.0, 10.0), (30.0, 20.0), (0.0, 20.0)]);
++    let why = refusal(&sharp, &params(WireSide::Left));
++    assert!(why.contains("tighter than the wire can cut on the left side") && why.contains("0.1650"), "{why}");
++    assert!(wire_contour(&[], &sharp, &params(WireSide::Right)).is_ok());
++}
++
++#[test]
++fn every_open_run_refusal_is_named() {
++    let line = run(&[(60.0, 0.0), (60.0, 50.0)]);
++    let why = refusal(&line, &params(WireSide::Die));
++    assert!(why.contains("no punch or die side") && why.contains("left or right"), "{why}");
++    let why = refusal(&line, &WireParams { stock: None, ..params(WireSide::Left) });
++    assert!(why.contains("states no stock"), "{why}");
++    let why = refusal(&run(&[(60.0, 10.0), (60.0, 50.0)]), &params(WireSide::Left));
++    assert!(why.contains("start at X60.000 Y10.000 stops 10.000 mm inside the stock"), "{why}");
++    let why = refusal(&run(&[(60.0, 0.0), (60.0, 40.0)]), &params(WireSide::Left));
++    assert!(why.contains("end at X60.000 Y40.000 stops"), "{why}");
++    let why = refusal(&run(&[(-5.0, -5.0), (105.0, -5.0)]), &params(WireSide::Left));
++    assert!(why.contains("never enters the stock"), "{why}");
++    let crossed = run(&[(50.0, -1.0), (50.0, 30.0), (40.0, 20.0), (60.0, 20.0), (60.0, 51.0)]);
++    let why = refusal(&crossed, &params(WireSide::Left));
++    assert!(why.contains("crosses itself"), "{why}");
++    let why = refusal(&run(&[(60.0, -1.0), (60.0, 30.0), (60.0, -1.0)]), &params(WireSide::Left));
++    assert!(why.contains("crosses itself") || why.contains("doubles back"), "{why}");
++    let why = refusal(&line, &WireParams { clearance: f64::NAN, ..params(WireSide::Left) });
++    assert!(why.contains("clearance"), "{why}");
++    let two = vec![line[0].clone(), run(&[(70.0, 0.0), (70.0, 50.0)])[0].clone()];
++    assert!(refusal(&two, &params(WireSide::Left)).contains("2 open run(s)"));
++    // Left / right on a closed profile: a closed profile states die or punch.
++    let ring = Loop::new(vec![Point2::new(0.0, 0.0), Point2::new(10.0, 0.0), Point2::new(10.0, 10.0), Point2::new(0.0, 10.0)]).unwrap();
++    let why = wire_contour(&[ring], &[], &WireParams { start: Some(Point2::new(5.0, 5.0)), ..params(WireSide::Right) })
++        .expect_err("refused")
++        .to_string();
++    assert!(why.contains("profile is closed") && why.contains("die or punch"), "{why}");
++}
+diff --git a/crates/motion/src/wire_edm/ring.rs b/crates/motion/src/wire_edm/ring.rs
+index 2465095a6..c746020e1 100644
+--- a/crates/motion/src/wire_edm/ring.rs
++++ b/crates/motion/src/wire_edm/ring.rs
+@@ -31,6 +31,15 @@ pub(super) fn pt_seg(p: Point2, a: Point2, b: Point2) -> f64 {
+     (p.x - (a.x + t * dx)).hypot(p.y - (a.y + t * dy))
+ }
+ 
++/// Distance from `p` to the open polyline `run` (#1109).
++pub(super) fn pt_poly(p: Point2, run: &[Point2]) -> f64 {
++    match run {
++        [] => f64::INFINITY,
++        [one] => dist(p, *one),
++        _ => run.windows(2).map(|w| pt_seg(p, w[0], w[1])).fold(f64::INFINITY, f64::min),
++    }
++}
++
+ /// Distance from `p` to the closed ring.
+ pub(super) fn pt_ring(p: Point2, ring: &[Point2]) -> f64 {
+     let n = ring.len();
+@@ -81,6 +90,9 @@ pub(super) fn wire_ring(profile: &Region, side: WireSide, k: f64) -> Result<Vec<
+     let off = profile.offset_sharp(match side {
+         WireSide::Die => -k,
+         WireSide::Punch => k,
++        WireSide::Left | WireSide::Right => {
++            return Err(invalid("a closed profile states its die or punch side, not left or right".into()));
++        }
+     })?;
+     let kerf = 2.0 * k;
+     let one = match (off.loops(), side) {
+@@ -95,7 +107,7 @@ pub(super) fn wire_ring(profile: &Region, side: WireSide, k: f64) -> Result<Vec<
+                 "the profile narrows to a neck under the kerf width ({kerf:.4} mm) - the wire cannot pass it without burning the die"
+             )));
+         }
+-        (_, WireSide::Punch) => {
++        (_, WireSide::Punch | WireSide::Left | WireSide::Right) => {
+             return Err(invalid(format!(
+                 "the profile has a slot or notch narrower than the kerf width ({kerf:.4} mm) - the wire cannot enter it; widen it or use a thinner wire"
+             )));
+diff --git a/crates/motion/src/wire_edm/tests.rs b/crates/motion/src/wire_edm/tests.rs
+index 878fa9333..0c24a9b59 100644
+--- a/crates/motion/src/wire_edm/tests.rs
++++ b/crates/motion/src/wire_edm/tests.rs
+@@ -23,6 +23,8 @@ fn params(side: WireSide, start: Option<(f64, f64)>) -> WireParams {
+         side,
+         start: start.map(|(x, y)| Point2::new(x, y)),
+         plane_z: -12.0,
++        stock: None,
++        clearance: 1.0,
+     }
+ }
+ 
+diff --git a/crates/ui/src/egui_app/wire_page.rs b/crates/ui/src/egui_app/wire_page.rs
+index 3767aa56f..23b56b74f 100644
+--- a/crates/ui/src/egui_app/wire_page.rs
++++ b/crates/ui/src/egui_app/wire_page.rs
+@@ -15,18 +15,25 @@
+ use super::fields::*;
+ use camcraft_app::operation::{WireContourOp, WireSide};
+ 
+-const SIDES: [&str; 2] = ["Die - the wire runs inside the profile", "Punch - the wire runs outside the profile"];
++const SIDES: [&str; 4] = [
++    "Die - the wire runs inside the profile",
++    "Punch - the wire runs outside the profile",
++    "Left - an open run's kerf left of travel",
++    "Right - an open run's kerf right of travel",
++];
++const SIDE_OF: [WireSide; 4] = [WireSide::Die, WireSide::Punch, WireSide::Left, WireSide::Right];
+ 
+ pub(super) fn fields(ui: &mut Ui, world: &World, params: &mut OpParams, cx: &mut Cx<'_>) {
+     let (u, tab, op_ctx) = (cx.u, cx.tab, cx.op_ctx);
+     let OpParams::WireContour(p) = params else {
+         return;
+     };
+-    let WireContourOp { top_z, bottom_z, condition, side, start } = p;
++    let WireContourOp { top_z, bottom_z, condition, side, start, clearance } = p;
+     if tab == SEC_GEO {
+-        let mut si = usize::from(*side == WireSide::Punch);
++        let mut si = SIDE_OF.iter().position(|s| s == side).unwrap_or(0);
+         prop_row(ui, "Side", |ui| combo(ui, "wire.side", &mut si, &SIDES));
+-        *side = if si == 1 { WireSide::Punch } else { WireSide::Die };
++        *side = SIDE_OF.get(si).copied().unwrap_or(WireSide::Die);
++        prop_row(ui, "Run-out clearance", |ui| num(ui, u, clearance));
+         let mut stated = start.is_some();
+         check_row(ui, "Start hole stated", &mut stated);
+         match (stated, start.as_mut()) {
+@@ -38,6 +45,7 @@ pub(super) fn fields(ui: &mut Ui, world: &World, params: &mut OpParams, cx: &mut
+             (false, _) => *start = None,
+         }
+         hint(ui, "pick the one closed profile to cut; the wire is threaded at the start hole - inside the profile for a die, outside it for a punch");
++        hint(ui, "or pick one open run reaching the stock's edge at both ends (a cut-off, a slot): left / right puts the kerf beside its travel, threaded outside the stock the run-out clearance off its edge");
+     }
+     if tab == SEC_HEIGHTS {
+         height_editor(ui, "Top of workpiece", world, op_ctx.as_deref(), top_z, "wire.top");
+diff --git a/docs/decisions/1109-wire-open-profile.md b/docs/decisions/1109-wire-open-profile.md
+new file mode 100644
+index 000000000..9cef97a3d
+--- /dev/null
++++ b/docs/decisions/1109-wire-open-profile.md
+@@ -0,0 +1,16 @@
++## #1109 - Wire EDM: open-profile contour (cut-off and slots from the stock edge)
++
++#532 refused an open run by name (an open run has no punch or die side) and left these open design points to this issue.
++
++**Decided:**
++
++- **The kerf side of an open run is `left` / `right` of travel, in the same `side` field.** `WireSide` (and the file's `side`) gains `left` and `right` beside `die` and `punch`, so the side stays one stated field with no serde default. `left` / `right` on a closed profile, and `die` / `punch` on an open run, are refused by name ("an open profile has no punch or die side; state the kerf side: left or right of the run's travel"). Considered and dropped: a second field (`open_side`) beside `side` - two fields that must agree is one more way to be wrong.
++- **Travel is the run's own point order.** The picked chain's order is the travel; the path preview shows it. A "reverse" toggle and viewport arrows belong to the page work (#535). No "on the line" (centred kerf) slitting option yet: the issue named it as a possibility, but every cut in the Done means states a side, and a centred kerf burns both neighbours - left for a follow-up if asked for.
++- **No start hole for an open run: both ends must reach the stock's edge.** An end that stops more than 1 um inside the stock (`EDGE_TOL`) is refused by name with its distance, as is a run that never enters the stock. A run ending inside the material needs a relief/start hole and is cut today as a closed profile from a start hole - the issue's open question "relief hole at the end" is answered "not in this op" rather than guessed.
++- **Threading and run-out.** The path is extended along the run's own end directions (never sideways) until the wire's centre stands `kerf offset + clearance` off the stock (bisected to the shortest such run-out); the wire is threaded there in the air and leaves the cut at the far end's run-out point (no return, no lead-out). The run-out may not cut the stock deeper than the kerf offset it already stands in at the run's end - a run-out that would is refused by name. `clearance` is a stated op field (mm, 0 to 1000), seeded at 1.0 mm in the draft; the file omits it while it equals that seed, so #532's closed-cut files read and write unchanged.
++- **The stock edge is the setup's stock outline** (its facets projected to XY, as the 2D generators read the swarf column), read only when an open run is picked; no stock is refused by name.
++- **The same laws, on an open polyline.** The path is the one-sided parallel at wire radius + gap with mitred joins (an outside turn keeps the kept corner sharp; a near reversal is refused as "doubles back"). The cover law (corner minimum, 2 um) and the kerf law (no move nearer than the offset, the run-outs included) run over the open run with open-polyline distances; an inside turn tighter than the offset is refused by the parallel folding over or by the cover law, named with its spot. A run that crosses or touches itself is refused before any offset.
++- **One open run per operation**, never mixed with closed profiles - the same "one cut, one op" rule as #532.
++- **Verification is #534's.** The generator certifies only its own laws; the notes say the cut is not verified (no wire sweep against the part), as for a closed cut.
++
++**Cost to change later:** the side words are file format; adding `centre` is additive. The run-out shape (straight along the end tangent) is generator-only.
+
+From 42bee8faa263861e221aeca825f9b2570029fd72 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 01:10:02 -0800
+Subject: [PATCH 2/5] fix(edm): open run offset iterates the run (clippy)
+
+Refs #1109
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/motion/src/wire_edm/open.rs | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/crates/motion/src/wire_edm/open.rs b/crates/motion/src/wire_edm/open.rs
+index 3e93004c1..8ba57e5da 100644
+--- a/crates/motion/src/wire_edm/open.rs
++++ b/crates/motion/src/wire_edm/open.rs
+@@ -248,18 +248,17 @@ fn offset(run: &[Point2], s: f64, z: f64) -> Result<Vec<Point2>, GenError> {
+     let mut out = Vec::with_capacity(n);
+     let n0 = normal(0);
+     out.push(Point2::new(run[0].x + s * n0.x, run[0].y + s * n0.y));
+-    for i in 1..n - 1 {
++    for (i, &q) in run.iter().enumerate().take(n - 1).skip(1) {
+         let (a, b) = (normal(i - 1), normal(i));
+         let c = 1.0 + a.x * b.x + a.y * b.y;
+         if !(c.is_finite() && c > 1e-3) {
+-            let q = run[i];
+             return Err(at(
+                 format!("the open run doubles back on itself at X{:.3} Y{:.3} - the wire cannot turn back along its own kerf", q.x, q.y),
+                 q,
+                 z,
+             ));
+         }
+-        out.push(Point2::new(run[i].x + s * (a.x + b.x) / c, run[i].y + s * (a.y + b.y) / c));
++        out.push(Point2::new(q.x + s * (a.x + b.x) / c, q.y + s * (a.y + b.y) / c));
+     }
+     let nl = normal(n - 2);
+     out.push(Point2::new(run[n - 1].x + s * nl.x, run[n - 1].y + s * nl.y));
+
+From 0d82d2e7821f08e1a5ab2905f45004d053d72f02 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 12 Nov 2026 01:42:38 -0800
+Subject: [PATCH 3/5] feat(edm): wire verify and the wire-iso post read an open
+ run as open
+
+The open runs of #1109 (side left / right of travel) meet #534's wire
+laws and #1139's wire-iso post:
+
+- sim::verify::wire gains CutSide::Open: the kerf law judges the run
+  against the part at every height (a kerf that touches the part is a
+  gouge and blocks the post); the start-hole and slug laws are skipped
+  with the reason on the verdict (OPEN_SKIP) and the report line; both
+  ends must stand clear of the stock by the kerf (OpenEndInStock).
+- The verify gate maps left / right to Open and no longer refuses an
+  open run for its missing start hole.
+- wire-iso.cps threads at the run-in point and cuts the wire at the
+  run-out (operator notes say so without AWT); it writes the path's
+  moves only, so no return move exists. Closed goldens unchanged.
+
+Pinned by an_open_cutoff_posts_its_golden_and_a_gouging_one_is_refused
+(new golden nc/wire-iso/wire_contour_open_cutoff.nc) and
+an_open_run_is_judged_by_its_kerf_with_no_start_hole_or_slug.
+
+Refs #1109
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ assets/posts/wire-iso.cps                     |  12 +-
+ crates/app/src/operation/wire_verify.rs       |  10 +-
+ crates/app/src/posting_wire.rs                |  10 +-
+ .../nc/wire-iso/wire_contour_open_cutoff.nc   |  18 +++
+ crates/app/tests/wire_post.rs                 | 114 +++++++++++++++++-
+ crates/app/tests/wire_verify.rs               |   2 +-
+ crates/sim/src/verify/wire/mod.rs             |  60 +++++++++
+ crates/sim/src/verify/wire/slug.rs            |   2 +
+ crates/sim/src/verify/wire/tests.rs           |  34 +++++-
+ docs/decisions/1109-wire-open-profile.md      |   3 +-
+ 10 files changed, 251 insertions(+), 14 deletions(-)
+ create mode 100644 crates/app/tests/golden/nc/wire-iso/wire_contour_open_cutoff.nc
+
+diff --git a/assets/posts/wire-iso.cps b/assets/posts/wire-iso.cps
+index 825b2a0ab..f1b730f8f 100644
+--- a/assets/posts/wire-iso.cps
++++ b/assets/posts/wire-iso.cps
+@@ -167,7 +167,13 @@ function onSection() {
+ }
+ 
+ // The first motion of a section: go to the start hole with the wire
+-// cut, thread there, select the condition, cancel compensation.
++// cut, thread there, select the condition, cancel compensation. An open
++// run (#1109, side left / right of travel) has no start hole: its path
++// starts at its run-in point in the air outside the stock, and it is
++// threaded there; it ends at its run-out point past the stock's far
++// edge, where onSectionEnd cuts the wire - the post writes the path's
++// moves only, so no return to the threading point is ever written.
++function openRun() { return side === "left" || side === "right"; }
+ function startCut(p) {
+   if (threaded) return true;
+   if (!codesOk || condition === "") return false;
+@@ -178,7 +184,7 @@ function startCut(p) {
+   block(["G0", wo("X", p.StartX, orgX), wo("Y", p.StartY, orgY)]);
+   if (awt) block([code("thread")]);
+   else {
+-    note("THREAD THE WIRE AT THE START HOLE");
++    note(openRun() ? "THREAD THE WIRE AT THE RUN-IN POINT OUTSIDE THE STOCK" : "THREAD THE WIRE AT THE START HOLE");
+     block(["M00"]);
+   }
+   block([code("condition").split("{id}").join(condition)]);
+@@ -253,7 +259,7 @@ function onSectionEnd() {
+       block([code("cut")]);
+       block([code("tip_disposal")]);
+     } else {
+-      note("CUT THE WIRE");
++      note(openRun() ? "CUT THE WIRE AT THE RUN-OUT POINT" : "CUT THE WIRE");
+       block(["M00"]);
+     }
+   }
+diff --git a/crates/app/src/operation/wire_verify.rs b/crates/app/src/operation/wire_verify.rs
+index 483453bd3..688e4f177 100644
+--- a/crates/app/src/operation/wire_verify.rs
++++ b/crates/app/src/operation/wire_verify.rs
+@@ -51,10 +51,11 @@ pub fn wire_verdict(world: &World, e: &Entity) -> Option<Result<WireVerdict, Str
+     let OpParams::WireContour(w) = &op.params else { return None };
+     Some((|| {
+         let setup = op.setup.as_deref();
+-        // A cut with no start hole never generates; said by the law's
+-        // own name, not as a missing path.
+-        if w.start.is_none() {
+-            return Ok(WireVerdict { findings: vec![WireFinding::NoStart], slugs: Vec::new() });
++        // A closed cut with no start hole never generates; said by the
++        // law's own name, not as a missing path. An open run (#1109,
++        // left / right) states none: it is threaded outside the stock.
++        if w.start.is_none() && !w.side.is_open_side() {
++            return Ok(WireVerdict { findings: vec![WireFinding::NoStart], ..WireVerdict::default() });
+         }
+         let cache = model::toolpath_of(world, e).ok_or("the wire laws have no toolpath to judge - generate it first")?;
+         let cond = super::wire_op::condition_of(world, setup, w)?;
+@@ -89,6 +90,7 @@ pub fn wire_verdict(world: &World, e: &Entity) -> Option<Result<WireVerdict, Str
+         let side = match w.side {
+             WireSide::Die => CutSide::Die,
+             WireSide::Punch => CutSide::Punch,
++            WireSide::Left | WireSide::Right => CutSide::Open,
+         };
+         Ok(judge(&WireJob {
+             path: &cache.path,
+diff --git a/crates/app/src/posting_wire.rs b/crates/app/src/posting_wire.rs
+index bbc4711de..1c9ecfc1c 100644
+--- a/crates/app/src/posting_wire.rs
++++ b/crates/app/src/posting_wire.rs
+@@ -25,7 +25,7 @@
+ 
+ use crate::model;
+ use crate::operation::wire_verify::wire_verdict;
+-use crate::operation::{self, WireContourOp};
++use crate::operation::{self, OpParams, WireContourOp};
+ use crate::post::AfterOperation;
+ use crate::post::{self, cnc, Dump};
+ use crate::schema::Operation;
+@@ -78,7 +78,13 @@ pub fn wire_clause(world: &World) -> WireClause {
+             Err(why) => out.problems.push(format!("{name}: {why}")),
+             Ok(v) => {
+                 out.problems.extend(v.findings.iter().map(|f| format!("{name}: wire {}", f.describe())));
+-                judged.push(format!("{name} {}", slugs(&v.slugs)));
++                let what = match (v.skipped, &op.params) {
++                    // #1109: an open run says which laws it skipped and why.
++                    (Some(why), OpParams::WireContour(w)) => format!("open run ({} of travel): kerf judged; {why}", w.side.word()),
++                    (Some(why), _) => why.to_owned(),
++                    (None, _) => slugs(&v.slugs),
++                };
++                judged.push(format!("{name} {what}"));
+             }
+         }
+     }
+diff --git a/crates/app/tests/golden/nc/wire-iso/wire_contour_open_cutoff.nc b/crates/app/tests/golden/nc/wire-iso/wire_contour_open_cutoff.nc
+new file mode 100644
+index 000000000..af9badb51
+--- /dev/null
++++ b/crates/app/tests/golden/nc/wire-iso/wire_contour_open_cutoff.nc
+@@ -0,0 +1,18 @@
++%
++(SYNTHETIC WIRE EDM FICTIONAL CODES)
++(WIRE NOT THREADED AT START)
++G21 G90 G17
++(Cutoff1 - Wire Contour)
++(SIDE RIGHT - KERF IN THE PATH)
++G54
++G0 X60.165 Y-1.165
++FX-THREAD
++FX-COND C110
++FX-COMP-OFF
++G1 X60.165 Y0
++G1 X60.165 Y50
++G1 X60.165 Y51.165
++FX-CUT
++FX-TIP-OUT
++M30
++%
+diff --git a/crates/app/tests/wire_post.rs b/crates/app/tests/wire_post.rs
+index 89cc05b3e..5ec93f772 100644
+--- a/crates/app/tests/wire_post.rs
++++ b/crates/app/tests/wire_post.rs
+@@ -6,7 +6,10 @@
+ //! name; a mill machine, and a cutting post on the wire section, are
+ //! refused by name; the registry offers the post for wire EDMs only.
+ //! The wire laws (#534) gate it: a clean cut posts its golden, a
+-//! gouging one is refused by name with no NC text written.
++//! gouging one is refused by name with no NC text written. An open
++//! cut-off (#1109, kerf left / right of travel) posts its own golden -
++//! threaded at its run-in point in the air, cut off at its run-out point,
++//! no return move - and an open run whose kerf burns the part is refused.
+ //! Not exercised on a real EDM control (D10).
+ //!
+ //! Gate map (#533): covers app::posting (posting_wire, WIRE_POSTS,
+@@ -21,7 +24,7 @@ use flecs_ecs::prelude::World;
+ use camcraft_app::commands::{CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SetStock};
+ use camcraft_app::geometry::{Mesh, Point3, Triangle};
+ use camcraft_app::machine::{parse_mch, Kind};
+-use camcraft_app::operation::{Height, OpParams, SrcRef, WireContourOp, WireSide};
++use camcraft_app::operation::{self, Height, OpParams, SrcRef, WireContourOp, WireSide};
+ use camcraft_app::post::{self, cnc};
+ use camcraft_app::posting::{self, BUILTINS, WIRE_POSTS};
+ use camcraft_app::schema::Location;
+@@ -31,6 +34,7 @@ use camcraft_app::world::new_world;
+ const FIXTURE: &str = include_str!("edm/wire-iso-fixture.mch");
+ const WIRE: &str = "Generic ISO Wire EDM";
+ const GOLDEN: &str = "tests/golden/nc/wire-iso/wire_contour_punch.nc";
++const OPEN_GOLDEN: &str = "tests/golden/nc/wire-iso/wire_contour_open_cutoff.nc";
+ 
+ fn cps(name: &str) -> &'static str {
+     BUILTINS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s).expect("registered")
+@@ -83,6 +87,7 @@ fn punch_doc(machine_text: &str) -> World {
+         condition: "C110".into(),
+         side: WireSide::Punch,
+         start: Some([-30.0, 0.0]),
++        clearance: operation::DEFAULT_CLEARANCE,
+     };
+     let c = CreateOperation::new(&world, "Punch1", "", SrcRef::Entity("slug".into()), OpParams::WireContour(op)).expect("op");
+     h.execute(&world, c);
+@@ -106,6 +111,7 @@ fn gouging_die() -> World {
+         condition: "C110".into(),
+         side: WireSide::Die,
+         start: Some([0.0, 0.0]),
++        clearance: operation::DEFAULT_CLEARANCE,
+     };
+     let c = CreateOperation::new(&world, "Die1", "", SrcRef::Entity("opening".into()), OpParams::WireContour(op)).expect("op");
+     h.execute(&world, c);
+@@ -251,3 +257,107 @@ fn the_registry_offers_the_wire_post_for_wire_edms_only() {
+     }
+     assert_eq!(posting::post_name(&posting::default_post_for(Kind::WireEdm)), Some(WIRE));
+ }
++
++/// #1109: a 60 x 50 x 12 part at the left end of a 100 x 50 x 12 bar,
++/// cut off along the part's top edge at x = 60 by an open run, the kerf
++/// on the offcut's side (`wrong` puts it on the part's). The side is read
++/// from the picked chain's own travel, so the fixture holds whichever way
++/// the feature graph orders the edge.
++fn cutoff_doc(wrong: bool) -> World {
++    use camcraft_app::geometry::feature;
++    use camcraft_app::model;
++    use camcraft_app::operation::{FeatureSel, GeoSel};
++    let world = new_world();
++    let mut h = History::default();
++    let m = parse_mch(FIXTURE).expect("the fixture parses");
++    h.execute(&world, LoadMachine::new(&world, "wire-iso.mch".into(), Some(m)).expect("mount"));
++    h.execute(&world, ImportModel::from_mesh("part", prism(&[(0.0, 0.0), (60.0, 0.0), (60.0, 50.0), (0.0, 50.0)])));
++    let loc = Location { pos: Point3::new(50.0, 25.0, 0.0), ..Location::default() };
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx: 100.0, dy: 50.0, dz: 12.0 }, loc).expect("stock"));
++    let e = model::find_by_name(&world, "part").expect("model");
++    let f = model::features_of(&world, &e).expect("features");
++    let (chain, up) = feature::chains(&f)
++        .into_iter()
++        .filter(|c| !c.closed)
++        .find_map(|c| {
++            let p = feature::chain_points(&f, &c);
++            let on = p.len() >= 2 && p.iter().all(|q| (q[0] - 60.0).abs() < 1e-9 && (q[2] - 12.0).abs() < 1e-9);
++            on.then(|| (c.id, p[p.len() - 1][1] > p[0][1]))
++        })
++        .expect("the part's top edge at x = 60 is its own open chain");
++    // Travelling +Y the offcut (x > 60) is on the right.
++    let side = if up != wrong { WireSide::Right } else { WireSide::Left };
++    let op = WireContourOp {
++        top_z: Height::fixed(12.0),
++        bottom_z: Height::fixed(0.0),
++        condition: "C110".into(),
++        side,
++        start: None,
++        clearance: operation::DEFAULT_CLEARANCE,
++    };
++    let src = SrcRef::Selection(vec![GeoSel { entity: "part".into(), feature: FeatureSel::Chain(chain) }]);
++    h.execute(&world, CreateOperation::new(&world, "Cutoff1", "", src, OpParams::WireContour(op)).expect("op"));
++    h.execute(&world, GenerateOperation::new(&world, "Cutoff1").expect("the open run generates"));
++    world
++}
++
++/// Done means (#1109 over #533/#534): an open cut-off posts through
++/// the wire post to its golden - threaded at the run-in point outside
++/// the bar, one cut across it, the wire cut at the run-out point, never
++/// a move back to the threading point - judged by the kerf law with the
++/// start-hole and slug laws said skipped; the same run with its kerf on
++/// the part's side is refused at the gate with no NC text written, and
++/// the closed punch's golden is untouched.
++#[test]
++fn an_open_cutoff_posts_its_golden_and_a_gouging_one_is_refused() {
++    let world = cutoff_doc(false);
++    let clause = posting::wire_clause(&world);
++    assert!(clause.problems.is_empty(), "{:?}", clause.problems);
++    let line = clause.line.expect("the open run is judged, not skipped");
++    assert!(line.contains("Cutoff1 open run (") && line.contains("kerf judged") && line.contains("slug laws not applied"), "{line}");
++    let out = std::env::temp_dir().join(format!("camcraft-wire-open-{}.nc", std::process::id()));
++    let posted = posting::post_script(&world, &out, cps(WIRE)).expect("the open cut-off posts");
++    let _ = std::fs::remove_file(&out);
++    let text = posted.program;
++    if std::env::var_os("WRITE_GOLDEN").is_some() {
++        std::fs::write(OPEN_GOLDEN, &text).expect("write golden");
++    }
++    assert_eq!(text, std::fs::read_to_string(OPEN_GOLDEN).expect("golden present"), "the open program drifted from its golden");
++    let lines: Vec<&str> = text.lines().collect();
++    let at = |w: &str| lines.iter().position(|l| *l == w).unwrap_or_else(|| panic!("no {w} in\n{text}"));
++    let (comp, cut) = (at("FX-COMP-OFF"), at("FX-CUT"));
++    let g0: Vec<&&str> = lines.iter().filter(|l| l.starts_with("G0 ")).collect();
++    assert_eq!(g0.len(), 1, "one positioning move, to the run-in point: {text}");
++    let xy = |l: &str| -> (f64, f64) {
++        let w = |c: char| l.split_whitespace().find_map(|t| t.strip_prefix(c)?.parse::<f64>().ok()).unwrap_or(f64::NAN);
++        (w('X'), w('Y'))
++    };
++    let thread = xy(g0[0]);
++    assert!((thread.0 - 60.165).abs() < 1e-9 && (thread.1 < -1.0 || thread.1 > 51.0), "threaded in the air: {text}");
++    let cuts = &lines[comp + 1..cut];
++    assert!(!cuts.is_empty() && cuts.iter().all(|l| l.starts_with("G1 X")), "{text}");
++    let end = cuts.last().map(|l| xy(l)).expect("a cut");
++    assert!((end.1 - thread.1).abs() > 50.0, "the run ends across the bar at its run-out, not back at its start: {text}");
++    assert!(cuts.iter().all(|l| (xy(l).0 - 60.165).abs() < 1e-9), "every cut stands the kerf off the part: {text}");
++    // Without AWT the stops say where the operator threads and cuts.
++    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).expect("json");
++    v["edm"]["awt"] = serde_json::json!(false);
++    let m = parse_mch(&v.to_string()).expect("parses");
++    let manual = post::engine::run(cps(WIRE), &post::machine::mirror(&m), &stream_text(&world)).expect("runs").program;
++    assert!(manual.contains("(THREAD THE WIRE AT THE RUN-IN POINT OUTSIDE THE STOCK)") && manual.contains("(CUT THE WIRE AT THE RUN-OUT POINT)"), "{manual}");
++
++    // The kerf on the part's side: the generator cannot see the part,
++    // the wire laws can - refused at the post, nothing written.
++    let world = cutoff_doc(true);
++    let out = std::env::temp_dir().join(format!("camcraft-wire-open-gouge-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&out);
++    let err = posting::post_script(&world, &out, cps(WIRE)).expect_err("an open run that burns the part never posts");
++    let wrote = out.exists();
++    let _ = std::fs::remove_file(&out);
++    assert!(err.starts_with("post blocked") && err.contains("Cutoff1: wire gouge: the kerf of move"), "{err}");
++    assert!(!wrote, "no NC text is written for a refused open run");
++    // The closed punch's golden stands byte for byte beside it.
++    let punch = posting::post_script(&punch_doc(FIXTURE), &out, cps(WIRE)).expect("the punch posts").program;
++    let _ = std::fs::remove_file(&out);
++    assert_eq!(punch, std::fs::read_to_string(GOLDEN).expect("golden present"));
++}
+diff --git a/crates/app/tests/wire_verify.rs b/crates/app/tests/wire_verify.rs
+index 6b368bed2..3a78650ec 100644
+--- a/crates/app/tests/wire_verify.rs
++++ b/crates/app/tests/wire_verify.rs
+@@ -70,7 +70,7 @@ fn doc(dz: f64) -> (World, History) {
+ }
+ 
+ fn cut(world: &World, h: &mut History, name: &str, side: WireSide, start: Option<[f64; 2]>) {
+-    let op = WireContourOp { top_z: Height::fixed(12.0), bottom_z: Height::fixed(0.0), condition: "C110".into(), side, start };
++    let op = WireContourOp { top_z: Height::fixed(12.0), bottom_z: Height::fixed(0.0), condition: "C110".into(), side, start, clearance: camcraft_app::operation::DEFAULT_CLEARANCE };
+     let c = CreateOperation::new(world, name, "", SrcRef::Entity("part".into()), OpParams::WireContour(op)).expect("op");
+     h.execute(world, c);
+     if start.is_some() {
+diff --git a/crates/sim/src/verify/wire/mod.rs b/crates/sim/src/verify/wire/mod.rs
+index e7717ece7..74c495b52 100644
+--- a/crates/sim/src/verify/wire/mod.rs
++++ b/crates/sim/src/verify/wire/mod.rs
+@@ -17,6 +17,13 @@
+ //!   a punch's freed piece IS the product. A cut that frees nothing, or
+ //!   frees the wrong side, is refused by name.
+ //!
++//! An OPEN run (#1109, side left / right of travel) is threaded in the
++//! air outside the stock and leaves it at a run-out point: it has no
++//! start hole and closes no slug, so the threading and slug laws do not
++//! apply and say so ([`OPEN_SKIP`]). The kerf law judges it against the
++//! part as for any cut, and its ends - where the wire is threaded and
++//! cut - must stand clear of the stock by the kerf offset.
++//!
+ //! The product's section by the stated side: a punch's product is the
+ //! model. A die's product is the model too when the start hole stands
+ //! outside it (the model is a die plate, the opening a hole in it); when
+@@ -51,6 +58,10 @@ pub const KERF_TOL: f64 = 1e-4;
+ /// part.
+ pub const SLUG_AREA_TOL: f64 = 1e-3;
+ 
++/// Why an open run's verdict holds no threading or slug finding: said
++/// on the report line, never silent.
++pub const OPEN_SKIP: &str = "start-hole and slug laws not applied (an open run is threaded in the air outside the stock and closes no slug)";
++
+ /// Which side of the cut is kept - stated by the operation, never read
+ /// from the geometry.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -59,6 +70,9 @@ pub enum CutSide {
+     Die,
+     /// The enclosed piece is the product: it drops when the cut closes.
+     Punch,
++    /// An open run (#1109): the kerf on the stated left or right of
++    /// travel, the model is the product, nothing is enclosed.
++    Open,
+ }
+ 
+ impl CutSide {
+@@ -67,6 +81,7 @@ impl CutSide {
+         match self {
+             CutSide::Die => "die",
+             CutSide::Punch => "punch",
++            CutSide::Open => "open",
+         }
+     }
+ }
+@@ -104,6 +119,9 @@ pub enum WireFinding {
+     StartMoved { stated: Point2, path: Point2 },
+     /// The product stands nearer the threading point than the kerf.
+     Threading { z: f64, at: Point2, clear: f64, need: f64 },
++    /// An open run's end (where the wire is threaded or cut) stands in
++    /// the stock or nearer it than the kerf.
++    OpenEndInStock { z: f64, at: Point2, clear: f64, need: f64 },
+     /// The kerf of move `move_no` (1-based) enters the product.
+     Gouge { move_no: usize, z: f64, at: Point2, depth: f64, moves: usize },
+     /// The closed cut frees no material.
+@@ -131,6 +149,12 @@ impl WireFinding {
+                 at.y,
+                 if *clear <= 0.0 { "at the threading point itself".to_owned() } else { format!("{clear:.4} mm from it") }
+             ),
++            WireFinding::OpenEndInStock { z, at, clear, need } => format!(
++                "the open run's end at X{:.3} Y{:.3} is not clear of the stock at Z{z:.3}: the stock stands {} - the wire is threaded and cut in the air, {need:.4} mm clear all round (regenerate the run against the stock as it stands)",
++                at.x,
++                at.y,
++                if *clear <= 0.0 { "at the point itself".to_owned() } else { format!("{clear:.4} mm from it") }
++            ),
+             WireFinding::Gouge { move_no, z, at, depth, moves } => format!(
+                 "gouge: the kerf of move {move_no} enters the part by {depth:.4} mm near X{:.3} Y{:.3} at Z{z:.3} ({moves} move(s) gouge)",
+                 at.x, at.y
+@@ -146,6 +170,10 @@ impl WireFinding {
+                 "slug: the piece freed near X{:.3} Y{:.3} at Z{z:.3} holds none of the part - a punch's cut frees the punch, but here only waste drops and the part stays in the skeleton",
+                 at.x, at.y
+             ),
++            WireFinding::WrongSlug { z, side: CutSide::Open, at, .. } => format!(
++                "slug: an open run frees a piece near X{:.3} Y{:.3} at Z{z:.3} - an open run closes no slug",
++                at.x, at.y
++            ),
+         }
+     }
+ }
+@@ -156,6 +184,9 @@ impl WireFinding {
+ pub struct WireVerdict {
+     pub findings: Vec<WireFinding>,
+     pub slugs: Vec<Slug>,
++    /// The laws not applied to this cut and why ([`OPEN_SKIP`] for an
++    /// open run); `None` when every law ran.
++    pub skipped: Option<&'static str>,
+ }
+ 
+ /// The product's section at one height (module head): the model, or
+@@ -198,6 +229,10 @@ pub fn judge(job: &WireJob<'_>) -> WireVerdict {
+             return v;
+         }
+     };
++    if job.side == CutSide::Open {
++        open(job, &polyline, k, &mut v);
++        return v;
++    }
+     let Some(start) = job.start else {
+         v.findings.push(WireFinding::NoStart);
+         return v;
+@@ -230,6 +265,31 @@ pub fn judge(job: &WireJob<'_>) -> WireVerdict {
+     v
+ }
+ 
++/// An open run (#1109, module head): the kerf law against the part at
++/// every height, both ends clear of the stock; no threading, no slug.
++fn open(job: &WireJob<'_>, pts: &[Point2], k: f64, v: &mut WireVerdict) {
++    v.skipped = Some(OPEN_SKIP);
++    let ends = [pts.first(), pts.last()];
++    let mut worst: Option<(f64, f64, Point2)> = None;
++    let mut gouge: Option<WireFinding> = None;
++    for s in &job.sections {
++        if gouge.is_none() {
++            gouge = gouge_at(&Product::Part(&s.part), pts, k, s.z);
++        }
++        let Some(stock) = s.stock.as_ref() else { continue };
++        for &e in ends.iter().flatten() {
++            let (clear, _) = dist::clearance(&Product::Part(stock), *e, *e);
++            if worst.is_none_or(|(c, _, _)| clear < c) {
++                worst = Some((clear, s.z, *e));
++            }
++        }
++    }
++    if let Some((clear, z, at)) = worst.filter(|(c, _, _)| *c < k - KERF_TOL) {
++        v.findings.push(WireFinding::OpenEndInStock { z, at, clear, need: k });
++    }
++    v.findings.extend(gouge);
++}
++
+ fn product(s: &WireSection, opening: bool) -> Product<'_> {
+     if opening {
+         Product::Around { opening: &s.part, stock: s.stock.as_ref() }
+diff --git a/crates/sim/src/verify/wire/slug.rs b/crates/sim/src/verify/wire/slug.rs
+index d278a6577..9c9e4e149 100644
+--- a/crates/sim/src/verify/wire/slug.rs
++++ b/crates/sim/src/verify/wire/slug.rs
+@@ -110,6 +110,8 @@ pub(super) fn judge(job: &WireJob<'_>, pts: &[Point2], opening: bool, v: &mut Wi
+             reported = true;
+         }
+         let flag = match job.side {
++            // An open run closes no slug (#1109): `judge` never asks.
++            CutSide::Open => None,
+             _ if freed.is_empty() => Some(WireFinding::NothingFreed { z: s.z }),
+             CutSide::Die => freed.iter().find(|f| f.product_area > SLUG_AREA_TOL).map(|f| WireFinding::WrongSlug {
+                 z: s.z,
+diff --git a/crates/sim/src/verify/wire/tests.rs b/crates/sim/src/verify/wire/tests.rs
+index 1cb23d12b..401b1103b 100644
+--- a/crates/sim/src/verify/wire/tests.rs
++++ b/crates/sim/src/verify/wire/tests.rs
+@@ -1,6 +1,7 @@
+ //! The wire laws on synthetic squares (#534): a clean punch and die
+ //! pass, a kerf into the part is a gouge naming its move, a missing or
+-//! crowded start hole is refused, and the slug is read for each side.
++//! crowded start hole is refused, and the slug is read for each side;
++//! an open run (#1109) is judged by its kerf and its ends alone.
+ //! Provenance: our own fixtures.
+ 
+ use super::*;
+@@ -113,3 +114,34 @@ fn the_slug_is_read_for_the_stated_side() {
+     let v = run(CutSide::Die, &path(5.0 - K, start), Some(start), &plate, None);
+     assert!(v.findings.iter().any(|f| matches!(f, WireFinding::NothingFreed { .. })), "{:?}", v.findings);
+ }
++
++/// #1109: an open run (a cut-off at x = 5 across a 30 mm stock, the part
++/// left of it) - the wire at `x`, from `y0` up to `y1`.
++fn open_run(x: f64, y0: f64, y1: f64) -> Toolpath {
++    let mut b = PathBuilder::new(Point3::new(x, y0, 0.0));
++    b.push(MoveKind::Feed, Point3::new(x, y1, 0.0), None);
++    b.finish()
++}
++
++fn left_part() -> Region {
++    let l = Loop::new(vec![Point2::new(-15.0, -15.0), Point2::new(5.0, -15.0), Point2::new(5.0, 15.0), Point2::new(-15.0, 15.0)]);
++    Region::new(vec![l.expect("loop")]).expect("region")
++}
++
++#[test]
++fn an_open_run_is_judged_by_its_kerf_with_no_start_hole_or_slug() {
++    let (part, stock) = (left_part(), square(15.0));
++    // Clean: the kerf right of travel stands its offset off the part,
++    // both ends in the air past the stock. No start hole is stated.
++    let v = run(CutSide::Open, &open_run(5.0 + K, -15.0 - 2.0 * K, 15.0 + 2.0 * K), None, &part, Some(&stock));
++    assert!(v.findings.is_empty(), "{:?}", v.findings);
++    assert!(v.slugs.is_empty(), "an open run closes no slug: {:?}", v.slugs);
++    assert_eq!(v.skipped, Some(OPEN_SKIP), "the skipped laws are said");
++    // The kerf on the wrong side burns the part: a gouge, never a pass.
++    let v = run(CutSide::Open, &open_run(5.0 - K, -15.0 - 2.0 * K, 15.0 + 2.0 * K), None, &part, Some(&stock));
++    assert!(matches!(v.findings.as_slice(), [WireFinding::Gouge { move_no: 1, .. }]), "{:?}", v.findings);
++    // An end inside the stock: the wire would be threaded in material.
++    let v = run(CutSide::Open, &open_run(5.0 + K, -14.0, 15.0 + 2.0 * K), None, &part, Some(&stock));
++    assert!(matches!(v.findings.as_slice(), [WireFinding::OpenEndInStock { .. }]), "{:?}", v.findings);
++    assert!(v.findings[0].describe().contains("threaded and cut in the air"), "{}", v.findings[0].describe());
++}
+diff --git a/docs/decisions/1109-wire-open-profile.md b/docs/decisions/1109-wire-open-profile.md
+index 9cef97a3d..183ff5606 100644
+--- a/docs/decisions/1109-wire-open-profile.md
++++ b/docs/decisions/1109-wire-open-profile.md
+@@ -11,6 +11,7 @@
+ - **The stock edge is the setup's stock outline** (its facets projected to XY, as the 2D generators read the swarf column), read only when an open run is picked; no stock is refused by name.
+ - **The same laws, on an open polyline.** The path is the one-sided parallel at wire radius + gap with mitred joins (an outside turn keeps the kept corner sharp; a near reversal is refused as "doubles back"). The cover law (corner minimum, 2 um) and the kerf law (no move nearer than the offset, the run-outs included) run over the open run with open-polyline distances; an inside turn tighter than the offset is refused by the parallel folding over or by the cover law, named with its spot. A run that crosses or touches itself is refused before any offset.
+ - **One open run per operation**, never mixed with closed profiles - the same "one cut, one op" rule as #532.
+-- **Verification is #534's.** The generator certifies only its own laws; the notes say the cut is not verified (no wire sweep against the part), as for a closed cut.
++- **Verification is #534's, and it reads an open run as open** (integration with #1144/#1139). The wire laws take a third side, `open`: the kerf law judges the run (run-in and run-out included) against the part at every judged height exactly as for a closed cut, so a run whose kerf touches the part is a gouge and blocks the post; the start-hole/threading and slug laws are not applied and the report line says so ("open run (right of travel): kerf judged; start-hole and slug laws not applied ..."). In their place both ends - where the wire is threaded and cut - must stand clear of the stock by the kerf offset at every height, so a stock that grew after generation cannot put the threading inside material. *Dropped:* refusing an open run for having no start hole or slug (it never has either), and a slug law for the offcut (a cut-off frees the offcut, but a slot or relief frees nothing; the side states the kept side, so nothing is guessed).
++- **The wire-iso post writes the open run as its path says.** It threads at the path's first point (the run-in, in the air) and cuts the wire at section end, after the run-out; it writes the path's moves only, so no return to the threading point exists. Without AWT the operator stops say "at the run-in point outside the stock" / "at the run-out point". Closed goldens are byte-identical.
+ 
+ **Cost to change later:** the side words are file format; adding `centre` is additive. The run-out shape (straight along the end tangent) is generator-only.
+
+From 9f4d5dc684a197aceec04a87b025406b6ca68c58 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Fri, 13 Nov 2026 04:14:36 +0100
+Subject: [PATCH 4/5] fix: posted_gates wire verdict names the new WireParams
+ fields (stock, clearance)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/posted_gates/wire.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/app/tests/posted_gates/wire.rs b/crates/app/tests/posted_gates/wire.rs
+index 8354ce64f..047fb470b 100644
+--- a/crates/app/tests/posted_gates/wire.rs
++++ b/crates/app/tests/posted_gates/wire.rs
+@@ -36,7 +36,7 @@ fn outline() -> Loop {
+ /// The wire laws' verdict on the punch golden.
+ pub fn wire_verdict() -> WireVerdict {
+     let start = Point2::new(-30.0, 0.0);
+-    let p = WireParams { wire_diameter: 0.25, gap: 0.04, condition: "C110".into(), side: WireSide::Punch, start: Some(start), plane_z: 0.0 };
++    let p = WireParams { wire_diameter: 0.25, gap: 0.04, condition: "C110".into(), side: WireSide::Punch, start: Some(start), plane_z: 0.0, stock: None, clearance: 1.0 };
+     let t = wire_contour(&[outline()], &[], &p).expect("the punch generates");
+     assert_eq!(gen_to_cltext(&t), golden("wire_contour_punch.cl"), "wire_contour_punch.cl: the regenerated program is the golden");
+     let part = Region::new(vec![outline()]).expect("the profile region");
+
+From 73c88116a5aa6ce171e772310e3eaa74e9c1d623 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Fri, 13 Nov 2026 04:14:59 +0100
+Subject: [PATCH 5/5] fix: wire_readers die op names the new clearance field
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/wire_readers.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/crates/app/tests/wire_readers.rs b/crates/app/tests/wire_readers.rs
+index 186176c7c..8471eba6d 100644
+--- a/crates/app/tests/wire_readers.rs
++++ b/crates/app/tests/wire_readers.rs
+@@ -70,6 +70,7 @@ fn wire_doc() -> (World, History) {
+         condition: "C110".into(),
+         side: WireSide::Die,
+         start: Some([0.0, 0.0]),
++        clearance: camcraft_app::operation::DEFAULT_CLEARANCE,
+     };
+     let create = CreateOperation::new(&world, "Die1", "", SrcRef::Entity("slug".into()), OpParams::WireContour(op));
+     h.execute(&world, create.expect("die"));
