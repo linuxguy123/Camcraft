@@ -1,0 +1,817 @@
+From af47a6ea81112872afcfd6397cd513d917ff6490 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 14 Nov 2026 12:16:32 +0100
+Subject: [PATCH 1/2] fix(2d): contour arc fit passes each vertex on the wall's
+ air side
+
+A coarse contour fit (tolerance 0.1) let a vertex stand 0.05 mm off its
+circle toward the part. The verifier forgives 0.01 mm, so a tessellated
+round wall walked clockwise posted arcs that verify held as gouges.
+Walls that know their part side (closed rings, open chains, the lead
+reseat) now fit one-sided: the circle keeps the run's end vertices and
+its centre slides along their bisector until no vertex is on the part
+side.
+
+Fixes #1579
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/contour_arc_fit_wall.rs      | 78 +++++++++++++++++
+ crates/motion/src/machining2d/arc_side.rs     | 84 +++++++++++++++++++
+ crates/motion/src/machining2d/arcs.rs         | 32 ++++++-
+ crates/motion/src/machining2d/contour.rs      |  4 +-
+ .../motion/src/machining2d/contour_chain.rs   |  4 +-
+ crates/motion/src/machining2d/lead_fit.rs     |  4 +-
+ crates/motion/src/machining2d/mod.rs          |  3 +-
+ crates/motion/tests/arcs.rs                   | 53 +++++++++++-
+ crates/ui/src/law_tests.rs                    |  7 +-
+ docs/decisions/1579-arc-fit-one-sided.md      | 30 +++++++
+ 10 files changed, 284 insertions(+), 15 deletions(-)
+ create mode 100644 crates/app/tests/contour_arc_fit_wall.rs
+ create mode 100644 crates/motion/src/machining2d/arc_side.rs
+ create mode 100644 docs/decisions/1579-arc-fit-one-sided.md
+
+diff --git a/crates/app/tests/contour_arc_fit_wall.rs b/crates/app/tests/contour_arc_fit_wall.rs
+new file mode 100644
+index 000000000..ff9c34a49
+--- /dev/null
++++ b/crates/app/tests/contour_arc_fit_wall.rs
+@@ -0,0 +1,78 @@
++//! #1579: a 2D Contour arc-fitted at a coarse tolerance around a
++//! tessellated round wall stays on the air side of the wall in both
++//! walk directions - the fit never hands the verifier a gouge.
++//!
++//! Gate map (M4.4): covers motion::machining2d (arcs::fit_arcs), app::operation (generate + verify of a 2D contour).
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, SetStock};
++use camcraft_app::geometry::{IDENTITY_Q, Point3};
++use camcraft_app::machining2d::{Lead, Side};
++use camcraft_app::model;
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++/// The UI draw law's fixture (`arc_moves_draw_curved`): a Ø30 cylinder
++/// stock skinned by a 4 mm end mill, Side Auto, tolerance 0.1.
++fn skin(climb: bool) -> camcraft_app::schema::Toolpath {
++    let world = new_world();
++    let mut history = History::default();
++    let stock = SetStock::new(
++        &world,
++        StockShape::Cylinder { diameter: 30.0, height: 10.0 },
++        Location { pos: Point3::new(0.0, 0.0, 0.0), rot: IDENTITY_Q },
++    );
++    history.execute(&world, stock.expect("cylinder stock"));
++    let em = catalog()
++        .into_iter()
++        .find(|(n, _)| *n == "EM-0400-2FL")
++        .map(|(_, t)| t)
++        .expect("catalog entry");
++    history.execute(&world, AddTool::new(&world, "EM-0400-2FL", em).expect("tool"));
++    let params = OpParams::Contour {
++        tilt: None,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(20.0),
++        retract_z: Height::fixed(15.0),
++        top_z: Height::fixed(10.0),
++        bottom_z: Height::fixed(8.0),
++        stepdown: 2.0,
++        feed: 800.0,
++        plunge_feed: 200.0,
++        climb,
++        side: Side::Auto,
++        lead: Lead::None,
++        tolerance: 0.1,
++        tab_count: 0,
++        tab_width: 0.0,
++        tab_height: 0.0,
++        entry: camcraft_app::machining3d::Entry3D::Plunge,
++        helix_radius: 1.0,
++        blend_turns: false,
++        links: camcraft_app::links::Links::PLANAR,
++    };
++    let op = CreateOperation::new(&world, "Skin1", "EM-0400-2FL", SrcRef::Stock, params);
++    history.execute(&world, op.expect("operation"));
++    history.execute(&world, GenerateOperation::new(&world, "Skin1").expect("generate"));
++    model::find_by_name(&world, "Skin1")
++        .and_then(|e| model::toolpath_of(&world, &e))
++        .expect("cache")
++}
++
++#[test]
++fn coarse_arc_fit_on_a_round_wall_verifies_clean_both_ways() {
++    for climb in [true, false] {
++        let cache = skin(climb);
++        assert!(
++            cache.path.has_arcs(),
++            "climb={climb}: the tessellated wall still fits to arcs at tol 0.1"
++        );
++        assert!(
++            cache.warnings.is_empty(),
++            "climb={climb}: the fitted contour must not cross the wall: {:?}",
++            cache.warnings
++        );
++    }
++}
+diff --git a/crates/motion/src/machining2d/arc_side.rs b/crates/motion/src/machining2d/arc_side.rs
+new file mode 100644
+index 000000000..37425f584
+--- /dev/null
++++ b/crates/motion/src/machining2d/arc_side.rs
+@@ -0,0 +1,84 @@
++//! One-sided arc fit for a wall walk (#1579): when the walk knows on
++//! which side of travel its part lies, the fitted circle may pass a
++//! vertex only on the air side, never between the vertex and the wall.
++//!
++//! The two-sided fit (`arcs::arc_over`) lets a vertex stand up to half
++//! the fit tolerance off its circle in either direction. Toward the part
++//! that is a cut past a verified point, and the verifier forgives only
++//! its fixed gouge allowance (0.01 mm), not the operation's tolerance -
++//! so a coarse fit (0.1) on a tessellated round wall posted arcs that
++//! the verify then held as gouges. Here the circle stays through the
++//! run's two end vertices (the arc's endpoints are path points, so the
++//! chaining stays exact) and its centre moves along their chord's
++//! perpendicular bisector until no interior vertex lies on the part
++//! side. Each vertex bounds the centre's offset `t` along that bisector
++//! linearly, so the feasible offsets are one interval; the offset
++//! nearest the two-sided circle is taken. No interval: no arc.
++//!
++//! Provenance: circle-through-two-points family and the power of a
++//! point (elementary plane geometry); no vendor material consulted.
++
++use crate::geo2d::Point2;
++
++/// The circle through `a` and `b` nearest `(c, _)` that keeps every
++/// point of `run` on the air side: inside or on the circle when the part
++/// lies on the centre's side of the arc (`part_in`, an outside wall), on
++/// or outside it otherwise (a pocket wall). `None` when no such circle
++/// exists or the chord `a`-`b` is degenerate.
++pub(super) fn one_sided(run: &[Point2], a: Point2, b: Point2, c: Point2, part_in: bool) -> Option<(Point2, f64)> {
++    let m = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let len = dx.hypot(dy);
++    if !(len.is_finite() && len > 0.0) {
++        return None;
++    }
++    let n = Point2::new(-dy / len, dx / len);
++    let h2 = (len * 0.5).powi(2);
++    // Centre c(t) = m + t n, radius^2 = h^2 + t^2. A point p is inside
++    // or on the circle iff |p-m|^2 - h^2 <= 2 t (p-m).n - linear in t.
++    // The end vertices are on every circle of the family: only the
++    // interior ones bound `t` (their rounding noise would not).
++    let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
++    for p in run.iter().take(run.len().saturating_sub(1)).skip(1) {
++        let (px, py) = (p.x - m.x, p.y - m.y);
++        let q = px * px + py * py - h2;
++        let k = px * n.x + py * n.y;
++        if !(q.is_finite() && k.is_finite()) {
++            return None;
++        }
++        // inside: 2tk >= q; outside: 2tk <= q.
++        let (k, q) = if part_in { (k, q) } else { (-k, -q) };
++        if k.abs() <= f64::EPSILON {
++            // The bound does not depend on t: a point on the chord's own
++            // line, which is on the air side only when q <= 0.
++            if q > 0.0 {
++                return None;
++            }
++        } else if k > 0.0 {
++            lo = lo.max(q / (2.0 * k));
++        } else {
++            hi = hi.min(q / (2.0 * k));
++        }
++    }
++    if lo > hi {
++        return None;
++    }
++    let t0 = (c.x - m.x) * n.x + (c.y - m.y) * n.y;
++    let t = t0.clamp(lo, hi);
++    if !t.is_finite() {
++        return None;
++    }
++    let center = Point2::new(m.x + t * n.x, m.y + t * n.y);
++    let r = (h2 + t * t).sqrt();
++    r.is_finite().then_some((center, r))
++}
++
++/// True when every point of `run` lies on the air side of the circle
++/// `(c, r)` within `slack` (see [`one_sided`] for `part_in`): the check
++/// a closing ring takes, whose circle has no chord to slide along.
++pub(super) fn air_side_holds(run: &[Point2], c: Point2, r: f64, part_in: bool, slack: f64) -> bool {
++    run.iter().all(|p| {
++        let s = (p.x - c.x).hypot(p.y - c.y) - r;
++        if part_in { s <= slack } else { s >= -slack }
++    })
++}
+diff --git a/crates/motion/src/machining2d/arcs.rs b/crates/motion/src/machining2d/arcs.rs
+index 149fa3ffd..63d43a6ac 100644
+--- a/crates/motion/src/machining2d/arcs.rs
++++ b/crates/motion/src/machining2d/arcs.rs
+@@ -5,6 +5,7 @@ use crate::cl::{lattice, MoveKind, PathBuilder};
+ use crate::geo2d::Point2;
+ use crate::geometry::Point3;
+ 
++use super::arc_side;
+ use super::contour::unit;
+ use super::ring::dist;
+ // The lead geometry moved to `arc_leads` (#689, the 400-line law); its
+@@ -134,6 +135,15 @@ pub(super) fn walk_tangent(segs: &[Seg], poly: &[Point2], front: bool) -> Point2
+ /// chaining is exact by construction. Consumers fit at use; nothing
+ /// about a [`crate::geometry::Features`] digest ever depends on this.
+ pub fn fit_arcs(pts: &[Point2], tol: f64) -> Vec<Seg> {
++    fit_arcs_sided(pts, tol, None)
++}
++
++/// [`fit_arcs`] for a wall walk that knows its part's side (#1579):
++/// `air_left` `Some(true)` when the air (no part) is left of travel, the
++/// contour family's `climb` convention. Every fitted arc then passes each
++/// vertex of its run on the air side only (`arc_side`), so the fit never
++/// cuts past a point the plan verified; `None` is the two-sided fit.
++pub fn fit_arcs_sided(pts: &[Point2], tol: f64, air_left: Option<bool>) -> Vec<Seg> {
+     let tol = if tol.is_finite() && tol > 0.0 { tol } else { ARC_FIT_TOL };
+     let n = pts.len();
+     let mut segs = Vec::new();
+@@ -144,7 +154,7 @@ pub fn fit_arcs(pts: &[Point2], tol: f64) -> Vec<Seg> {
+         let mut e = s + 2;
+         let mut flat = 0;
+         while e <= cap {
+-            match arc_over(&pts[s..=e], tol) {
++            match arc_over(&pts[s..=e], tol, air_left) {
+                 Over::Fit(center, ccw, total) => {
+                     best = Some((e, center, ccw, total));
+                     e += 1;
+@@ -211,7 +221,7 @@ pub(super) enum Over {
+ /// [`fit_arcs`]). `Straight` is the honest answer when no vertex leaves
+ /// the end chord by more than `tol`: there is nothing there an arc
+ /// could describe better than the chords already do.
+-pub(super) fn arc_over(run: &[Point2], tol: f64) -> Over {
++pub(super) fn arc_over(run: &[Point2], tol: f64, air_left: Option<bool>) -> Over {
+     let (a, b) = (run[0], run[run.len() - 1]);
+     let dev = |p: Point2| chord_dev(p, a, b);
+     // Farthest interior vertex from the end chord anchors the circle.
+@@ -276,6 +286,24 @@ pub(super) fn arc_over(run: &[Point2], tol: f64) -> Over {
+         }
+         (false, None) => return Over::Fail,
+     };
++    // #1579: a walk that knows its part's side keeps every vertex on the
++    // air side of its arc. The centre is left of travel on a ccw arc, so
++    // the part is on the centre's side exactly when the air is not.
++    let (c, r) = match air_left {
++        None => (c, r),
++        Some(air_left) => {
++            let part_in = air_left != ccw;
++            let held = if closing {
++                arc_side::air_side_holds(run, c, r, part_in, 1e-9).then_some((c, r))
++            } else {
++                arc_side::one_sided(run, a, b, c, part_in)
++            };
++            match held {
++                Some(cr) => cr,
++                None => return Over::Fail,
++            }
++        }
++    };
+     if !r.is_finite() || r <= tol {
+         return Over::Fail;
+     }
+diff --git a/crates/motion/src/machining2d/contour.rs b/crates/motion/src/machining2d/contour.rs
+index cd795de10..410d2707c 100644
+--- a/crates/motion/src/machining2d/contour.rs
++++ b/crates/motion/src/machining2d/contour.rs
+@@ -9,7 +9,7 @@ use crate::geo2d::{Loop, Point2, Region};
+ use crate::geometry::{Point3, Triangle};
+ use crate::links::{Link, LinkTally};
+ 
+-use super::arcs::{fit_arcs, push_segs};
++use super::arcs::{fit_arcs_sided, push_segs};
+ use super::contour_depth::{Ladder, ladder};
+ use super::contour_entry::{Engage, crosses, flatten, say, seam_leads, wall_arc, wall_arc_top};
+ use super::contour_comp::{self, SpanCtx};
+@@ -245,7 +245,7 @@ fn contour_impl(
+             if poly.len() < 2 {
+                 continue;
+             }
+-            let mut walk = fit_arcs(&poly, p.tolerance);
++            let mut walk = fit_arcs_sided(&poly, p.tolerance, legal.air_left);
+             if p.blend_turns {
+                 let (w, t) = fillet_corners(&walk, poly[0], r, p.tolerance, &legal);
+                 walk = w;
+diff --git a/crates/motion/src/machining2d/contour_chain.rs b/crates/motion/src/machining2d/contour_chain.rs
+index 9c6c31369..ae5b52bdb 100644
+--- a/crates/motion/src/machining2d/contour_chain.rs
++++ b/crates/motion/src/machining2d/contour_chain.rs
+@@ -14,7 +14,7 @@ use crate::geometry::Point3;
+ use crate::links::Link;
+ use crate::plunge_law;
+ 
+-use super::arcs::{fit_arcs, lead_in, lead_out, push_segs, walk_tangent};
++use super::arcs::{fit_arcs_sided, lead_in, lead_out, push_segs, walk_tangent};
+ use super::contour::{ContourParams, air_side};
+ use super::face::GenError;
+ 
+@@ -68,7 +68,7 @@ pub fn contour_along_chain(
+         v
+     };
+     let zs = p.levels()?;
+-    let walk = fit_arcs(&poly, p.tolerance);
++    let walk = fit_arcs_sided(&poly, p.tolerance, Some(p.climb));
+     let t0 = walk_tangent(&walk, &poly, true);
+     let (entry, lead) = lead_in(poly[0], t0, air_side(t0, p.climb), p.lead);
+     let n = poly.len();
+diff --git a/crates/motion/src/machining2d/lead_fit.rs b/crates/motion/src/machining2d/lead_fit.rs
+index 9a46e7010..23a3a096c 100644
+--- a/crates/motion/src/machining2d/lead_fit.rs
++++ b/crates/motion/src/machining2d/lead_fit.rs
+@@ -10,7 +10,7 @@ use std::f64::consts::TAU;
+ 
+ use crate::geo2d::Point2;
+ 
+-use super::arcs::{Seg, chord_dev, fit_arcs, lead_in, lead_out, walk_tangent};
++use super::arcs::{Seg, chord_dev, fit_arcs_sided, lead_in, lead_out, walk_tangent};
+ use super::contour::{ContourParams, Lead, air_side};
+ use super::fillet::Legal;
+ use super::ring::{Ring, dist};
+@@ -184,7 +184,7 @@ pub(super) fn reseat(
+     let walked = |v: Vec<Point2>| {
+         let ring = Ring::new(v.clone());
+         let poly = ring.arc_between(0.0, ring.len);
+-        let walk = fit_arcs(&poly, p.tolerance);
++        let walk = fit_arcs_sided(&poly, p.tolerance, legal.air_left);
+         (v, poly, walk)
+     };
+     let n = pts.len();
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index ebebe9574..8206647ea 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -23,6 +23,7 @@
+ mod arc_biarc;
+ mod arc_cross;
+ mod arc_proof;
++mod arc_side;
+ mod arc_leads;
+ mod arcs;
+ mod blend;
+@@ -93,7 +94,7 @@ mod thread_tests;
+ #[cfg(test)]
+ mod thread_pass_tests;
+ 
+-pub use arcs::{fit_arcs, Seg, ARC_FIT_TOL};
++pub use arcs::{fit_arcs, fit_arcs_sided, Seg, ARC_FIT_TOL};
+ pub use blend::MIN_BLEND_RADIUS;
+ pub use bore::{bore, BoreHole, BoreParams};
+ pub use bore_core::{bore_core_gap, bore_floor_reach, bore_leaves_core, cutting_radius_at, max_bore_diameter};
+diff --git a/crates/motion/tests/arcs.rs b/crates/motion/tests/arcs.rs
+index ae427f7c8..8546c1cd6 100644
+--- a/crates/motion/tests/arcs.rs
++++ b/crates/motion/tests/arcs.rs
+@@ -3,12 +3,12 @@
+ //! arc moves, chords stay inside the sagitta law's word, and paths with
+ //! arcs still chain and stay finite.
+ //!
+-//! Gate map (M4.4): covers motion::machining2d (contour, fit_arcs).
++//! Gate map (M4.4): covers motion::machining2d (contour, fit_arcs, fit_arcs_sided).
+ 
+ use camcraft_motion::cl::{Move, MoveKind};
+ use camcraft_motion::geo2d::{Loop, Point2, Region};
+ use camcraft_motion::geometry::Point3;
+-use camcraft_motion::machining2d::{ContourParams, Lead, Seg, Side, contour, fit_arcs};
++use camcraft_motion::machining2d::{ContourParams, Lead, Seg, Side, contour, fit_arcs, fit_arcs_sided};
+ 
+ fn p2(x: f64, y: f64) -> Point2 {
+     Point2::new(x, y)
+@@ -258,3 +258,52 @@ fn a_closed_rim_fits_whole_in_either_direction() {
+         assert!(matches!(segs.last(), Some(Seg::Arc { to, .. }) if Some(to) == pts.last()), "the last arc closes on the seam");
+     }
+ }
++
++/// The worst amount any vertex of a fitted run stands on the part side
++/// of its arc (#1579): `part_in` when the part is on the centre's side.
++fn worst_part_side(pts: &[Point2], segs: &[Seg], part_in: bool) -> f64 {
++    let mut worst = f64::NEG_INFINITY;
++    let mut i = 0usize;
++    for seg in segs {
++        match seg {
++            Seg::Line(qs) => i += qs.len(),
++            Seg::Arc { center, to, .. } => {
++                let j = (i + 1..pts.len()).find(|&j| pts[j] == *to).expect("arc ends on a vertex");
++                let r = (pts[i].x - center.x).hypot(pts[i].y - center.y);
++                for p in &pts[i..=j] {
++                    let s = (p.x - center.x).hypot(p.y - center.y) - r;
++                    worst = worst.max(if part_in { s } else { -s });
++                }
++                i = j;
++            }
++        }
++    }
++    worst
++}
++
++#[test]
++fn a_sided_fit_never_passes_a_vertex_on_the_part_side() {
++    // #1579: a boss wall tessellated with a radial wobble of 0.04 mm (the
++    // offset of a faceted cylinder rides that much in and out). At tol
++    // 0.1 the two-sided fit may pass a vertex up to 0.05 on the part's
++    // side - the verifier's 0.01 allowance convicts that as a gouge. The
++    // sided fit keeps every vertex on the air side, in both directions.
++    let wobble: Vec<Point2> = ring(p2(0.0, 0.0), 17.0, 96)
++        .iter()
++        .enumerate()
++        .map(|(k, p)| if k % 2 == 1 { p2(p.x * (1.0 - 0.04 / 17.0), p.y * (1.0 - 0.04 / 17.0)) } else { *p })
++        .collect();
++    let mut cw = wobble.clone();
++    cw.reverse();
++    // Around a boss the part is on the centre's side either way: the
++    // climb walk (cw) has the air on its left, the conventional one (ccw)
++    // on its right.
++    for (walk, air_left) in [(&cw, true), (&wobble, false)] {
++        let two = fit_arcs(walk, 0.1);
++        assert!(worst_part_side(walk, &two, true) > 0.01, "the two-sided fit shows the defect");
++        let one = fit_arcs_sided(walk, 0.1, Some(air_left));
++        assert!(one.iter().any(|s| matches!(s, Seg::Arc { .. })), "air_left={air_left}: still fits arcs");
++        let w = worst_part_side(walk, &one, true);
++        assert!(w <= 1e-9, "air_left={air_left}: a vertex stands {w} mm on the part side");
++    }
++}
+diff --git a/crates/ui/src/law_tests.rs b/crates/ui/src/law_tests.rs
+index c747dfc49..83485991b 100644
+--- a/crates/ui/src/law_tests.rs
++++ b/crates/ui/src/law_tests.rs
+@@ -681,10 +681,9 @@ mod path_tests {
+                     stepdown: 2.0,
+                     feed: 800.0,
+                     plunge_feed: 200.0,
+-                    // #1555: climb rides this coarse (0.1) fit 0.01 mm
+-                    // past the wall - the verify flags it red - so the
+-                    // draw law is pinned on the conventional walk.
+-                    climb: false,
++                    // #1579: the coarse (0.1) fit keeps the wall's air
++                    // side on the climb walk too, so the default holds.
++                    climb: true,
+                     side: camcraft_app::machining2d::Side::Auto,
+                     lead: camcraft_app::machining2d::Lead::None,
+                     tolerance: 0.1,
+diff --git a/docs/decisions/1579-arc-fit-one-sided.md b/docs/decisions/1579-arc-fit-one-sided.md
+new file mode 100644
+index 000000000..7e9ba8789
+--- /dev/null
++++ b/docs/decisions/1579-arc-fit-one-sided.md
+@@ -0,0 +1,30 @@
++## #1579 - one-sided arc fit on contour walls
++
++**Chosen.** A contour walk that knows its part side (closed rings, open
++chains and the lead reseat; `air_left` = `climb`) fits arcs one-sided: the
++circle stays through the run's two end vertices, and its centre slides
++along their bisector until no interior vertex is on the part side. The
++offset nearest the two-sided circle is taken. A closing ring keeps its
++circle only when every vertex is already on the air side; otherwise the
++greedy fit keeps the longest open run. The two-sided fit
++(`fit_arcs`) is unchanged for every other caller.
++
++**Why.** The two-sided fit let a vertex stand half the operation
++tolerance (0.05 at 0.1) off the circle in either direction. Toward the
++part that is a cut past a verified point, and the verifier forgives only
++`GOUGE_TOL` (0.01), whatever the operation tolerance. So a coarse fit on
++a tessellated round wall posted arcs that verify then held as gouges,
++and the result depended on the walk direction.
++
++**Considered and dropped.**
++- Cap the vertex share at `ARC_FIT_TOL` (0.005): the Ø30 cylinder wall
++  then fit no arcs at all at tolerance 0.1 - the offset wobble of the
++  facets is wider than that.
++- Prove each arc against the legal region after the fit (as the adaptive
++  plan's `arc_proof` does) and drop the refused ones: it keeps chords
++  where a slightly larger circle is safe, and costs a region test per arc.
++- Raise the verifier's allowance to the operation tolerance: that hides
++  a real cut past the wall, against the Prime Directive.
++
++**Not changed.** The compensation walk (`contour_comp`) and the pocket,
++ring and waterline fits stay two-sided; their sag laws are their own.
+
+From 7f528bebaacc48f2360fb30cd81772d6c546d436 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sat, 14 Nov 2026 12:59:27 +0100
+Subject: [PATCH 2/2] fix(2d): sided arc fit keeps true circles and refuses
+ split pieces off the circle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The held one-sided fit counted any vertex 1e-9 mm on the part side, so
+exact holes, bores and the M8 boss lost their closed-ring arcs and seven
+golden tests failed. A vertex within ARC_SIDE_SLACK (1e-3 mm, ten times
+under the verifier's GOUGE_TOL) now keeps the two-sided circle; only a
+vertex past it moves the centre or refuses the arc. Every golden test
+passes unchanged.
+
+A sweep over half a turn posts as pieces that end on interior vertices.
+A sided fit now takes only split vertices on the circle: the
+conventional walk of the Ø30 fixture posted a piece that ended 0.05 mm
+off its circle and verify held it as a gouge. A sided fit also looks
+past up to 4 refused run ends, so a faceted wall fits 3 arcs a level,
+not 22-32. The compensation part contour fits sided too.
+
+Fixes #1579
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/tests/contour_arc_fit_wall.rs      | 10 ++++
+ crates/motion/src/machining2d/arc_side.rs     | 46 +++++++++++++++
+ crates/motion/src/machining2d/arcs.rs         | 45 +++++++++------
+ crates/motion/src/machining2d/contour_comp.rs |  8 ++-
+ crates/motion/tests/arcs.rs                   |  5 +-
+ docs/decisions/1579-arc-fit-one-sided.md      | 56 ++++++++++++++++---
+ 6 files changed, 141 insertions(+), 29 deletions(-)
+
+diff --git a/crates/app/tests/contour_arc_fit_wall.rs b/crates/app/tests/contour_arc_fit_wall.rs
+index ff9c34a49..348205506 100644
+--- a/crates/app/tests/contour_arc_fit_wall.rs
++++ b/crates/app/tests/contour_arc_fit_wall.rs
+@@ -74,5 +74,15 @@ fn coarse_arc_fit_on_a_round_wall_verifies_clean_both_ways() {
+             "climb={climb}: the fitted contour must not cross the wall: {:?}",
+             cache.warnings
+         );
++        // Each arc move ends on its own circle (within the fit's 1e-3 mm
++        // part-side slack): a split piece that ended on a vertex off the
++        // circle bent between the checked vertices and gouged.
++        for m in cache.path.moves.iter() {
++            if let Some(a) = &m.arc {
++                let rf = (m.from.x - a.center.x).hypot(m.from.y - a.center.y);
++                let rt = (m.to.x - a.center.x).hypot(m.to.y - a.center.y);
++                assert!((rf - rt).abs() <= 1e-3 + 1e-6, "climb={climb}: an arc ends {} mm off its circle", (rf - rt).abs());
++            }
++        }
+     }
+ }
+diff --git a/crates/motion/src/machining2d/arc_side.rs b/crates/motion/src/machining2d/arc_side.rs
+index 37425f584..8d83eb092 100644
+--- a/crates/motion/src/machining2d/arc_side.rs
++++ b/crates/motion/src/machining2d/arc_side.rs
+@@ -20,6 +20,41 @@
+ 
+ use crate::geo2d::Point2;
+ 
++/// How far a vertex may stand on the part side of a fitted arc before
++/// the fit counts it (#1579), in mm. Far above the rounding noise of a
++/// true circle (1e-9 refused exact holes and bores whose vertices sat
++/// 1e-12 off), ten times below the verifier's `GOUGE_TOL` (0.01) - so no
++/// arc passes a vertex near what the verify would hold as a gouge.
++pub(super) const ARC_SIDE_SLACK: f64 = 1e-3;
++
++/// How many refused run ends a sided fit looks past before its run ends
++/// (#1579): see `arcs::fit_arcs_sided`.
++pub(super) const ARC_SIDE_LOOKAHEAD: usize = 4;
++
++/// The circle a run takes on a wall walk whose air is left of travel
++/// when `air_left` is `Some(true)` (`None`: the two-sided `(c, r)` as it
++/// is). The centre is left of travel on a `ccw` arc, so the part is on
++/// the centre's side exactly when the air is not. A vertex within
++/// [`ARC_SIDE_SLACK`] of the two-sided circle (rounding noise on a true
++/// circle) keeps that circle, so an exact bore or boss fits as before;
++/// only a vertex past the slack moves the centre ([`one_sided`], an open
++/// run) or refuses the arc (a `closing` ring, whose circle has no chord
++/// to slide along). `None`: no arc.
++pub(super) fn sided(run: &[Point2], c: Point2, r: f64, ccw: bool, closing: bool, air_left: Option<bool>) -> Option<(Point2, f64)> {
++    let Some(air_left) = air_left else {
++        return Some((c, r));
++    };
++    let part_in = air_left != ccw;
++    if air_side_holds(run, c, r, part_in, ARC_SIDE_SLACK) {
++        Some((c, r))
++    } else if closing {
++        None
++    } else {
++        let (a, b) = (*run.first()?, *run.last()?);
++        one_sided(run, a, b, c, part_in)
++    }
++}
++
+ /// The circle through `a` and `b` nearest `(c, _)` that keeps every
+ /// point of `run` on the air side: inside or on the circle when the part
+ /// lies on the centre's side of the arc (`part_in`, an outside wall), on
+@@ -82,3 +117,14 @@ pub(super) fn air_side_holds(run: &[Point2], c: Point2, r: f64, part_in: bool, s
+         if part_in { s <= slack } else { s >= -slack }
+     })
+ }
++
++/// True when every vertex a sweep split into `k` pieces ends a piece on
++/// (the run's `len * m / k`, `0 < m < k`, as `arcs::fit_arcs_sided`
++/// splits) lies within [`ARC_SIDE_SLACK`] of the circle `(c, r)`.
++pub(super) fn splits_on_circle(run: &[Point2], c: Point2, r: f64, k: usize) -> bool {
++    let last = run.len().saturating_sub(1);
++    (1..k).all(|m| {
++        run.get(last * m / k)
++            .is_some_and(|p| ((p.x - c.x).hypot(p.y - c.y) - r).abs() <= ARC_SIDE_SLACK)
++    })
++}
+diff --git a/crates/motion/src/machining2d/arcs.rs b/crates/motion/src/machining2d/arcs.rs
+index 63d43a6ac..c996b6fd5 100644
+--- a/crates/motion/src/machining2d/arcs.rs
++++ b/crates/motion/src/machining2d/arcs.rs
+@@ -153,10 +153,20 @@ pub fn fit_arcs_sided(pts: &[Point2], tol: f64, air_left: Option<bool>) -> Vec<S
+         let mut best: Option<(usize, Point2, bool, f64)> = None;
+         let mut e = s + 2;
+         let mut flat = 0;
++        let mut missed = 0;
+         while e <= cap {
+             match arc_over(&pts[s..=e], tol, air_left) {
+                 Over::Fit(center, ccw, total) => {
+                     best = Some((e, center, ccw, total));
++                    missed = 0;
++                    e += 1;
++                }
++                // #1579: a sided fit refuses a run that ends on a vertex
++                // short of the circle (a facet's flat) yet takes the run
++                // one or two vertices on (the next corner): look past a
++                // few refusals before the run ends.
++                Over::Fail if air_left.is_some() && best.is_some() && missed < arc_side::ARC_SIDE_LOOKAHEAD => {
++                    missed += 1;
+                     e += 1;
+                 }
+                 // Too straight to have said anything yet: extend, up
+@@ -183,7 +193,7 @@ pub fn fit_arcs_sided(pts: &[Point2], tol: f64, air_left: Option<bool>) -> Vec<S
+                 // and still honours a genuine fraction: a ratio that
+                 // really sits > 5e-7 above an integer wanted another
+                 // piece and keeps it.
+-                let k = (lattice(total / PI) + 1e-12).ceil().max(1.0) as usize;
++                let k = split_count(total);
+                 for m in 1..=k {
+                     let idx = if m == k { e } else { s + (e - s) * m / k };
+                     segs.push(Seg::Arc {
+@@ -203,6 +213,12 @@ pub fn fit_arcs_sided(pts: &[Point2], tol: f64, air_left: Option<bool>) -> Vec<S
+     segs
+ }
+ 
++/// How many pieces of at most half a turn a fitted sweep `total` posts
++/// as (see [`fit_arcs_sided`]).
++fn split_count(total: f64) -> usize {
++    (lattice(total / PI) + 1e-12).ceil().max(1.0) as usize
++}
++
+ /// What a window of at least 3 points says about sitting on one circle
+ /// (see [`fit_arcs`]).
+ pub(super) enum Over {
+@@ -287,22 +303,9 @@ pub(super) fn arc_over(run: &[Point2], tol: f64, air_left: Option<bool>) -> Over
+         (false, None) => return Over::Fail,
+     };
+     // #1579: a walk that knows its part's side keeps every vertex on the
+-    // air side of its arc. The centre is left of travel on a ccw arc, so
+-    // the part is on the centre's side exactly when the air is not.
+-    let (c, r) = match air_left {
+-        None => (c, r),
+-        Some(air_left) => {
+-            let part_in = air_left != ccw;
+-            let held = if closing {
+-                arc_side::air_side_holds(run, c, r, part_in, 1e-9).then_some((c, r))
+-            } else {
+-                arc_side::one_sided(run, a, b, c, part_in)
+-            };
+-            match held {
+-                Some(cr) => cr,
+-                None => return Over::Fail,
+-            }
+-        }
++    // air side of its arc (`arc_side::sided`).
++    let Some((c, r)) = arc_side::sided(run, c, r, ccw, closing, air_left) else {
++        return Over::Fail;
+     };
+     if !r.is_finite() || r <= tol {
+         return Over::Fail;
+@@ -336,6 +339,14 @@ pub(super) fn arc_over(run: &[Point2], tol: f64, air_left: Option<bool>) -> Over
+     if total <= 0.0 || total > 2.0 * PI + tol / r {
+         return Over::Fail;
+     }
++    // #1579: a sweep past half a turn posts as pieces that end on interior
++    // vertices (`fit_arcs_sided`). The control and the verifier read each
++    // piece from its own endpoints, so a split vertex off the circle bends
++    // the piece between the checked vertices; a sided fit takes only split
++    // vertices on the circle within the slack.
++    if air_left.is_some() && !arc_side::splits_on_circle(run, c, r, split_count(total)) {
++        return Over::Fail;
++    }
+     Over::Fit(c, ccw, total)
+ }
+ 
+diff --git a/crates/motion/src/machining2d/contour_comp.rs b/crates/motion/src/machining2d/contour_comp.rs
+index 980e3996a..30f9759e7 100644
+--- a/crates/motion/src/machining2d/contour_comp.rs
++++ b/crates/motion/src/machining2d/contour_comp.rs
+@@ -22,7 +22,7 @@ use crate::geo2d::{Point2, Region};
+ use crate::geometry::Point3;
+ use crate::links::{Compensation, Link};
+ 
+-use super::arcs::{fit_arcs, Seg};
++use super::arcs::{fit_arcs_sided, Seg};
+ use super::contour_comp_room as room;
+ use super::contour::{ContourParams, Lead, Side};
+ use super::face::GenError;
+@@ -269,7 +269,11 @@ pub(super) fn push_span(b: &mut PathBuilder, ctx: &SpanCtx, first: usize, last:
+     if poly.last().is_none_or(|l| dist(*l, s_p) > 1e-9) {
+         poly.push(s_p);
+     }
+-    let walk = fit_arcs(&poly, p.tolerance);
++    // #1579: the control cuts this part contour offset by its register,
++    // so an arc of it that passes a vertex on the part side cuts past the
++    // wall just as the centre walk's would; it walks the centre ring's
++    // way round, so the air is on the same side (`climb`).
++    let walk = fit_arcs_sided(&poly, p.tolerance, Some(p.climb));
+     room::arcs(&walk, s_p, p)?;
+     let feed = moves.get(first + 1).and_then(|m| m.feed).unwrap_or(p.feed);
+     let mut programmed = Vec::with_capacity(walk.len() + 2);
+diff --git a/crates/motion/tests/arcs.rs b/crates/motion/tests/arcs.rs
+index 8546c1cd6..f7d078fa7 100644
+--- a/crates/motion/tests/arcs.rs
++++ b/crates/motion/tests/arcs.rs
+@@ -304,6 +304,9 @@ fn a_sided_fit_never_passes_a_vertex_on_the_part_side() {
+         let one = fit_arcs_sided(walk, 0.1, Some(air_left));
+         assert!(one.iter().any(|s| matches!(s, Seg::Arc { .. })), "air_left={air_left}: still fits arcs");
+         let w = worst_part_side(walk, &one, true);
+-        assert!(w <= 1e-9, "air_left={air_left}: a vertex stands {w} mm on the part side");
++        eprintln!("air_left={air_left}: worst part-side excursion {w} mm (two-sided {})", worst_part_side(walk, &two, true));
++        // The fit forgives 1e-3 mm (`ARC_SIDE_SLACK`), ten times under the
++        // verifier's 0.01 gouge allowance.
++        assert!(w <= 1e-3 + 1e-9, "air_left={air_left}: a vertex stands {w} mm on the part side");
+     }
+ }
+diff --git a/docs/decisions/1579-arc-fit-one-sided.md b/docs/decisions/1579-arc-fit-one-sided.md
+index 7e9ba8789..f58a0dd60 100644
+--- a/docs/decisions/1579-arc-fit-one-sided.md
++++ b/docs/decisions/1579-arc-fit-one-sided.md
+@@ -1,13 +1,24 @@
+ ## #1579 - one-sided arc fit on contour walls
+ 
+ **Chosen.** A contour walk that knows its part side (closed rings, open
+-chains and the lead reseat; `air_left` = `climb`) fits arcs one-sided: the
+-circle stays through the run's two end vertices, and its centre slides
+-along their bisector until no interior vertex is on the part side. The
+-offset nearest the two-sided circle is taken. A closing ring keeps its
+-circle only when every vertex is already on the air side; otherwise the
+-greedy fit keeps the longest open run. The two-sided fit
+-(`fit_arcs`) is unchanged for every other caller.
++chains, the lead reseat and the cutter-compensation part contour;
++`air_left` = `climb`) fits arcs one-sided:
++- A vertex may stand at most `ARC_SIDE_SLACK` = 1e-3 mm on the part side
++  of its arc. When the two-sided circle already meets that, it is kept
++  as it is.
++- Otherwise an open run keeps its two end vertices, and the centre
++  slides along their bisector until no interior vertex is on the part
++  side (the offset nearest the two-sided circle). A closing ring has no
++  chord to slide along, so its arc is refused and the greedy fit keeps
++  the longest open run.
++- A sweep past half a turn posts as pieces that end on interior
++  vertices. In a sided fit each such split vertex must lie within the
++  slack of the circle, or the run is refused.
++- A sided fit looks past up to 4 refused run ends before a run ends
++  (`ARC_SIDE_LOOKAHEAD`), because a run that ends on a facet's flat is
++  refused while the run to the next corner fits.
++
++The two-sided fit (`fit_arcs`) is unchanged for every other caller.
+ 
+ **Why.** The two-sided fit let a vertex stand half the operation
+ tolerance (0.05 at 0.1) off the circle in either direction. Toward the
+@@ -16,7 +27,29 @@ part that is a cut past a verified point, and the verifier forgives only
+ a tessellated round wall posted arcs that verify then held as gouges,
+ and the result depended on the walk direction.
+ 
++**The slack value (1e-3 mm).** The maintainer's session decided that
++golden output does not change. The first held fix used a slack of 1e-9:
++exact holes, bores and the M8 boss then lost their closed-ring arcs to
++rounding noise, and seven golden tests failed. 1e-3 is far above that
++noise and ten times below `GOUGE_TOL`, so no fitted arc passes a vertex
++near what the verify holds as a gouge. With it every golden test passes
++unchanged. Values up to 5e-3 were possible; the smaller value keeps the
++larger margin, and the tests did not need more.
++
++**Split vertices.** Without the split check, the Ø30 cylinder fixture
++walked conventional (ccw) posted a sweep over half a turn split at a
++vertex 0.05 mm off its circle. The verify then held that piece as a
++gouge, although every vertex was on the air side of the circle.
++
++**The lookahead.** Without it the same fixture fit 22 (climb) and 32
++(conventional) short arcs, and the UI draw law `arc_moves_draw_curved`
++(at least 8 chords for each arc move) failed. With it each level fits 3
++arcs in both directions, and the draw law holds on the climb walk, as
++the issue asks.
++
+ **Considered and dropped.**
++- Regenerate the goldens with the 1e-9 slack: refused by the
++  maintainer's session; a true circle must post as before.
+ - Cap the vertex share at `ARC_FIT_TOL` (0.005): the Ø30 cylinder wall
+   then fit no arcs at all at tolerance 0.1 - the offset wobble of the
+   facets is wider than that.
+@@ -25,6 +58,11 @@ and the result depended on the walk direction.
+   where a slightly larger circle is safe, and costs a region test per arc.
+ - Raise the verifier's allowance to the operation tolerance: that hides
+   a real cut past the wall, against the Prime Directive.
++- Leave the compensation part contour (`contour_comp`) two-sided: the
++  control offsets that contour by the register, so a part-side sag of it
++  cuts past the wall the same way, and the verifier reads only the
++  centre moves, so it would not see it. It walks the centre ring's way
++  round, so its air side is also `climb`.
+ 
+-**Not changed.** The compensation walk (`contour_comp`) and the pocket,
+-ring and waterline fits stay two-sided; their sag laws are their own.
++**Not changed.** The pocket, ring, waterline and plasma fits stay
++two-sided; their sag laws are their own.

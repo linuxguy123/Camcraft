@@ -1,0 +1,851 @@
+From 39328bf4960c965abea02d99641aba62f2b100e3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 14 Nov 2026 01:14:29 -0800
+Subject: [PATCH 1/3] fix(motion): judge every piece of a grazing chord, not
+ its midpoint
+
+WIP from the held worktree: chord_clears splits the chord at every
+boundary touch (collinear edge ends, tangent vertices) and checks the
+midpoint of each piece.
+
+Refs #1620
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/app/tests/adaptive_pinch.rs           | 175 +++++++++++++++++++
+ crates/motion/src/machining2d/chord_clear.rs | 134 ++++++++++++++
+ crates/motion/src/machining2d/mod.rs         |   1 +
+ crates/motion/src/machining2d/slots.rs       |  67 +------
+ 4 files changed, 313 insertions(+), 64 deletions(-)
+ create mode 100644 crates/app/tests/adaptive_pinch.rs
+ create mode 100644 crates/motion/src/machining2d/chord_clear.rs
+
+diff --git a/crates/app/tests/adaptive_pinch.rs b/crates/app/tests/adaptive_pinch.rs
+new file mode 100644
+index 000000000..e943a0af5
+--- /dev/null
++++ b/crates/app/tests/adaptive_pinch.rs
+@@ -0,0 +1,175 @@
++//! Issue #1620: a whole-model 2D Adaptive with default settings cut the
++//! user's `Milling-test.step` about 1 mm into its D wall at every level
++//! (the program sim read the column 10-25 mm deep at (-1.44, -29.94)).
++//! The part pinches the stock's band shut: the cutter-centre area is
++//! pieces whose walls lie on one line (the stock's offset edge), and the
++//! Offset rings the HSM plan fell back to joined two pieces with a feed
++//! along that line, across the gap where the part stands. The chord law
++//! (`machining2d::chord_clears`) read the graze along the second piece's
++//! wall and passed the whole chord on its midpoint; it now judges every
++//! piece of the chord between boundary touches.
++//!
++//! Gate map (#1620): covers app::operation (generate, area), motion
++//! machining2d (chord_clear, waterscan, pocket_hsm).
++//! Provenance: our own regression of the reviewer's reproduction; no
++//! vendor material consulted.
++
++use camcraft_app::cl::{MoveKind, Toolpath};
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
++use camcraft_app::geo2d::{Point2, Region};
++use camcraft_app::geometry::{Mesh, Point3, cylinder, quat_from_yaw, slice};
++use camcraft_app::model;
++use camcraft_app::operation::{self, Height, OpParams, OpType, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++use flecs_ecs::prelude::World;
++
++const TOOL: &str = "EM-0600-4FL";
++const R: f64 = 3.0;
++
++/// `part` in a `side` x `side` box stock standing on Z `z0` .. `z0 + dz`,
++/// aligned or turned a quarter about Z (the same footprint).
++fn job(part: Mesh, side: f64, z0: f64, dz: f64, turned: bool) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("part", part));
++    let rot = if turned { quat_from_yaw(std::f64::consts::FRAC_PI_2) } else { Location::default().rot };
++    let at = Location { pos: Point3::new(0.0, 0.0, z0), rot };
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx: side, dy: side, dz }, at).expect("stock"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    h.execute(&world, AddTool::new(&world, TOOL, tool).expect("tool"));
++    (world, h)
++}
++
++fn generated(world: &World, h: &mut History, src: &str, params: OpParams) -> (Toolpath, usize) {
++    h.execute(world, CreateOperation::new(world, "Op1", TOOL, SrcRef::Entity(src.into()), params).expect("create"));
++    h.execute(world, GenerateOperation::new(world, "Op1").expect("generate"));
++    let e = model::find_by_name(world, "Op1").expect("op");
++    let tp = model::toolpath_of(world, &e).expect("the op generates");
++    (tp.path.clone(), tp.warnings.len())
++}
++
++/// The least distance any cutting move's centre keeps from the Z axis
++/// below `top`, read along arcs on the arc.
++fn closest_to_axis(t: &Toolpath, top: f64) -> (f64, Point3) {
++    let mut worst = (f64::INFINITY, Point3::new(0.0, 0.0, 0.0));
++    for m in t.moves.iter().filter(|m| m.kind != MoveKind::Rapid && m.from.z.min(m.to.z) < top - 1e-6) {
++        for (a, b) in m.chords(0.01) {
++            for k in 0..=16 {
++                let s = f64::from(k) / 16.0;
++                let (x, y) = (a.x + (b.x - a.x) * s, a.y + (b.y - a.y) * s);
++                if x.hypot(y) < worst.0 {
++                    worst = (x.hypot(y), Point3::new(x, y, m.from.z.min(m.to.z)));
++                }
++            }
++        }
++    }
++    worst
++}
++
++fn retyped(kind: OpType, top: f64, bottom: f64) -> OpParams {
++    let mut p = operation::seed_params(kind.ordinal());
++    match &mut p {
++        OpParams::Adaptive2D { top_z, bottom_z, .. } | OpParams::Offset2D { top_z, bottom_z, .. } => {
++            *top_z = Height::fixed(top);
++            *bottom_z = Height::fixed(bottom);
++        }
++        _ => panic!("a pocket-family kind"),
++    }
++    p
++}
++
++/// A 20 mm disc standing in a 31 mm stock: the stock's band around it
++/// is 5.5 mm, under the 6 mm cutter, so the cutter-centre area is the four
++/// corners, whose walls lie on the stock's offset edges. Every cutting
++/// move keeps the cutter off the disc - on the aligned stock and the
++/// turned one, under 2D Adaptive and 2D Offset (both ride the rings).
++#[test]
++fn a_whole_model_clearing_never_joins_two_corners_across_the_part_that_pinches_them() {
++    // 64 facets: the circumradius is 10, every edge at least 9.99 out.
++    let rim = 10.0 * (std::f64::consts::PI / 64.0).cos();
++    for kind in [OpType::Adaptive2D, OpType::Offset2D] {
++        for turned in [false, true] {
++            let (world, mut h) = job(cylinder(20.0, 10.0, 64), 31.0, 0.0, 10.0, turned);
++            let (t, warns) = generated(&world, &mut h, "part", retyped(kind, 10.0, 5.0));
++            let tag = format!("{kind:?} turned {turned}");
++            assert!(t.moves.iter().any(|m| m.kind == MoveKind::Feed && m.to.z < 10.0 - 1e-6), "{tag}: the corners are cut");
++            let (d, at) = closest_to_axis(&t, 10.0);
++            assert!(d >= rim + R - 0.02, "{tag}: a cut at ({:.3}, {:.3}, {:.3}) stands {d:.3} from the axis - {:.3} into the disc", at.x, at.y, at.z, rim + R - d);
++            assert_eq!(warns, 0, "{tag}: the op verifies clean");
++        }
++    }
++}
++
++fn milling_test() -> Mesh {
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/Milling-test.step");
++    let imp = ImportModel::new(&path).expect("the user's STEP imports");
++    let world = new_world();
++    let mut h = History::default();
++    let name = imp.name.clone();
++    h.execute(&world, imp);
++    let e = model::find_by_name(&world, &name).expect("the part");
++    Mesh::from_facets(model::world_facets(&world, &e).expect("facets"))
++}
++
++fn seg_dist(p: Point2, a: Point2, b: Point2) -> f64 {
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let l2 = dx * dx + dy * dy;
++    let t = if l2 > 0.0 { (((p.x - a.x) * dx + (p.y - a.y) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
++    (p.x - a.x - t * dx).hypot(p.y - a.y - t * dy)
++}
++
++/// How far a cutter of radius `R` centred at `p` reaches into `section`.
++fn reach_into(section: &Region, p: Point2) -> f64 {
++    let mut d = f64::INFINITY;
++    for l in section.loops() {
++        let q = l.points();
++        for i in 0..q.len() {
++            d = d.min(seg_dist(p, q[i], q[(i + 1) % q.len()]));
++        }
++    }
++    if section.contains(p) { R + d } else { R - d }
++}
++
++/// The issue's own job: the user's part (a D whose round side is
++/// tangent to Y -30 near X 0) in the 70 mm box with its top at Z 10,
++/// the kind's seed params (Top/Bottom of model, 5 mm steps, helix
++/// entry) and the 6 mm end mill. Before #1620 the Offset rings the HSM
++/// plan fell back to fed along Y -32 from (-8.05, -32) to (32, -32) at
++/// every level, 0.94 mm into the D. Read against the part's own section
++/// at each move's Z; the 0.06 allowance is the arc fit on the faceted
++/// round side (0.045 at worst), far under that cut.
++#[test]
++#[ignore = "heavy lane (release): the HSM plan grinds its budget on the user's part in debug (~90 s)"]
++fn the_users_part_with_default_adaptive_keeps_the_cutter_off_it() {
++    let part = milling_test();
++    let mut sections: Vec<(i64, Region)> = Vec::new();
++    for turned in [false, true] {
++        let (world, mut h) = job(part.clone(), 70.0, -7.0, 17.0, turned);
++        let (t, warns) = generated(&world, &mut h, "part", operation::seed_params(OpType::Adaptive2D.ordinal()));
++        let mut worst = (0.0f64, Point3::new(0.0, 0.0, 0.0));
++        for m in t.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++            let z = m.from.z.min(m.to.z);
++            let key = (z * 1000.0).round() as i64;
++            if !sections.iter().any(|(k, _)| *k == key) {
++                sections.push((key, slice::material_above(&part.facets, z).expect("the part sections")));
++            }
++            let Some((_, sec)) = sections.iter().find(|(k, _)| *k == key) else { continue };
++            for (a, b) in m.chords(0.01) {
++                for k in 0..=8 {
++                    let s = f64::from(k) / 8.0;
++                    let p = Point2::new(a.x + (b.x - a.x) * s, a.y + (b.y - a.y) * s);
++                    let r = reach_into(sec, p);
++                    if r > worst.0 {
++                        worst = (r, Point3::new(p.x, p.y, z));
++                    }
++                }
++            }
++        }
++        let (r, at) = worst;
++        assert!(r < 0.06, "turned {turned}: a cut at ({:.3}, {:.3}, {:.3}) reaches {r:.3} into the part", at.x, at.y, at.z);
++        assert_eq!(warns, 0, "turned {turned}: the op verifies clean");
++    }
++}
+diff --git a/crates/motion/src/machining2d/chord_clear.rs b/crates/motion/src/machining2d/chord_clear.rs
+new file mode 100644
+index 000000000..c607e2f69
+--- /dev/null
++++ b/crates/motion/src/machining2d/chord_clear.rs
+@@ -0,0 +1,134 @@
++//! The straight-chord law of the planar generators: does a chord stay
++//! inside (or on) a closed region? Split from `slots.rs` by #1620, which
++//! also closed its collinear hole (below).
++//!
++//! Provenance: segment/polygon intersection and point-in-polygon tests
++//! (O'Rourke, "Computational Geometry in C", 2nd ed., ch. 7); our own
++//! arrangement of them. No vendor material consulted.
++
++use crate::geo2d::{Point2, Region};
++
++use super::ring::on_boundary;
++
++/// Parameter slack along the chord: a touch closer than this to either
++/// end is the end itself.
++const EPS: f64 = 1e-9;
++
++/// True when the straight chord `a` -> `b` never passes outside the
++/// closed region: both ends in it, no loop edge properly crossing the
++/// open chord, and every piece of the chord between two points where it
++/// touches the boundary inside or on it. A chord running along a
++/// boundary edge is exactly the tangency a wall pass is, so grazing
++/// reads as clear.
++///
++/// Why pieces and not one midpoint (#1620): without a proper crossing
++/// the chord can still leave the region where it runs along an edge and
++/// slips off its end at a vertex whose other edge turns away - two
++/// pieces of one area that meet the chord line only along their own
++/// walls (the cutter-centre pieces either side of a part that pinches
++/// the stock's band shut). Every edge touch splits the chord, and the
++/// midpoint of each piece decides for that piece: between two touches
++/// it meets no boundary, so it lies wholly inside or wholly outside.
++pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
++    if (!region.contains(a) && !on_boundary(region, a))
++        || (!region.contains(b) && !on_boundary(region, b))
++    {
++        return false;
++    }
++    if a == b {
++        return true;
++    }
++    let d = Point2::new(b.x - a.x, b.y - a.y);
++    let dd = d.x * d.x + d.y * d.y;
++    let mut cuts: Vec<f64> = vec![0.0, 1.0];
++    let along = |q: Point2| ((q.x - a.x) * d.x + (q.y - a.y) * d.y) / dd;
++    for l in region.loops() {
++        let pts = l.points();
++        let n = pts.len();
++        for i in 0..n {
++            let c = pts[i];
++            let e = pts[(i + 1) % n];
++            let g = Point2::new(e.x - c.x, e.y - c.y);
++            let ca = Point2::new(c.x - a.x, c.y - a.y);
++            let den = d.x * g.y - d.y * g.x;
++            if den == 0.0 {
++                // Parallel to this edge. On the chord's line (within
++                // the boundary tolerance) it is a graze: its ends split
++                // the chord, so the piece beyond the edge is judged on
++                // its own.
++                let off = ca.x * d.y - ca.y * d.x;
++                if off * off <= 1e-18 * dd {
++                    cuts.extend([along(c), along(e)].into_iter().filter(|t| EPS < *t && *t < 1.0 - EPS));
++                }
++                continue;
++            }
++            let t = (ca.x * g.y - ca.y * g.x) / den;
++            let u = (ca.x * d.y - ca.y * d.x) / den;
++            if !(EPS < t && t < 1.0 - EPS) {
++                continue;
++            }
++            if u > EPS && u < 1.0 - EPS {
++                return false; // crosses the open edge: a real crossing
++            }
++            if u >= -EPS && u <= 1.0 + EPS {
++                // The chord goes through a loop vertex. That cuts the
++                // boundary only if the two edges meeting there are on
++                // opposite sides of the chord line; both on one side is
++                // tangency (a fillet touching the straight it joins).
++                let j = if u < 0.5 { i } else { (i + 1) % n };
++                let p0 = pts[(j + n - 1) % n];
++                let p2 = pts[(j + 1) % n];
++                let h0 = (p0.x - a.x) * d.y - (p0.y - a.y) * d.x;
++                let h2 = (p2.x - a.x) * d.y - (p2.y - a.y) * d.x;
++                if h0 * h2 < 0.0 {
++                    return false;
++                }
++                cuts.push(t);
++            }
++        }
++    }
++    cuts.sort_by(f64::total_cmp);
++    cuts.dedup_by(|x, y| (*x - *y).abs() <= EPS);
++    cuts.windows(2).all(|w| {
++        let s = (w[0] + w[1]) * 0.5;
++        let m = Point2::new(a.x + d.x * s, a.y + d.y * s);
++        region.contains(m) || on_boundary(region, m)
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::geo2d::Loop;
++
++    fn sq(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++        let p = Point2::new;
++        Loop::new(vec![p(x0, y0), p(x1, y0), p(x1, y1), p(x0, y1)]).expect("loop")
++    }
++
++    /// #1620's shape: two pieces whose bottoms lie on one line with a
++    /// gap between them. The chord from one piece's inner corner along
++    /// the shared line to the far corner of the other grazes the second
++    /// piece's wall and leaves the area across the gap.
++    #[test]
++    fn a_chord_along_two_pieces_walls_across_the_gap_between_them_does_not_clear() {
++        let region = Region::new(vec![sq(-32.0, -32.0, -8.0, -8.0), sq(8.0, -32.0, 32.0, -8.0)]).expect("region");
++        let (a, b) = (Point2::new(-8.0, -32.0), Point2::new(32.0, -32.0));
++        assert!(!chord_clears(&region, a, b), "the gap x in (-8, 8) is outside the area");
++        assert!(!chord_clears(&region, b, a), "either way along it");
++        // Its two grazing halves on each piece's own wall still clear.
++        assert!(chord_clears(&region, Point2::new(-32.0, -32.0), a));
++        assert!(chord_clears(&region, Point2::new(8.0, -32.0), b));
++    }
++
++    /// The graze law the wall passes ride stays: a chord along one edge,
++    /// past a convex corner tangent to the chord, inside one piece.
++    #[test]
++    fn a_chord_grazing_one_pieces_wall_still_clears() {
++        let region = Region::new(vec![sq(0.0, 0.0, 30.0, 30.0)]).expect("region");
++        assert!(chord_clears(&region, Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)));
++        assert!(chord_clears(&region, Point2::new(5.0, 0.0), Point2::new(25.0, 0.0)));
++        assert!(chord_clears(&region, Point2::new(0.0, 0.0), Point2::new(30.0, 30.0)));
++        assert!(!chord_clears(&region, Point2::new(0.0, 0.0), Point2::new(31.0, 0.0)));
++    }
++}
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index ebebe9574..45cb7656e 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -73,6 +73,7 @@ mod adaptive;
+ mod adaptive_method;
+ mod adaptive_troch;
+ mod rest2d;
++mod chord_clear;
+ mod ring;
+ mod slots;
+ mod slot_room;
+diff --git a/crates/motion/src/machining2d/slots.rs b/crates/motion/src/machining2d/slots.rs
+index 67853e9cc..a0c3697bc 100644
+--- a/crates/motion/src/machining2d/slots.rs
++++ b/crates/motion/src/machining2d/slots.rs
+@@ -8,7 +8,6 @@ use crate::links::Links;
+ 
+ use super::face::{GenError, band};
+ use super::levels::{Cert, Motion, cut_levels, run_levels};
+-use super::ring::on_boundary;
+ /// Slotting: a straight channel between two XY points, cleared in rows
+ /// parallel to its axis. The channel is the stadium swept by a disc of
+ /// radius `width / 2` along `a` -> `b`; shrinking a stadium is narrowing
+@@ -373,66 +372,6 @@ pub fn trace(region: &Region, p: &TraceParams) -> Result<Toolpath, GenError> {
+     Ok(path)
+ }
+ 
+-/// True when the straight chord `a` -> `b` never passes outside the
+-/// closed region: both ends in it, no loop edge properly crossing the
+-/// open chord, and the chord midpoint inside or on the boundary. Without
+-/// a proper crossing the open chord lies in one connected piece of the
+-/// plane complement, so the midpoint decides for all of it - and a chord
+-/// running along a boundary edge is exactly the tangency a wall pass is,
+-/// so grazing reads as clear.
+-pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+-    if (!region.contains(a) && !on_boundary(region, a))
+-        || (!region.contains(b) && !on_boundary(region, b))
+-    {
+-        return false;
+-    }
+-    if a == b {
+-        return true;
+-    }
+-    let d = Point2::new(b.x - a.x, b.y - a.y);
+-    let m = Point2::new(a.x + d.x * 0.5, a.y + d.y * 0.5);
+-    let eps = 1e-9;
+-    for l in region.loops() {
+-        let pts = l.points();
+-        let n = pts.len();
+-        for i in 0..n {
+-            let c = pts[i];
+-            let e = pts[(i + 1) % n];
+-            let g = Point2::new(e.x - c.x, e.y - c.y);
+-            let ca = Point2::new(c.x - a.x, c.y - a.y);
+-            let den = d.x * g.y - d.y * g.x;
+-            if den == 0.0 {
+-                // Parallel to this edge: touching it is decided by the
+-                // midpoint test below (a graze along a boundary line is
+-                // exactly what wall and hole-ceiling passes are).
+-                continue;
+-            }
+-            let t = (ca.x * g.y - ca.y * g.x) / den;
+-            let u = (ca.x * d.y - ca.y * d.x) / den;
+-            if !(eps < t && t < 1.0 - eps) {
+-                continue;
+-            }
+-            if u > eps && u < 1.0 - eps {
+-                return false; // crosses the open edge: a real crossing
+-            }
+-            if u >= -eps && u <= 1.0 + eps {
+-                // The chord goes through a loop vertex. That cuts the
+-                // boundary only if the two edges meeting there are on
+-                // opposite sides of the chord line; both on one side is
+-                // tangency (a fillet touching the straight it joins).
+-                let j = if u < 0.5 { i } else { (i + 1) % n };
+-                let p0 = pts[(j + n - 1) % n];
+-                let p2 = pts[(j + 1) % n];
+-                let h0 = (p0.x - a.x) * d.y - (p0.y - a.y) * d.x;
+-                let h2 = (p2.x - a.x) * d.y - (p2.y - a.y) * d.x;
+-                if h0 * h2 < 0.0 {
+-                    return false;
+-                }
+-            }
+-        }
+-    }
+-    // No proper crossing: the open chord lives in one connected piece of
+-    // the plane minus the loops, and the midpoint decides which. This
+-    // also decides every parallel/graze case (on_boundary is tolerant).
+-    region.contains(m) || on_boundary(region, m)
+-}
++/// The chord law lives in `chord_clear` (#1620); re-exported here, where
++/// its callers have always found it.
++pub use super::chord_clear::chord_clears;
+
+From ec697404e66e0e13452b544510bee2034c607c33 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 14 Nov 2026 01:51:47 -0800
+Subject: [PATCH 2/3] fix(motion): a chord that grazes one piece's wall and
+ leaves the area no longer clears
+
+chord_clears read one midpoint when no edge crossed the chord. A chord
+can run along a wall of one piece of the cutter-centre area, leave the
+area at the end of that wall, and come back on a second piece on the
+same line. On Milling-test.step with a default whole-model 2D Adaptive
+the path fed along Y -32 from (-8.05, -32) to (32, -32) at every level,
+0.94 mm into the part. The law now splits the chord at every vertex it
+touches without a crossing and judges the midpoint of each piece.
+
+Pinned by adaptive_pinch (a disc that pinches the band, Adaptive and
+Offset, aligned and turned stock; the user's part through generate and
+the program sim) and two chord_clear unit tests.
+
+Fixes #1620
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/app/tests/adaptive_pinch.rs           | 52 +++++++++++++-------
+ crates/motion/src/machining2d/chord_clear.rs | 23 ++++-----
+ docs/decisions/1620-chord-pieces.md          | 38 ++++++++++++++
+ 3 files changed, 82 insertions(+), 31 deletions(-)
+ create mode 100644 docs/decisions/1620-chord-pieces.md
+
+diff --git a/crates/app/tests/adaptive_pinch.rs b/crates/app/tests/adaptive_pinch.rs
+index e943a0af5..314915b51 100644
+--- a/crates/app/tests/adaptive_pinch.rs
++++ b/crates/app/tests/adaptive_pinch.rs
+@@ -1,16 +1,15 @@
+ //! Issue #1620: a whole-model 2D Adaptive with default settings cut the
+-//! user's `Milling-test.step` about 1 mm into its D wall at every level
+-//! (the program sim read the column 10-25 mm deep at (-1.44, -29.94)).
++//! user's `Milling-test.step` 0.94 mm into its D wall at every level.
+ //! The part pinches the stock's band shut: the cutter-centre area is
+ //! pieces whose walls lie on one line (the stock's offset edge), and the
+-//! Offset rings the HSM plan fell back to joined two pieces with a feed
+-//! along that line, across the gap where the part stands. The chord law
++//! clearing joined two pieces with a feed along that line, across the
++//! gap where the part stands. The chord law
+ //! (`machining2d::chord_clears`) read the graze along the second piece's
+ //! wall and passed the whole chord on its midpoint; it now judges every
+ //! piece of the chord between boundary touches.
+ //!
+-//! Gate map (#1620): covers app::operation (generate, area), motion
+-//! machining2d (chord_clear, waterscan, pocket_hsm).
++//! Gate map (#1620): covers app::operation (generate, area),
++//! app::stock_sim, motion machining2d (chord_clear, waterscan, pocket_hsm).
+ //! Provenance: our own regression of the reviewer's reproduction; no
+ //! vendor material consulted.
+ 
+@@ -22,6 +21,7 @@ use camcraft_app::model;
+ use camcraft_app::operation::{self, Height, OpParams, OpType, SrcRef};
+ use camcraft_app::schema::Location;
+ use camcraft_app::stock::StockShape;
++use camcraft_app::stock_sim::simulate_document;
+ use camcraft_app::tools::catalog;
+ use camcraft_app::world::new_world;
+ use flecs_ecs::prelude::World;
+@@ -30,15 +30,20 @@ const TOOL: &str = "EM-0600-4FL";
+ const R: f64 = 3.0;
+ 
+ /// `part` in a `side` x `side` box stock standing on Z `z0` .. `z0 + dz`,
+-/// aligned or turned a quarter about Z (the same footprint).
+-fn job(part: Mesh, side: f64, z0: f64, dz: f64, turned: bool) -> (World, History) {
++/// aligned or turned a quarter about Z (the same footprint). `flutes`
++/// lengthens the end mill's flutes when the part is deeper than the
++/// catalog's 15 mm (the shank law is not this issue's).
++fn job(part: Mesh, side: f64, z0: f64, dz: f64, turned: bool, flutes: Option<f64>) -> (World, History) {
+     let world = new_world();
+     let mut h = History::default();
+     h.execute(&world, ImportModel::from_mesh("part", part));
+     let rot = if turned { quat_from_yaw(std::f64::consts::FRAC_PI_2) } else { Location::default().rot };
+     let at = Location { pos: Point3::new(0.0, 0.0, z0), rot };
+     h.execute(&world, SetStock::new(&world, StockShape::Box { dx: side, dy: side, dz }, at).expect("stock"));
+-    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    let mut tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    if let Some(f) = flutes {
++        tool.flute_len = f;
++    }
+     h.execute(&world, AddTool::new(&world, TOOL, tool).expect("tool"));
+     (world, h)
+ }
+@@ -92,7 +97,7 @@ fn a_whole_model_clearing_never_joins_two_corners_across_the_part_that_pinches_t
+     let rim = 10.0 * (std::f64::consts::PI / 64.0).cos();
+     for kind in [OpType::Adaptive2D, OpType::Offset2D] {
+         for turned in [false, true] {
+-            let (world, mut h) = job(cylinder(20.0, 10.0, 64), 31.0, 0.0, 10.0, turned);
++            let (world, mut h) = job(cylinder(20.0, 10.0, 64), 31.0, 0.0, 10.0, turned, None);
+             let (t, warns) = generated(&world, &mut h, "part", retyped(kind, 10.0, 5.0));
+             let tag = format!("{kind:?} turned {turned}");
+             assert!(t.moves.iter().any(|m| m.kind == MoveKind::Feed && m.to.z < 10.0 - 1e-6), "{tag}: the corners are cut");
+@@ -134,20 +139,23 @@ fn reach_into(section: &Region, p: Point2) -> f64 {
+ }
+ 
+ /// The issue's own job: the user's part (a D whose round side is
+-/// tangent to Y -30 near X 0) in the 70 mm box with its top at Z 10,
+-/// the kind's seed params (Top/Bottom of model, 5 mm steps, helix
+-/// entry) and the 6 mm end mill. Before #1620 the Offset rings the HSM
+-/// plan fell back to fed along Y -32 from (-8.05, -32) to (32, -32) at
+-/// every level, 0.94 mm into the D. Read against the part's own section
++/// tangent to Y -30 near X 0, Z -5 .. 20) in the 70 x 70 x 27 box on
++/// Z -7 that covers it, the kind's seed params (Top/Bottom of model,
++/// 5 mm steps, helix entry) and the 6 mm end mill with 30 mm flutes.
++/// (A box with its top at Z 10, as first reported, leaves the part
++/// 10 mm proud of the stock: the sim reads that as a 10 mm "gouge" at
++/// the first part column, (-1.44, -29.94), whatever the path does.)
++/// Before #1620 the path fed along Y -32 from (-8.05, -32) to (32, -32)
++/// at every level, 0.94 mm into the D. Read against the part's own section
+ /// at each move's Z; the 0.06 allowance is the arc fit on the faceted
+ /// round side (0.045 at worst), far under that cut.
+ #[test]
+-#[ignore = "heavy lane (release): the HSM plan grinds its budget on the user's part in debug (~90 s)"]
++#[ignore = "heavy lane (release): the HSM plan grinds its budget on the user's part in debug (~5 min for both stocks)"]
+ fn the_users_part_with_default_adaptive_keeps_the_cutter_off_it() {
+     let part = milling_test();
+     let mut sections: Vec<(i64, Region)> = Vec::new();
+     for turned in [false, true] {
+-        let (world, mut h) = job(part.clone(), 70.0, -7.0, 17.0, turned);
++        let (world, mut h) = job(part.clone(), 70.0, -7.0, 27.0, turned, Some(30.0));
+         let (t, warns) = generated(&world, &mut h, "part", operation::seed_params(OpType::Adaptive2D.ordinal()));
+         let mut worst = (0.0f64, Point3::new(0.0, 0.0, 0.0));
+         for m in t.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
+@@ -171,5 +179,15 @@ fn the_users_part_with_default_adaptive_keeps_the_cutter_off_it() {
+         let (r, at) = worst;
+         assert!(r < 0.06, "turned {turned}: a cut at ({:.3}, {:.3}, {:.3}) reaches {r:.3} into the part", at.x, at.y, at.z);
+         assert_eq!(warns, 0, "turned {turned}: the op verifies clean");
++        if !turned {
++            // The program sim reads the same job (it judges the aligned
++            // stock; the turned one rests on the op law above).
++            let sim = simulate_document(&world).expect("the program sim runs");
++            assert_eq!(
++                sim.dev.gouge_cells, 0,
++                "the sim reads a gouge, worst {:.3} mm at {:?}",
++                sim.dev.max_gouge, sim.dev.max_gouge_at
++            );
++        }
+     }
+ }
+diff --git a/crates/motion/src/machining2d/chord_clear.rs b/crates/motion/src/machining2d/chord_clear.rs
+index c607e2f69..e887438fc 100644
+--- a/crates/motion/src/machining2d/chord_clear.rs
++++ b/crates/motion/src/machining2d/chord_clear.rs
+@@ -26,9 +26,11 @@ const EPS: f64 = 1e-9;
+ /// slips off its end at a vertex whose other edge turns away - two
+ /// pieces of one area that meet the chord line only along their own
+ /// walls (the cutter-centre pieces either side of a part that pinches
+-/// the stock's band shut). Every edge touch splits the chord, and the
+-/// midpoint of each piece decides for that piece: between two touches
+-/// it meets no boundary, so it lies wholly inside or wholly outside.
++/// the stock's band shut). Every vertex the chord touches without a
++/// crossing splits the chord (the ends of a grazed edge are such
++/// vertices), and the midpoint of each piece decides for that piece:
++/// between two touches it crosses no boundary, so it lies wholly in the
++/// closed region or wholly outside it.
+ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+     if (!region.contains(a) && !on_boundary(region, a))
+         || (!region.contains(b) && !on_boundary(region, b))
+@@ -39,9 +41,7 @@ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+         return true;
+     }
+     let d = Point2::new(b.x - a.x, b.y - a.y);
+-    let dd = d.x * d.x + d.y * d.y;
+     let mut cuts: Vec<f64> = vec![0.0, 1.0];
+-    let along = |q: Point2| ((q.x - a.x) * d.x + (q.y - a.y) * d.y) / dd;
+     for l in region.loops() {
+         let pts = l.points();
+         let n = pts.len();
+@@ -52,14 +52,9 @@ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+             let ca = Point2::new(c.x - a.x, c.y - a.y);
+             let den = d.x * g.y - d.y * g.x;
+             if den == 0.0 {
+-                // Parallel to this edge. On the chord's line (within
+-                // the boundary tolerance) it is a graze: its ends split
+-                // the chord, so the piece beyond the edge is judged on
+-                // its own.
+-                let off = ca.x * d.y - ca.y * d.x;
+-                if off * off <= 1e-18 * dd {
+-                    cuts.extend([along(c), along(e)].into_iter().filter(|t| EPS < *t && *t < 1.0 - EPS));
+-                }
++                // Parallel to this edge. An edge on the chord's line is
++                // a graze; its ends are vertices that the edges next to
++                // it meet (below), and those touches split the chord.
+                 continue;
+             }
+             let t = (ca.x * g.y - ca.y * g.x) / den;
+@@ -70,7 +65,7 @@ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+             if u > EPS && u < 1.0 - EPS {
+                 return false; // crosses the open edge: a real crossing
+             }
+-            if u >= -EPS && u <= 1.0 + EPS {
++            if (-EPS..=1.0 + EPS).contains(&u) {
+                 // The chord goes through a loop vertex. That cuts the
+                 // boundary only if the two edges meeting there are on
+                 // opposite sides of the chord line; both on one side is
+diff --git a/docs/decisions/1620-chord-pieces.md b/docs/decisions/1620-chord-pieces.md
+new file mode 100644
+index 000000000..42f549abb
+--- /dev/null
++++ b/docs/decisions/1620-chord-pieces.md
+@@ -0,0 +1,38 @@
++## #1620 - The chord law judges every piece of a chord
++
++**Decided:** `chord_clears` (now in `crates/motion/src/machining2d/chord_clear.rs`)
++splits the chord at every loop vertex it touches without a crossing (a
++vertex where both edges stay on one side of the line, or one edge lies
++on it). The midpoint of each piece
++must be inside the region or on its boundary. Before, one midpoint decided
++the whole chord.
++
++**Why:** A chord can run along an edge of one piece of the area, leave the
++area at the end of that edge, and come back on the edge of a second piece
++on the same line. No edge crosses the chord, so the old test found no
++crossing and read one midpoint. On `Milling-test.step` that midpoint was in
++a piece, and the 2D Adaptive path fed along Y -32 from (-8.05, -32) to
++(32, -32) at every level, 0.94 mm into the part. The law is the cause; each
++generator that links with it (2D pockets, Adaptive, Offset, the 3D ladders)
++gets the fix at once.
++
++The first draft also split the chord at the ends of each edge that lies
++on the chord line. A mutation test showed that this adds nothing: those
++ends are vertices, and the edges next to them already split the chord.
++It was removed.
++
++The issue's "10 mm at (-1.44, -29.94)" came from a stock with its top at
++Z 10, under the part's top at Z 20. The sim reads every part column above
++the stock as a 10 mm gouge, and that spot is the first part column. The
++pin uses a stock that covers the part (70 x 70 x 27 on Z -7) and an end
++mill with 30 mm flutes, because the catalog's 15 mm flutes cannot reach
++the 25 mm deep part without a shank hit (a separate, correct refusal).
++
++**Considered and dropped:** A check in the Offset ring linker only. It
++fixes this job but leaves the same hole for every other caller of the law.
++A full segment-region boolean (clip the chord against the region). It is
++correct but much slower on a law that runs for every link.
++
++**Cost to change later:** Low. The law has one function and unit tests in
++the same file. A tighter law only refuses more links; a refused link
++becomes a retract and a plunge, which is safe.
+
+From 8deec2acd6bf3469c2ad499527a362930c0e9db9 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 14 Nov 2026 03:13:39 -0800
+Subject: [PATCH 3/3] fix(motion): a vertex within the boundary tolerance of a
+ chord splits it
+
+Review of PR #1651: a vertex split the chord only when the edge
+parameter was within 1e-9 of an end. On a short chamfer edge, a chord
+end that on_boundary accepts (up to 1e-9 mm off the wall) passes the
+vertex by many parameter units, and the gap chord cleared again. Each
+loop vertex within BOUNDARY_TOL mm of the chord line now splits it;
+on_boundary and the chord law share that one constant.
+
+Pinned by chord_clear::tests::a_chord_end_a_hair_off_the_wall_line_still_splits_at_a_short_chamfer
+and a_vertex_touches_the_chord_within_the_boundary_tolerance_and_not_beyond.
+
+Refs #1620
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/motion/src/machining2d/chord_clear.rs | 60 +++++++++++++++++++-
+ crates/motion/src/machining2d/ring.rs        |  7 ++-
+ docs/decisions/1620-chord-pieces.md          |  9 +++
+ 3 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/crates/motion/src/machining2d/chord_clear.rs b/crates/motion/src/machining2d/chord_clear.rs
+index e887438fc..e988c9af2 100644
+--- a/crates/motion/src/machining2d/chord_clear.rs
++++ b/crates/motion/src/machining2d/chord_clear.rs
+@@ -8,7 +8,7 @@
+ 
+ use crate::geo2d::{Point2, Region};
+ 
+-use super::ring::on_boundary;
++use super::ring::{BOUNDARY_TOL, on_boundary};
+ 
+ /// Parameter slack along the chord: a touch closer than this to either
+ /// end is the end itself.
+@@ -31,6 +31,12 @@ const EPS: f64 = 1e-9;
+ /// vertices), and the midpoint of each piece decides for that piece:
+ /// between two touches it crosses no boundary, so it lies wholly in the
+ /// closed region or wholly outside it.
++///
++/// A vertex is a touch when it lies within [`BOUNDARY_TOL`] mm of the
++/// chord's line, measured as a distance - the same slack `on_boundary`
++/// gives the chord's ends. An edge-parameter test alone misses it on a
++/// short edge (a chamfer facet a few microns long), where a nanometer
++/// off the line is many parameter units (#1620 review).
+ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+     if (!region.contains(a) && !on_boundary(region, a))
+         || (!region.contains(b) && !on_boundary(region, b))
+@@ -42,6 +48,9 @@ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+     }
+     let d = Point2::new(b.x - a.x, b.y - a.y);
+     let mut cuts: Vec<f64> = vec![0.0, 1.0];
++    for l in region.loops() {
++        cuts.extend(l.points().iter().filter_map(|v| vertex_touch(a, d, *v)));
++    }
+     for l in region.loops() {
+         let pts = l.points();
+         let n = pts.len();
+@@ -91,6 +100,20 @@ pub fn chord_clears(region: &Region, a: Point2, b: Point2) -> bool {
+     })
+ }
+ 
++/// Where (as a chord parameter strictly between the ends) vertex `v`
++/// touches the chord `a` -> `a + d`, when it lies within
++/// [`BOUNDARY_TOL`] mm of the chord's line.
++fn vertex_touch(a: Point2, d: Point2, v: Point2) -> Option<f64> {
++    let dd = d.x * d.x + d.y * d.y;
++    if !dd.is_finite() || dd <= 0.0 {
++        return None;
++    }
++    let (vx, vy) = (v.x - a.x, v.y - a.y);
++    let h = vx * d.y - vy * d.x; // the distance off the line, times |d|
++    let t = (vx * d.x + vy * d.y) / dd;
++    (h * h <= BOUNDARY_TOL * BOUNDARY_TOL * dd && EPS < t && t < 1.0 - EPS).then_some(t)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -126,4 +149,39 @@ mod tests {
+         assert!(chord_clears(&region, Point2::new(0.0, 0.0), Point2::new(30.0, 30.0)));
+         assert!(!chord_clears(&region, Point2::new(0.0, 0.0), Point2::new(31.0, 0.0)));
+     }
++
++    /// The review's probe: the second piece's near corner is a 0.014 mm
++    /// chamfer. A chord end under a nanometer below the wall line is on
++    /// the boundary, and the chord line then passes the chamfer's lower
++    /// vertex by a fraction of a nanometer - many parameter units of that
++    /// short edge. The vertex still splits the chord, so the 16 mm gap
++    /// is still read.
++    #[test]
++    fn a_chord_end_a_hair_off_the_wall_line_still_splits_at_a_short_chamfer() {
++        let p = Point2::new;
++        let chamfered = Loop::new(vec![p(8.01, -32.0), p(32.0, -32.0), p(32.0, -8.0), p(8.0, -8.0), p(8.0, -31.99)]).expect("loop");
++        let region = Region::new(vec![sq(-32.0, -32.0, -8.0, -8.0), chamfered]).expect("region");
++        for d in [0.0, 1e-12, 1e-10, 5e-10, 9e-10, -5e-10] {
++            assert!(!chord_clears(&region, p(-8.0, -32.0), p(32.0, -32.0 - d)), "end {d:e} mm off the line: the gap x in (-8, 8) is outside");
++        }
++    }
++
++    /// The vertex touch is a distance in mm, from both sides of
++    /// `BOUNDARY_TOL`, on a long chord and a short one.
++    #[test]
++    fn a_vertex_touches_the_chord_within_the_boundary_tolerance_and_not_beyond() {
++        let p = Point2::new;
++        for len in [40.0, 0.01] {
++            let (a, d) = (p(0.0, 0.0), p(len, 0.0));
++            for side in [1.0, -1.0] {
++                let near = p(len * 0.25, side * 0.9 * BOUNDARY_TOL);
++                let far = p(len * 0.25, side * 1.1 * BOUNDARY_TOL);
++                let t = vertex_touch(a, d, near).expect("0.9 tol off the line touches");
++                assert!((t - 0.25).abs() < 1e-12, "at its foot on the chord: {t}");
++                assert_eq!(vertex_touch(a, d, far), None, "1.1 tol off the line does not touch (len {len})");
++            }
++            assert_eq!(vertex_touch(a, d, a), None, "a chord end is not a split");
++            assert_eq!(vertex_touch(a, d, p(len * 1.5, 0.0)), None, "a vertex past the end is not a split");
++        }
++    }
+ }
+diff --git a/crates/motion/src/machining2d/ring.rs b/crates/motion/src/machining2d/ring.rs
+index 2d3f66fe8..ff90cdfff 100644
+--- a/crates/motion/src/machining2d/ring.rs
++++ b/crates/motion/src/machining2d/ring.rs
+@@ -153,6 +153,11 @@ pub(super) fn dist(a: Point2, b: Point2) -> f64 {
+     ((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)).sqrt()
+ }
+ 
++/// How far (mm) a point may sit off a loop edge and still read as on it:
++/// [`on_boundary`] and the chord law's vertex touch (`chord_clear`, #1620)
++/// share it, so a chord end the one accepts is a touch the other sees.
++pub(super) const BOUNDARY_TOL: f64 = 1e-9;
++
+ /// True when `p` sits on some loop edge, within a nanometer - exact-zero
+ /// float tests cannot work here: a computed point on an edge (a chord's
+ /// midpoint) has round-off of a few ulps against the cross product, and
+@@ -160,7 +165,7 @@ pub(super) fn dist(a: Point2, b: Point2) -> f64 {
+ /// is far under the micron quantization of the geometry and far over the
+ /// cancellation error.
+ pub fn on_boundary(region: &Region, p: Point2) -> bool {
+-    pub(super) const TOL: f64 = 1e-9;
++    const TOL: f64 = BOUNDARY_TOL;
+     for l in region.loops() {
+         let pts = l.points();
+         let n = pts.len();
+diff --git a/docs/decisions/1620-chord-pieces.md b/docs/decisions/1620-chord-pieces.md
+index 42f549abb..58b708915 100644
+--- a/docs/decisions/1620-chord-pieces.md
++++ b/docs/decisions/1620-chord-pieces.md
+@@ -16,6 +16,15 @@ a piece, and the 2D Adaptive path fed along Y -32 from (-8.05, -32) to
+ generator that links with it (2D pockets, Adaptive, Offset, the 3D ladders)
+ gets the fix at once.
+ 
++After review, a vertex also counts as a touch when it is within
++`BOUNDARY_TOL` (1e-9 mm, in `ring.rs`) of the chord line, measured as a
++distance. `on_boundary` uses the same constant. Before, only the edge
++parameter decided, so a chord end that `on_boundary` accepted (up to
++1e-9 mm off the wall) could pass the vertex of a short chamfer edge by
++many parameter units, and the gap chord cleared again. An extra split
++only adds a midpoint test, so it cannot let through a chord that the law
++refused before.
++
+ The first draft also split the chord at the ends of each edge that lies
+ on the chord line. A mutation test showed that this adds nothing: those
+ ends are vertices, and the edges next to them already split the chord.
