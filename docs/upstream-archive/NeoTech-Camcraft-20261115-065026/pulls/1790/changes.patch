@@ -1,0 +1,503 @@
+From 31dc65818dbb341c6ba199979a07e87891f84a21 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 14 Nov 2026 19:35:21 -0800
+Subject: [PATCH] fix(build): run independent release gate lanes in parallel
+
+Prebuild both profiles, bound release waves to four lanes, and isolate
+watchdog-containing crates and UI suites. Preserve separate lane logs,
+checkout validation, and failed-build stopping.
+
+Normalize unchanged Cargo.lock lines when checking version-only release
+diffs so CRLF conversion does not reject a valid version bump.
+
+Co-Authored-By: OpenAI Codex <noreply@openai.com>
+
+Fixes #1703
+---
+ docs/decisions/1703-parallel-gate.md |  37 +++++++++
+ xtask/src/exec.rs                    |  57 +++++++++++---
+ xtask/src/lanes.rs                   |  59 ++++++++++++++
+ xtask/src/lanes_tests.rs             | 114 +++++++++++++++++++++++++++
+ xtask/src/main.rs                    |   3 +
+ xtask/src/plan.rs                    |  15 +++-
+ xtask/src/release_bump.rs            |  42 +++++++---
+ xtask/src/release_tests.rs           |  12 +++
+ xtask/src/tests.rs                   |   8 +-
+ 9 files changed, 317 insertions(+), 30 deletions(-)
+ create mode 100644 docs/decisions/1703-parallel-gate.md
+ create mode 100644 xtask/src/lanes.rs
+ create mode 100644 xtask/src/lanes_tests.rs
+
+diff --git a/docs/decisions/1703-parallel-gate.md b/docs/decisions/1703-parallel-gate.md
+new file mode 100644
+index 000000000..a544f7984
+--- /dev/null
++++ b/docs/decisions/1703-parallel-gate.md
+@@ -0,0 +1,37 @@
++## #1703 - Run independent release-gate lanes together
++
++**Decided:** Prebuild the debug test targets and the release heavy targets before
++running release-gate suites. Run independent suites in waves of at most four,
++mixing debug and release steps. Keep app, kernel, UI, build and clippy steps alone.
++Keep invoking Cargo for each suite after the prebuilds, with the existing working
++directories, libtest arguments and separate numbered logs.
++
++**Why:** This preserves the existing suite selection and diagnostics while
++overlapping test execution. App and kernel contain import watchdogs; keeping their
++whole suites alone avoids a fragile list of individual timed tests. UI suites can
++open windows and must also run alone. Debug and release use different profile
++directories. A temporary probe with four prebuilt two-second test runs measured
++8.086 seconds serially and 2.052 seconds concurrently. Cargo briefly held package
++and build locks, then released them before test execution. This supports using the
++existing Cargo commands rather than writing an artifact parser and test launcher.
++
++The gate reports each lane's duration, total elapsed time and the sum of lane wall
++times. The sum is an estimate of serial cost under the current load, not a measured
++serial release benchmark. A full release-tier serial/parallel comparison has not
++been exercised by this issue's quick verification.
++
++**Also decided:** Compare corresponding removed and added Cargo.lock lines after
++normalizing CRLF line endings. Permit unchanged lines and version-line changes;
++continue refusing changed names, checksums and other content.
++
++**Considered and dropped:** Running every suite concurrently risks watchdog and
++window failures. An unbounded worker pool risks exhausting machine resources.
++Splitting individual app/kernel binaries can improve utilization later but needs
++a reliable inventory of timed suites. A custom Cargo artifact parser duplicates
++Cargo's target selection. Splitting work between uma and m3 adds coordination,
++artifact transfer and failure handling beyond the optional multi-host request.
++
++**Cost to change later:** The wave planner and its tests own concurrency and
++isolation policy. Finer isolation or a queue that immediately fills freed slots
++can change that module without changing suite commands. Multi-host execution
++would additionally need a runner protocol and combined checkout/log validation.
+diff --git a/xtask/src/exec.rs b/xtask/src/exec.rs
+index 81f2c3ec3..b599942ef 100644
+--- a/xtask/src/exec.rs
++++ b/xtask/src/exec.rs
+@@ -151,11 +151,37 @@ impl Run {
+         for n in &plan.notes {
+             println!("{n}");
+         }
+-        for s in &plan.steps {
+-            if self.check(&format!("before {}", s.name)) {
+-                break;
++        if self.label == "release" {
++            for wave in crate::lanes::waves(&plan.steps) {
++                if self.check("before release wave") {
++                    break;
++                }
++                let results = std::thread::scope(|scope| {
++                    let handles: Vec<_> = wave.iter().map(|&i| {
++                        let (root, logs, dry) = (&self.root, &self.log_dir, self.dry);
++                        let step = &plan.steps[i];
++                        scope.spawn(move || Self::execute(root, logs, dry, i + 1, step))
++                    }).collect();
++                    // Join every lane even when one returns an error or panics.
++                    let joined: Vec<_> = handles.into_iter().map(|h| {
++                        h.join().map_err(|_| "gate lane thread failed".to_string()).and_then(|r| r)
++                    }).collect();
++                    joined.into_iter().collect::<Result<Vec<_>, String>>()
++                })?;
++                let build_failed = wave.iter().any(|&i| plan.steps[i].args.iter().any(|a| a == "--no-run"))
++                    && results.iter().any(|d| !d.ok);
++                self.done.extend(results);
++                if build_failed {
++                    break;
++                }
++            }
++        } else {
++            for s in &plan.steps {
++                if self.check(&format!("before {}", s.name)) {
++                    break;
++                }
++                self.step(s)?;
+             }
+-            self.step(s)?;
+         }
+         if self.void.is_none() {
+             self.check("at the end");
+@@ -185,15 +211,19 @@ impl Run {
+     }
+ 
+     fn step(&mut self, s: &Step) -> Result<(), String> {
+-        let n = self.done.len() + 1;
+-        let log = self.log_dir.join(log_name(n, &s.name));
+-        let dir = if s.in_ui { self.root.join("crates").join("ui") } else { self.root.clone() };
++        let done = Self::execute(&self.root, &self.log_dir, self.dry, self.done.len() + 1, s)?;
++        self.done.push(done);
++        Ok(())
++    }
++
++    fn execute(root: &Path, log_dir: &Path, dry: bool, n: usize, s: &Step) -> Result<Done, String> {
++        let log = log_dir.join(log_name(n, &s.name));
++        let dir = if s.in_ui { root.join("crates").join("ui") } else { root.to_path_buf() };
+         let leaf = dir.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+         println!("[{n:02}] {}", s.name);
+         println!("     (cwd {leaf}) cargo {}", s.args.join(" "));
+-        if self.dry {
+-            self.done.push(Done { name: s.name.clone(), ok: true, secs: 0, note: "dry run".into() });
+-            return Ok(());
++        if dry {
++            return Ok(Done { name: s.name.clone(), ok: true, secs: 0, note: "dry run".into() });
+         }
+         let cache = gate_cache_env();
+         if !cache.is_empty() {
+@@ -219,8 +249,7 @@ impl Run {
+         let note = read_log(&std::fs::read_to_string(&log).unwrap_or_default(), code)?;
+         let ok = code == 0;
+         println!("     {} in {secs}s {note}", if ok { "ok" } else { "FAIL" });
+-        self.done.push(Done { name: s.name.clone(), ok, secs, note });
+-        Ok(())
++        Ok(Done { name: s.name.clone(), ok, secs, note })
+     }
+ 
+     /// Prints the summary table; the process exit code (0 all passed, 1 any failed).
+@@ -231,6 +260,10 @@ impl Run {
+         }
+         let bad = self.done.iter().filter(|d| !d.ok).count();
+         let mins = self.clock.elapsed().as_secs_f64() / 60.0;
++        if self.label == "release" {
++            let serial: u64 = self.done.iter().map(|d| d.secs).sum();
++            println!("  summed lane wall time {serial}s (serial estimate; not a serial benchmark)");
++        }
+         println!("  wall {mins:.1} min, {} step(s), {bad} failed", self.done.len());
+         if self.void.is_some() {
+             println!("== gate VOID ({}) - the checkout moved during the run; no verdict, re-run on a checkout nobody pulls into", self.label);
+diff --git a/xtask/src/lanes.rs b/xtask/src/lanes.rs
+new file mode 100644
+index 000000000..7e44adf83
+--- /dev/null
++++ b/xtask/src/lanes.rs
+@@ -0,0 +1,59 @@
++//! Provenance: bounded release-gate lanes requested in issue #1703; standard Rust scoped threads.
++
++use crate::plan::Step;
++
++pub const LIMIT: usize = 4;
++
++/// Whole app/kernel suites include import watchdogs, and UI suites can open windows. Keep these,
++/// builds and clippy alone. A selected release subset uses the same conservative rule.
++pub fn alone(s: &Step) -> bool {
++    s.in_ui
++        || s.args.iter().any(|a| matches!(a.as_str(),
++            "--no-run" | "clippy" | "camcraft-ui" | "camcraft-kernel" | "camcraft-app"
++        ))
++}
++
++/// Group independent suites into waves of at most four. Mix profiles within a wave so heavy release
++/// tests can run beside debug suites. Barrier steps never share a wave, including in selected runs.
++pub fn waves(steps: &[Step]) -> Vec<Vec<usize>> {
++    let mut out = Vec::new();
++    let mut debug = Vec::new();
++    let mut release = Vec::new();
++    for (i, s) in steps.iter().enumerate() {
++        if s.args.iter().any(|a| a == "--no-run") {
++            out.push(vec![i]);
++        } else if !alone(s) {
++            if s.args.iter().any(|a| a == "--release") {
++                release.push(i);
++            } else {
++                debug.push(i);
++            }
++        }
++    }
++    let (mut debug, mut release) = (debug.into_iter(), release.into_iter());
++    loop {
++        let mut wave = Vec::new();
++        for _ in 0..LIMIT / 2 {
++            if let Some(i) = debug.next() {
++                wave.push(i);
++            }
++            if let Some(i) = release.next() {
++                wave.push(i);
++            }
++        }
++        while wave.len() < LIMIT {
++            let Some(i) = debug.next().or_else(|| release.next()) else { break };
++            wave.push(i);
++        }
++        if wave.is_empty() {
++            break;
++        }
++        out.push(wave);
++    }
++    for (i, s) in steps.iter().enumerate() {
++        if alone(s) && !s.args.iter().any(|a| a == "--no-run") {
++            out.push(vec![i]);
++        }
++    }
++    out
++}
+diff --git a/xtask/src/lanes_tests.rs b/xtask/src/lanes_tests.rs
+new file mode 100644
+index 000000000..141a200e2
+--- /dev/null
++++ b/xtask/src/lanes_tests.rs
+@@ -0,0 +1,114 @@
++//! Provenance: release-gate prebuild requirements from issue #1703.
++
++use crate::{lanes, plan::Step};
++
++#[test]
++fn release_prebuilds_both_profiles_before_running_suites() {
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace");
++    let plan = crate::plan::release(root);
++    let first = &plan.steps[0];
++    assert!(first.args.iter().any(|a| a == "--no-run"), "debug prebuild must come before any suite: {}", first.name);
++    assert!(!first.args.iter().any(|a| a == "--release"));
++    let second = &plan.steps[1];
++    assert!(second.args.iter().any(|a| a == "--no-run"), "release prebuild must come before any suite: {}", second.name);
++    assert!(second.args.iter().any(|a| a == "--release"));
++}
++
++#[test]
++fn release_waves_mix_profiles_with_a_four_lane_bound_and_no_omissions() {
++    let mut steps = Vec::new();
++    for i in 0..7 {
++        steps.push(Step::new(format!("debug {i}"), &["test", "-p", "camcraft-motion"], ""));
++        steps.push(Step::new(format!("release {i}"), &["test", "--release", "-p", "camcraft-motion"], ""));
++    }
++    let waves = lanes::waves(&steps);
++    assert_eq!(waves[0].len(), 4, "independent suites must run concurrently");
++    assert!(waves.iter().all(|wave| !wave.is_empty() && wave.len() <= 4));
++    assert!(waves.iter().any(|wave| {
++        wave.iter().any(|&i| steps[i].args.iter().any(|a| a == "--release"))
++            && wave.iter().any(|&i| !steps[i].args.iter().any(|a| a == "--release"))
++    }), "debug and release suites must share a wave");
++    let mut seen: Vec<_> = waves.into_iter().flatten().collect();
++    seen.sort_unstable();
++    assert_eq!(seen, (0..steps.len()).collect::<Vec<_>>());
++}
++
++#[test]
++fn release_builds_and_watchdog_or_window_suites_run_alone() {
++    let steps = vec![
++        Step::new("ordinary", &["test", "-p", "camcraft-motion"], ""),
++        Step::new("debug build", &["test", "--no-run"], ""),
++        Step::new("ui", &["test", "-p", "camcraft-ui"], ""),
++        Step::new("app", &["test", "-p", "camcraft-app"], ""),
++        Step::new("kernel", &["test", "-p", "camcraft-kernel"], ""),
++        Step::new("clippy", &["clippy"], ""),
++        Step::new("release build", &["test", "--release", "--no-run"], ""),
++        Step::new("ui cwd", &["test"], "ui"),
++    ];
++    let waves = lanes::waves(&steps);
++    assert_eq!(&waves[..2], &[vec![1], vec![6]], "both builds precede every run");
++    for &i in &[1, 2, 3, 4, 5, 6, 7] {
++        assert!(waves.contains(&vec![i]), "{} must run alone", steps[i].name);
++    }
++    let mut seen: Vec<_> = waves.into_iter().flatten().collect();
++    seen.sort_unstable();
++    assert_eq!(seen, (0..steps.len()).collect::<Vec<_>>());
++}
++
++#[test]
++fn selected_release_without_builds_still_keeps_watchdogs_alone() {
++    let steps = vec![
++        Step::new("ordinary", &["test", "-p", "camcraft-motion"], ""),
++        Step::new("selected app", &["test", "--release", "-p", "camcraft-app"], ""),
++        Step::new("selected ui", &["test"], "ui"),
++    ];
++    assert_eq!(lanes::waves(&steps), vec![vec![0], vec![1], vec![2]]);
++    assert!(lanes::waves(&[]).is_empty());
++}
++
++#[test]
++fn release_executor_overlaps_lanes_and_keeps_failure_and_checkout_guards() {
++    use std::{fs, process::Command};
++    let root = std::env::temp_dir().join(format!("xtask-lanes-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&root);
++    fs::create_dir_all(root.join("src")).expect("fixture dir");
++    fs::write(root.join("Cargo.toml"), "[package]\nname = \"lane-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n").expect("manifest");
++    fs::write(root.join(".gitignore"), "target/\ngate-logs/\nmarkers/\n").expect("ignore");
++    fs::write(root.join("tracked"), "original").expect("tracked fixture");
++    fs::write(root.join("src/main.rs"), r#"
++use std::{env, fs, path::Path, thread, time::{Duration, Instant}};
++fn main() {
++    fs::create_dir_all("markers").unwrap();
++    let args: Vec<_> = env::args().collect();
++    let own = &args[1];
++    fs::write(format!("markers/{own}"), "ran").unwrap();
++    if own == "fail" { std::process::exit(7); }
++    if own == "move" { fs::write("tracked", "changed").unwrap(); }
++    if let Some(peer) = args.get(2) {
++        let start = Instant::now();
++        while !Path::new(&format!("markers/{peer}")).exists() {
++            assert!(start.elapsed() < Duration::from_secs(5), "peer lane never started");
++            thread::sleep(Duration::from_millis(10));
++        }
++    }
++}
++"#).expect("fixture source");
++    let cargo = Command::new(crate::exec::cargo()).args(["build", "--quiet"]).current_dir(&root).status().expect("build fixture");
++    assert!(cargo.success());
++    for args in [vec!["init", "--quiet"], vec!["add", "."], vec!["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"]] {
++        assert!(Command::new("git").args(args).current_dir(&root).status().expect("git fixture").success());
++    }
++    let run = |steps| {
++        let mut runner = crate::exec::Run::new(&root, "release", false).expect("runner");
++        runner.plan(&crate::plan::Plan { notes: Vec::new(), steps }).expect("execute fixture");
++        runner.summary()
++    };
++    let step = |name: &str, extra: &[&str]| Step::new(name, &["run", "--quiet", "--"], "").with(&extra.iter().map(|s| s.to_string()).collect::<Vec<_>>());
++    assert_eq!(run(vec![step("first", &["first", "second"]), step("second", &["second", "first"])]), 0, "both child commands must overlap");
++    assert_eq!(run(vec![step("failure", &["fail"]), step("survivor", &["survivor"])]), 1);
++    assert!(root.join("markers/survivor").exists(), "a failed suite must not discard other lane results");
++    assert_eq!(run(vec![Step::new("bad build", &["test", "--no-run", "--invalid-build-flag"], ""), step("must not run", &["after-build-failure"])]), 1);
++    assert!(!root.join("markers/after-build-failure").exists(), "a failed prebuild must stop suites");
++    assert_eq!(run(vec![step("checkout movement", &["move"])]), 1, "successful children still yield VOID after checkout movement");
++    fs::remove_dir_all(root).expect("remove fixture");
++}
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 36455da0e..93e48bbc3 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -15,6 +15,7 @@ mod decisions;
+ #[cfg(test)]
+ mod directory_tests;
+ mod exec;
++mod lanes;
+ #[cfg(test)]
+ mod gate_maps_tests;
+ #[cfg(test)]
+@@ -23,6 +24,8 @@ mod icon_font;
+ mod icons;
+ #[cfg(test)]
+ mod icons_tests;
++#[cfg(test)]
++mod lanes_tests;
+ mod logo;
+ #[cfg(test)]
+ mod logo_tests;
+diff --git a/xtask/src/plan.rs b/xtask/src/plan.rs
+index a26b98514..d3f3c36fe 100644
+--- a/xtask/src/plan.rs
++++ b/xtask/src/plan.rs
+@@ -228,7 +228,7 @@ pub fn release(root: &Path) -> Plan {
+ pub fn release_with(root: &Path, snapshots: bool) -> Plan {
+     let mut plan = Plan::default();
+     plan.notes.push(
+-        "release: every debug suite, ui, clippy, then the --ignored heavy lanes in release and the ui snapshot lane"
++        "release: prebuild both profiles, then up to four debug/release lanes; app, kernel, ui and clippy run alone"
+             .into(),
+     );
+     if !snapshots {
+@@ -237,10 +237,21 @@ pub fn release_with(root: &Path, snapshots: bool) -> Plan {
+         );
+     }
+     let non_ui: Vec<&str> = ALL_CRATES.iter().copied().filter(|d| *d != "ui").collect();
++    let mut build = vec!["test", "-j", J];
++    let packages: Vec<String> = ALL_CRATES.iter().map(|d| pkg(d)).collect();
++    for p in &packages {
++        build.extend(["-p", p]);
++    }
++    build.push("--no-run");
++    plan.steps.push(Step::new("debug build (--no-run)", &build, ""));
++    let mut heavy = heavy_steps(root).into_iter();
++    if let Some(build) = heavy.next() {
++        plan.steps.push(build);
++    }
+     plan.steps.extend(run_suites(root, &non_ui, false));
+     plan.steps.extend(run_suites(root, &["ui"], false));
+     plan.steps.push(clippy());
+-    plan.steps.extend(heavy_steps(root));
++    plan.steps.extend(heavy);
+     if !snapshots {
+         return plan;
+     }
+diff --git a/xtask/src/release_bump.rs b/xtask/src/release_bump.rs
+index 5690ff3c1..f1304cc9d 100644
+--- a/xtask/src/release_bump.rs
++++ b/xtask/src/release_bump.rs
+@@ -87,17 +87,35 @@ pub fn bump_lock(text: &str, old: &str, new: &str) -> (String, usize) {
+ /// `git diff Cargo.lock` after the bump may change version lines only: the number changed, or the
+ /// refusal.
+ pub fn lock_diff_versions_only(diff: &str) -> Result<usize, String> {
+-    let changed = diff
+-        .lines()
+-        .filter(|l| {
+-            let mut c = l.chars();
+-            matches!(c.next(), Some('-' | '+')) && !matches!(c.next(), None | Some('-' | '+'))
+-        })
+-        .count();
+-    let versions = diff.lines().filter(|l| l.starts_with("-version") || l.starts_with("+version")).count();
+-    if changed == versions {
+-        Ok(versions)
+-    } else {
+-        Err("Cargo.lock changed beyond version lines".into())
++    let (mut removed, mut added, mut versions) = (Vec::new(), Vec::new(), 0);
++    fn check(removed: &mut Vec<&str>, added: &mut Vec<&str>, versions: &mut usize) -> Result<(), String> {
++        if removed.len() != added.len() {
++            return Err("Cargo.lock changed beyond version lines".into());
++        }
++        for (old, new) in removed.drain(..).zip(added.drain(..)) {
++            if old == new {
++                continue;
++            }
++            if !old.starts_with("version = ") || !new.starts_with("version = ") {
++                return Err("Cargo.lock changed beyond version lines".into());
++            }
++            *versions += 2;
++        }
++        Ok(())
++    }
++    // Compare each hunk independently: line-ending churn may remove and re-add every line.
++    for line in diff.lines() {
++        if line.starts_with("--- ") || line.starts_with("+++ ") {
++            continue;
++        }
++        if let Some(old) = line.strip_prefix('-') {
++            removed.push(old);
++        } else if let Some(new) = line.strip_prefix('+') {
++            added.push(new);
++        } else {
++            check(&mut removed, &mut added, &mut versions)?;
++        }
+     }
++    check(&mut removed, &mut added, &mut versions)?;
++    Ok(versions)
+ }
+diff --git a/xtask/src/release_tests.rs b/xtask/src/release_tests.rs
+index eb9e9989c..5f97261a5 100644
+--- a/xtask/src/release_tests.rs
++++ b/xtask/src/release_tests.rs
+@@ -114,6 +114,18 @@ fn lock_diff_guard_takes_version_lines_only() {
+     assert!(lock_diff_versions_only(&bad).is_err());
+ }
+ 
++#[test]
++fn lock_diff_guard_ignores_only_line_ending_changes() {
++    let diff = "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n-[[package]]\n-name = \"xtask\"\n-version = \"0.20.0\"\n+[[package]]\r\n+name = \"xtask\"\r\n+version = \"0.21.0\"\r\n";
++    assert_eq!(lock_diff_versions_only(diff), Ok(2));
++    let endings_only = diff.replace("0.21.0", "0.20.0");
++    assert_eq!(lock_diff_versions_only(&endings_only), Ok(0));
++    let changed_name = diff.replace("+name = \"xtask\"", "+name = \"other\"");
++    assert!(lock_diff_versions_only(&changed_name).is_err());
++    let changed_checksum = format!("{diff}-checksum = \"a\"\n+checksum = \"b\"\r\n");
++    assert!(lock_diff_versions_only(&changed_checksum).is_err());
++}
++
+ #[test]
+ fn notes_need_this_versions_section_above_the_history() {
+     assert_eq!(check_notes("\u{feff}# CamCraft 0.17.0\n\nnew\n---\nold\n", "0.17.0"), Ok(2));
+diff --git a/xtask/src/tests.rs b/xtask/src/tests.rs
+index 817a0a0ba..c3f4c31f6 100644
+--- a/xtask/src/tests.rs
++++ b/xtask/src/tests.rs
+@@ -174,11 +174,11 @@ fn batch_skips_slow_binaries_and_release_runs_everything() {
+     assert_eq!(b[b.len() - 2], "[ui] ui suites (cwd crates/ui) | test -j 6 -p camcraft-ui --no-fail-fast -- --test-threads=6");
+     assert!(b[b.len() - 1].starts_with("clippy -D warnings | clippy -j 6 -p camcraft-geometry -p camcraft-cl"));
+     let r: Vec<String> = plan::release(&fx.0).steps.iter().map(line).collect();
+-    // 8 suites, ui, clippy, the heavy build + lib+bins+doc of motion, and of app with its ops binary (the only fixture binary holding an ignore), 2 snapshot lanes.
+-    assert_eq!(r.len(), 8 + 1 + 1 + (1 + 3 + 4) + 2);
++    // Two prebuilds, 8 suites, ui, clippy, lib+bins+doc of motion, and of app with its ops binary (the only fixture binary holding an ignore), 2 snapshot lanes.
++    assert_eq!(r.len(), 2 + 8 + 1 + 1 + (3 + 4) + 2);
+     assert!(r.iter().any(|s| s.starts_with("kernel suites")));
+-    assert_eq!(r[18], "[ui] ui snapshot lane (debug --ignored, cwd crates/ui) | test -j 6 -p camcraft-ui --lib --no-fail-fast -- --test-threads=6 --ignored snapshot");
+-    assert_eq!(r[19], "[ui] ui gpu_render snapshot lane (debug --ignored) | test -j 6 -p camcraft-ui --test gpu_render --no-fail-fast -- --test-threads=6 --ignored snapshot");
++    assert_eq!(r[19], "[ui] ui snapshot lane (debug --ignored, cwd crates/ui) | test -j 6 -p camcraft-ui --lib --no-fail-fast -- --test-threads=6 --ignored snapshot");
++    assert_eq!(r[20], "[ui] ui gpu_render snapshot lane (debug --ignored) | test -j 6 -p camcraft-ui --test gpu_render --no-fail-fast -- --test-threads=6 --ignored snapshot");
+ }
+ 
+ #[test]
