@@ -1,0 +1,750 @@
+From c80c188f4ee869b50569f12e4fec60ff0dd8127c Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Sun, 15 Nov 2026 14:19:34 +0100
+Subject: [PATCH] test(post): pin the G76 readings that two published manuals
+ settle
+
+Three of the four open G76 readings of the Fanuc lathe post agree with
+the FANUC 0i-F lathe operator's manual (B-64604EN-1, 4.2.7) and the
+Siemens SINUMERIK ISO Turning manual (A5E52211627B, G76): the start
+point and the flank shift along the travel, every pass ending at the
+programmed end point, and the minimum depth clamping the cut of one
+pass. New tests pin each one; the shared fixture moves to
+tests/common/g76.rs (the schedule suite stood at the 400-line law).
+The internal rounding of dd*sqrt(n) stays open. No posted G-code
+changes. Follow-up for the pass-end difference: #1896.
+
+Refs #1842
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/common/g76.rs              | 234 ++++++++++++++++++++
+ crates/app/tests/common/mod.rs              |   1 +
+ crates/app/tests/lathe_post_g76_schedule.rs | 203 +----------------
+ crates/app/tests/lathe_post_g76_sources.rs  | 154 +++++++++++++
+ docs/decisions/1842-g76-schedule-sources.md |  77 +++++++
+ 5 files changed, 472 insertions(+), 197 deletions(-)
+ create mode 100644 crates/app/tests/common/g76.rs
+ create mode 100644 crates/app/tests/lathe_post_g76_sources.rs
+ create mode 100644 docs/decisions/1842-g76-schedule-sources.md
+
+diff --git a/crates/app/tests/common/g76.rs b/crates/app/tests/common/g76.rs
+new file mode 100644
+index 000000000..af0478661
+--- /dev/null
++++ b/crates/app/tests/common/g76.rs
+@@ -0,0 +1,234 @@
++//! The G76 suites' shared document (#1842 split it out of
++//! lathe_post_g76_schedule.rs, which stood at the 400-line law): a
++//! threaded bar on a lathe, the thread generated with a chosen infeed
++//! plan, the Fanuc lathe post chosen with G76 output, and the control's
++//! schedule for the posted words.
++//!
++//! Provenance: our own fixtures. The control model follows the published
++//! G76 two-block descriptions (FANUC Series 0i-F lathe operator's manual
++//! B-64604EN-1 section 4.2.7; Siemens SINUMERIK ISO Turning programming
++//! manual A5E52211627B, "Multiple-thread cutting cycle (G76)"; GSK988TA
++//! G76) - behaviour only, see docs/decisions/1842-g76-schedule-sources.md.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SelectPost, SetPostOptions,
++    SetStock,
++};
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::machine::{Coolant, Machine};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::post::engine;
++use camcraft_app::posting;
++use camcraft_app::schema::{Location, PostOptions, PostRef, ThreadingOutput};
++use camcraft_app::tools::catalog;
++use camcraft_app::turning::ThreadInfeed;
++use camcraft_app::world::new_world;
++
++pub const TAU: f64 = std::f64::consts::TAU;
++pub const LATHE_CPS: &str = include_str!("../../../../assets/posts/fanuc-lathe.cps");
++pub const MAJOR: f64 = 6.0;
++pub const PITCH: f64 = 2.0;
++pub const DEPTH: f64 = 1.2;
++
++pub fn revolve(meridian: &[(f64, f64)]) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / 16.0;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..16 {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++/// Wall r 6, a 60-degree V every 2.0 from z 8 to z 14, 1.2 deep.
++pub fn threaded() -> Mesh {
++    let half = DEPTH * (30.0_f64).to_radians().tan();
++    let root = MAJOR - DEPTH;
++    let mut m = vec![(0.0, -16.0), (MAJOR, -16.0), (MAJOR, 8.0 - half)];
++    let mut c = 8.0;
++    while c <= 14.0 + 1e-9 {
++        m.push((root, c));
++        m.push((MAJOR, c + half));
++        if c + PITCH <= 14.0 + 1e-9 {
++            m.push((MAJOR, c + PITCH - half));
++        }
++        c += PITCH;
++    }
++    m.extend([(MAJOR, 14.0 + half), (MAJOR, 40.0), (0.0, 40.0)]);
++    revolve(&m)
++}
++
++/// The threaded bar on a lathe, the thread generated with `plan` and
++/// first depth `infeed`, the lathe post chosen with G76 output.
++pub fn g76_world(infeed: f64, plan: ThreadInfeed) -> World {
++    let world = new_world();
++    let mut history = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
++    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: 56.0 }, at);
++    history.execute(&world, cmd.expect("bar stock"));
++    let lathe = Machine {
++        model: "TestBench lathe".into(),
++        vendor: "Camcraft Testbench".into(),
++        kind: Some("lathe".into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12000.0),
++        coolants: vec![Coolant { name: "Flood".into(), m_code: "M8".into() }],
++        ..Default::default()
++    };
++    history.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe)).expect("lathe"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "TD-1732-60").map(|(_, t)| t).expect("insert");
++    history.execute(&world, AddTool::new(&world, "TD-1732-60", tool).expect("tool"));
++    history.execute(&world, ImportModel::from_mesh("bar", threaded()));
++    let params = OpParams::Threading {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(24.0),
++        top_z: Height::fixed(14.3),
++        bottom_z: Height::fixed(7.7),
++        pitch: PITCH,
++        depth: DEPTH,
++        infeed,
++        feed: 120.0,
++        plunge_feed: 40.0,
++        infeed_plan: plan,
++        hand: camcraft_app::cl::ThreadHand::Right,
++    };
++    let cmd = CreateOperation::new(&world, "TH1", "TD-1732-60", SrcRef::Entity("bar".into()), params);
++    history.execute(&world, cmd.expect("create"));
++    history.execute(&world, GenerateOperation::new(&world, "TH1").expect("generate"));
++    history.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("lathe post"));
++    let g76 = PostOptions { threading: ThreadingOutput::G76Cycle, ..PostOptions::default() };
++    history.execute(&world, SetPostOptions::new(&world, g76).expect("G76"));
++    world
++}
++
++/// The program and the script's own refusals.
++pub fn post(world: &World) -> (String, Vec<String>) {
++    let stream = camcraft_app::post::cnc::serialize(&posting::stream_records(world).expect("generated"));
++    post_stream(world, &stream, "mm")
++}
++
++/// `stream` posted in `unit` ("mm" or "inch") on the world's machine.
++pub fn post_stream(world: &World, stream: &str, unit: &str) -> (String, Vec<String>) {
++    let mut options = posting::options_value(posting::post_options(world));
++    if let Some(m) = options.as_object_mut() {
++        m.insert("Units".into(), serde_json::json!(unit));
++    }
++    let out = engine::run_with(LATHE_CPS, &posting::machine_value(world), stream, &options).expect("the lathe script runs");
++    (out.program, out.warnings)
++}
++
++/// A word's number from the G76 block whose words include `marker`.
++pub fn word(text: &str, marker: &str, letter: char) -> String {
++    let line = text.lines().find(|l| l.starts_with("G76") && l.contains(marker)).expect("the G76 block");
++    line.split_whitespace()
++        .find_map(|w| w.strip_prefix(letter).filter(|_| w != "G76").map(str::to_string))
++        .unwrap_or_else(|| panic!("{letter} in {line}"))
++}
++
++/// The program's least increment in mm: 0.001 mm under G21, 0.0001 in
++/// under G20 (the no-point words count it; the R word is in its unit).
++pub fn least_increment(text: &str) -> f64 {
++    if text.lines().any(|l| l.split_whitespace().any(|w| w == "G20")) {
++        0.00254
++    } else {
++        0.001
++    }
++}
++
++/// The posted words as numbers: (m, a, dmin, d, k, dd), lengths in mm.
++pub fn g76_words(text: &str) -> (usize, f64, f64, f64, f64, f64) {
++    let inc = least_increment(text);
++    let unit = if inc < 0.002 { 1.0 } else { 25.4 };
++    let p1 = word(text, "R", 'P');
++    let (m, a) = (p1[0..2].parse::<usize>().expect("m"), p1[4..6].parse::<f64>().expect("a"));
++    let dmin = word(text, "R", 'Q').parse::<f64>().expect("dmin") * inc;
++    let d = word(text, "R", 'R').parse::<f64>().expect("d") * unit;
++    let k = word(text, "F", 'P').parse::<f64>().expect("k") * inc;
++    let dd = word(text, "F", 'Q').parse::<f64>().expect("dd") * inc;
++    (m, a, dmin, d, k, dd)
++}
++
++/// The control's depths (radius, from the crest, in mm) for the posted
++/// words. It works on the words as written - each rounded on its own -
++/// never on the record's numbers. The minimum clamps the cut of ONE pass
++/// (the depth below the pass before it, as cut): both published
++/// descriptions state the clamp on that one-pass cut (#1842).
++pub fn control_depths(text: &str) -> (Vec<f64>, f64) {
++    let (m, a, dmin, d, k, dd) = g76_words(text);
++    let mut cum = Vec::new();
++    let mut prev = 0.0_f64;
++    let mut n = 1.0_f64;
++    loop {
++        let next = (dd * n.sqrt()).max(prev + dmin);
++        if next >= k - d - 1e-9 {
++            cum.push(k - d);
++            break;
++        }
++        cum.push(next);
++        prev = next;
++        n += 1.0;
++    }
++    cum.extend(std::iter::repeat_n(k, m));
++    (cum, a)
++}
++
++/// The kernel's laid passes: (station z, depth from the crest) at each
++/// plunge, and the record's start z.
++pub fn laid(world: &World) -> (Vec<(f64, f64)>, f64) {
++    let e = camcraft_app::model::find_by_name(world, "TH1").expect("op");
++    let path = camcraft_app::model::toolpath_of(world, &e).expect("cache").path;
++    let rho = |q: Point3| (q.x * q.x + q.y * q.y).sqrt();
++    let passes = path
++        .moves
++        .iter()
++        .filter(|m| m.kind == camcraft_app::cl::MoveKind::Feed && m.arc.is_none())
++        .map(|m| (m.to.z, MAJOR - rho(m.to)))
++        .collect();
++    (passes, path.threads.first().expect("record").start.z)
++}
++
++/// The kernel's laid pass ends: the z of each pass's last threading arc
++/// (the move before its retract), and the record's end z.
++pub fn laid_ends(world: &World) -> (Vec<f64>, f64) {
++    let e = camcraft_app::model::find_by_name(world, "TH1").expect("op");
++    let path = camcraft_app::model::toolpath_of(world, &e).expect("cache").path;
++    let ends = path
++        .moves
++        .windows(2)
++        .filter(|w| w[0].arc.is_some() && w[1].kind == camcraft_app::cl::MoveKind::Rapid)
++        .map(|w| w[0].to.z)
++        .collect();
++    (ends, path.threads.first().expect("record").end.z)
++}
++
++pub fn same_ladder(world: &World, text: &str) {
++    let (want, a) = control_depths(text);
++    let (got, z0) = laid(world);
++    assert_eq!(got.len(), want.len(), "pass count: laid {got:?} vs the control's {want:?}\n{text}");
++    let tan = (a * 0.5).to_radians().tan();
++    // mm words are exact on the micron lattice; an inch word is one
++    // ten-thousandth from its mm value at most 1.5 increments down a rung.
++    let tol = if least_increment(text) < 0.002 { 1e-3 } else { 1.5 * 0.00254 };
++    for ((z, depth), w) in got.iter().zip(&want) {
++        assert!((depth - w).abs() < tol, "depth: laid {got:?} vs the control's {want:?}");
++        // #629's ladder runs toward the chuck (-Z): the record starts a
++        // full flank shift toward the free end, each pass `w·tan` back
++        // toward the chuck from it (the merge of #416 onto #629).
++        assert!((z - (z0 - w * tan)).abs() < tol, "station: laid {got:?}, start {z0}, a {a}");
++    }
++}
+diff --git a/crates/app/tests/common/mod.rs b/crates/app/tests/common/mod.rs
+index c255d9599..0936c2537 100644
+--- a/crates/app/tests/common/mod.rs
++++ b/crates/app/tests/common/mod.rs
+@@ -13,6 +13,7 @@ pub mod bore;
+ pub mod cl_read;
+ pub mod engine_consumers;
+ pub mod engine_fixtures;
++pub mod g76;
+ pub mod legacy_program;
+ pub mod rotary_bar;
+ pub mod solid_part;
+diff --git a/crates/app/tests/lathe_post_g76_schedule.rs b/crates/app/tests/lathe_post_g76_schedule.rs
+index dff76ec74..6f7cd7afe 100644
+--- a/crates/app/tests/lathe_post_g76_schedule.rs
++++ b/crates/app/tests/lathe_post_g76_schedule.rs
+@@ -8,7 +8,9 @@
+ //! max(dd*sqrt(n), previous + dmin) up to k - d, the first finishing
+ //! pass cuts d to k and m - 1 more repeat k, and with a non-zero tool
+ //! angle each pass starts tan(a/2) x its depth along Z from the start
+-//! point. Pinned: a constant-area flank thread's golden whose words
++//! point (the fixture and the control model: tests/common/g76.rs; the
++//! published sources: lathe_post_g76_sources.rs, #1842). Pinned: a
++//! constant-area flank thread's golden whose words
+ //! reproduce its laid depths and stations; the default thread's words
+ //! reproducing its three passes; a refusal by name for each plan the
+ //! cycle cannot state - the repeat of each roughing depth (issue #418)
+@@ -23,206 +25,13 @@
+ 
+ mod common;
+ 
+-use flecs_ecs::prelude::World;
+-
+-use camcraft_app::commands::{
+-    AddTool, CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SelectPost, SetPostOptions,
+-    SetStock,
+-};
+-use camcraft_app::geometry::{Mesh, Point3, Triangle};
+-use camcraft_app::machine::{Coolant, Machine};
+-use camcraft_app::operation::{Height, OpParams, SrcRef};
+-use camcraft_app::post::engine;
++use camcraft_app::commands::{History, SetPostOptions};
+ use camcraft_app::posting;
+-use camcraft_app::schema::{Location, PostOptions, PostRef, ThreadingOutput};
+-use camcraft_app::tools::catalog;
++use camcraft_app::schema::{PostOptions, ThreadingOutput};
+ use camcraft_app::turning::{DepthSchedule, InfeedMethod, ThreadInfeed};
+ use camcraft_app::world::new_world;
+ 
+-const TAU: f64 = std::f64::consts::TAU;
+-const LATHE_CPS: &str = include_str!("../../../assets/posts/fanuc-lathe.cps");
+-const MAJOR: f64 = 6.0;
+-const PITCH: f64 = 2.0;
+-const DEPTH: f64 = 1.2;
+-
+-fn revolve(meridian: &[(f64, f64)]) -> Mesh {
+-    let v = |j: usize, r: f64, z: f64| {
+-        let th = TAU * j as f64 / 16.0;
+-        Point3::new(r * th.cos(), r * th.sin(), z)
+-    };
+-    let mut facets = Vec::new();
+-    for seg in meridian.windows(2) {
+-        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
+-        for j in 0..16 {
+-            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
+-            if ra <= 1e-12 {
+-                facets.push(Triangle::new(a1, b2, b1));
+-            } else if rb <= 1e-12 {
+-                facets.push(Triangle::new(a1, a2, b2));
+-            } else {
+-                facets.push(Triangle::new(a1, a2, b2));
+-                facets.push(Triangle::new(a1, b2, b1));
+-            }
+-        }
+-    }
+-    Mesh::from_facets(facets)
+-}
+-
+-/// Wall r 6, a 60-degree V every 2.0 from z 8 to z 14, 1.2 deep.
+-fn threaded() -> Mesh {
+-    let half = DEPTH * (30.0_f64).to_radians().tan();
+-    let root = MAJOR - DEPTH;
+-    let mut m = vec![(0.0, -16.0), (MAJOR, -16.0), (MAJOR, 8.0 - half)];
+-    let mut c = 8.0;
+-    while c <= 14.0 + 1e-9 {
+-        m.push((root, c));
+-        m.push((MAJOR, c + half));
+-        if c + PITCH <= 14.0 + 1e-9 {
+-            m.push((MAJOR, c + PITCH - half));
+-        }
+-        c += PITCH;
+-    }
+-    m.extend([(MAJOR, 14.0 + half), (MAJOR, 40.0), (0.0, 40.0)]);
+-    revolve(&m)
+-}
+-
+-/// The threaded bar on a lathe, the thread generated with `plan` and
+-/// first depth `infeed`, the lathe post chosen with G76 output.
+-fn g76_world(infeed: f64, plan: ThreadInfeed) -> World {
+-    let world = new_world();
+-    let mut history = History::default();
+-    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
+-    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: 56.0 }, at);
+-    history.execute(&world, cmd.expect("bar stock"));
+-    let lathe = Machine {
+-        model: "TestBench lathe".into(),
+-        vendor: "Camcraft Testbench".into(),
+-        kind: Some("lathe".into()),
+-        spindle_min: Some(25.0),
+-        spindle_max: Some(12000.0),
+-        coolants: vec![Coolant { name: "Flood".into(), m_code: "M8".into() }],
+-        ..Default::default()
+-    };
+-    history.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe)).expect("lathe"));
+-    let tool = catalog().into_iter().find(|(n, _)| *n == "TD-1732-60").map(|(_, t)| t).expect("insert");
+-    history.execute(&world, AddTool::new(&world, "TD-1732-60", tool).expect("tool"));
+-    history.execute(&world, ImportModel::from_mesh("bar", threaded()));
+-    let params = OpParams::Threading {
+-        tolerance: 0.05,
+-        clearance_z: Height::fixed(24.0),
+-        top_z: Height::fixed(14.3),
+-        bottom_z: Height::fixed(7.7),
+-        pitch: PITCH,
+-        depth: DEPTH,
+-        infeed,
+-        feed: 120.0,
+-        plunge_feed: 40.0,
+-        infeed_plan: plan,
+-        hand: camcraft_app::cl::ThreadHand::Right,
+-    };
+-    let cmd = CreateOperation::new(&world, "TH1", "TD-1732-60", SrcRef::Entity("bar".into()), params);
+-    history.execute(&world, cmd.expect("create"));
+-    history.execute(&world, GenerateOperation::new(&world, "TH1").expect("generate"));
+-    history.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("lathe post"));
+-    let g76 = PostOptions { threading: ThreadingOutput::G76Cycle, ..PostOptions::default() };
+-    history.execute(&world, SetPostOptions::new(&world, g76).expect("G76"));
+-    world
+-}
+-
+-/// The program and the script's own refusals.
+-fn post(world: &World) -> (String, Vec<String>) {
+-    let stream = camcraft_app::post::cnc::serialize(&posting::stream_records(world).expect("generated"));
+-    post_stream(world, &stream, "mm")
+-}
+-
+-/// `stream` posted in `unit` ("mm" or "inch") on the world's machine.
+-fn post_stream(world: &World, stream: &str, unit: &str) -> (String, Vec<String>) {
+-    let mut options = posting::options_value(posting::post_options(world));
+-    if let Some(m) = options.as_object_mut() {
+-        m.insert("Units".into(), serde_json::json!(unit));
+-    }
+-    let out = engine::run_with(LATHE_CPS, &posting::machine_value(world), stream, &options).expect("the lathe script runs");
+-    (out.program, out.warnings)
+-}
+-
+-/// A word's number from the G76 block whose words include `marker`.
+-fn word(text: &str, marker: &str, letter: char) -> String {
+-    let line = text.lines().find(|l| l.starts_with("G76") && l.contains(marker)).expect("the G76 block");
+-    line.split_whitespace()
+-        .find_map(|w| w.strip_prefix(letter).filter(|_| w != "G76").map(str::to_string))
+-        .unwrap_or_else(|| panic!("{letter} in {line}"))
+-}
+-
+-/// The program's least increment in mm: 0.001 mm under G21, 0.0001 in
+-/// under G20 (the no-point words count it; the R word is in its unit).
+-fn least_increment(text: &str) -> f64 {
+-    if text.lines().any(|l| l.split_whitespace().any(|w| w == "G20")) {
+-        0.00254
+-    } else {
+-        0.001
+-    }
+-}
+-
+-/// The control's depths (radius, from the crest, in mm) for the posted
+-/// words. It works on the words as written - each rounded on its own -
+-/// never on the record's numbers.
+-fn control_depths(text: &str) -> (Vec<f64>, f64) {
+-    let inc = least_increment(text);
+-    let unit = if inc < 0.002 { 1.0 } else { 25.4 };
+-    let p1 = word(text, "R", 'P');
+-    let (m, a) = (p1[0..2].parse::<usize>().expect("m"), p1[4..6].parse::<f64>().expect("a"));
+-    let dmin = word(text, "R", 'Q').parse::<f64>().expect("dmin") * inc;
+-    let d = word(text, "R", 'R').parse::<f64>().expect("d") * unit;
+-    let k = word(text, "F", 'P').parse::<f64>().expect("k") * inc;
+-    let dd = word(text, "F", 'Q').parse::<f64>().expect("dd") * inc;
+-    let mut cum = Vec::new();
+-    let mut prev = 0.0_f64;
+-    let mut n = 1.0_f64;
+-    loop {
+-        let next = (dd * n.sqrt()).max(prev + dmin);
+-        if next >= k - d - 1e-9 {
+-            cum.push(k - d);
+-            break;
+-        }
+-        cum.push(next);
+-        prev = next;
+-        n += 1.0;
+-    }
+-    cum.extend(std::iter::repeat_n(k, m));
+-    (cum, a)
+-}
+-
+-/// The kernel's laid passes: (station z, depth from the crest) at each
+-/// plunge, and the record's start z.
+-fn laid(world: &World) -> (Vec<(f64, f64)>, f64) {
+-    let e = camcraft_app::model::find_by_name(world, "TH1").expect("op");
+-    let path = camcraft_app::model::toolpath_of(world, &e).expect("cache").path;
+-    let rho = |q: Point3| (q.x * q.x + q.y * q.y).sqrt();
+-    let passes = path
+-        .moves
+-        .iter()
+-        .filter(|m| m.kind == camcraft_app::cl::MoveKind::Feed && m.arc.is_none())
+-        .map(|m| (m.to.z, MAJOR - rho(m.to)))
+-        .collect();
+-    (passes, path.threads.first().expect("record").start.z)
+-}
+-
+-fn same_ladder(world: &World, text: &str) {
+-    let (want, a) = control_depths(text);
+-    let (got, z0) = laid(world);
+-    assert_eq!(got.len(), want.len(), "pass count: laid {got:?} vs the control's {want:?}\n{text}");
+-    let tan = (a * 0.5).to_radians().tan();
+-    // mm words are exact on the micron lattice; an inch word is one
+-    // ten-thousandth from its mm value at most 1.5 increments down a rung.
+-    let tol = if least_increment(text) < 0.002 { 1e-3 } else { 1.5 * 0.00254 };
+-    for ((z, depth), w) in got.iter().zip(&want) {
+-        assert!((depth - w).abs() < tol, "depth: laid {got:?} vs the control's {want:?}");
+-        // #629's ladder runs toward the chuck (-Z): the record starts a
+-        // full flank shift toward the free end, each pass `w·tan` back
+-        // toward the chuck from it (the merge of #416 onto #629).
+-        assert!((z - (z0 - w * tan)).abs() < tol, "station: laid {got:?}, start {z0}, a {a}");
+-    }
+-}
++use common::g76::{control_depths, g76_world, laid, post, post_stream, same_ladder};
+ 
+ #[test]
+ fn a_constant_area_flank_g76_states_its_verified_passes() {
+diff --git a/crates/app/tests/lathe_post_g76_sources.rs b/crates/app/tests/lathe_post_g76_sources.rs
+new file mode 100644
+index 000000000..ad794ff03
+--- /dev/null
++++ b/crates/app/tests/lathe_post_g76_sources.rs
+@@ -0,0 +1,154 @@
++//! The G76 readings that two published sources settle (issue #1842).
++//! The Fanuc lathe post states the kernel's laid passes as the two-block
++//! G76 cycle; these tests pin the three readings of that cycle which the
++//! FANUC Series 0i-F lathe operator's manual (B-64604EN-1, section 4.2.7,
++//! Fig. 4.2.7 (a) and (b)) and the Siemens SINUMERIK ISO Turning
++//! programming manual (A5E52211627B, "Multiple-thread cutting cycle
++//! (G76)", Fig. 4-25 and 4-26) state the same way:
++//! 1. the cycle starts at the start point A, and with a tool angle each
++//!    deeper pass starts further along the direction of travel, on the
++//!    flank line from the crest point B (single-edge infeed);
++//! 2. every pass ends at the programmed X/Z end point (D);
++//! 3. Q(dmin) clamps the cut of ONE pass - its depth below the pass
++//!    before it - never the sqrt(n) depth itself.
++//!
++//! The fourth reading (how the control rounds dd*sqrt(n) inside the
++//! cycle) has no published statement and stays open on #1842. The
++//! sources and what was dropped: docs/decisions/1842-g76-schedule-sources.md.
++//!
++//! Gate map (M4.4): covers camcraft_motion::turning (thread_cycle's
++//! record), app::posting + the lathe dialect's G76 words.
++//! Lane shape (M4.4): all tests here run in seconds.
++
++mod common;
++
++use camcraft_app::turning::{DepthSchedule, InfeedMethod, ThreadInfeed};
++
++use common::g76::{control_depths, g76_words, g76_world, laid, laid_ends, post, same_ladder};
++
++/// A 55-degree flank thread whose minimum depth engages the clamp.
++fn flank_area() -> ThreadInfeed {
++    ThreadInfeed {
++        method: InfeedMethod::Flank,
++        flank_angle: 27.5,
++        schedule: DepthSchedule::ConstantArea,
++        min_depth: 0.1,
++        finish_allowance: 0.05,
++        spring_passes: 1,
++        repeat_each_depth: false,
++    }
++}
++
++/// The Z word of the first line of `text` that starts with `head` and
++/// contains `marker`.
++fn z_of(text: &str, head: &str, marker: &str) -> f64 {
++    let line = text.lines().find(|l| l.starts_with(head) && l.contains(marker)).expect("the block");
++    line.split_whitespace()
++        .find_map(|w| w.strip_prefix('Z'))
++        .and_then(|z| z.parse::<f64>().ok())
++        .unwrap_or_else(|| panic!("Z in {line}"))
++}
++
++/// The positioning Z right before the cycle: the start point A.
++fn start_z(text: &str) -> f64 {
++    let lines: Vec<&str> = text.lines().collect();
++    let at = lines.iter().position(|l| l.starts_with("G76")).expect("a G76 block");
++    let before = lines.get(at.wrapping_sub(1)).copied().unwrap_or_default();
++    assert!(before.starts_with("G00"), "the cycle is not entered from a G00: {before}\n{text}");
++    z_of(before, "G00", "Z")
++}
++
++#[test]
++fn each_pass_starts_on_the_crest_flank_line_along_the_travel() {
++    let world = g76_world(0.4, flank_area());
++    let (text, refused) = post(&world);
++    assert!(refused.is_empty(), "{refused:?}");
++    let (_, a, _, _, k, _) = g76_words(&text);
++    let tan = (a * 0.5).to_radians().tan();
++    let (passes, z0) = laid(&world);
++    // A: the posted start point is the record's start, the station where
++    // a zero-depth pass on the flank line would start (point B's Z).
++    let a_z = start_z(&text);
++    assert!((a_z - z0).abs() < 1e-3, "G00 Z{a_z} vs the record start {z0}\n{text}");
++    // The travel runs from A toward the posted end Z (-Z here).
++    let end_z = z_of(&text, "G76", "F");
++    assert!(end_z < a_z, "the cycle runs toward -Z: A {a_z}, end {end_z}");
++    // Each deeper pass starts further along that travel, depth x tan(a/2)
++    // from A: the leading flank cuts (single-edge infeed).
++    for w in passes.windows(2) {
++        let ((z1, d1), (z2, d2)) = (w[0], w[1]);
++        if d2 > d1 + 1e-9 {
++            assert!(z2 < z1, "a deeper pass starts back toward A: {passes:?}");
++        }
++    }
++    let (z_root, _) = passes.last().copied().expect("passes");
++    assert!((z_root - (z0 - k * tan)).abs() < 1e-3, "the root pass starts k*tan(a/2) from A: {passes:?}");
++    same_ladder(&world, &text);
++}
++
++#[test]
++fn every_pass_runs_to_the_posted_end_z_inside_the_root_pass() {
++    let world = g76_world(0.4, flank_area());
++    let (text, refused) = post(&world);
++    assert!(refused.is_empty(), "{refused:?}");
++    let (_, a, _, _, k, _) = g76_words(&text);
++    let tan = (a * 0.5).to_radians().tan();
++    let end_z = z_of(&text, "G76", "F");
++    let (ends, record_end) = laid_ends(&world);
++    let (passes, _) = laid(&world);
++    assert_eq!(ends.len(), passes.len(), "one end for each pass: {ends:?}");
++    // The posted end point D is the record's end: the root pass's end.
++    assert!((end_z - record_end).abs() < 1e-3, "G76 Z{end_z} vs the record end {record_end}");
++    let last = ends.last().copied().expect("ends");
++    assert!((last - end_z).abs() < 1e-3, "the root pass ends at D: {ends:?}");
++    // The control runs EVERY pass to D. The kernel lays a shallower pass
++    // short of D by (k - depth) x tan(a/2): the control's extra length is
++    // that much, at that depth, inside the groove the root pass cuts to
++    // D. No pass ends past D toward the chuck.
++    for (end, (_, depth)) in ends.iter().zip(&passes) {
++        let short = (k - depth) * tan;
++        assert!((end - (end_z + short)).abs() < 1e-3, "pass at {depth}: ends {end}, D {end_z}, short {short}");
++        assert!(*end >= end_z - 1e-3, "a pass ends past D: {ends:?}");
++    }
++}
++
++#[test]
++fn the_minimum_depth_clamps_the_cut_of_one_pass() {
++    let world = g76_world(0.4, flank_area());
++    let (text, refused) = post(&world);
++    assert!(refused.is_empty(), "{refused:?}");
++    let (m, _, dmin, d, k, dd) = g76_words(&text);
++    let (got, _) = laid(&world);
++    let depths: Vec<f64> = got.iter().map(|&(_, w)| w).collect();
++    let rough = depths.len() - m;
++    // The clamp engages on this ladder: a sqrt(n) rung less than dmin
++    // below the pass before it.
++    let engaged = (2..=rough).any(|n| {
++        let prev = depths[n - 2];
++        dd * (n as f64).sqrt() < prev + dmin - 1e-9
++    });
++    assert!(engaged, "the clamp never engages: {depths:?}");
++    // Every roughing cut below the pass before it is dmin or more (the
++    // last one may stop at k - d).
++    for n in 1..rough {
++        let cut = depths[n] - depths[n - 1];
++        assert!(cut >= dmin - 1e-3 || (depths[n] - (k - d)).abs() < 1e-3, "pass {}: cut {cut} < {dmin}: {depths:?}", n + 1);
++    }
++    // The other reading - clamp against the UNCLAMPED rung before,
++    // dd*sqrt(n-1) + dmin - gives a different ladder, so this pin tells
++    // the two apart.
++    let mut other = Vec::new();
++    for n in 1.. {
++        let nf = n as f64;
++        let next = (dd * nf.sqrt()).max(if n == 1 { 0.0 } else { dd * (nf - 1.0).sqrt() + dmin });
++        if next >= k - d - 1e-9 {
++            other.push(k - d);
++            break;
++        }
++        other.push(next);
++    }
++    let differs = other.len() != rough || other.iter().zip(&depths).any(|(o, w)| (o - w).abs() > 1e-3);
++    assert!(differs, "the two readings agree here, the pin is blind: {other:?}");
++    let (want, _) = control_depths(&text);
++    assert_eq!(want.len(), depths.len(), "{want:?} vs {depths:?}");
++}
+diff --git a/docs/decisions/1842-g76-schedule-sources.md b/docs/decisions/1842-g76-schedule-sources.md
+new file mode 100644
+index 000000000..f9fa134a4
+--- /dev/null
++++ b/docs/decisions/1842-g76-schedule-sources.md
+@@ -0,0 +1,77 @@
++## #1842 - G76 schedule readings checked against published sources
++
++**What was decided.** Three of the four open G76 readings in
++`assets/posts/fanuc-lathe.cps` (decision #417) agree with two published
++control manuals of two different makers. The post and its goldens stay as
++they are. New tests in `crates/app/tests/lathe_post_g76_sources.rs` pin the
++three readings. The fourth reading stays open on #1842.
++
++Sources (behaviour only; no post-processor text or output of another CAM
++product was read):
++
++- S1: FANUC Series 0i-MODEL F Operator's Manual, Lathe System,
++  B-64604EN-1/01, section 4.2.7 "Multiple Threading Cycle (G76)", text and
++  Fig. 4.2.7 (a) "Cutting path in multiple threading cycle" and
++  Fig. 4.2.7 (b) "Detail of cutting". The same text and figures are in
++  FANUC 0i-D Descriptions B-64302EN/01, section 5.36.7 (same maker, so
++  not counted as a second source).
++- S2: Siemens SINUMERIK ISO Turning Programming Manual 07/2022,
++  A5E52211627B AA, section 4.1 "Multiple-thread cutting cycle (G76)",
++  Fig. 4-25 "Cutting path ..." and Fig. 4-26 "Infeed during thread
++  cutting", pages 87-89. The SINUMERIK 808D ISO manuals (6FC5398-0DP40)
++  have the same text.
++- Contrast only: Hurco WinMax Lathe "G76 - Multiple Threading Cycle"
++  ("Z(w) - Z end position of the cycle", "single-edge"); Haas lathe G76
++  ("The leading edge of the cutter does all of the cutting"; a different
++  word format); GSK988TA G76 (used by #417); LinuxCNC G76.
++
++Readings:
++
++1. **Start point and Z shift - settled, the post agrees.** S1 Fig. (a)/(b)
++   and S2 Fig. 4-25/4-26: the start point A is above the crest point B at
++   the same Z; each pass starts on the line from B at a/2 to the radial
++   direction, deeper passes further along the direction of travel. S2 and
++   S1 both say one edge cuts. The post starts at the record's crest
++   station `c_last + k*tan(a/2)`, and pass n starts `depth_n*tan(a/2)`
++   from it along the travel. Pinned by
++   `each_pass_starts_on_the_crest_flank_line_along_the_travel`.
++2. **End point - settled, the post agrees.** S1: "X_, Z_: Coordinates of
++   the cutting end point (point D ...)"; S2: "Z, W: Endpoint of thread in
++   the direction of Z axis"; both figures end every pass on the one
++   vertical line through D. The post writes the root pass's end as Z. The
++   kernel lays a shallower pass short of D by `(k - depth)*tan(a/2)`; the
++   control runs it to D. That extra length is at a smaller depth inside
++   the groove that the root pass cuts to D, so it removes no material
++   beyond the verified root pass and does not move toward a shoulder.
++   Pinned by `every_pass_runs_to_the_posted_end_z_inside_the_root_pass`.
++   The simulation detail is tracked in #1896.
++3. **Minimum depth - settled, the post agrees.** S1: "When the cutting
++   depth of one cycle operation becomes smaller than this limit, the
++   cutting depth is clamped at this value." S2: the clamp applies "when
++   the cutting depth during a cycle operation (Δd - Δd-1) becomes less
++   than this limiting value". The quantity clamped is the cut of one pass
++   below the pass before it. A clamp against the unclamped rung
++   `dd*sqrt(n-1)` would give cuts smaller than dmin after the first clamp,
++   which contradicts "clamped at this value". Pinned by
++   `the_minimum_depth_clamps_the_cut_of_one_pass`, which also proves that
++   the two readings give different ladders on its fixture.
++4. **Internal rounding - open.** S1's unit table and S2's note 5 confirm
++   that dmin, dd and k are in the least input increment with no decimal
++   point, and that R(d) takes a decimal point. Neither source says how the
++   control rounds `dd*sqrt(n)` inside the cycle. The post's guard (R from
++   the rounded ladder, refusal beyond one increment) stays. Only a run on
++   a control or its simulator can settle this.
++
++**Why.** The launching task permits a reading to be "settled" only on two
++independent published sources that agree with the post. S1 and S2 are from
++two makers. No reading showed the post wrong, so no posted G-code changed.
++
++**Considered and dropped.** Refusing or warning on flank G76 until the
++readings are verified (the issue's open question): dropped, because
++readings 1 and 2 are now settled. Editing the post's header comment to cite
++the sources: dropped, to keep the diff away from the open draft PRs #1866
++and #468 that also edit the post.
++
++**Cost to change later.** If a control run shows reading 4 differs, only
++`g76Allowance` in the post and `control_depths` in
++`crates/app/tests/common/g76.rs` change.
