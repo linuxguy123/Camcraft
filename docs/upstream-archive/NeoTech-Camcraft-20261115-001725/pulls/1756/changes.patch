@@ -1,0 +1,733 @@
+From 52e4c70c73f52753390e6ea01a377c8f3fa4a017 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 14 Nov 2026 15:26:32 -0800
+Subject: [PATCH] fix(boundary): edges bound the cut - in any pick mode, and
+ two edges keep the area between them
+
+An armed Boundary row took the toolbar's pick kinds, so in Faces mode
+no edge could be picked as a boundary. It now takes faces and edges in
+any mode.
+
+The open boundary may now hold two or more separate open chains: each
+splits the stock as a single chain does, keeps the side holding the
+operation's own area, and the area kept is between them - a face
+bounded by two of its edges is faced between them and runs on at the
+open ends. Chains that touch or cross, a chain with the area evenly on
+both sides, a Contour given two chains and an include / exclude of
+separate chains are each refused by name.
+
+Fixes #1727
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/boundary.rs          |  18 ++-
+ crates/app/src/operation/boundary_chains.rs   | 151 ++++++++++++++++++
+ crates/app/src/operation/boundary_ctx.rs      |   2 +-
+ crates/app/src/operation/boundary_picks.rs    |  74 ++++-----
+ crates/app/src/operation/contour_open.rs      |   8 +-
+ crates/app/src/operation/mod.rs               |   1 +
+ crates/app/tests/area_chains.rs               | 101 ++++++++++++
+ crates/app/tests/area_picks.rs                |   5 +-
+ crates/app/tests/mcp_pick.rs                  |  21 +++
+ crates/ui/src/boundary_draft.rs               |   4 +-
+ .../egui_app/tests/edge_click_modifiers.rs    |  40 +++++
+ crates/ui/src/feature_click.rs                |   5 +
+ docs/decisions/1727-boundary-edges.md         |  40 +++++
+ 13 files changed, 416 insertions(+), 54 deletions(-)
+ create mode 100644 crates/app/src/operation/boundary_chains.rs
+ create mode 100644 crates/app/tests/area_chains.rs
+ create mode 100644 docs/decisions/1727-boundary-edges.md
+
+diff --git a/crates/app/src/operation/boundary.rs b/crates/app/src/operation/boundary.rs
+index 4ba656fa3..91436e2f4 100644
+--- a/crates/app/src/operation/boundary.rs
++++ b/crates/app/src/operation/boundary.rs
+@@ -70,6 +70,8 @@ pub(super) enum Family {
+ #[derive(Clone, Debug)]
+ pub(super) enum OpenGeom {
+     Chain(Vec<Point2>),
++    /// Separate chains that stay apart; the area lies between them (#1727).
++    Chains(Vec<Vec<Point2>>),
+     Ring(Region),
+ }
+ 
+@@ -220,14 +222,19 @@ pub(super) fn resolve(base: Region, ctx: &AreaCtx) -> Result<AreaApplied, GenErr
+                 Family::Face => stock.clone(),
+                 _ => stock.offset_sharp(2.0 * r)?,
+             };
+-            let (left, right, dir) = match geom {
++            let (left, right, dir, laid) = match geom {
+                 OpenGeom::Chain(pts) => {
+                     let (l, rt, d) = sides_of_chain(pts, &reach)?;
+-                    (l, rt, Some(d))
++                    (l, rt, Some(d), None)
+                 }
+-                OpenGeom::Ring(ring) => (reach.intersect(ring)?, reach.difference(ring)?, None),
++                OpenGeom::Chains(cs) => {
++                    let (between, beyond, t) = super::boundary_chains::sides_of_chains(cs, &reach, &base)?;
++                    (between, beyond, None, Some(t))
++                }
++                OpenGeom::Ring(ring) => (reach.intersect(ring)?, reach.difference(ring)?, None, None),
+             };
+-            let left_inside = pick_side_left(&base, &left, &right)?;
++            // Separate chains name their Inside themselves (between them).
++            let left_inside = laid.is_some() || pick_side_left(&base, &left, &right)?;
+             let keep_left = (*side == ChainSide::Inside) == left_inside;
+             let (keep, drop) = if keep_left { (left, right) } else { (right, left) };
+             if let Some(theta) = dir {
+@@ -235,6 +242,9 @@ pub(super) fn resolve(base: Region, ctx: &AreaCtx) -> Result<AreaApplied, GenErr
+                 // the band starts at the far edge and works in.
+                 turn = snap_turn(if keep_left { std::f64::consts::PI - theta } else { -theta });
+             }
++            if let Some(t) = laid {
++                turn = t;
++            }
+             far_side = Some(drop);
+             check(keep, "open boundary (the chosen side holds no stock)")?
+         }
+diff --git a/crates/app/src/operation/boundary_chains.rs b/crates/app/src/operation/boundary_chains.rs
+new file mode 100644
+index 000000000..08d11d3e7
+--- /dev/null
++++ b/crates/app/src/operation/boundary_chains.rs
+@@ -0,0 +1,151 @@
++//! Two or more separate open chains as one open boundary (#1727): the
++//! picked runs grouped into chains joined end to end, chains that touch
++//! or cross refused by name, and the area kept between them - each chain
++//! splits the stock as the single open chain does (`sides_of_chain`),
++//! each keeps the side holding the operation's own area, and the kept
++//! area is where every chain's side agrees.
++//!
++//! Provenance: our own design notes; the side construction is
++//! `boundary_turn`'s, the rest is region intersection. No vendor
++//! material consulted.
++
++use super::*;
++use super::boundary_turn::{sides_of_chain, snap_turn};
++use super::contour_open::seg_seg;
++
++/// Closer than this, two chains touch, mm.
++const TOUCH: f64 = 1e-3;
++
++/// Group open runs into chains joined end to end (either direction), in
++/// pick order: a run that meets neither end of the chain being grown
++/// starts the next one.
++pub(super) fn group_runs(mut runs: Vec<Vec<Point2>>) -> Vec<Vec<Point2>> {
++    let mut out: Vec<Vec<Point2>> = Vec::new();
++    while !runs.is_empty() {
++        let mut chain = runs.remove(0);
++        while let (Some(h), Some(t)) = (chain.first().map(qkey), chain.last().map(qkey)) {
++            let Some(j) = runs.iter().position(|r| {
++                let (a, b) = (r.first().map(qkey), r.last().map(qkey));
++                a == Some(t) || b == Some(t) || a == Some(h) || b == Some(h)
++            }) else {
++                break;
++            };
++            let mut r = runs.remove(j);
++            let (a, b) = (r.first().map(qkey), r.last().map(qkey));
++            if a == Some(t) {
++                chain.extend(r.into_iter().skip(1));
++            } else if b == Some(t) {
++                r.reverse();
++                chain.extend(r.into_iter().skip(1));
++            } else {
++                if a == Some(h) {
++                    r.reverse();
++                }
++                r.pop();
++                r.extend(chain);
++                chain = r;
++            }
++        }
++        out.push(chain);
++    }
++    out
++}
++
++/// Whether two polylines touch or cross anywhere.
++fn chains_touch(a: &[Point2], b: &[Point2]) -> bool {
++    a.windows(2).any(|s| b.windows(2).any(|q| seg_seg(s[0], s[1], q[0], q[1]) <= TOUCH))
++}
++
++/// The refusal for chains that touch or cross: which side of either lies
++/// between them is a guess, so it is never taken.
++pub(super) fn touching_refusal(chains: &[Vec<Point2>]) -> Option<GenError> {
++    for i in 0..chains.len() {
++        for j in (i + 1)..chains.len() {
++            if chains_touch(&chains[i], &chains[j]) {
++                return Some(GenError::Invalid(format!(
++                    "the boundary picks spell {} open chains and chains {} and {} touch or cross - separate chains bound the area between them only when they stay apart; pick the edges between them to make one chain, or remove one",
++                    chains.len(),
++                    i + 1,
++                    j + 1
++                )));
++            }
++        }
++    }
++    None
++}
++
++/// The area between `chains` inside `reach`, what lies beyond them, and
++/// the turn that lays Face's rows along the first chain with the kept
++/// side below it. Each chain keeps the side that holds more of `base`;
++/// a chain with `base` evenly on both sides is refused by name.
++pub(super) fn sides_of_chains(
++    chains: &[Vec<Point2>],
++    reach: &Region,
++    base: &Region,
++) -> Result<(Region, Region, f64), GenError> {
++    let mut between = reach.clone();
++    let mut turn = 0.0;
++    for (i, c) in chains.iter().enumerate() {
++        let (left, right, theta) = sides_of_chain(c, reach)?;
++        let in_l = left.intersect(base)?.area().abs();
++        let in_r = right.intersect(base)?.area().abs();
++        if (in_l - in_r).abs() <= 0.01 * in_l.max(in_r) {
++            return Err(GenError::Invalid(format!(
++                "open chain {} of {} has the operation's area evenly on both sides - which side lies between the chains is a guess; pick edges that bound the area from one side",
++                i + 1,
++                chains.len()
++            )));
++        }
++        let keep_left = in_l > in_r;
++        if i == 0 {
++            turn = snap_turn(if keep_left { std::f64::consts::PI - theta } else { -theta });
++        }
++        between = between.intersect(if keep_left { &left } else { &right })?;
++    }
++    let beyond = reach.difference(&between)?;
++    Ok((between, beyond, turn))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn p(x: f64, y: f64) -> Point2 {
++        Point2::new(x, y)
++    }
++
++    fn square(h: f64) -> Region {
++        let ring = vec![p(-h, -h), p(h, -h), p(h, h), p(-h, h)];
++        Loop::new(ring).and_then(|l| Region::new(vec![l])).unwrap_or_else(|_| Region::empty())
++    }
++
++    #[test]
++    fn runs_group_into_chains_and_touching_chains_are_refused() {
++        // Two runs meeting end to end are one chain; a third apart is a second.
++        let runs = vec![vec![p(0.0, 0.0), p(5.0, 0.0)], vec![p(0.0, 9.0), p(5.0, 9.0)], vec![p(5.0, 0.0), p(9.0, 0.0)]];
++        let chains = group_runs(runs);
++        assert_eq!(chains.len(), 2, "{chains:?}");
++        assert!(touching_refusal(&chains).is_none(), "parallel chains stay apart");
++        // A run that meets a chain mid-way (a T) is a second chain that touches it.
++        let t = group_runs(vec![vec![p(0.0, 0.0), p(10.0, 0.0)], vec![p(5.0, 0.0), p(5.0, 8.0)]]);
++        assert_eq!(t.len(), 2);
++        let why = touching_refusal(&t).map(|e| e.to_string()).unwrap_or_default();
++        assert!(why.contains("chains 1 and 2 touch or cross"), "{why}");
++        // Two chains that cross.
++        let x = vec![vec![p(-5.0, 0.0), p(5.0, 0.0)], vec![p(0.0, -5.0), p(0.0, 5.0)]];
++        assert!(touching_refusal(&x).is_some(), "crossing chains are refused");
++    }
++
++    #[test]
++    fn the_area_lies_between_the_chains_and_a_tie_is_refused() {
++        let (reach, base) = (square(30.0), square(10.0));
++        let chains = vec![vec![p(-10.0, 10.0), p(10.0, 10.0)], vec![p(-10.0, -10.0), p(10.0, -10.0)]];
++        let (between, beyond, _) = sides_of_chains(&chains, &reach, &base).unwrap_or_else(|e| panic!("{e}"));
++        assert!((between.area().abs() - 60.0 * 20.0).abs() < 1.0, "the strip across the reach: {}", between.area());
++        assert!((beyond.area().abs() - 60.0 * 40.0).abs() < 1.0, "{}", beyond.area());
++        // A chain through the middle of the area: which side is between is a guess.
++        let mid = vec![vec![p(-10.0, 10.0), p(10.0, 10.0)], vec![p(-10.0, 0.0), p(10.0, 0.0)]];
++        let why = sides_of_chains(&mid, &reach, &base).err().map(|e| e.to_string()).unwrap_or_default();
++        assert!(why.contains("open chain 2 of 2 has the operation's area evenly on both sides"), "{why}");
++    }
++}
+diff --git a/crates/app/src/operation/boundary_ctx.rs b/crates/app/src/operation/boundary_ctx.rs
+index beedd6bd7..1f127a84f 100644
+--- a/crates/app/src/operation/boundary_ctx.rs
++++ b/crates/app/src/operation/boundary_ctx.rs
+@@ -156,7 +156,7 @@ fn build(world: &World, op: &Operation, tool_r: f64, material: &Material, part_s
+                 OpenGeom::Ring(r) => r,
+                 // The backstop: the page and the Apply door
+                 // (`area_pick_issue`) catch this first.
+-                OpenGeom::Chain(_) => {
++                OpenGeom::Chain(_) | OpenGeom::Chains(_) => {
+                     return Err(GenError::Invalid(
+                         "an include / exclude boundary must close - its picks spell an open chain; use it as the open boundary instead".into(),
+                     ));
+diff --git a/crates/app/src/operation/boundary_picks.rs b/crates/app/src/operation/boundary_picks.rs
+index 8df1a38b8..615b7508e 100644
+--- a/crates/app/src/operation/boundary_picks.rs
++++ b/crates/app/src/operation/boundary_picks.rs
+@@ -4,7 +4,8 @@
+ //! selection"). Three things live here, all on the world's features:
+ //!
+ //! - what an entry's picks SPELL ([`boundary_pick_shape`]): one open
+-//!   chain (several picked runs joined end to end), or closed rings - the
++//!   chain (several picked runs joined end to end), separate chains
++//!   that stay apart (#1727), or closed rings - the
+ //!   same walk generation takes (`picks_geom`), so the page's summary and
+ //!   the generator can never disagree;
+ //! - the door check ([`area_pick_issue`]): an include / exclude whose
+@@ -20,6 +21,7 @@
+ //! material consulted.
+ 
+ use super::boundary::OpenGeom;
++use super::boundary_chains::{group_runs, touching_refusal};
+ use super::*;
+ 
+ /// What a boundary entry's picks spell.
+@@ -27,6 +29,8 @@ use super::*;
+ pub enum PickShape {
+     /// One open chain, world XY in walk order.
+     Open { picks: usize, chain: Vec<Point2> },
++    /// Two or more separate open chains (#1727): the area lies between them.
++    Chains { picks: usize, chains: Vec<Vec<Point2>> },
+     /// Closed rings (`faces` of the picks were faces).
+     Closed { picks: usize, faces: usize, rings: usize },
+     /// The picks spell no boundary; the reason, named.
+@@ -40,7 +44,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
+ impl PickShape {
+     #[must_use]
+     pub fn is_open(&self) -> bool {
+-        matches!(self, PickShape::Open { .. })
++        matches!(self, PickShape::Open { .. } | PickShape::Chains { .. })
+     }
+ 
+     #[must_use]
+@@ -53,6 +57,9 @@ impl PickShape {
+     pub fn summary(&self) -> String {
+         match self {
+             PickShape::Open { picks, .. } => format!("{}, open chain", plural(*picks, "edge", "edges")),
++            PickShape::Chains { picks, chains } => {
++                format!("{}, {} open chains", plural(*picks, "edge", "edges"), chains.len())
++            }
+             PickShape::Closed { picks, faces, rings } => {
+                 let mut parts = Vec::new();
+                 if *faces > 0 {
+@@ -69,43 +76,11 @@ impl PickShape {
+     }
+ }
+ 
+-/// Join open runs end to end into one chain (either direction), or
+-/// `None` when they do not form one connected walk.
+-fn join_runs(mut runs: Vec<Vec<Point2>>) -> Option<Vec<Point2>> {
+-    if runs.is_empty() {
+-        return None;
+-    }
+-    let mut chain = runs.remove(0);
+-    while !runs.is_empty() {
+-        let (head, tail) = (qkey(chain.first()?), qkey(chain.last()?));
+-        let j = runs.iter().position(|r| {
+-            let (a, b) = (r.first().map(qkey), r.last().map(qkey));
+-            a == Some(tail) || b == Some(tail) || a == Some(head) || b == Some(head)
+-        })?;
+-        let mut r = runs.remove(j);
+-        let (a, b) = (r.first().map(qkey), r.last().map(qkey));
+-        if a == Some(tail) {
+-            chain.extend(r.into_iter().skip(1));
+-        } else if b == Some(tail) {
+-            r.reverse();
+-            chain.extend(r.into_iter().skip(1));
+-        } else {
+-            if a == Some(head) {
+-                r.reverse();
+-            }
+-            r.pop();
+-            r.extend(chain);
+-            chain = r;
+-        }
+-    }
+-    Some(chain)
+-}
+-
+ /// Picked boundary features in the operation's plane - world XY, or the
+ /// 3+2 index's tilted plane through `frame` - through the selection
+ /// walk every region runs (stitching, rim dedupe and every named
+-/// refusal included): one open chain - its runs joined end to end - or
+-/// closed rings, never a mix, never two separate chains.
++/// refusal included): one open chain - its runs joined end to end -,
++/// separate chains that stay apart (#1727), or closed rings, never a mix.
+ pub(super) fn picks_geom(
+     world: &World,
+     setup: Option<&str>,
+@@ -120,11 +95,18 @@ pub(super) fn picks_geom(
+     match (loops.is_empty(), runs.len()) {
+         (false, 0) => Ok(OpenGeom::Ring(Region::new(loops)?)),
+         (true, 0) => Err(GenError::Empty("the boundary picks resolve to nothing".into())),
+-        (true, n) => join_runs(runs).map(OpenGeom::Chain).ok_or_else(|| {
+-            GenError::Invalid(format!(
+-                "the boundary picks spell {n} separate open runs - an open boundary is one connected chain; pick the edges between them or remove the stray one"
+-            ))
+-        }),
++        (true, _) => {
++            // #1727: separate chains bound the area between them, unless
++            // they touch or cross (named, never guessed).
++            let mut chains = group_runs(runs);
++            if chains.len() == 1 {
++                return chains.pop().map(OpenGeom::Chain).ok_or_else(|| GenError::Empty("no open chain".into()));
++            }
++            match touching_refusal(&chains) {
++                Some(e) => Err(e),
++                None => Ok(OpenGeom::Chains(chains)),
++            }
++        }
+         (false, n) => Err(GenError::Invalid(format!(
+             "the boundary picks spell {} closed ring(s) and {n} open run(s) - a boundary is one open chain or closed rings; remove the open edges or close them",
+             loops.len()
+@@ -149,6 +131,7 @@ pub fn boundary_pick_shape(world: &World, setup: Option<&str>, picks: &[GeoSel],
+     };
+     match picks_geom(world, setup, picks, params, frame.as_ref()) {
+         Ok(OpenGeom::Chain(chain)) => PickShape::Open { picks: picks.len(), chain },
++        Ok(OpenGeom::Chains(chains)) => PickShape::Chains { picks: picks.len(), chains },
+         Ok(OpenGeom::Ring(r)) => PickShape::Closed { picks: picks.len(), faces, rings: r.loops().len() },
+         Err(e) => PickShape::Invalid(e.to_string()),
+     }
+@@ -368,18 +351,21 @@ mod law {
+         let a = vec![p(0.0, 0.0), p(10.0, 0.0)];
+         let b = vec![p(10.0, 10.0), p(10.0, 0.0)];
+         let c = vec![p(0.0, 10.0), p(0.0, 0.0)];
+-        let j = join_runs(vec![a, b, c]).expect("one chain");
++        let mut one = group_runs(vec![a, b, c]);
++        assert_eq!(one.len(), 1, "one chain");
++        let j = one.pop().expect("one chain");
+         assert_eq!(j.len(), 4);
+         assert_eq!(qkey(&j[0]), qkey(&p(0.0, 10.0)));
+         assert_eq!(qkey(&j[3]), qkey(&p(10.0, 10.0)));
+         let far = vec![p(50.0, 50.0), p(60.0, 50.0)];
+-        assert!(join_runs(vec![vec![p(0.0, 0.0), p(1.0, 0.0)], far]).is_none(), "two separate runs");
+-        assert!(join_runs(Vec::new()).is_none());
++        assert_eq!(group_runs(vec![vec![p(0.0, 0.0), p(1.0, 0.0)], far]).len(), 2, "two separate runs");
++        assert!(group_runs(Vec::new()).is_empty());
+     }
+ 
+     #[test]
+     fn the_summary_names_the_shape() {
+         assert_eq!(PickShape::Open { picks: 3, chain: Vec::new() }.summary(), "3 edges, open chain");
++        assert_eq!(PickShape::Chains { picks: 2, chains: vec![Vec::new(), Vec::new()] }.summary(), "2 edges, 2 open chains");
+         assert_eq!(PickShape::Closed { picks: 1, faces: 1, rings: 1 }.summary(), "1 face loop, closed");
+         assert_eq!(PickShape::Closed { picks: 4, faces: 0, rings: 1 }.summary(), "4 edges, closed");
+     }
+diff --git a/crates/app/src/operation/contour_open.rs b/crates/app/src/operation/contour_open.rs
+index a537d1fe3..fe9e3d925 100644
+--- a/crates/app/src/operation/contour_open.rs
++++ b/crates/app/src/operation/contour_open.rs
+@@ -80,6 +80,12 @@ pub(super) fn open_run(base: &Region, ctx: &AreaCtx, stock_to_leave: f64) -> Res
+     if ctx.family != Family::Contour {
+         return Err(unreached("contour open boundary family"));
+     }
++    if let OpenGeom::Chains(cs) = geom {
++        return Err(GenError::Invalid(format!(
++            "a Contour rides one open chain - its open boundary spells {} separate chains; pick the edges between them or use a clearing kind to cut between them",
++            cs.len()
++        )));
++    }
+     let OpenGeom::Chain(raw) = geom else {
+         return Err(GenError::Invalid(
+             "a Contour's open boundary must be an open chain - a closed ring is ridden by picking it as the selection".into(),
+@@ -177,7 +183,7 @@ fn cross(o: Point2, a: Point2, b: Point2) -> f64 {
+ }
+ 
+ /// Closest distance between segments ab and cd (zero when they cross).
+-fn seg_seg(a: Point2, b: Point2, c: Point2, d: Point2) -> f64 {
++pub(super) fn seg_seg(a: Point2, b: Point2, c: Point2, d: Point2) -> f64 {
+     let (d1, d2) = (cross(a, b, c), cross(a, b, d));
+     let (d3, d4) = (cross(c, d, a), cross(c, d, b));
+     if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 3b41b0f6e..1a4c95e65 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -146,6 +146,7 @@ mod boundary;
+ pub use boundary::AreaCtx;
+ use boundary::AreaApplied;
+ mod boundary_turn;
++mod boundary_chains;
+ mod contour_open;
+ mod finish_clip;
+ mod finish_entry;
+diff --git a/crates/app/tests/area_chains.rs b/crates/app/tests/area_chains.rs
+new file mode 100644
+index 000000000..d36808f11
+--- /dev/null
++++ b/crates/app/tests/area_chains.rs
+@@ -0,0 +1,101 @@
++//! #1727: two separate edges as one open boundary. A face selection
++//! bounded by two of its edges is faced between them - never across
++//! either - and runs on past the face at the open ends, with the
++//! depth-aware verify silent; a Contour cannot ride two chains and an
++//! include made of two chains is refused at Apply, each by name.
++//! Provenance: our own tests, specced from the issue's "Done means".
++//!
++//! Gate map (#1727): covers app::operation (boundary_chains,
++//! boundary_picks, boundary, contour_open), app::commands
++//! (EditOperationParams::with_area).
++
++mod area_support;
++
++use area_support::*;
++
++fn north_south(world: &World) -> Vec<GeoSel> {
++    [
++        rim_edge(world, |q| (q[1] - 20.0).abs() < 1e-9),
++        rim_edge(world, |q| (q[1] + 20.0).abs() < 1e-9),
++    ]
++    .into_iter()
++    .map(|f| GeoSel { entity: "part".into(), feature: f })
++    .collect()
++}
++
++fn between(world: &World) -> AreaControls {
++    AreaControls { open: Some(OpenBoundary { picks: north_south(world), side: ChainSide::Inside }), ..Default::default() }
++}
++
++#[test]
++fn a_face_bounded_by_two_of_its_edges_is_faced_between_them() {
++    let world = block_world();
++    let top = top_face(&world, "part", 10.0);
++    let shape = operation::boundary_pick_shape(&world, None, &north_south(&world), &face(10.0));
++    assert_eq!(shape.summary(), "2 edges, 2 open chains");
++    let (t, warns) = run(&world, &op(sel("part", top), face(10.0), between(&world))).expect("faced between the edges");
++    assert_eq!(warns, 0, "the verify is silent: {:?}", t.notes);
++    let f = feeds(&t);
++    assert!(!f.is_empty(), "a path was cut");
++    assert!(f.iter().all(|p| p.y + R <= 20.0 + EPS), "never across the north edge");
++    assert!(f.iter().all(|p| p.y - R >= -20.0 - EPS), "never across the south edge");
++    assert!((max_by(&f, |p| p.y) + R - 20.0).abs() < EPS, "works up to the north edge");
++    assert!((max_by(&f, |p| -p.y) + R - 20.0).abs() < EPS, "works down to the south edge");
++    // The ends are open: the rows run on past the face both ways.
++    assert!(max_by(&f, |p| p.x) > 20.0 + R && max_by(&f, |p| -p.x) > 20.0 + R, "the open ends run on");
++}
++
++#[test]
++fn a_contour_cannot_ride_two_separate_chains() {
++    let world = block_world();
++    let top = top_face(&world, "part", 10.0);
++    let a = AreaControls { open: Some(OpenBoundary { picks: north_south(&world), side: ChainSide::Outside }), ..Default::default() };
++    let err = run(&world, &op(sel("part", top), contour(10.0, 5.0, Side::Auto), a)).expect_err("refused");
++    assert!(err.contains("a Contour rides one open chain") && err.contains("2 separate chains"), "{err}");
++}
++
++#[test]
++fn an_include_of_two_separate_chains_is_refused_at_apply() {
++    let world = block_world();
++    let mut h = History::default();
++    h.execute(&world, CreateOperation::new(&world, "F", TOOL, SrcRef::Stock, face(10.0)).expect("create"));
++    let e = model::find_by_name(&world, "F").expect("op");
++    let params = model::operation_of(&world, &e).expect("op").params;
++    let bad = AreaControls {
++        extra: vec![ExtraBoundary { mode: BoundaryMode::Include, shape: BoundaryShape::Picks(north_south(&world)) }],
++        ..Default::default()
++    };
++    let err = EditOperationParams::with_area(&world, "F", params.clone(), bad).err().expect("refused at Apply");
++    assert!(err.to_string().contains("boundary 1 (Include) is an open chain (2 edges, 2 open chains)"), "{err}");
++    // The same picks as the open boundary ride one undoable edit.
++    h.execute(&world, EditOperationParams::with_area(&world, "F", params, between(&world)).expect("open is fine"));
++    assert_eq!(model::operation_of(&world, &e).expect("op").area, between(&world));
++    assert!(h.undo(&world));
++    assert_eq!(model::operation_of(&world, &e).expect("op").area, AreaControls::default());
++}
++
++#[test]
++fn chains_that_cross_are_refused_by_name() {
++    // A second block whose west rim edge (x = -5, y 15..25) crosses the
++    // first block's north rim edge (y = 20) at (-5, 20).
++    let world = block_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("other", cube(Point3::new(-5.0, 15.0, 0.0), Point3::new(5.0, 25.0, 10.0))));
++    let e = model::find_by_name(&world, "other").expect("model");
++    let f = model::features_of(&world, &e).expect("features");
++    let west = feature::chains(&f)
++        .into_iter()
++        .find(|c| {
++            let p = feature::chain_points(&f, c);
++            !c.closed && p.len() >= 2 && p.iter().all(|q| (q[2] - 10.0).abs() < 1e-9 && (q[0] + 5.0).abs() < 1e-9)
++        })
++        .map(|c| FeatureSel::Chain(c.id))
++        .expect("the other block's west rim edge");
++    let picks = vec![
++        GeoSel { entity: "part".into(), feature: rim_edge(&world, |q| (q[1] - 20.0).abs() < 1e-9) },
++        GeoSel { entity: "other".into(), feature: west },
++    ];
++    let shape = operation::boundary_pick_shape(&world, None, &picks, &face(10.0));
++    let operation::PickShape::Invalid(why) = shape else { panic!("crossing chains are refused: {shape:?}") };
++    assert!(why.contains("chains 1 and 2 touch or cross"), "{why}");
++}
+diff --git a/crates/app/tests/area_picks.rs b/crates/app/tests/area_picks.rs
+index a8937b235..c7a1d0f95 100644
+--- a/crates/app/tests/area_picks.rs
++++ b/crates/app/tests/area_picks.rs
+@@ -53,9 +53,10 @@ fn the_picks_spell_an_open_chain_or_closed_rings_before_generate() {
+     assert!(shape(&world, &all).is_closed(), "the four sides close");
+     let top = pick("part", top_face(&world, "part", 10.0));
+     assert_eq!(shape(&world, &top).summary(), "1 face loop, closed");
+-    // Two opposite sides do not touch: named, not guessed.
++    // #1727: two opposite sides do not touch - two open chains, the
++    // area between them (touching chains are refused, boundary_chains).
+     let apart = vec![all[0].clone(), all[2].clone()];
+-    assert!(matches!(shape(&world, &apart), PickShape::Invalid(ref why) if why.contains("separate open runs")));
++    assert!(matches!(shape(&world, &apart), PickShape::Chains { picks: 2, ref chains } if chains.len() == 2));
+     assert!(matches!(shape(&world, &[]), PickShape::Invalid(_)));
+ }
+ 
+diff --git a/crates/app/tests/mcp_pick.rs b/crates/app/tests/mcp_pick.rs
+index 211bbab24..81528f04b 100644
+--- a/crates/app/tests/mcp_pick.rs
++++ b/crates/app/tests/mcp_pick.rs
+@@ -454,3 +454,24 @@ fn list_features_normal_follows_the_part_placement() {
+     assert_eq!((facings(&flipped, "up"), facings(&flipped, "down")), (1, 1), "{flipped:?}");
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++/// #1727: edges are boundaries over MCP too - two picked edge chains set
++/// as the open boundary through `set_operation_area` (the same undoable
++/// `EditOperationParams::with_area` the page's Apply runs), read back,
++/// and undone in one step.
++#[test]
++fn edges_set_as_the_open_boundary_ride_one_undo_step() {
++    let (mut c, dir) = pocket_job("edge-bound");
++    let (_, chains) = floor_loop(&mut c);
++    let picks = json!([{ "model": "part", "id": chains[0] }, { "model": "part", "id": chains[2] }]);
++    let area = json!({ "open": { "picks": picks, "side": "inside" } });
++    let set = c.ok("set_operation_area", json!({ "operation": "P1", "area": area }));
++    assert_eq!(set["area"]["open"]["picks"], picks, "{set}");
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["area"]["open"]["picks"], picks, "{g}");
++    assert_eq!(g["area"]["open"]["side"], json!("inside"));
++    c.ok("undo", json!({}));
++    let g = c.ok("get_operation_geometry", json!({ "operation": "P1" }));
++    assert_eq!(g["area"]["open"], Value::Null, "undo takes the boundary back out: {g}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/crates/ui/src/boundary_draft.rs b/crates/ui/src/boundary_draft.rs
+index 4f4ecc084..71be89414 100644
+--- a/crates/ui/src/boundary_draft.rs
++++ b/crates/ui/src/boundary_draft.rs
+@@ -170,7 +170,7 @@ pub fn entries(state: &State) -> Vec<Entry> {
+             BoundaryShape::Silhouette => (Vec::new(), None, "part silhouette, closed".to_owned()),
+         };
+         let issue = match &shape {
+-            Some(PickShape::Open { .. }) => Some(format!(
++            Some(PickShape::Open { .. } | PickShape::Chains { .. }) => Some(format!(
+                 "an {} must enclose an area and these picks are an open chain - Shift-click an edge or 'Extend to loop' to close it, or 'Use as open boundary'",
+                 role.label()
+             )),
+@@ -207,7 +207,7 @@ pub fn role_block(state: &State, entry: &Entry, role: Role) -> Option<String> {
+         }
+         return None;
+     }
+-    if matches!(entry.shape, Some(PickShape::Open { .. })) {
++    if entry.shape.as_ref().is_some_and(PickShape::is_open) {
+         return Some(format!(
+             "these picks are an open chain ({}) - an {} must enclose an area; close it first (Shift-click / Extend to loop)",
+             entry.summary,
+diff --git a/crates/ui/src/egui_app/tests/edge_click_modifiers.rs b/crates/ui/src/egui_app/tests/edge_click_modifiers.rs
+index a8c76613c..5c0b2ffeb 100644
+--- a/crates/ui/src/egui_app/tests/edge_click_modifiers.rs
++++ b/crates/ui/src/egui_app/tests/edge_click_modifiers.rs
+@@ -169,3 +169,43 @@ fn hovering_a_selection_rows_remove_button_highlights_that_pick() {
+     assert_eq!(h.state().state.geo_hover, None, "the highlight goes when the pointer leaves");
+     assert_eq!(h.state().state.history.is_dirty(), history, "hover is not a command");
+ }
++
++/// The open boundary's picks in the page draft.
++fn open_picks(st: &crate::state::State) -> Vec<GeoSel> {
++    st.op_ui.area.open.as_ref().map(|o| o.picks.clone()).unwrap_or_default()
++}
++
++/// #1727: with the toolbar in Faces mode, an armed boundary row still takes
++/// the edge under the cursor (it took faces only, so no edge could bound
++/// the cut), and Ctrl adds a second, separate edge. Apply commits the two
++/// edges as one undoable edit; undo takes them back out. The click goes
++/// through the viewport's own feature-click route (`feature_click::click`)
++/// at the pixel over each edge, between frames, as the shell calls it.
++#[test]
++fn an_armed_boundary_row_takes_edges_in_faces_mode() {
++    let (h, name) = harness_for(Some(OpType::Face));
++    let (near, far) = (side(h.state(), 0), side(h.state(), 3));
++    let mut sh = h.into_state();
++    let st = &mut sh.state;
++    st.geo_pick = GeoPick::Face;
++    st.boundary_pick = Some(crate::state::BoundaryPick::Open);
++    let ctrl = crate::interact::Mods { command: true, ..Default::default() };
++    crate::feature_click::click(st, [near.x, near.y], crate::interact::Mods::default());
++    let one = open_picks(st);
++    assert_eq!(one.len(), 1, "a click takes one pick: {one:?} / {}", st.status);
++    assert!(matches!(one[0].feature, operation::FeatureSel::Chain(_)), "the pick is an edge, not the face: {one:?}");
++    crate::feature_click::click(st, [far.x, far.y], ctrl);
++    let two = open_picks(st);
++    assert_eq!(two.len(), 2, "Ctrl adds the far edge: {two:?} / {}", st.status);
++    assert!(two.iter().all(|g| matches!(g.feature, operation::FeatureSel::Chain(_))), "both picks are edges: {two:?}");
++    assert!(st.status.contains("2 open chains"), "the entry reads as two chains: {}", st.status);
++    st.apply_operation_params(&name);
++    st.drain_actions();
++    let stored = |st: &crate::state::State| {
++        model::find_by_name(&st.world, &name).and_then(|e| model::operation_of(&st.world, &e)).and_then(|o| o.area.open).map(|o| o.picks)
++    };
++    assert_eq!(stored(st), Some(two), "Apply commits the two edges: {}", st.status);
++    st.pending.push_back(CommandKind::Undo);
++    st.drain_actions();
++    assert_eq!(stored(st), None, "undo takes the boundary back out");
++}
+diff --git a/crates/ui/src/feature_click.rs b/crates/ui/src/feature_click.rs
+index 020ec47c8..868552f6e 100644
+--- a/crates/ui/src/feature_click.rs
++++ b/crates/ui/src/feature_click.rs
+@@ -112,6 +112,11 @@ pub(crate) fn ask(state: &State, mods: Mods) -> Ask {
+         // #701: the role draft takes faces, edges, corners and walls alike -
+         // the toolbar's pick mode stays the user's own.
+         PickKinds { faces: true, edges: true, points: true, centres: false }
++    } else if state.boundary_pick.is_some() {
++        // #1727: an armed boundary row takes faces AND edges whatever the
++        // toolbar's pick mode - in Faces mode it took faces only, so no
++        // edge could ever bound the cut.
++        PickKinds { faces: true, edges: true, points: false, centres: false }
+     } else {
+         mode
+     };
+diff --git a/docs/decisions/1727-boundary-edges.md b/docs/decisions/1727-boundary-edges.md
+new file mode 100644
+index 000000000..7248839c6
+--- /dev/null
++++ b/docs/decisions/1727-boundary-edges.md
+@@ -0,0 +1,40 @@
++## #1727 - Edges as boundaries: any pick mode, and two separate chains bound the area between them
++
++**Decided.**
++- An armed boundary row takes faces and edges whatever the toolbar's pick
++  mode. Before, it took the toolbar's kinds, so in Faces mode (the usual
++  one) no edge could be picked as a boundary.
++- The open boundary may hold two or more separate open chains. Each chain
++  splits the stock as one chain already did; each keeps the side that holds
++  more of the operation's own area; the area kept is where every chain's
++  side agrees (between the chains). The open ends run on to the stock as a
++  single chain's do. The Open - side B role keeps everything beyond them.
++  Face lays its rows along the first chain.
++- Refused by name, never guessed: chains that touch or cross; a chain with
++  the operation's area evenly on both sides (which side is "between" is a
++  guess); a Contour given two chains (it rides one); an include / exclude
++  made of separate chains (the Apply door, as for one open chain).
++- The old refusal "the boundary picks spell N separate open runs" is gone:
++  it is exactly the case the maintainer asked to work. The pick-shape test
++  in `area_picks.rs` that pinned it now pins two chains.
++
++**Why.** The maintainer's report: a face selection must be able to be
++bounded by two edges, the cut staying between them. The law reuses the
++single chain's side construction and region intersection; no new geometry
++kernel.
++
++**Considered and dropped.**
++- Two separate Open entries (one per edge): the page and the file hold one
++  open boundary; a second would change the project file format.
++- Per-chain sides (A/B per edge): one side choice for the whole boundary is
++  what the page offers; "between" is the case asked for.
++- `set_operation_geometry` taking boundary edges: that tool sets the
++  operation's source. The boundary is the area controls, set over MCP by
++  `set_operation_area` (`open.picks` takes edge chain ids, already did); the
++  issue's "Done means" names the first tool, the pin is on the second.
++- Drawing the separate chains in the viewport's boundary overlay: the
++  overlay draws one open chain; the page lists the entry as
++  "2 edges, 2 open chains". Left for a follow-up if wanted.
++
++**Cost to change later.** Small: the law is `operation::boundary_chains`
++and one arm in `boundary::resolve`; nothing new is saved.
