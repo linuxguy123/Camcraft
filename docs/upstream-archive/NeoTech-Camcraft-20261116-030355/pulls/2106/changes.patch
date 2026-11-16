@@ -1,0 +1,3037 @@
+From 3c65e18a2732ead7d61bec553d622a4d59c51f9e Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 15 Nov 2026 18:16:01 -0800
+Subject: [PATCH] feat(geometry): chain 2D sketch primitives into loops with
+ stable ids and nesting
+
+Add camcraft-geometry::sketch_chains. `chain()` joins the DXF reader's lines,
+arcs and circles into closed loops and open chains within a caller join
+tolerance (default 0.01 mm), per layer, and never bridges a wider gap: such a
+chain stays open and reports its two free ends.
+
+- Curves stay analytic: a segment is the input primitive turned to the walk
+  direction, so arc centre, radius and sweep sign survive for G2/G3.
+- Closed loops are walked counterclockwise from their lowest joint, open
+  chains from their lower end; ChainId is the 128-bit FNV-1a hash of the
+  layer name and the curves in that order, quantized to 1e-6 mm.
+- Closed loops are read as outer boundaries or holes by an exact
+  crossing-number test against the arcs (even-odd, as geo2d::Region).
+- Refusals are named and per chain: duplicate primitive, segment shorter
+  than the tolerance, branching joint, self-crossing or self-touching loop,
+  zero area. Loops that cross each other keep their geometry but get
+  NestingAmbiguous instead of a role. Invalid input, bad tolerances and
+  drawings over the work budget return an error; nothing panics or hangs.
+
+Algorithms are from published literature, named in each submodule's
+provenance line and in docs/decisions/1861-sketch-chaining.md.
+
+Fixes #1861
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ crates/geometry/src/lib.rs                    |   1 +
+ crates/geometry/src/sketch_chains/connect.rs  | 273 ++++++++++++++
+ crates/geometry/src/sketch_chains/crossing.rs | 192 ++++++++++
+ crates/geometry/src/sketch_chains/curve.rs    | 300 +++++++++++++++
+ crates/geometry/src/sketch_chains/identity.rs | 133 +++++++
+ .../geometry/src/sketch_chains/intersect.rs   | 146 +++++++
+ crates/geometry/src/sketch_chains/mod.rs      | 286 ++++++++++++++
+ crates/geometry/src/sketch_chains/nesting.rs  | 159 ++++++++
+ crates/geometry/src/sketch_chains/types.rs    | 166 ++++++++
+ crates/geometry/tests/common/mod.rs           | 228 +++++++++++
+ crates/geometry/tests/sketch_chains.rs        | 296 +++++++++++++++
+ .../geometry/tests/sketch_chains_nesting.rs   | 251 ++++++++++++
+ .../geometry/tests/sketch_chains_refusals.rs  | 356 ++++++++++++++++++
+ docs/decisions/1861-sketch-chaining.md        | 103 +++++
+ 14 files changed, 2890 insertions(+)
+ create mode 100644 crates/geometry/src/sketch_chains/connect.rs
+ create mode 100644 crates/geometry/src/sketch_chains/crossing.rs
+ create mode 100644 crates/geometry/src/sketch_chains/curve.rs
+ create mode 100644 crates/geometry/src/sketch_chains/identity.rs
+ create mode 100644 crates/geometry/src/sketch_chains/intersect.rs
+ create mode 100644 crates/geometry/src/sketch_chains/mod.rs
+ create mode 100644 crates/geometry/src/sketch_chains/nesting.rs
+ create mode 100644 crates/geometry/src/sketch_chains/types.rs
+ create mode 100644 crates/geometry/tests/common/mod.rs
+ create mode 100644 crates/geometry/tests/sketch_chains.rs
+ create mode 100644 crates/geometry/tests/sketch_chains_nesting.rs
+ create mode 100644 crates/geometry/tests/sketch_chains_refusals.rs
+ create mode 100644 docs/decisions/1861-sketch-chaining.md
+
+diff --git a/crates/geometry/src/lib.rs b/crates/geometry/src/lib.rs
+index f5c3a16ca..81c913a57 100644
+--- a/crates/geometry/src/lib.rs
++++ b/crates/geometry/src/lib.rs
+@@ -20,3 +20,4 @@ pub mod geo2d;
+ 
+ pub mod boundary_chains;
+ pub mod dxf;
++pub mod sketch_chains;
+diff --git a/crates/geometry/src/sketch_chains/connect.rs b/crates/geometry/src/sketch_chains/connect.rs
+new file mode 100644
+index 000000000..94e2f08c3
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/connect.rs
+@@ -0,0 +1,273 @@
++//! Provenance: tolerance joining of sketch endpoints. Fixed-radius neighbour search on a uniform
++//! grid (Bentley, Stanat and Williams, "The complexity of finding fixed-radius near neighbors",
++//! Information Processing Letters 6(6), 1977); clusters by disjoint-set union (Tarjan,
++//! "Efficiency of a good but not linear set union algorithm", JACM 22(2), 1975); a component
++//! whose joints all have degree two or less is walked as a path or a cycle (any graph text,
++//! e.g. Cormen et al., "Introduction to Algorithms", ch. 22). Original implementation.
++
++use super::curve::{Piece, Shape, dist};
++use super::{Budget, ChainError};
++use crate::geo2d::Point2;
++use std::collections::HashMap;
++use std::f64::consts::PI;
++
++/// Pieces in walk order, each with its input index.
++#[derive(Clone, Debug)]
++pub(super) struct Walk {
++    pub pieces: Vec<(usize, Piece)>,
++    pub closed: bool,
++}
++
++pub(super) enum Component {
++    Walk(Walk),
++    /// The input indices of the component and why it cannot be a chain.
++    Rejected(Vec<usize>, ChainError),
++}
++
++struct Sets(Vec<usize>);
++
++impl Sets {
++    fn new(n: usize) -> Sets {
++        Sets((0..n).collect())
++    }
++
++    fn find(&mut self, mut i: usize) -> usize {
++        // Path halving: every step shortens the path, so the loop ends at the root.
++        while let Some(&parent) = self.0.get(i) {
++            if parent == i {
++                break;
++            }
++            let grand = self.0.get(parent).copied().unwrap_or(parent);
++            if let Some(slot) = self.0.get_mut(i) {
++                *slot = grand;
++            }
++            i = grand;
++        }
++        i
++    }
++
++    /// The smaller root wins, so the result does not depend on the order of the unions.
++    fn union(&mut self, i: usize, j: usize) {
++        let (a, b) = (self.find(i), self.find(j));
++        let (keep, drop) = if a <= b { (a, b) } else { (b, a) };
++        if let Some(slot) = self.0.get_mut(drop) {
++            *slot = keep;
++        }
++    }
++}
++
++fn end_point(items: &[(usize, Piece)], end: usize) -> Option<Point2> {
++    let (_, piece) = items.get(end / 2)?;
++    Some(if end.is_multiple_of(2) {
++        piece.a
++    } else {
++        piece.b
++    })
++}
++
++/// Which cluster each piece end joined, and the ends of every cluster in ascending order.
++struct Joints {
++    of_end: Vec<usize>,
++    members: Vec<Vec<usize>>,
++}
++
++impl Joints {
++    fn cluster(&self, end: usize) -> usize {
++        self.of_end.get(end).copied().unwrap_or(usize::MAX)
++    }
++
++    fn ends_of(&self, end: usize) -> &[usize] {
++        self.members
++            .get(self.cluster(end))
++            .map_or(&[][..], Vec::as_slice)
++    }
++}
++
++/// Group `keys` (one per element) into lists of element numbers, in order of first appearance.
++fn group(keys: impl Iterator<Item = usize>) -> (Vec<usize>, Vec<Vec<usize>>) {
++    let mut number: HashMap<usize, usize> = HashMap::new();
++    let mut of = Vec::new();
++    let mut lists: Vec<Vec<usize>> = Vec::new();
++    for (element, key) in keys.enumerate() {
++        let id = *number.entry(key).or_insert(lists.len());
++        if id == lists.len() {
++            lists.push(Vec::new());
++        }
++        if let Some(list) = lists.get_mut(id) {
++            list.push(element);
++        }
++        of.push(id);
++    }
++    (of, lists)
++}
++
++/// Cluster the ends of `items` (no circles) that lie within `tol` of each other.
++fn clusters(items: &[(usize, Piece)], tol: f64, budget: &mut Budget) -> Result<Joints, ChainError> {
++    let ends = items.len() * 2;
++    // Cells of twice the tolerance: two ends within the tolerance are at most one cell apart
++    // even after the rounding of the division (coordinates are below SKETCH_LIMIT).
++    let cell = |p: Point2| {
++        (
++            (p.x / (2.0 * tol)).floor() as i64,
++            (p.y / (2.0 * tol)).floor() as i64,
++        )
++    };
++    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
++    let mut sets = Sets::new(ends);
++    for end in 0..ends {
++        let Some(p) = end_point(items, end) else {
++            continue;
++        };
++        let (cx, cy) = cell(p);
++        for dx in -1..=1i64 {
++            for dy in -1..=1i64 {
++                let Some(others) = grid.get(&(cx.saturating_add(dx), cy.saturating_add(dy))) else {
++                    continue;
++                };
++                budget.spend(others.len())?;
++                for &other in others {
++                    if end_point(items, other).is_some_and(|q| dist(p, q) <= tol) {
++                        sets.union(end, other);
++                    }
++                }
++            }
++        }
++        grid.entry((cx, cy)).or_default().push(end);
++    }
++    let roots: Vec<usize> = (0..ends).map(|end| sets.find(end)).collect();
++    let (of_end, members) = group(roots.into_iter());
++    Ok(Joints { of_end, members })
++}
++
++fn centroid(items: &[(usize, Piece)], ends: &[usize]) -> Point2 {
++    let (mut x, mut y, mut n) = (0.0, 0.0, 0.0);
++    for p in ends.iter().filter_map(|&end| end_point(items, end)) {
++        x += p.x;
++        y += p.y;
++        n += 1.0;
++    }
++    if n == 0.0 {
++        Point2::default()
++    } else {
++        Point2::new(x / n, y / n)
++    }
++}
++
++/// Join one layer's validated pieces into components and walk each clean one.
++pub(super) fn connect(
++    pieces: &[(usize, Piece)],
++    tol: f64,
++    budget: &mut Budget,
++) -> Result<Vec<Component>, ChainError> {
++    let mut out = Vec::new();
++    let mut items = Vec::new();
++    for &(index, piece) in pieces {
++        match piece.shape {
++            Shape::Circle { .. } => {
++                out.push(Component::Walk(Walk {
++                    pieces: vec![(index, piece)],
++                    closed: true,
++                }));
++            }
++            _ => items.push((index, piece)),
++        }
++    }
++    let joints = clusters(&items, tol, budget)?;
++    // Pieces that share a joint belong to one component.
++    let mut sets = Sets::new(items.len());
++    for ends in &joints.members {
++        if let Some((&first, rest)) = ends.split_first() {
++            for &end in rest {
++                sets.union(first / 2, end / 2);
++            }
++        }
++    }
++    let roots: Vec<usize> = (0..items.len()).map(|item| sets.find(item)).collect();
++    let (_, components) = group(roots.into_iter());
++    for component in components {
++        match walk(&items, &component, &joints) {
++            Ok(walk) => out.push(Component::Walk(walk)),
++            Err(error) => {
++                let indices = component
++                    .iter()
++                    .filter_map(|&item| items.get(item).map(|(index, _)| *index));
++                out.push(Component::Rejected(indices.collect(), error));
++            }
++        }
++    }
++    Ok(out)
++}
++
++/// An arc that returns to its own start within the tolerance is a closed loop of one piece.
++fn closes_on_itself(piece: &Piece) -> bool {
++    matches!(piece.shape, Shape::Arc { sweep, .. } if sweep.abs() > PI)
++}
++
++fn walk(
++    items: &[(usize, Piece)],
++    component: &[usize],
++    joints: &Joints,
++) -> Result<Walk, ChainError> {
++    let alone = component.len() == 1;
++    for &item in component {
++        if joints.cluster(item * 2) != joints.cluster(item * 2 + 1) {
++            continue;
++        }
++        let Some(&(index, piece)) = items.get(item) else {
++            continue;
++        };
++        if alone && joints.ends_of(item * 2).len() == 2 && closes_on_itself(&piece) {
++            return Ok(Walk {
++                pieces: vec![(index, piece)],
++                closed: true,
++            });
++        }
++        return Err(ChainError::DegenerateSegment { primitive: index });
++    }
++    // The branch reported is the lowest in (x, y), whatever the input order.
++    let mut branch: Option<(Point2, usize)> = None;
++    let mut start = None;
++    for &item in component {
++        for end in [item * 2, item * 2 + 1] {
++            let ends = joints.ends_of(end);
++            if ends.len() > 2 {
++                let at = centroid(items, ends);
++                let lower = |old: Point2| at.x < old.x || (at.x == old.x && at.y < old.y);
++                if branch.is_none_or(|(old, _)| lower(old)) {
++                    branch = Some((at, ends.len()));
++                }
++            } else if ends.len() == 1 && start.is_none() {
++                start = Some(end);
++            }
++        }
++    }
++    if let Some((at, degree)) = branch {
++        return Err(ChainError::Branch { at, degree });
++    }
++    let closed = start.is_none();
++    let first = start
++        .or_else(|| component.first().map(|&item| item * 2))
++        .unwrap_or(0);
++    let mut pieces = Vec::with_capacity(component.len());
++    let mut enter = first;
++    // Every piece is entered once, so the walk takes at most `component.len()` steps.
++    for _ in 0..component.len() {
++        let Some(&(index, piece)) = items.get(enter / 2) else {
++            break;
++        };
++        pieces.push((
++            index,
++            if enter.is_multiple_of(2) {
++                piece
++            } else {
++                piece.flipped()
++            },
++        ));
++        let exit = enter ^ 1;
++        match joints.ends_of(exit).iter().find(|&&end| end != exit) {
++            Some(&next) if next / 2 != first / 2 => enter = next,
++            _ => break,
++        }
++    }
++    Ok(Walk { pieces, closed })
++}
+diff --git a/crates/geometry/src/sketch_chains/crossing.rs b/crates/geometry/src/sketch_chains/crossing.rs
+new file mode 100644
+index 000000000..f15f20d10
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/crossing.rs
+@@ -0,0 +1,192 @@
++//! Provenance: crossing search over closed sketch loops. Candidate pairs come from a sweep over
++//! the bounding boxes sorted on one axis ("sweep and prune": Cohen, Lin, Manocha and Ponamgi,
++//! "I-COLLIDE", Symposium on Interactive 3D Graphics, 1995; the sweep itself is Shamos and
++//! Hoey, "Geometric intersection problems", FOCS 1976); each pair is then tested exactly by
++//! `intersect`. The pair count is budgeted, so a hostile drawing is refused, not hung on.
++//! Original implementation.
++
++use super::curve::{Piece, dist, same};
++use super::intersect::contacts;
++use super::{Budget, ChainError};
++use crate::geo2d::Point2;
++
++const NO_JOINT: usize = usize::MAX;
++
++/// A closed loop made watertight: its pieces in order, with a straight bridge over every
++/// joint gap. Each element knows the joints it ends at, so contact there is not a crossing.
++#[derive(Clone, Debug)]
++pub(super) struct Sealed {
++    pub pieces: Vec<Piece>,
++    /// Per element of `pieces`: the joint at its start and at its end.
++    joints: Vec<(usize, usize)>,
++    /// Per joint: the end of the piece before it and the start of the piece after it.
++    joint_ends: Vec<(Point2, Point2)>,
++    pub lo: Point2,
++    pub hi: Point2,
++}
++
++impl Sealed {
++    pub fn new(walk: &[Piece]) -> Sealed {
++        let n = walk.len();
++        let mut sealed = Sealed {
++            pieces: Vec::with_capacity(n),
++            joints: Vec::with_capacity(n),
++            joint_ends: vec![(Point2::default(), Point2::default()); n],
++            lo: Point2::new(f64::INFINITY, f64::INFINITY),
++            hi: Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
++        };
++        for (i, piece) in walk.iter().enumerate() {
++            let (lo, hi) = piece.bounds();
++            sealed.lo = Point2::new(sealed.lo.x.min(lo.x), sealed.lo.y.min(lo.y));
++            sealed.hi = Point2::new(sealed.hi.x.max(hi.x), sealed.hi.y.max(hi.y));
++            let after = (i + 1) % n;
++            let Some(next) = walk.get(after) else {
++                continue;
++            };
++            if same(piece.a, piece.b) && n == 1 {
++                // A full circle has no joint.
++                sealed.pieces.push(*piece);
++                sealed.joints.push((NO_JOINT, NO_JOINT));
++                continue;
++            }
++            sealed.pieces.push(*piece);
++            sealed.joints.push((i, after));
++            if let Some(slot) = sealed.joint_ends.get_mut(after) {
++                *slot = (piece.b, next.a);
++            }
++            if !same(piece.b, next.a) {
++                sealed.pieces.push(Piece::line(piece.b, next.a));
++                sealed.joints.push((after, after));
++            }
++        }
++        sealed
++    }
++
++    /// Whether `at` is contact that the shared joints of elements `i` and `j` explain: it
++    /// lies within `reach` of an end that meets there.
++    fn at_shared_joint(&self, i: usize, j: usize, at: Point2, reach: f64) -> bool {
++        let (Some(&(a0, a1)), Some(&(b0, b1))) = (self.joints.get(i), self.joints.get(j)) else {
++            return false;
++        };
++        [a0, a1]
++            .into_iter()
++            .filter(|&joint| joint != NO_JOINT && (joint == b0 || joint == b1))
++            .any(|joint| {
++                self.joint_ends
++                    .get(joint)
++                    .is_some_and(|&(p, q)| dist(at, p) <= reach || dist(at, q) <= reach)
++            })
++    }
++}
++
++/// One element's bounds as (along the sweep axis, across it).
++struct Entry {
++    chain: usize,
++    element: usize,
++    piece: Piece,
++    lo: (f64, f64),
++    hi: (f64, f64),
++}
++
++/// Whether to sweep along y: the axis on which the box centres spread widest keeps the fewest
++/// boxes open at once (Ericson, "Real-Time Collision Detection", 2005, sec. 7.5.1).
++pub(super) fn sweep_on_y(boxes: impl Iterator<Item = (Point2, Point2)> + Clone) -> bool {
++    let n = boxes.clone().count().max(1) as f64;
++    let centre = |(lo, hi): (Point2, Point2)| (0.5 * (lo.x + hi.x), 0.5 * (lo.y + hi.y));
++    let (sx, sy) = boxes
++        .clone()
++        .map(centre)
++        .fold((0.0, 0.0), |(x, y), c| (x + c.0, y + c.1));
++    let (mx, my) = (sx / n, sy / n);
++    let spread =
++        |(x, y): (f64, f64), c: (f64, f64)| (x + (c.0 - mx).powi(2), y + (c.1 - my).powi(2));
++    let (vx, vy) = boxes.map(centre).fold((0.0, 0.0), spread);
++    vy > vx
++}
++
++#[derive(Clone, Copy, PartialEq)]
++pub(super) enum Search {
++    /// Contact of a loop with itself, away from its joints.
++    Within,
++    /// Contact between two different loops.
++    Between,
++}
++
++/// The first contact found per loop: where, and (for `Between`) with which other loop.
++/// Loops flagged in `skip` take no part.
++pub(super) fn search(
++    loops: &[Sealed],
++    skip: &[bool],
++    mode: Search,
++    tol: f64,
++    eps: f64,
++    budget: &mut Budget,
++) -> Result<Vec<Option<(usize, Point2)>>, ChainError> {
++    let skipped = |chain: usize| skip.get(chain).copied().unwrap_or(false);
++    let live = || {
++        loops
++            .iter()
++            .enumerate()
++            .filter(|(chain, _)| !skipped(*chain))
++    };
++    let on_y = sweep_on_y(live().flat_map(|(_, sealed)| sealed.pieces.iter().map(Piece::bounds)));
++    let axes = |p: Point2| if on_y { (p.y, p.x) } else { (p.x, p.y) };
++    let mut entries = Vec::new();
++    for (chain, sealed) in live() {
++        for (element, piece) in sealed.pieces.iter().enumerate() {
++            let (lo, hi) = piece.bounds();
++            entries.push(Entry {
++                chain,
++                element,
++                piece: *piece,
++                lo: axes(lo),
++                hi: axes(hi),
++            });
++        }
++    }
++    entries.sort_by(|p, q| {
++        p.lo.0
++            .total_cmp(&q.lo.0)
++            .then(p.chain.cmp(&q.chain))
++            .then(p.element.cmp(&q.element))
++    });
++    let mut hits: Vec<Option<(usize, Point2)>> = vec![None; loops.len()];
++    let mut active: Vec<usize> = Vec::new();
++    let mut found = Vec::new();
++    for (current, entry) in entries.iter().enumerate() {
++        active.retain(|&k| {
++            entries
++                .get(k)
++                .is_some_and(|other| other.hi.0 + eps >= entry.lo.0)
++        });
++        budget.spend(active.len())?;
++        for &k in &active {
++            let Some(other) = entries.get(k) else {
++                continue;
++            };
++            if (other.chain == entry.chain) != (mode == Search::Within) {
++                continue;
++            }
++            if other.hi.1 + eps < entry.lo.1 || entry.hi.1 + eps < other.lo.1 {
++                continue;
++            }
++            found.clear();
++            contacts(&other.piece, &entry.piece, eps, &mut found);
++            let real = found.iter().copied().find(|&at| {
++                mode == Search::Between
++                    || !loops.get(entry.chain).is_some_and(|sealed| {
++                        sealed.at_shared_joint(other.element, entry.element, at, tol + eps)
++                    })
++            });
++            if let Some(at) = real {
++                for (chain, with) in [(entry.chain, other.chain), (other.chain, entry.chain)] {
++                    if let Some(slot @ None) = hits.get_mut(chain) {
++                        *slot = Some((with, at));
++                    }
++                }
++            }
++        }
++        active.push(current);
++    }
++    Ok(hits)
++}
+diff --git a/crates/geometry/src/sketch_chains/curve.rs b/crates/geometry/src/sketch_chains/curve.rs
+new file mode 100644
+index 000000000..6d13c6045
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/curve.rs
+@@ -0,0 +1,300 @@
++//! Provenance: oriented line/arc/circle pieces of a sketch chain. Arc area by Green's theorem
++//! (any calculus text, e.g. Stewart, "Calculus", ch. 16.4); arc extents from the quadrant points.
++//! Original implementation; no vendor material consulted.
++
++use super::ChainError;
++use crate::dxf::Primitive;
++use crate::geo2d::Point2;
++use std::f64::consts::{FRAC_PI_2, PI, TAU};
++
++/// Sketch coordinates stay below this magnitude (mm, ten kilometres) so that the quotient
++/// `coordinate / tolerance`, the identity quantization and the contact slack keep their meaning
++/// in `f64`.
++pub(super) const SKETCH_LIMIT: f64 = 1e7;
++
++/// Identity quantum: 1e-6 mm per unit.
++const ID_SCALE: f64 = 1e6;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(super) enum Shape {
++    Line,
++    /// As drawn: the arc runs from `start` by the signed `sweep`, whatever the traversal.
++    Arc {
++        center: Point2,
++        radius: f64,
++        start: f64,
++        sweep: f64,
++    },
++    Circle {
++        center: Point2,
++        radius: f64,
++    },
++}
++
++/// One curve piece in traversal direction: it is walked from `a` to `b`.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(super) struct Piece {
++    pub shape: Shape,
++    pub a: Point2,
++    pub b: Point2,
++    /// The traversal runs against the drawn direction.
++    pub reversed: bool,
++}
++
++pub(super) fn sub(p: Point2, q: Point2) -> Point2 {
++    Point2::new(p.x - q.x, p.y - q.y)
++}
++
++pub(super) fn cross(p: Point2, q: Point2) -> f64 {
++    p.x * q.y - p.y * q.x
++}
++
++pub(super) fn dot(p: Point2, q: Point2) -> f64 {
++    p.x * q.x + p.y * q.y
++}
++
++pub(super) fn dist(p: Point2, q: Point2) -> f64 {
++    (p.x - q.x).hypot(p.y - q.y)
++}
++
++pub(super) fn same(p: Point2, q: Point2) -> bool {
++    p.x == q.x && p.y == q.y
++}
++
++fn on_circle(center: Point2, radius: f64, angle: f64) -> Point2 {
++    Point2::new(
++        center.x + radius * angle.cos(),
++        center.y + radius * angle.sin(),
++    )
++}
++
++fn in_range(index: usize, values: &[f64]) -> Result<(), ChainError> {
++    if values.iter().any(|v| !v.is_finite()) {
++        return Err(ChainError::NonFinite { primitive: index });
++    }
++    if values.iter().any(|v| v.abs() >= SKETCH_LIMIT) {
++        return Err(ChainError::OutOfRange { primitive: index });
++    }
++    Ok(())
++}
++
++fn invalid(primitive: usize, reason: &'static str) -> ChainError {
++    ChainError::InvalidPrimitive { primitive, reason }
++}
++
++impl Piece {
++    pub fn line(a: Point2, b: Point2) -> Piece {
++        Piece {
++            shape: Shape::Line,
++            a,
++            b,
++            reversed: false,
++        }
++    }
++
++    /// Validate one input primitive and return it in its drawn direction.
++    pub fn from_primitive(index: usize, primitive: &Primitive) -> Result<Piece, ChainError> {
++        match *primitive {
++            Primitive::Line { start, end } => {
++                in_range(index, &[start.x, start.y, end.x, end.y])?;
++                Ok(Piece::line(start, end))
++            }
++            Primitive::Arc {
++                center,
++                radius,
++                start_angle,
++                sweep_angle,
++            } => {
++                in_range(
++                    index,
++                    &[center.x, center.y, radius, start_angle, sweep_angle],
++                )?;
++                in_range(index, &[center.x.abs() + radius, center.y.abs() + radius])?;
++                if radius <= 0.0 {
++                    return Err(invalid(index, "arc radius must be positive"));
++                }
++                if sweep_angle == 0.0 || sweep_angle.abs() > TAU + 1e-12 {
++                    return Err(invalid(
++                        index,
++                        "arc sweep must be non-zero and at most a turn",
++                    ));
++                }
++                let shape = Shape::Arc {
++                    center,
++                    radius,
++                    start: start_angle,
++                    sweep: sweep_angle,
++                };
++                let a = on_circle(center, radius, start_angle);
++                let b = on_circle(center, radius, start_angle + sweep_angle);
++                Ok(Piece {
++                    shape,
++                    a,
++                    b,
++                    reversed: false,
++                })
++            }
++            Primitive::Circle { center, radius } => {
++                in_range(index, &[center.x, center.y, radius])?;
++                in_range(index, &[center.x.abs() + radius, center.y.abs() + radius])?;
++                if radius <= 0.0 {
++                    return Err(invalid(index, "circle radius must be positive"));
++                }
++                let a = Point2::new(center.x + radius, center.y);
++                Ok(Piece {
++                    shape: Shape::Circle { center, radius },
++                    a,
++                    b: a,
++                    reversed: false,
++                })
++            }
++        }
++    }
++
++    /// The same curve walked the other way. A circle has no ends and stays as it is.
++    pub fn flipped(self) -> Piece {
++        match self.shape {
++            Shape::Circle { .. } => self,
++            _ => Piece {
++                shape: self.shape,
++                a: self.b,
++                b: self.a,
++                reversed: !self.reversed,
++            },
++        }
++    }
++
++    /// The signed sweep in traversal direction (zero for a line).
++    pub fn travel_sweep(&self) -> f64 {
++        match self.shape {
++            Shape::Line => 0.0,
++            Shape::Arc { sweep, .. } => {
++                if self.reversed {
++                    -sweep
++                } else {
++                    sweep
++                }
++            }
++            Shape::Circle { .. } => TAU,
++        }
++    }
++
++    /// The piece as an analytic primitive in traversal direction.
++    pub fn oriented(&self) -> Primitive {
++        match self.shape {
++            Shape::Line => Primitive::Line {
++                start: self.a,
++                end: self.b,
++            },
++            Shape::Arc {
++                center,
++                radius,
++                start,
++                sweep,
++            } => {
++                let (start_angle, sweep_angle) = if self.reversed {
++                    (start + sweep, -sweep)
++                } else {
++                    (start, sweep)
++                };
++                Primitive::Arc {
++                    center,
++                    radius,
++                    start_angle,
++                    sweep_angle,
++                }
++            }
++            Shape::Circle { center, radius } => Primitive::Circle { center, radius },
++        }
++    }
++
++    /// Green's theorem term `1/2 * integral(x dy - y dx)` along the piece; the terms of a
++    /// closed walk sum to its signed area (counterclockwise positive).
++    pub fn area_term(&self) -> f64 {
++        match self.shape {
++            Shape::Line => 0.5 * cross(self.a, self.b),
++            Shape::Arc { center, radius, .. } => {
++                0.5 * (radius * radius * self.travel_sweep() + center.x * (self.b.y - self.a.y)
++                    - center.y * (self.b.x - self.a.x))
++            }
++            Shape::Circle { radius, .. } => PI * radius * radius,
++        }
++    }
++
++    /// Axis-aligned bounds: the ends, plus every quadrant point an arc passes.
++    pub fn bounds(&self) -> (Point2, Point2) {
++        let mut lo = Point2::new(self.a.x.min(self.b.x), self.a.y.min(self.b.y));
++        let mut hi = Point2::new(self.a.x.max(self.b.x), self.a.y.max(self.b.y));
++        match self.shape {
++            Shape::Line => {}
++            Shape::Circle { center, radius } => {
++                lo = Point2::new(center.x - radius, center.y - radius);
++                hi = Point2::new(center.x + radius, center.y + radius);
++            }
++            Shape::Arc {
++                center,
++                radius,
++                start,
++                sweep,
++            } => {
++                let (from, to) = if sweep < 0.0 {
++                    (start + sweep, start)
++                } else {
++                    (start, start + sweep)
++                };
++                let mut k = (from / FRAC_PI_2).ceil();
++                // At most five quadrant points lie in one turn.
++                for _ in 0..5 {
++                    let angle = k * FRAC_PI_2;
++                    if angle > to {
++                        break;
++                    }
++                    let (dx, dy) = match (k as i64).rem_euclid(4) {
++                        0 => (radius, 0.0),
++                        1 => (0.0, radius),
++                        2 => (-radius, 0.0),
++                        _ => (0.0, -radius),
++                    };
++                    lo = Point2::new(lo.x.min(center.x + dx), lo.y.min(center.y + dy));
++                    hi = Point2::new(hi.x.max(center.x + dx), hi.y.max(center.y + dy));
++                    k += 1.0;
++                }
++            }
++        }
++        (lo, hi)
++    }
++
++    /// Whether `p`, a point of the support circle, lies in the arc's angular span.
++    pub fn spans(&self, p: Point2, eps: f64) -> bool {
++        match self.shape {
++            Shape::Line | Shape::Circle { .. } => true,
++            Shape::Arc {
++                center,
++                radius,
++                start,
++                sweep,
++            } => {
++                let angle = (p.y - center.y).atan2(p.x - center.x);
++                let along = if sweep < 0.0 {
++                    start - angle
++                } else {
++                    angle - start
++                }
++                .rem_euclid(TAU);
++                let slack = (eps / radius).min(PI);
++                along <= sweep.abs() + slack || along >= TAU - slack
++            }
++        }
++    }
++}
++
++pub(super) type Key = (i64, i64);
++
++/// Quantize a validated coordinate; `SKETCH_LIMIT * ID_SCALE` is far inside `i64`.
++pub(super) fn quantum(v: f64) -> i64 {
++    (v * ID_SCALE).round() as i64
++}
++
++pub(super) fn key(p: Point2) -> Key {
++    (quantum(p.x), quantum(p.y))
++}
+diff --git a/crates/geometry/src/sketch_chains/identity.rs b/crates/geometry/src/sketch_chains/identity.rs
+new file mode 100644
+index 000000000..d25bfbc1a
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/identity.rs
+@@ -0,0 +1,133 @@
++//! Provenance: canonical order and identity of a sketch chain. A closed chain is turned
++//! counterclockwise by its signed area (Green's theorem) and started at its lowest joint; an
++//! open chain starts at its lower end. The identity is the 128-bit FNV-1a hash (Fowler, Noll
++//! and Vo; IETF draft-eastlake-fnv, "The FNV Non-Cryptographic Hash Algorithm") of the layer
++//! name and the quantized curves in that order. Original implementation.
++
++use super::ChainId;
++use super::connect::Walk;
++use super::curve::{Key, Piece, Shape, cross, dist, key, quantum};
++
++const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
++const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
++/// Mixed in first; raise the version when the fed bytes change, so old ids never alias new ones.
++const DOMAIN: &[u8] = b"camcraft-sketch-chain-v1";
++
++struct Fnv(u128);
++
++impl Fnv {
++    fn bytes(&mut self, bytes: &[u8]) {
++        for &byte in bytes {
++            self.0 = (self.0 ^ u128::from(byte)).wrapping_mul(FNV_PRIME);
++        }
++    }
++
++    fn int(&mut self, v: i64) {
++        self.bytes(&v.to_le_bytes());
++    }
++
++    fn key(&mut self, k: Key) {
++        self.int(k.0);
++        self.int(k.1);
++    }
++}
++
++/// Signed area of a closed walk, its joint gaps bridged by straight lines.
++pub(super) fn signed_area(pieces: &[(usize, Piece)]) -> f64 {
++    let mut area = 0.0;
++    for (i, (_, piece)) in pieces.iter().enumerate() {
++        area += piece.area_term();
++        if let Some((_, next)) = pieces.get((i + 1) % pieces.len()) {
++            area += 0.5 * cross(piece.b, next.a);
++        }
++    }
++    area
++}
++
++/// The widest joint gap the walk bridges (a closed walk includes its closing joint).
++pub(super) fn max_gap(walk: &Walk) -> f64 {
++    let n = walk.pieces.len();
++    let joints = if walk.closed { n } else { n.saturating_sub(1) };
++    let mut gap = 0.0f64;
++    for i in 0..joints {
++        if let (Some((_, from)), Some((_, to))) = (walk.pieces.get(i), walk.pieces.get((i + 1) % n))
++        {
++            gap = gap.max(dist(from.b, to.a));
++        }
++    }
++    gap
++}
++
++fn reverse(walk: &mut Walk) {
++    walk.pieces.reverse();
++    for (_, piece) in &mut walk.pieces {
++        *piece = piece.flipped();
++    }
++}
++
++/// Put the walk in its canonical direction and start. Returns the area of a closed walk
++/// (positive after the turn; zero for an open one).
++pub(super) fn canonicalize(walk: &mut Walk) -> f64 {
++    if walk.closed {
++        let mut area = signed_area(&walk.pieces);
++        if area < 0.0 {
++            reverse(walk);
++            area = -area;
++        }
++        // Joints are farther apart than the tolerance, which is above the quantum, so the
++        // lowest key is unique and the start does not depend on the input order.
++        let lowest = walk
++            .pieces
++            .iter()
++            .enumerate()
++            .min_by_key(|(_, (_, piece))| key(piece.a));
++        if let Some((at, _)) = lowest {
++            walk.pieces.rotate_left(at);
++        }
++        return area;
++    }
++    let first = walk.pieces.first().map(|(_, piece)| key(piece.a));
++    let last = walk.pieces.last().map(|(_, piece)| key(piece.b));
++    if last < first {
++        reverse(walk);
++    }
++    0.0
++}
++
++/// The key the chains of a layer are sorted by: where the canonical walk starts.
++pub(super) fn start_key(walk: &Walk) -> Key {
++    walk.pieces
++        .first()
++        .map_or((0, 0), |(_, piece)| key(piece.a))
++}
++
++pub(super) fn chain_id(layer: &str, walk: &Walk) -> ChainId {
++    let mut hash = Fnv(FNV_OFFSET);
++    hash.bytes(DOMAIN);
++    hash.int(layer.len() as i64);
++    hash.bytes(layer.as_bytes());
++    hash.bytes(&[u8::from(walk.closed)]);
++    hash.int(walk.pieces.len() as i64);
++    for (_, piece) in &walk.pieces {
++        match piece.shape {
++            Shape::Line => {
++                hash.bytes(&[1]);
++                hash.key(key(piece.a));
++                hash.key(key(piece.b));
++            }
++            Shape::Arc { center, radius, .. } => {
++                hash.bytes(&[2, u8::from(piece.travel_sweep() > 0.0)]);
++                hash.key(key(piece.a));
++                hash.key(key(piece.b));
++                hash.key(key(center));
++                hash.int(quantum(radius));
++            }
++            Shape::Circle { center, radius } => {
++                hash.bytes(&[3]);
++                hash.key(key(center));
++                hash.int(quantum(radius));
++            }
++        }
++    }
++    ChainId(hash.0)
++}
+diff --git a/crates/geometry/src/sketch_chains/intersect.rs b/crates/geometry/src/sketch_chains/intersect.rs
+new file mode 100644
+index 000000000..7a180a29f
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/intersect.rs
+@@ -0,0 +1,146 @@
++//! Provenance: contact points of two line/arc/circle pieces. Segment-segment by the parametric
++//! cross-product test (O'Rourke, "Computational Geometry in C", 2nd ed., sec. 7.2); line-circle
++//! and circle-circle by the closed forms in Schneider and Eberly, "Geometric Tools for Computer
++//! Graphics" (2003), sec. 7.3 and 7.5. An end of one piece lying on the other also counts, which
++//! covers collinear and co-circular overlap. Original implementation.
++
++use super::curve::{Piece, Shape, cross, dist, dot, sub};
++use crate::geo2d::Point2;
++
++fn along(p: Point2, d: Point2, t: f64) -> Point2 {
++    Point2::new(p.x + d.x * t, p.y + d.y * t)
++}
++
++/// Distance from `p` to the piece's curve.
++fn distance(piece: &Piece, p: Point2, eps: f64) -> f64 {
++    match piece.shape {
++        Shape::Line => {
++            let d = sub(piece.b, piece.a);
++            let len2 = dot(d, d);
++            if len2 == 0.0 {
++                return dist(p, piece.a);
++            }
++            let t = (dot(sub(p, piece.a), d) / len2).clamp(0.0, 1.0);
++            dist(p, along(piece.a, d, t))
++        }
++        Shape::Circle { center, radius } => (dist(p, center) - radius).abs(),
++        Shape::Arc { center, radius, .. } => {
++            let ends = dist(p, piece.a).min(dist(p, piece.b));
++            if piece.spans(p, eps) {
++                ends.min((dist(p, center) - radius).abs())
++            } else {
++                ends
++            }
++        }
++    }
++}
++
++fn round(piece: &Piece) -> Option<(Point2, f64)> {
++    match piece.shape {
++        Shape::Line => None,
++        Shape::Arc { center, radius, .. } | Shape::Circle { center, radius } => {
++            Some((center, radius))
++        }
++    }
++}
++
++fn line_line(p: &Piece, q: &Piece, eps: f64, out: &mut Vec<Point2>) {
++    let (r, s) = (sub(p.b, p.a), sub(q.b, q.a));
++    let (lr, ls) = (dot(r, r).sqrt(), dot(s, s).sqrt());
++    let denom = cross(r, s);
++    // Parallel or point-like lines have no single crossing; their overlap shows at the ends.
++    if lr == 0.0 || ls == 0.0 || denom.abs() <= 1e-12 * lr * ls {
++        return;
++    }
++    let w = sub(q.a, p.a);
++    let (t, u) = (cross(w, s) / denom, cross(w, r) / denom);
++    if t >= -eps / lr && t <= 1.0 + eps / lr && u >= -eps / ls && u <= 1.0 + eps / ls {
++        out.push(along(p.a, r, t.clamp(0.0, 1.0)));
++    }
++}
++
++fn line_round(
++    line: &Piece,
++    arc: &Piece,
++    center: Point2,
++    radius: f64,
++    eps: f64,
++    out: &mut Vec<Point2>,
++) {
++    let d = sub(line.b, line.a);
++    let len = dot(d, d).sqrt();
++    if len == 0.0 {
++        return;
++    }
++    let f = sub(line.a, center);
++    let off = cross(f, d).abs() / len;
++    if off > radius + eps {
++        return;
++    }
++    let mid = -dot(f, d) / (len * len);
++    let half = (radius * radius - off * off).max(0.0).sqrt() / len;
++    for t in [mid - half, mid + half] {
++        if t >= -eps / len && t <= 1.0 + eps / len {
++            let at = along(line.a, d, t.clamp(0.0, 1.0));
++            if arc.spans(at, eps) {
++                out.push(at);
++            }
++        }
++    }
++}
++
++fn round_round(
++    p: &Piece,
++    q: &Piece,
++    (c1, r1): (Point2, f64),
++    (c2, r2): (Point2, f64),
++    eps: f64,
++    out: &mut Vec<Point2>,
++) {
++    let gap = dist(c1, c2);
++    if gap <= eps {
++        // Concentric: equal radii overlap. Arcs show that at their ends; two full circles
++        // have no ends, so name a point of the shared circle.
++        let circles = matches!(
++            (p.shape, q.shape),
++            (Shape::Circle { .. }, Shape::Circle { .. })
++        );
++        if circles && (r1 - r2).abs() <= eps {
++            out.push(p.a);
++        }
++        return;
++    }
++    if gap > r1 + r2 + eps || gap < (r1 - r2).abs() - eps {
++        return;
++    }
++    let a = (gap * gap + r1 * r1 - r2 * r2) / (2.0 * gap);
++    let h = (r1 * r1 - a * a).max(0.0).sqrt();
++    let u = Point2::new((c2.x - c1.x) / gap, (c2.y - c1.y) / gap);
++    let foot = along(c1, u, a);
++    for side in [-1.0, 1.0] {
++        let at = Point2::new(foot.x - side * h * u.y, foot.y + side * h * u.x);
++        if p.spans(at, eps) && q.spans(at, eps) {
++            out.push(at);
++        }
++    }
++}
++
++/// Append every point where `p` and `q` cross, touch or overlap within `eps`.
++pub(super) fn contacts(p: &Piece, q: &Piece, eps: f64, out: &mut Vec<Point2>) {
++    match (round(p), round(q)) {
++        (None, None) => line_line(p, q, eps, out),
++        (None, Some((center, radius))) => line_round(p, q, center, radius, eps, out),
++        (Some((center, radius)), None) => line_round(q, p, center, radius, eps, out),
++        (Some(a), Some(b)) => round_round(p, q, a, b, eps, out),
++    }
++    for (piece, other) in [(p, q), (q, p)] {
++        if matches!(piece.shape, Shape::Circle { .. }) {
++            continue;
++        }
++        for end in [piece.a, piece.b] {
++            if distance(other, end, eps) <= eps {
++                out.push(end);
++            }
++        }
++    }
++}
+diff --git a/crates/geometry/src/sketch_chains/mod.rs b/crates/geometry/src/sketch_chains/mod.rs
+new file mode 100644
+index 000000000..a1f2bf6ae
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/mod.rs
+@@ -0,0 +1,286 @@
++//! Sketch chaining: join 2D line, arc and circle primitives into closed loops and open chains,
++//! give each a stable identity, and read the closed loops as outer boundaries or holes.
++//!
++//! Provenance: our own design from published computational-geometry literature; each submodule
++//! names its sources (grid neighbour search and union-find in `connect`, FNV-1a in `identity`,
++//! sweep and prune in `crossing`, closed-form contacts in `intersect`, crossing-number
++//! containment in `nesting`). No vendor code or output was consulted.
++//!
++//! Contract. Primitives and the join tolerance are in millimetres (scale a DXF document by its
++//! units first). Ends join only when they lie within the tolerance, and only on the same layer;
++//! a wider gap stays open and is reported, never closed. Curves are kept analytic: every chain
++//! segment is the input line, arc or circle, turned to the walk direction. Anything that cannot
++//! be a chain is listed in `rejected` with a named error, never dropped silently and never
++//! repaired. Nesting is read over all closed chains passed in, whatever their layers: filter the
++//! primitives first to nest a subset. This module has no file I/O and no application state.
++
++mod connect;
++mod crossing;
++mod curve;
++mod identity;
++mod intersect;
++mod nesting;
++mod types;
++
++use crate::dxf::LayeredPrimitive;
++use connect::{Component, Walk};
++use crossing::{Sealed, Search};
++use curve::{Key, Piece, Shape};
++use std::collections::{BTreeMap, HashMap, HashSet};
++
++pub use types::*;
++
++/// Pair tests one call may spend on joining, crossing search and nesting before it is refused.
++const WORK_LIMIT: u64 = 200_000_000;
++
++pub(crate) struct Budget(u64);
++
++impl Budget {
++    fn spend(&mut self, work: usize) -> Result<(), ChainError> {
++        self.0 = self
++            .0
++            .checked_sub(work as u64)
++            .ok_or(ChainError::TooComplex)?;
++        Ok(())
++    }
++}
++
++/// Geometry of a primitive as a key that is equal for a repeat drawn in either direction.
++fn repeat_key(piece: &Piece) -> (u8, [Key; 3], i64) {
++    let (a, b) = (curve::key(piece.a), curve::key(piece.b));
++    match piece.shape {
++        Shape::Line => (1, [a.min(b), a.max(b), (0, 0)], 0),
++        Shape::Arc {
++            center,
++            radius,
++            sweep,
++            ..
++        } => {
++            let (from, to) = if sweep < 0.0 { (b, a) } else { (a, b) };
++            (2, [from, to, curve::key(center)], curve::quantum(radius))
++        }
++        Shape::Circle { center, radius } => (3, [curve::key(center); 3], curve::quantum(radius)),
++    }
++}
++
++struct Draft {
++    layer: String,
++    walk: Walk,
++    id: ChainId,
++    area: f64,
++}
++
++impl Draft {
++    fn order(&self) -> (&str, Key, ChainId) {
++        (&self.layer, identity::start_key(&self.walk), self.id)
++    }
++
++    fn indices(&self) -> Vec<usize> {
++        let mut indices: Vec<usize> = self.walk.pieces.iter().map(|(index, _)| *index).collect();
++        indices.sort_unstable();
++        indices
++    }
++
++    fn segments(&self) -> Vec<ChainSegment> {
++        let segment = |&(primitive, piece): &(usize, Piece)| ChainSegment {
++            primitive,
++            curve: piece.oriented(),
++            reversed: piece.reversed,
++            start: piece.a,
++            end: piece.b,
++        };
++        self.walk.pieces.iter().map(segment).collect()
++    }
++}
++
++/// Chain `primitives` (millimetres) by `options`. `Err` is for input no chain can be read
++/// from at all: a bad tolerance, a non-finite, out-of-range or invalid primitive, or a drawing
++/// over the size and work limits. Everything else is in the result, chained or rejected by name.
++pub fn chain(
++    primitives: &[LayeredPrimitive],
++    options: ChainOptions,
++) -> Result<SketchChains, ChainError> {
++    let tol = options.join_tolerance;
++    if !(tol.is_finite() && (MIN_JOIN_TOLERANCE..=MAX_JOIN_TOLERANCE).contains(&tol)) {
++        return Err(ChainError::InvalidTolerance);
++    }
++    if primitives.len() > MAX_PRIMITIVES {
++        return Err(ChainError::TooComplex);
++    }
++    let mut budget = Budget(WORK_LIMIT);
++    let mut out = SketchChains::default();
++    let mut layers: BTreeMap<&str, Vec<(usize, Piece)>> = BTreeMap::new();
++    let mut seen = HashMap::new();
++    let mut extent = 0.0f64;
++    for (index, item) in primitives.iter().enumerate() {
++        let piece = Piece::from_primitive(index, &item.primitive)?;
++        let (lo, hi) = piece.bounds();
++        extent = [lo.x, lo.y, hi.x, hi.y]
++            .iter()
++            .fold(extent, |m, v| m.max(v.abs()));
++        let first = *seen
++            .entry((item.layer.as_str(), repeat_key(&piece)))
++            .or_insert(index);
++        if first == index {
++            layers
++                .entry(item.layer.as_str())
++                .or_default()
++                .push((index, piece));
++        } else {
++            let error = ChainError::DuplicatePrimitive {
++                primitive: index,
++                of: first,
++            };
++            out.rejected.push(Rejected {
++                layer: item.layer.clone(),
++                primitives: vec![index],
++                error,
++            });
++        }
++    }
++    // Absolute slack of the contact tests: above float noise at this extent, and (coordinates
++    // are below 1e7 mm) never above the smallest join tolerance.
++    let eps = 1e-12 * (1.0 + extent);
++
++    let mut drafts = Vec::new();
++    for (layer, pieces) in &layers {
++        for component in connect::connect(pieces, tol, &mut budget)? {
++            match component {
++                Component::Rejected(mut primitives, error) => {
++                    primitives.sort_unstable();
++                    out.rejected.push(Rejected {
++                        layer: (*layer).into(),
++                        primitives,
++                        error,
++                    });
++                }
++                Component::Walk(mut walk) => {
++                    let area = identity::canonicalize(&mut walk);
++                    let id = identity::chain_id(layer, &walk);
++                    drafts.push(Draft {
++                        layer: (*layer).into(),
++                        walk,
++                        id,
++                        area,
++                    });
++                }
++            }
++        }
++    }
++    drafts.sort_by(|p, q| p.order().cmp(&q.order()));
++    let mut ids = HashSet::new();
++    let mut closed = Vec::new();
++    for draft in drafts {
++        if !ids.insert(draft.id) {
++            let error = ChainError::DuplicateChain { of: draft.id };
++            out.rejected.push(Rejected {
++                layer: draft.layer.clone(),
++                primitives: draft.indices(),
++                error,
++            });
++        } else if draft.walk.closed {
++            closed.push(draft);
++        } else {
++            let (first, last) = (draft.walk.pieces.first(), draft.walk.pieces.last());
++            let (Some((_, first)), Some((_, last))) = (first, last) else {
++                continue;
++            };
++            out.open.push(OpenChain {
++                id: draft.id,
++                layer: draft.layer.clone(),
++                segments: draft.segments(),
++                start: first.a,
++                end: last.b,
++                max_gap: identity::max_gap(&draft.walk),
++            });
++        }
++    }
++    nest(closed, tol, eps, &mut budget, &mut out)?;
++    out.rejected
++        .sort_by(|p, q| (&p.layer, &p.primitives).cmp(&(&q.layer, &q.primitives)));
++    Ok(out)
++}
++
++/// Refuse the self-crossing and the empty loops, then read the nesting of the rest.
++fn nest(
++    closed: Vec<Draft>,
++    tol: f64,
++    eps: f64,
++    budget: &mut Budget,
++    out: &mut SketchChains,
++) -> Result<(), ChainError> {
++    let loops: Vec<Sealed> = closed
++        .iter()
++        .map(|draft| {
++            Sealed::new(
++                &draft
++                    .walk
++                    .pieces
++                    .iter()
++                    .map(|(_, piece)| *piece)
++                    .collect::<Vec<_>>(),
++            )
++        })
++        .collect();
++    let within = crossing::search(
++        &loops,
++        &vec![false; loops.len()],
++        Search::Within,
++        tol,
++        eps,
++        budget,
++    )?;
++    // A loop that crosses itself or encloses nothing is refused and takes no part in nesting.
++    let refusal = |i: usize| match (within.get(i), closed.get(i)) {
++        (Some(&Some((_, at))), _) => Some(ChainError::SelfCrossing { at }),
++        (_, Some(draft)) if draft.area <= tol * tol => Some(ChainError::ZeroArea),
++        _ => None,
++    };
++    let refused: Vec<bool> = (0..loops.len()).map(|i| refusal(i).is_some()).collect();
++    let between = crossing::search(&loops, &refused, Search::Between, tol, eps, budget)?;
++    let containers = nesting::containers(&loops, &refused, budget)?;
++    let id_of = |i: usize| closed.get(i).map(|draft| draft.id);
++    let ambiguous = |i: usize| match between.get(i) {
++        Some(&Some((other, at))) => {
++            id_of(other).map(|other| ChainError::NestingAmbiguous { other, at })
++        }
++        _ => None,
++    };
++    for (i, draft) in closed.iter().enumerate() {
++        if let Some(error) = refusal(i) {
++            out.rejected.push(Rejected {
++                layer: draft.layer.clone(),
++                primitives: draft.indices(),
++                error,
++            });
++            continue;
++        }
++        let around = containers.get(i).map_or(&[][..], Vec::as_slice);
++        let depth_of = |j: usize| containers.get(j).map_or(0, Vec::len);
++        let nesting = match ambiguous(i).or_else(|| around.iter().find_map(|&j| ambiguous(j))) {
++            Some(error) => Err(error),
++            None => Ok(Nesting {
++                role: if around.len().is_multiple_of(2) {
++                    LoopRole::Outer
++                } else {
++                    LoopRole::Hole
++                },
++                depth: around.len(),
++                parent: around
++                    .iter()
++                    .copied()
++                    .max_by_key(|&j| depth_of(j))
++                    .and_then(id_of),
++            }),
++        };
++        out.closed.push(ClosedChain {
++            id: draft.id,
++            layer: draft.layer.clone(),
++            segments: draft.segments(),
++            area: draft.area,
++            max_gap: identity::max_gap(&draft.walk),
++            nesting,
++        });
++    }
++    Ok(())
++}
+diff --git a/crates/geometry/src/sketch_chains/nesting.rs b/crates/geometry/src/sketch_chains/nesting.rs
+new file mode 100644
+index 000000000..1bf1b8018
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/nesting.rs
+@@ -0,0 +1,159 @@
++//! Provenance: outer-versus-hole reading of closed sketch loops. Containment is the crossing-
++//! number test with the half-open edge rule (Shimrat, "Algorithm 112: Position of point relative
++//! to polygon", CACM 5(8), 1962; Haines, "Point in Polygon Strategies", Graphics Gems IV, 1994),
++//! extended to circular arcs by cutting each arc into y-monotone pieces at its top and bottom
++//! points. A loop inside an even number of loops is an outer boundary and inside an odd number
++//! a hole: the even-odd rule `geo2d::Region` reads its loops by. Original implementation.
++
++use super::crossing::{Sealed, sweep_on_y};
++use super::curve::{Piece, Shape};
++use super::{Budget, ChainError};
++use crate::geo2d::Point2;
++use std::f64::consts::{FRAC_PI_2, PI};
++
++/// Whether a ray from `p` towards +x crosses the y-monotone span from `ya` to `yb`, whose x at
++/// the ray's height is `x()`. Lower end inclusive, upper end exclusive.
++fn crosses(p: Point2, ya: f64, yb: f64, x: impl Fn() -> f64) -> bool {
++    (ya > p.y) != (yb > p.y) && x() > p.x
++}
++
++fn arc_parity(
++    p: Point2,
++    piece: &Piece,
++    center: Point2,
++    radius: f64,
++    start: f64,
++    sweep: f64,
++) -> bool {
++    // Walk the arc by increasing angle; the drawn ends keep the exact points of the piece.
++    let (drawn_from, drawn_to) = if piece.reversed {
++        (piece.b, piece.a)
++    } else {
++        (piece.a, piece.b)
++    };
++    let (from, to, y_from, y_to) = if sweep < 0.0 {
++        (start + sweep, start, drawn_to.y, drawn_from.y)
++    } else {
++        (start, start + sweep, drawn_from.y, drawn_to.y)
++    };
++    let dy = p.y - center.y;
++    let half = (radius * radius - dy * dy).max(0.0).sqrt();
++    let mut inside = false;
++    let (mut angle, mut y) = (from, y_from);
++    let mut k = ((from - FRAC_PI_2) / PI).floor() + 1.0;
++    // The top and bottom points lie half a turn apart, so one turn holds at most three of
++    // them: the bound is never reached.
++    for _ in 0..8 {
++        let turn = FRAC_PI_2 + k * PI;
++        if turn <= angle {
++            k += 1.0;
++            continue;
++        }
++        let last = turn >= to;
++        let (next, y_next) = if last {
++            (to, y_to)
++        } else if (k as i64).rem_euclid(2) == 0 {
++            (turn, center.y + radius)
++        } else {
++            (turn, center.y - radius)
++        };
++        let right = (0.5 * (angle + next)).cos() >= 0.0;
++        inside ^= crosses(p, y, y_next, || {
++            if right {
++                center.x + half
++            } else {
++                center.x - half
++            }
++        });
++        if last {
++            break;
++        }
++        (angle, y) = (next, y_next);
++        k += 1.0;
++    }
++    inside
++}
++
++/// Crossing-number containment of `p` in a watertight loop.
++fn contains(sealed: &Sealed, p: Point2) -> bool {
++    let mut inside = false;
++    for piece in &sealed.pieces {
++        inside ^= match piece.shape {
++            Shape::Line => crosses(p, piece.a.y, piece.b.y, || {
++                piece.a.x + (p.y - piece.a.y) * (piece.b.x - piece.a.x) / (piece.b.y - piece.a.y)
++            }),
++            Shape::Circle { center, radius } => {
++                let dy = p.y - center.y;
++                let half = (radius * radius - dy * dy).max(0.0).sqrt();
++                let (bottom, top) = (center.y - radius, center.y + radius);
++                crosses(p, bottom, top, || center.x + half)
++                    ^ crosses(p, top, bottom, || center.x - half)
++            }
++            Shape::Arc {
++                center,
++                radius,
++                start,
++                sweep,
++            } => arc_parity(p, piece, center, radius, start, sweep),
++        };
++    }
++    inside
++}
++
++/// Per loop: the loops that contain it. `skip` loops neither contain nor are contained.
++/// A container's bounds span those of what it contains, so the loops are swept by their low
++/// edge on the wider-spread axis and only those still open there are tested.
++pub(super) fn containers(
++    loops: &[Sealed],
++    skip: &[bool],
++    budget: &mut Budget,
++) -> Result<Vec<Vec<usize>>, ChainError> {
++    let mut order: Vec<usize> = (0..loops.len())
++        .filter(|&i| !skip.get(i).copied().unwrap_or(false))
++        .collect();
++    let on_y = sweep_on_y(
++        order
++            .iter()
++            .filter_map(|&i| loops.get(i))
++            .map(|sealed| (sealed.lo, sealed.hi)),
++    );
++    let along = |p: Point2| if on_y { p.y } else { p.x };
++    let low = |i: usize| {
++        loops
++            .get(i)
++            .map_or(f64::INFINITY, |sealed| along(sealed.lo))
++    };
++    order.sort_by(|&i, &j| low(i).total_cmp(&low(j)).then(i.cmp(&j)));
++    let mut out = vec![Vec::new(); loops.len()];
++    let mut active: Vec<usize> = Vec::new();
++    for i in order {
++        let Some(inner) = loops.get(i) else { continue };
++        let Some(sample) = inner.pieces.first().map(|piece| piece.a) else {
++            continue;
++        };
++        active.retain(|&j| {
++            loops
++                .get(j)
++                .is_some_and(|outer| along(outer.hi) >= along(inner.lo))
++        });
++        budget.spend(active.len())?;
++        for &j in &active {
++            let Some(outer) = loops.get(j) else { continue };
++            let around = outer.lo.x <= inner.lo.x
++                && outer.lo.y <= inner.lo.y
++                && outer.hi.x >= inner.hi.x
++                && outer.hi.y >= inner.hi.y;
++            if !around {
++                continue;
++            }
++            budget.spend(outer.pieces.len())?;
++            if contains(outer, sample)
++                && let Some(list) = out.get_mut(i)
++            {
++                list.push(j);
++            }
++        }
++        active.push(i);
++    }
++    Ok(out)
++}
+diff --git a/crates/geometry/src/sketch_chains/types.rs b/crates/geometry/src/sketch_chains/types.rs
+new file mode 100644
+index 000000000..80432b065
+--- /dev/null
++++ b/crates/geometry/src/sketch_chains/types.rs
+@@ -0,0 +1,166 @@
++//! Provenance: the public values of sketch chaining - options, identities, chains, rejections
++//! and the named errors. Our own design for issue 1861; no vendor material consulted.
++
++use crate::dxf::Primitive;
++use crate::geo2d::Point2;
++use std::fmt;
++
++/// Default join tolerance in millimetres.
++pub const DEFAULT_JOIN_TOLERANCE: f64 = 0.01;
++/// The smallest join tolerance: above the identity quantum (1e-6 mm), so two joints of one
++/// chain never share a quantized position.
++pub const MIN_JOIN_TOLERANCE: f64 = 1e-5;
++/// The largest join tolerance, in millimetres.
++pub const MAX_JOIN_TOLERANCE: f64 = 10.0;
++/// Input size limit; above it the call is refused.
++pub const MAX_PRIMITIVES: usize = 2_000_000;
++
++#[derive(Clone, Debug, PartialEq, thiserror::Error)]
++pub enum ChainError {
++    #[error("sketch chaining: join tolerance must be between 1e-5 mm and 10 mm")]
++    InvalidTolerance,
++    #[error("sketch chaining: primitive {primitive} has a non-finite value")]
++    NonFinite { primitive: usize },
++    #[error("sketch chaining: primitive {primitive} lies outside the supported coordinate range")]
++    OutOfRange { primitive: usize },
++    #[error("sketch chaining: primitive {primitive} is invalid: {reason}")]
++    InvalidPrimitive {
++        primitive: usize,
++        reason: &'static str,
++    },
++    #[error(
++        "sketch chaining: the drawing is too large or too dense to chain within the work limit"
++    )]
++    TooComplex,
++    #[error("sketch chaining: primitive {primitive} repeats primitive {of} on the same layer")]
++    DuplicatePrimitive { primitive: usize, of: usize },
++    #[error("sketch chaining: primitive {primitive} is shorter than the join tolerance")]
++    DegenerateSegment { primitive: usize },
++    #[error("sketch chaining: {degree} curve ends meet at ({}, {}); a chain cannot branch", at.x, at.y)]
++    Branch { at: Point2, degree: usize },
++    #[error("sketch chaining: closed loop crosses or touches itself at ({}, {})", at.x, at.y)]
++    SelfCrossing { at: Point2 },
++    #[error("sketch chaining: closed loop encloses no area")]
++    ZeroArea,
++    #[error("sketch chaining: chain repeats chain {of}")]
++    DuplicateChain { of: ChainId },
++    #[error("sketch chaining: nesting is ambiguous: chain {other} crosses or touches a loop at ({}, {})", at.x, at.y)]
++    NestingAmbiguous { other: ChainId, at: Point2 },
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct ChainOptions {
++    /// Ends closer than this (mm) are joined; a wider gap is never bridged.
++    pub join_tolerance: f64,
++}
++
++impl Default for ChainOptions {
++    fn default() -> Self {
++        ChainOptions {
++            join_tolerance: DEFAULT_JOIN_TOLERANCE,
++        }
++    }
++}
++
++/// Identity of a chain: a hash of its layer name and its quantized curves in canonical order.
++/// It does not depend on the order or direction the primitives were drawn in.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct ChainId(pub u128);
++
++impl fmt::Display for ChainId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{:032x}", self.0)
++    }
++}
++
++/// One input primitive in walk direction.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ChainSegment {
++    /// Index of the primitive in the input slice.
++    pub primitive: usize,
++    /// The analytic curve, turned to the walk direction (an arc keeps centre and radius; its
++    /// sweep sign says clockwise or counterclockwise).
++    pub curve: Primitive,
++    /// The walk runs against the drawn direction.
++    pub reversed: bool,
++    pub start: Point2,
++    pub end: Point2,
++}
++
++/// A chain with two free ends. It starts at its lower end in (x, y).
++#[derive(Clone, Debug, PartialEq)]
++pub struct OpenChain {
++    pub id: ChainId,
++    pub layer: String,
++    pub segments: Vec<ChainSegment>,
++    pub start: Point2,
++    pub end: Point2,
++    /// The widest joint gap inside the chain, at most the join tolerance.
++    pub max_gap: f64,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LoopRole {
++    /// Inside an even number of other loops: material lies inside it.
++    Outer,
++    /// Inside an odd number of other loops: a hole in its parent.
++    Hole,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Nesting {
++    pub role: LoopRole,
++    /// How many closed chains contain this one.
++    pub depth: usize,
++    /// The innermost chain that contains this one.
++    pub parent: Option<ChainId>,
++}
++
++/// A closed loop, walked counterclockwise from its lowest joint in (x, y).
++#[derive(Clone, Debug, PartialEq)]
++pub struct ClosedChain {
++    pub id: ChainId,
++    pub layer: String,
++    pub segments: Vec<ChainSegment>,
++    /// Enclosed area in mm^2, arcs included exactly.
++    pub area: f64,
++    /// The widest joint gap inside the loop, at most the join tolerance.
++    pub max_gap: f64,
++    /// Outer boundary or hole; `NestingAmbiguous` when this loop or one around it crosses or
++    /// touches another closed chain, so no reading is safe.
++    pub nesting: Result<Nesting, ChainError>,
++}
++
++/// Primitives that form no usable chain, and why.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Rejected {
++    pub layer: String,
++    /// Input indices, ascending.
++    pub primitives: Vec<usize>,
++    pub error: ChainError,
++}
++
++/// Every chain of the input, each list sorted by layer name, then start position, then id.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct SketchChains {
++    pub closed: Vec<ClosedChain>,
++    pub open: Vec<OpenChain>,
++    pub rejected: Vec<Rejected>,
++}
++
++impl SketchChains {
++    /// The chains, or the first rejection or ambiguous nesting as an error.
++    pub fn strict(self) -> Result<SketchChains, ChainError> {
++        if let Some(rejected) = self.rejected.first() {
++            return Err(rejected.error.clone());
++        }
++        if let Some(error) = self
++            .closed
++            .iter()
++            .find_map(|chain| chain.nesting.as_ref().err())
++        {
++            return Err(error.clone());
++        }
++        Ok(self)
++    }
++}
+diff --git a/crates/geometry/tests/common/mod.rs b/crates/geometry/tests/common/mod.rs
+new file mode 100644
+index 000000000..e68d6e5bc
+--- /dev/null
++++ b/crates/geometry/tests/common/mod.rs
+@@ -0,0 +1,228 @@
++//! Provenance: shared sketch builders for the sketch-chaining suites (issue 1861).
++#![allow(dead_code)]
++
++use camcraft_geometry::dxf::{LayeredPrimitive, Primitive};
++use camcraft_geometry::geo2d::Point2;
++use camcraft_geometry::sketch_chains::{ClosedChain, LoopRole};
++use std::f64::consts::{FRAC_PI_2, PI, TAU};
++
++/// The pinned identity of `slot("cut", 0.0)`.
++pub const SLOT_ID: &str = "d38b0c1165832c5bd78b0bdc79473e80";
++
++pub fn p(x: f64, y: f64) -> Point2 {
++    Point2::new(x, y)
++}
++
++pub fn near(actual: f64, expected: f64) {
++    assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
++}
++
++fn on(layer: &str, primitive: Primitive) -> LayeredPrimitive {
++    LayeredPrimitive {
++        layer: layer.into(),
++        primitive,
++    }
++}
++
++pub fn line(layer: &str, x0: f64, y0: f64, x1: f64, y1: f64) -> LayeredPrimitive {
++    on(
++        layer,
++        Primitive::Line {
++            start: p(x0, y0),
++            end: p(x1, y1),
++        },
++    )
++}
++
++pub fn arc(
++    layer: &str,
++    cx: f64,
++    cy: f64,
++    radius: f64,
++    start_angle: f64,
++    sweep_angle: f64,
++) -> LayeredPrimitive {
++    on(
++        layer,
++        Primitive::Arc {
++            center: p(cx, cy),
++            radius,
++            start_angle,
++            sweep_angle,
++        },
++    )
++}
++
++pub fn circle(layer: &str, cx: f64, cy: f64, radius: f64) -> LayeredPrimitive {
++    on(
++        layer,
++        Primitive::Circle {
++            center: p(cx, cy),
++            radius,
++        },
++    )
++}
++
++/// The same curve drawn the other way.
++pub fn flip(item: &LayeredPrimitive) -> LayeredPrimitive {
++    let primitive = match item.primitive {
++        Primitive::Line { start, end } => Primitive::Line {
++            start: end,
++            end: start,
++        },
++        Primitive::Arc {
++            center,
++            radius,
++            start_angle,
++            sweep_angle,
++        } => Primitive::Arc {
++            center,
++            radius,
++            start_angle: start_angle + sweep_angle,
++            sweep_angle: -sweep_angle,
++        },
++        Primitive::Circle { center, radius } => Primitive::Circle { center, radius },
++    };
++    on(&item.layer, primitive)
++}
++
++/// Four sides of an axis-aligned rectangle, counterclockwise.
++pub fn rect(layer: &str, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<LayeredPrimitive> {
++    vec![
++        line(layer, x0, y0, x1, y0),
++        line(layer, x1, y0, x1, y1),
++        line(layer, x1, y1, x0, y1),
++        line(layer, x0, y1, x0, y0),
++    ]
++}
++
++/// A 20 x 10 slot with radius-5 caps, lower-left arc centre at (dx, 5). The right cap is drawn
++/// clockwise, the top side right to left.
++pub fn slot(layer: &str, dx: f64) -> Vec<LayeredPrimitive> {
++    vec![
++        line(layer, dx, 0.0, dx + 20.0, 0.0),
++        arc(layer, dx + 20.0, 5.0, 5.0, FRAC_PI_2, -PI),
++        line(layer, dx + 20.0, 10.0, dx, 10.0),
++        arc(layer, dx, 5.0, 5.0, FRAC_PI_2, PI),
++    ]
++}
++
++/// A w x h rectangle with corner radius r: four sides and four quarter arcs, every line
++/// coordinate rounded to 1e-6 the way a DXF writer prints them.
++pub fn rounded_rect(layer: &str, w: f64, h: f64, r: f64) -> Vec<LayeredPrimitive> {
++    let q = |v: f64| (v * 1e6).round() / 1e6;
++    let s = 0.333_333_3; // an offset that does not round evenly
++    let (x0, y0, x1, y1) = (q(s), q(s), q(s + w), q(s + h));
++    vec![
++        line(layer, x0 + r, y0, x1 - r, y0),
++        arc(layer, x1 - r, y0 + r, r, -FRAC_PI_2, FRAC_PI_2),
++        line(layer, x1, y0 + r, x1, y1 - r),
++        arc(layer, x1 - r, y1 - r, r, 0.0, FRAC_PI_2),
++        line(layer, x1 - r, y1, x0 + r, y1),
++        arc(layer, x0 + r, y1 - r, r, FRAC_PI_2, FRAC_PI_2),
++        line(layer, x0, y1 - r, x0, y0 + r),
++        arc(layer, x0 + r, y0 + r, r, PI, FRAC_PI_2),
++    ]
++}
++
++/// Chord polygon of a closed chain, 2-degree steps on arcs.
++pub fn flatten(chain: &ClosedChain) -> Vec<Point2> {
++    let mut points = Vec::new();
++    for segment in &chain.segments {
++        let (center, radius, from, sweep) = match segment.curve {
++            Primitive::Line { start, .. } => {
++                points.push(start);
++                continue;
++            }
++            Primitive::Arc {
++                center,
++                radius,
++                start_angle,
++                sweep_angle,
++            } => (center, radius, start_angle, sweep_angle),
++            Primitive::Circle { center, radius } => (center, radius, 0.0, TAU),
++        };
++        let steps = (sweep.abs() / (PI / 90.0)).ceil().max(1.0) as usize;
++        for i in 0..steps {
++            let a = from + sweep * i as f64 / steps as f64;
++            points.push(p(center.x + radius * a.cos(), center.y + radius * a.sin()));
++        }
++    }
++    points
++}
++
++/// Move a primitive by (dx, dy).
++pub fn shift(item: &LayeredPrimitive, dx: f64, dy: f64) -> LayeredPrimitive {
++    let m = |q: Point2| p(q.x + dx, q.y + dy);
++    let primitive = match item.primitive {
++        Primitive::Line { start, end } => Primitive::Line {
++            start: m(start),
++            end: m(end),
++        },
++        Primitive::Arc {
++            center,
++            radius,
++            start_angle,
++            sweep_angle,
++        } => Primitive::Arc {
++            center: m(center),
++            radius,
++            start_angle,
++            sweep_angle,
++        },
++        Primitive::Circle { center, radius } => Primitive::Circle {
++            center: m(center),
++            radius,
++        },
++    };
++    on(&item.layer, primitive)
++}
++
++/// A small deterministic generator (Lehmer / Park-Miller minimal standard, CACM 31(10), 1988).
++pub struct Lehmer(pub u64);
++
++impl Lehmer {
++    pub fn next(&mut self, below: u64) -> u64 {
++        self.0 = self.0 * 48_271 % 2_147_483_647;
++        self.0 % below
++    }
++
++    /// Uniform in [0, 1).
++    pub fn unit(&mut self) -> f64 {
++        self.next(1_000_000) as f64 / 1e6
++    }
++}
++
++/// Outer or hole, and the depth; panics on an ambiguous nesting.
++pub fn role(chain: &ClosedChain) -> (LoopRole, usize) {
++    let nesting = chain.nesting.clone().unwrap();
++    (nesting.role, nesting.depth)
++}
++
++/// Turn a primitive about the origin by `angle` (radians, counterclockwise).
++pub fn turn(item: &LayeredPrimitive, angle: f64) -> LayeredPrimitive {
++    let (sin, cos) = angle.sin_cos();
++    let m = |q: Point2| p(q.x * cos - q.y * sin, q.x * sin + q.y * cos);
++    let primitive = match item.primitive {
++        Primitive::Line { start, end } => Primitive::Line {
++            start: m(start),
++            end: m(end),
++        },
++        Primitive::Arc {
++            center,
++            radius,
++            start_angle,
++            sweep_angle,
++        } => Primitive::Arc {
++            center: m(center),
++            radius,
++            start_angle: start_angle + angle,
++            sweep_angle,
++        },
++        Primitive::Circle { center, radius } => Primitive::Circle {
++            center: m(center),
++            radius,
++        },
++    };
++    on(&item.layer, primitive)
++}
+diff --git a/crates/geometry/tests/sketch_chains.rs b/crates/geometry/tests/sketch_chains.rs
+new file mode 100644
+index 000000000..003b69225
+--- /dev/null
++++ b/crates/geometry/tests/sketch_chains.rs
+@@ -0,0 +1,296 @@
++//! Provenance: hand-built sketches with areas and nesting known in closed form (issue 1861).
++//! Gate map (M4.4): covers camcraft_geometry::sketch_chains.
++
++mod common;
++
++use camcraft_geometry::dxf::{Primitive, Unit, Units};
++use camcraft_geometry::geo2d::Point2;
++use camcraft_geometry::sketch_chains::{ChainOptions, LoopRole, chain};
++use common::*;
++use std::f64::consts::{FRAC_PI_2, PI, TAU};
++
++#[test]
++fn unordered_lines_chain_into_one_counterclockwise_loop() {
++    // A 10 x 5 rectangle, its sides out of order and drawn in mixed directions.
++    let input = vec![
++        line("cut", 10.0, 5.0, 10.0, 0.0),
++        line("cut", 0.0, 5.0, 0.0, 0.0),
++        line("cut", 0.0, 0.0, 10.0, 0.0),
++        line("cut", 0.0, 5.0, 10.0, 5.0),
++    ];
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert!(chains.open.is_empty() && chains.rejected.is_empty());
++    let [rect] = chains.closed.as_slice() else {
++        panic!("one loop, got {}", chains.closed.len())
++    };
++    near(rect.area, 50.0);
++    assert_eq!(rect.layer, "cut");
++    assert_eq!(rect.max_gap, 0.0);
++    // Counterclockwise from the lowest corner: bottom, right, top, left.
++    let order: Vec<usize> = rect.segments.iter().map(|s| s.primitive).collect();
++    assert_eq!(order, [2, 0, 3, 1]);
++    let reversed: Vec<bool> = rect.segments.iter().map(|s| s.reversed).collect();
++    assert_eq!(reversed, [false, true, true, false]);
++    assert_eq!(rect.segments[0].start, Point2::new(0.0, 0.0));
++    assert_eq!(
++        rect.segments[2].curve,
++        Primitive::Line {
++            start: p(10.0, 5.0),
++            end: p(0.0, 5.0)
++        }
++    );
++    for (i, s) in rect.segments.iter().enumerate() {
++        assert_eq!(s.end, rect.segments[(i + 1) % 4].start);
++    }
++    assert_eq!(rect.nesting.clone().unwrap().role, LoopRole::Outer);
++}
++
++#[test]
++fn chain_id_ignores_draw_order_and_direction_but_not_layer_or_geometry() {
++    let base = slot("cut", 0.0);
++    let id = chain(&base, ChainOptions::default()).unwrap().closed[0].id;
++    // Every rotation of the input, and every primitive drawn the other way.
++    for turn in 0..base.len() {
++        let mut input = base.clone();
++        input.rotate_left(turn);
++        assert_eq!(
++            chain(&input, ChainOptions::default()).unwrap().closed[0].id,
++            id
++        );
++        let flipped: Vec<_> = input.iter().map(flip).collect();
++        let chains = chain(&flipped, ChainOptions::default()).unwrap();
++        assert_eq!(chains.closed[0].id, id);
++        near(chains.closed[0].area, 20.0 * 10.0 + PI * 25.0);
++    }
++    let other_layer = chain(&slot("mark", 0.0), ChainOptions::default())
++        .unwrap()
++        .closed[0]
++        .id;
++    let moved = chain(&slot("cut", 0.001), ChainOptions::default())
++        .unwrap()
++        .closed[0]
++        .id;
++    assert_ne!(other_layer, id);
++    assert_ne!(moved, id);
++    assert_eq!(id.to_string().len(), 32);
++    // The value is part of the contract: a project file may store it.
++    assert_eq!(id.to_string(), SLOT_ID);
++}
++
++#[test]
++fn arc_metadata_survives_chaining() {
++    let chains = chain(&slot("cut", 0.0), ChainOptions::default()).unwrap();
++    let [stadium] = chains.closed.as_slice() else {
++        panic!("one loop")
++    };
++    assert_eq!(stadium.segments.len(), 4);
++    let arcs: Vec<_> = stadium
++        .segments
++        .iter()
++        .filter_map(|s| match s.curve {
++            Primitive::Arc {
++                center,
++                radius,
++                start_angle,
++                sweep_angle,
++            } => Some((
++                s.primitive,
++                s.reversed,
++                center,
++                radius,
++                start_angle,
++                sweep_angle,
++            )),
++            _ => None,
++        })
++        .collect();
++    // The right cap was drawn clockwise; in the counterclockwise loop both caps sweep +pi (G3).
++    assert_eq!(arcs.len(), 2);
++    let (index, reversed, center, radius, start, sweep) = arcs[0];
++    assert_eq!(
++        (index, reversed, center, radius),
++        (1, true, p(20.0, 5.0), 5.0)
++    );
++    near(start, -FRAC_PI_2);
++    near(sweep, PI);
++    let (index, reversed, center, radius, start, sweep) = arcs[1];
++    assert_eq!(
++        (index, reversed, center, radius),
++        (3, false, p(0.0, 5.0), 5.0)
++    );
++    near(start, FRAC_PI_2);
++    near(sweep, PI);
++}
++
++#[test]
++fn gap_wider_than_tolerance_stays_open_and_is_reported() {
++    // The last side stops 0.02 mm short of the first corner.
++    let input = vec![
++        line("cut", 0.0, 0.0, 10.0, 0.0),
++        line("cut", 10.0, 0.0, 10.0, 5.0),
++        line("cut", 10.0, 5.0, 0.0, 5.0),
++        line("cut", 0.0, 5.0, 0.0, 0.02),
++    ];
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert!(chains.closed.is_empty() && chains.rejected.is_empty());
++    let [open] = chains.open.as_slice() else {
++        panic!("one open chain")
++    };
++    assert_eq!(open.segments.len(), 4);
++    assert_eq!((open.start, open.end), (p(0.0, 0.0), p(0.0, 0.02)));
++    assert_eq!(open.segments[0].start, open.start);
++    assert_eq!(open.segments[3].end, open.end);
++
++    // A tolerance that covers the gap closes it, and says how wide the bridged gap is.
++    let chains = chain(
++        &input,
++        ChainOptions {
++            join_tolerance: 0.05,
++        },
++    )
++    .unwrap();
++    assert!(chains.open.is_empty());
++    near(chains.closed[0].max_gap, 0.02);
++    near(chains.closed[0].area, 50.0);
++    // Exactly at the tolerance joins; just under it does not.
++    assert_eq!(
++        chain(
++            &input,
++            ChainOptions {
++                join_tolerance: 0.02
++            }
++        )
++        .unwrap()
++        .closed
++        .len(),
++        1
++    );
++    assert_eq!(
++        chain(
++            &input,
++            ChainOptions {
++                join_tolerance: 0.0199
++            }
++        )
++        .unwrap()
++        .open
++        .len(),
++        1
++    );
++}
++
++#[test]
++fn open_chain_of_lines_and_arcs_starts_at_its_lower_end() {
++    // (20,0) <- arc <- (10,0) <- line <- (0,0), drawn right to left and out of order.
++    let input = vec![
++        arc("cut", 15.0, 0.0, 5.0, 0.0, PI),
++        line("cut", 10.0, 0.0, 0.0, 0.0),
++        line("other", 20.0, 0.0, 30.0, 0.0),
++    ];
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert_eq!(chains.open.len(), 2);
++    let cut = &chains.open[0];
++    assert_eq!((cut.layer.as_str(), cut.start), ("cut", p(0.0, 0.0)));
++    near(cut.end.x, 20.0);
++    assert_eq!(
++        cut.segments
++            .iter()
++            .map(|s| (s.primitive, s.reversed))
++            .collect::<Vec<_>>(),
++        [(1, true), (0, true)]
++    );
++    let Primitive::Arc { sweep_angle, .. } = cut.segments[1].curve else {
++        panic!("arc")
++    };
++    near(sweep_angle, -PI);
++    // Layers never join, even where their ends coincide.
++    assert_eq!(
++        (chains.open[1].layer.as_str(), chains.open[1].segments.len()),
++        ("other", 1)
++    );
++    assert_ne!(chains.open[0].id, chains.open[1].id);
++}
++
++#[test]
++fn arcs_that_close_a_circle_and_tangent_fillets_are_clean_loops() {
++    // Two half arcs make one circle; an arc of almost a full turn closes on itself.
++    let halves = vec![
++        arc("c", 0.0, 0.0, 5.0, 0.0, PI),
++        arc("c", 0.0, 0.0, 5.0, PI, PI),
++    ];
++    let chains = chain(&halves, ChainOptions::default()).unwrap();
++    assert!(chains.rejected.is_empty(), "{:?}", chains.rejected);
++    near(chains.closed[0].area, PI * 25.0);
++    let nearly = vec![arc("c", 0.0, 0.0, 5.0, 0.3, -(TAU - 1e-3))];
++    let chains = chain(&nearly, ChainOptions::default()).unwrap();
++    assert!(chains.rejected.is_empty(), "{:?}", chains.rejected);
++    assert!((chains.closed[0].area - PI * 25.0).abs() < 1e-2);
++    let Primitive::Arc { sweep_angle, .. } = chains.closed[0].segments[0].curve else {
++        panic!("arc")
++    };
++    assert!(sweep_angle > 0.0, "the loop is walked counterclockwise");
++
++    // A rounded rectangle whose coordinates were rounded to 1e-6, as a DXF writer would.
++    let chains = chain(
++        &rounded_rect("cut", 40.0, 20.0, 3.0),
++        ChainOptions::default(),
++    )
++    .unwrap();
++    assert!(
++        chains.rejected.is_empty() && chains.open.is_empty(),
++        "{:?}",
++        chains.rejected
++    );
++    let [loop_] = chains.closed.as_slice() else {
++        panic!("one loop")
++    };
++    assert_eq!(loop_.segments.len(), 8);
++    assert!((loop_.area - (40.0 * 20.0 - (4.0 - PI) * 9.0)).abs() < 1e-4);
++    assert!(loop_.max_gap < 2e-6);
++}
++
++#[test]
++fn dxf_polyline_bulges_and_circles_chain_with_their_arcs() {
++    // A closed LWPOLYLINE slot (two bulge-1 caps) with a CIRCLE inside, as the DXF reader gives it.
++    let text = "0\nSECTION\n2\nHEADER\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n\
++0\nCIRCLE\n8\ncut\n10\n10\n20\n5\n40\n2\n\
++0\nLWPOLYLINE\n8\ncut\n90\n4\n70\n1\n10\n0\n20\n0\n10\n20\n20\n0\n42\n1\n10\n20\n20\n10\n10\n0\n20\n10\n42\n1\n\
++0\nENDSEC\n0\nEOF\n";
++    let document = camcraft_geometry::dxf::parse(text.as_bytes()).unwrap();
++    assert_eq!(document.units, Units::Known(Unit::Millimeters));
++    let chains = chain(&document.primitives, ChainOptions::default()).unwrap();
++    assert!(
++        chains.rejected.is_empty() && chains.open.is_empty(),
++        "{:?}",
++        chains.rejected
++    );
++    let stadium = chains
++        .closed
++        .iter()
++        .find(|c| c.segments.len() == 4)
++        .unwrap();
++    near(stadium.area, 200.0 + PI * 25.0);
++    let sweeps: Vec<f64> = stadium
++        .segments
++        .iter()
++        .filter_map(|s| match s.curve {
++            Primitive::Arc {
++                radius,
++                sweep_angle,
++                ..
++            } => Some(sweep_angle / radius),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(sweeps.len(), 2);
++    sweeps.iter().for_each(|s| near(*s, PI / 5.0));
++    // The same slot as loose primitives has the same identity as the polyline's.
++    assert_eq!(stadium.id.to_string(), SLOT_ID);
++    let bore = chains
++        .closed
++        .iter()
++        .find(|c| c.segments.len() == 1)
++        .unwrap();
++    assert_eq!(role(bore), (LoopRole::Hole, 1));
++    assert_eq!(bore.nesting.clone().unwrap().parent, Some(stadium.id));
++}
+diff --git a/crates/geometry/tests/sketch_chains_nesting.rs b/crates/geometry/tests/sketch_chains_nesting.rs
+new file mode 100644
+index 000000000..68e5a89d6
+--- /dev/null
++++ b/crates/geometry/tests/sketch_chains_nesting.rs
+@@ -0,0 +1,251 @@
++//! Provenance: hand-built nests with depth and area known in closed form (issue 1861).
++//! Gate map (M4.4): covers camcraft_geometry::sketch_chains.
++
++mod common;
++
++use camcraft_geometry::dxf::Primitive;
++use camcraft_geometry::geo2d::{Loop, Region};
++use camcraft_geometry::sketch_chains::{ChainOptions, ClosedChain, LoopRole, chain};
++use common::*;
++use std::f64::consts::{FRAC_PI_2, PI, TAU};
++
++#[test]
++fn nested_rectangles_and_circles_classify_as_outer_and_hole() {
++    let mut input = rect("cut", 0.0, 0.0, 100.0, 100.0);
++    input.push(circle("cut", 50.0, 50.0, 30.0));
++    input.extend(rect("cut", 45.0, 45.0, 55.0, 55.0));
++    input.push(circle("holes", 10.0, 10.0, 3.0));
++    input.push(circle("cut", 200.0, 50.0, 5.0));
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert!(chains.open.is_empty() && chains.rejected.is_empty());
++    let by_area = |area: f64| {
++        chains
++            .closed
++            .iter()
++            .find(|c| (c.area - area).abs() < 1e-6)
++            .unwrap()
++    };
++    let (plate, bore, island) = (by_area(10_000.0), by_area(PI * 900.0), by_area(100.0));
++    let (drill, apart) = (by_area(PI * 9.0), by_area(PI * 25.0));
++    assert_eq!(role(plate), (LoopRole::Outer, 0));
++    assert_eq!(role(bore), (LoopRole::Hole, 1));
++    assert_eq!(role(island), (LoopRole::Outer, 2));
++    assert_eq!(role(drill), (LoopRole::Hole, 1));
++    assert_eq!(role(apart), (LoopRole::Outer, 0));
++    assert_eq!(plate.nesting.clone().unwrap().parent, None);
++    assert_eq!(bore.nesting.clone().unwrap().parent, Some(plate.id));
++    assert_eq!(island.nesting.clone().unwrap().parent, Some(bore.id));
++    // A hole on another layer still nests in the plate.
++    assert_eq!(drill.nesting.clone().unwrap().parent, Some(plate.id));
++
++    // The same reading as geo2d::Region's even-odd rule over the flattened loops.
++    let loops: Vec<Loop> = chains
++        .closed
++        .iter()
++        .map(|c| Loop::new(flatten(c)).unwrap())
++        .collect();
++    let region = Region::new(loops).unwrap();
++    let signed: f64 = chains
++        .closed
++        .iter()
++        .map(|c| {
++            if role(c).0 == LoopRole::Outer {
++                c.area
++            } else {
++                -c.area
++            }
++        })
++        .sum();
++    assert!(
++        (region.area() - signed).abs() < 1.0,
++        "{} vs {signed}",
++        region.area()
++    );
++    assert!(region.contains(p(5.0, 50.0)) && !region.contains(p(30.0, 50.0)));
++    assert!(region.contains(p(50.0, 50.0)) && !region.contains(p(10.0, 10.0)));
++}
++
++#[test]
++fn containment_follows_the_arcs_not_their_chords() {
++    // A half disc: the chord x = 0 and a semicircle bulging to +x. Its chord polygon is empty.
++    let mut input = vec![
++        line("cut", 0.0, 10.0, 0.0, -10.0),
++        arc("cut", 0.0, 0.0, 10.0, -FRAC_PI_2, PI),
++    ];
++    input.push(circle("cut", 7.0, 0.0, 1.0)); // inside the bulge
++    input.push(circle("cut", -3.0, 0.0, 1.0)); // left of the chord
++    input.push(circle("cut", 8.0, 8.0, 1.0)); // inside the bounding box, outside the arc
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert!(chains.rejected.is_empty());
++    let half = chains
++        .closed
++        .iter()
++        .find(|c| c.segments.len() == 2)
++        .unwrap();
++    near(half.area, PI * 50.0);
++    let at = |x: f64| {
++        let found = chains.closed.iter().find(
++            |c| matches!(c.segments[0].curve, Primitive::Circle { center, .. } if center.x == x),
++        );
++        role(found.unwrap())
++    };
++    assert_eq!(at(7.0), (LoopRole::Hole, 1));
++    assert_eq!(at(-3.0), (LoopRole::Outer, 0));
++    assert_eq!(at(8.0), (LoopRole::Outer, 0));
++    // Concentric circles alternate, and a ring cut by a concave arc reads the same.
++    let rings: Vec<_> = (1..=5)
++        .map(|i| circle("r", 0.0, 0.0, f64::from(i)))
++        .collect();
++    let rings = chain(&rings, ChainOptions::default()).unwrap();
++    let mut depths: Vec<_> = rings.closed.iter().map(|c| (c.area, role(c))).collect();
++    depths.sort_by(|a, b| b.0.total_cmp(&a.0));
++    let roles: Vec<_> = depths.iter().map(|d| d.1).collect();
++    let (outer, hole) = (LoopRole::Outer, LoopRole::Hole);
++    assert_eq!(
++        roles,
++        [(outer, 0), (hole, 1), (outer, 2), (hole, 3), (outer, 4)]
++    );
++}
++
++#[test]
++fn long_loop_chains_in_bounded_time() {
++    // 40,000 sides of a circle-like polygon, given in a scrambled order.
++    let n = 40_000usize;
++    let at = |i: usize| {
++        let a = TAU * (i % n) as f64 / n as f64;
++        (1000.0 * a.cos(), 1000.0 * a.sin())
++    };
++    let mut input = Vec::with_capacity(n);
++    for k in 0..n {
++        let i = (k * 7919) % n;
++        let ((x0, y0), (x1, y1)) = (at(i), at(i + 1));
++        input.push(line("big", x0, y0, x1, y1));
++    }
++    input.push(circle("big", 0.0, 0.0, 10.0));
++    let chains = chain(&input, ChainOptions::default()).unwrap();
++    assert!(chains.rejected.is_empty() && chains.open.is_empty());
++    let polygon = chains
++        .closed
++        .iter()
++        .find(|c| c.segments.len() == n)
++        .unwrap();
++    assert!((polygon.area - PI * 1e6).abs() < 1.0);
++    let hole = chains
++        .closed
++        .iter()
++        .find(|c| c.segments.len() == 1)
++        .unwrap();
++    assert_eq!(role(hole), (LoopRole::Hole, 1));
++
++    // A tall strip whose long sides are 25,000 short collinear lines each: every one of them
++    // shares its x range, so the crossing search has to sweep along y to stay inside its budget.
++    let n = 25_000;
++    let mut strip = vec![
++        line("tall", 0.0, 0.0, 5.0, 0.0),
++        line("tall", 5.0, f64::from(n), 0.0, f64::from(n)),
++    ];
++    for i in 0..n {
++        let (y0, y1) = (f64::from(i), f64::from(i + 1));
++        strip.push(line("tall", 5.0, y0, 5.0, y1));
++        strip.push(line("tall", 0.0, y1, 0.0, y0));
++    }
++    let chains = chain(&strip, ChainOptions::default()).unwrap();
++    assert!(chains.rejected.is_empty() && chains.open.is_empty());
++    near(chains.closed[0].area, 5.0 * f64::from(n));
++}
++
++#[test]
++fn shuffled_nests_of_mixed_shapes_keep_their_depth_and_parent() {
++    let mut random = Lehmer(42);
++    for round in 0..200 {
++        // Every shape lies inside the disc of radius `reach` and contains the disc of 0.425 * reach;
++        // the next shape gets 0.38 * reach around a centre moved by at most 0.015 * reach.
++        let mut input = Vec::new();
++        let (mut cx, mut cy, mut reach) =
++            (random.unit() * 500.0 - 250.0, random.unit() * 500.0, 100.0);
++        let levels = 2 + random.next(5) as usize;
++        let mut areas = Vec::new();
++        for _ in 0..levels {
++            let half = 0.6 * reach;
++            let (shape, area) = match random.next(4) {
++                0 => (
++                    vec![circle("n", 0.0, 0.0, 0.8 * reach)],
++                    PI * 0.64 * reach * reach,
++                ),
++                1 => (rect("n", -half, -half, half, half), 4.0 * half * half),
++                2 => {
++                    let corner = 0.25 * half;
++                    let shape = rounded_rect("n", 2.0 * half, 2.0 * half, corner);
++                    let moved = shape
++                        .iter()
++                        .map(|item| shift(item, -half - 0.333_333, -half - 0.333_333));
++                    (
++                        moved.collect(),
++                        4.0 * half * half - (4.0 - PI) * corner * corner,
++                    )
++                }
++                _ => {
++                    // A half disc of radius d on its chord, moved so its inscribed circle (d / 2)
++                    // is centred; its corners reach d * sqrt(1.25) = 0.95 * reach.
++                    let d = 0.85 * reach;
++                    let shape = [
++                        line("n", 0.0, d, 0.0, -d),
++                        arc("n", 0.0, 0.0, d, -FRAC_PI_2, PI),
++                    ];
++                    let moved = shape.iter().map(|item| shift(item, -0.5 * d, 0.0));
++                    (moved.collect(), 0.5 * PI * d * d)
++                }
++            };
++            let angle = (random.unit() - 0.5) * 40.0; // several turns either way
++            input.extend(shape.iter().map(|item| shift(&turn(item, angle), cx, cy)));
++            areas.push(area);
++            cx += (random.unit() - 0.5) * 0.04 * reach;
++            cy += (random.unit() - 0.5) * 0.04 * reach;
++            reach *= 0.38;
++        }
++        for i in (1..input.len()).rev() {
++            input.swap(i, random.next(i as u64 + 1) as usize);
++        }
++        let input: Vec<_> = input
++            .iter()
++            .map(|item| {
++                if random.next(2) == 0 {
++                    flip(item)
++                } else {
++                    item.clone()
++                }
++            })
++            .collect();
++        let chains = chain(&input, ChainOptions::default()).unwrap();
++        assert!(
++            chains.rejected.is_empty() && chains.open.is_empty(),
++            "round {round}: {:?}",
++            chains.rejected
++        );
++        assert_eq!(chains.closed.len(), levels, "round {round}");
++        let mut nest: Vec<&ClosedChain> = chains.closed.iter().collect();
++        nest.sort_by(|a, b| b.area.total_cmp(&a.area));
++        for (depth, closed) in nest.iter().enumerate() {
++            assert!(
++                (closed.area - areas[depth]).abs() < 1e-6 * areas[depth].max(1.0),
++                "round {round}"
++            );
++            let nesting = closed.nesting.clone().unwrap();
++            let expected = if depth % 2 == 0 {
++                LoopRole::Outer
++            } else {
++                LoopRole::Hole
++            };
++            assert_eq!(
++                (nesting.role, nesting.depth),
++                (expected, depth),
++                "round {round}"
++            );
++            assert_eq!(
++                nesting.parent,
++                depth.checked_sub(1).map(|outer| nest[outer].id),
++                "round {round}"
++            );
++        }
++    }
++}
+diff --git a/crates/geometry/tests/sketch_chains_refusals.rs b/crates/geometry/tests/sketch_chains_refusals.rs
+new file mode 100644
+index 000000000..752e39df3
+--- /dev/null
++++ b/crates/geometry/tests/sketch_chains_refusals.rs
+@@ -0,0 +1,356 @@
++//! Provenance: hand-built degenerate sketches; every one must be refused by name (issue 1861).
++//! Gate map (M4.4): covers camcraft_geometry::sketch_chains.
++
++mod common;
++
++use camcraft_geometry::dxf::LayeredPrimitive;
++use camcraft_geometry::geo2d::{Loop, Region};
++use camcraft_geometry::sketch_chains::{
++    ChainError, ChainId, ChainOptions, LoopRole, SketchChains, chain,
++};
++use common::*;
++use std::f64::consts::PI;
++
++fn chained(input: &[LayeredPrimitive]) -> SketchChains {
++    chain(input, ChainOptions::default()).unwrap()
++}
++
++fn only_error(chains: &SketchChains) -> &ChainError {
++    let [rejected] = chains.rejected.as_slice() else {
++        panic!("one rejection: {:?}", chains.rejected)
++    };
++    &rejected.error
++}
++
++#[test]
++fn self_crossing_loop_is_refused_by_name() {
++    // A bow tie: the diagonals cross at (5, 5).
++    let input = vec![
++        line("cut", 0.0, 0.0, 10.0, 10.0),
++        line("cut", 10.0, 10.0, 10.0, 0.0),
++        line("cut", 10.0, 0.0, 0.0, 10.0),
++        line("cut", 0.0, 10.0, 0.0, 0.0),
++    ];
++    let chains = chained(&input);
++    assert!(chains.closed.is_empty() && chains.open.is_empty());
++    assert_eq!(chains.rejected[0].primitives, [0, 1, 2, 3]);
++    let ChainError::SelfCrossing { at } = *only_error(&chains) else {
++        panic!("{:?}", chains.rejected)
++    };
++    near(at.x, 5.0);
++    near(at.y, 5.0);
++    let text = chains.clone().strict().unwrap_err().to_string();
++    assert_eq!(
++        text,
++        "sketch chaining: closed loop crosses or touches itself at (5, 5)"
++    );
++
++    // A side that runs back over the one before it overlaps; an arc cutting a far side crosses.
++    let hairpin = vec![
++        line("cut", 0.0, 0.0, 10.0, 0.0),
++        line("cut", 10.0, 0.0, 4.0, 0.0),
++        line("cut", 4.0, 0.0, 4.0, 5.0),
++        line("cut", 4.0, 5.0, 0.0, 5.0),
++        line("cut", 0.0, 5.0, 0.0, 0.0),
++    ];
++    assert!(matches!(
++        only_error(&chained(&hairpin)),
++        ChainError::SelfCrossing { .. }
++    ));
++    let mut bulge = rect("cut", 0.0, 0.0, 10.0, 4.0);
++    bulge[0] = arc("cut", 5.0, 0.0, 5.0, PI, -PI); // the bottom side bulges up through the top
++    assert!(matches!(
++        only_error(&chained(&bulge)),
++        ChainError::SelfCrossing { .. }
++    ));
++}
++
++#[test]
++fn branching_vertex_is_a_named_diagnostic() {
++    // A rectangle with a spur from one corner: three ends meet at (10, 0).
++    let mut input = rect("cut", 0.0, 0.0, 10.0, 5.0);
++    input.push(line("cut", 10.0, 0.0, 15.0, -5.0));
++    input.extend(rect("cut", 20.0, 0.0, 30.0, 5.0));
++    let chains = chained(&input);
++    let ChainError::Branch { at, degree } = *only_error(&chains) else {
++        panic!("{:?}", chains.rejected)
++    };
++    assert_eq!((at, degree), (p(10.0, 0.0), 3));
++    assert_eq!(chains.rejected[0].primitives, [0, 1, 2, 3, 4]);
++    // The clean rectangle beside it is still chained.
++    assert_eq!(chains.closed.len(), 1);
++    near(chains.closed[0].area, 50.0);
++    assert!(chains.strict().is_err());
++}
++
++#[test]
++fn degenerate_pieces_are_refused_by_name() {
++    // A side shorter than the tolerance cannot be told from a joint.
++    let mut input = rect("cut", 0.0, 0.0, 10.0, 5.0);
++    input.push(line("cut", 50.0, 0.0, 50.005, 0.0));
++    input.push(line("cut", 60.0, 0.0, 60.0, 0.0));
++    input.push(circle("cut", 80.0, 0.0, 0.001));
++    input.push(arc("cut", 90.0, 0.0, 0.001, 0.0, 1.0));
++    let chains = chained(&input);
++    let errors: Vec<_> = chains
++        .rejected
++        .iter()
++        .map(|r| (r.primitives.clone(), r.error.clone()))
++        .collect();
++    assert_eq!(
++        errors,
++        [
++            (vec![4], ChainError::DegenerateSegment { primitive: 4 }),
++            (vec![5], ChainError::DegenerateSegment { primitive: 5 }),
++            (vec![6], ChainError::ZeroArea),
++            (vec![7], ChainError::DegenerateSegment { primitive: 7 }),
++        ]
++    );
++    assert_eq!(chains.closed.len(), 1);
++
++    // A repeated primitive is dropped by name, in either direction, and the loop still closes.
++    let mut doubled = rect("cut", 0.0, 0.0, 10.0, 5.0);
++    doubled.push(flip(&doubled[1]));
++    doubled.push(circle("cut", 5.0, 2.5, 1.0));
++    doubled.push(circle("cut", 5.0, 2.5, 1.0));
++    doubled.push(circle("other", 5.0, 2.5, 1.0));
++    let chains = chained(&doubled);
++    let errors: Vec<_> = chains.rejected.iter().map(|r| r.error.clone()).collect();
++    assert_eq!(
++        errors,
++        [
++            ChainError::DuplicatePrimitive {
++                primitive: 4,
++                of: 1
++            },
++            ChainError::DuplicatePrimitive {
++                primitive: 6,
++                of: 5
++            },
++        ]
++    );
++    assert_eq!(chains.closed.len(), 3);
++}
++
++#[test]
++fn invalid_input_is_an_error_not_a_panic() {
++    let square = rect("cut", 0.0, 0.0, 10.0, 5.0);
++    for join_tolerance in [0.0, -0.01, 1e-7, 10.5, f64::NAN, f64::INFINITY] {
++        assert_eq!(
++            chain(&square, ChainOptions { join_tolerance }),
++            Err(ChainError::InvalidTolerance)
++        );
++    }
++    let bad = |item: LayeredPrimitive| {
++        let mut input = square.clone();
++        input.push(item);
++        chain(&input, ChainOptions::default()).unwrap_err()
++    };
++    assert_eq!(
++        bad(line("cut", f64::NAN, 0.0, 1.0, 1.0)),
++        ChainError::NonFinite { primitive: 4 }
++    );
++    assert_eq!(
++        bad(circle("cut", 0.0, 0.0, f64::INFINITY)),
++        ChainError::NonFinite { primitive: 4 }
++    );
++    assert_eq!(
++        bad(line("cut", 0.0, 0.0, 1e7, 1.0)),
++        ChainError::OutOfRange { primitive: 4 }
++    );
++    assert_eq!(
++        bad(circle("cut", 9e6, 0.0, 2e6)),
++        ChainError::OutOfRange { primitive: 4 }
++    );
++    assert!(matches!(
++        bad(circle("cut", 0.0, 0.0, 0.0)),
++        ChainError::InvalidPrimitive { primitive: 4, .. }
++    ));
++    assert!(matches!(
++        bad(arc("cut", 0.0, 0.0, -1.0, 0.0, 1.0)),
++        ChainError::InvalidPrimitive { .. }
++    ));
++    assert!(matches!(
++        bad(arc("cut", 0.0, 0.0, 1.0, 0.0, 0.0)),
++        ChainError::InvalidPrimitive { .. }
++    ));
++    assert!(matches!(
++        bad(arc("cut", 0.0, 0.0, 1.0, 0.0, 7.0)),
++        ChainError::InvalidPrimitive { .. }
++    ));
++    let text = bad(arc("cut", 0.0, 0.0, 1.0, 0.0, 7.0)).to_string();
++    assert_eq!(
++        text,
++        "sketch chaining: primitive 4 is invalid: arc sweep must be non-zero and at most a turn"
++    );
++    assert_eq!(
++        chain(&[], ChainOptions::default()),
++        Ok(SketchChains::default())
++    );
++}
++
++#[test]
++fn crossing_loops_get_no_outer_or_hole_reading() {
++    let mut input = rect("a", 0.0, 0.0, 10.0, 10.0);
++    input.extend(rect("b", 5.0, 5.0, 15.0, 15.0)); // overlaps the first
++    input.push(circle("a", 2.0, 2.0, 1.0)); // inside the first only
++    input.push(circle("a", 40.0, 0.0, 1.0)); // clear of both
++    input.push(circle("t", 60.0, 0.0, 2.0));
++    input.push(circle("t", 64.0, 0.0, 2.0)); // tangent to the one before
++    let chains = chained(&input);
++    assert!(chains.rejected.is_empty());
++    let id = |area: f64, layer: &str| -> ChainId {
++        chains
++            .closed
++            .iter()
++            .find(|c| c.layer == layer && (c.area - area).abs() < 1e-6)
++            .unwrap()
++            .id
++    };
++    let (a, b) = (id(100.0, "a"), id(100.0, "b"));
++    for chain in &chains.closed {
++        let small = chain.segments.len() == 1 && chain.layer == "a";
++        match (&chain.nesting, small) {
++            (Ok(nesting), true) if chain.segments[0].start.x > 30.0 => {
++                assert_eq!((nesting.role, nesting.depth), (LoopRole::Outer, 0));
++            }
++            // The circle inside a crossed rectangle inherits its ambiguity.
++            (Err(ChainError::NestingAmbiguous { other, .. }), true) => assert_eq!(*other, b),
++            (Err(ChainError::NestingAmbiguous { other, at }), false) if chain.layer != "t" => {
++                assert_eq!(*other, if chain.id == a { b } else { a });
++                assert!([p(10.0, 5.0), p(5.0, 10.0)].contains(at), "{at:?}");
++            }
++            (Err(ChainError::NestingAmbiguous { at, .. }), false) => {
++                near(at.x, 62.0);
++                near(at.y, 0.0);
++            }
++            other => panic!("unexpected nesting {other:?} on layer {}", chain.layer),
++        }
++    }
++    assert!(matches!(
++        chains.strict(),
++        Err(ChainError::NestingAmbiguous { .. })
++    ));
++}
++
++#[test]
++fn dense_drawing_is_refused_within_the_work_limit() {
++    // 25,000 spokes from one point: every end there is a neighbour of every other.
++    let spokes: Vec<_> = (0..25_000)
++        .map(|i| {
++            let a = f64::from(i) * 1e-4;
++            line("star", 0.0, 0.0, 50.0 * a.cos(), 50.0 * a.sin())
++        })
++        .collect();
++    assert_eq!(
++        chain(&spokes, ChainOptions::default()),
++        Err(ChainError::TooComplex)
++    );
++    // A star within the limit is one branch, named once.
++    let chains = chained(&spokes[..500]);
++    let ChainError::Branch { degree, .. } = *only_error(&chains) else {
++        panic!("branch")
++    };
++    assert_eq!(degree, 500);
++}
++
++#[test]
++fn random_grid_sketches_never_panic_and_do_not_depend_on_input_order() {
++    let mut random = Lehmer(1861);
++    let (mut nested, mut loops, mut refused) = (0, 0, 0);
++    for round in 0..400 {
++        // Lines, arcs and circles on a coarse grid, so ends coincide, cross and overlap often.
++        let mut input = Vec::new();
++        for _ in 0..(3 + random.next(14)) {
++            let mut grid = || random.next(5) as f64 * 2.0;
++            let (x0, y0, x1, y1) = (grid(), grid(), grid(), grid());
++            let layer = if random.next(5) == 0 { "b" } else { "a" };
++            input.push(match random.next(6) {
++                0 => circle(layer, x0, y0, 1.0 + random.next(3) as f64),
++                1 => arc(
++                    layer,
++                    x0,
++                    y0,
++                    2.0,
++                    random.next(4) as f64 * PI / 2.0,
++                    PI / 2.0 * (1.0 + random.next(3) as f64),
++                ),
++                2 => arc(layer, x0, y0, 2.0, random.next(4) as f64 * PI / 2.0, -PI),
++                _ => line(layer, x0, y0, x1, y1),
++            });
++        }
++        let first = chained(&input);
++        let used: usize = first.closed.iter().map(|c| c.segments.len()).sum::<usize>()
++            + first.open.iter().map(|c| c.segments.len()).sum::<usize>()
++            + first
++                .rejected
++                .iter()
++                .map(|r| r.primitives.len())
++                .sum::<usize>();
++        assert_eq!(
++            used,
++            input.len(),
++            "round {round}: every primitive is chained or rejected once"
++        );
++        for closed in &first.closed {
++            assert!(closed.area > 0.0 && closed.max_gap <= 0.01);
++        }
++        // Oracle for the nesting: count the fine chord polygons that contain the loop's start.
++        let polygons: Vec<Region> = first
++            .closed
++            .iter()
++            .map(|c| Region::new(vec![Loop::new(flatten(c)).unwrap()]).unwrap())
++            .collect();
++        for (i, closed) in first.closed.iter().enumerate() {
++            let Ok(nesting) = &closed.nesting else {
++                continue;
++            };
++            let start = closed.segments[0].start;
++            let around = polygons
++                .iter()
++                .enumerate()
++                .filter(|(j, polygon)| *j != i && polygon.contains(start));
++            assert_eq!(
++                nesting.depth,
++                around.count(),
++                "round {round}: depth of loop {i}"
++            );
++            assert_eq!(nesting.role == LoopRole::Hole, nesting.depth % 2 == 1);
++            nested += usize::from(nesting.depth > 0);
++            // Loops with a reading are apart or nested, never partly overlapping.
++            for (j, other) in first.closed.iter().enumerate().skip(i + 1) {
++                if other.nesting.is_ok() {
++                    let shared = polygons[i].intersect(&polygons[j]).unwrap().area();
++                    let small = polygons[i].area().min(polygons[j].area());
++                    assert!(
++                        shared < 0.02 * small || shared > 0.98 * small,
++                        "round {round}: loops {i} and {j} share {shared} of {small}"
++                    );
++                }
++            }
++        }
++        let mut shuffled = input.clone();
++        for i in (1..shuffled.len()).rev() {
++            shuffled.swap(i, random.next(i as u64 + 1) as usize);
++        }
++        let flipped: Vec<_> = shuffled.iter().map(flip).collect();
++        let second = chained(&flipped);
++        let ids = |chains: &SketchChains| {
++            let closed: Vec<_> = chains
++                .closed
++                .iter()
++                .map(|c| (c.id, c.nesting.clone()))
++                .collect();
++            let open: Vec<_> = chains.open.iter().map(|c| (c.id, c.start, c.end)).collect();
++            (closed, open, chains.rejected.len())
++        };
++        assert_eq!(ids(&first), ids(&second), "round {round}");
++        loops += first.closed.len();
++        refused += first.rejected.len();
++    }
++    // The generator must keep reaching the interesting cases.
++    assert!(
++        loops > 500 && nested > 5 && refused > 100,
++        "{loops} loops, {nested} nested, {refused} refused"
++    );
++}
+diff --git a/docs/decisions/1861-sketch-chaining.md b/docs/decisions/1861-sketch-chaining.md
+new file mode 100644
+index 000000000..f3c16e9f9
+--- /dev/null
++++ b/docs/decisions/1861-sketch-chaining.md
+@@ -0,0 +1,103 @@
++## #1861 - Sketch chaining, outer-versus-hole nesting and open-chain safety
++
++**What was decided.** Add `camcraft-geometry::sketch_chains`: one call,
++`chain(&[LayeredPrimitive], ChainOptions) -> Result<SketchChains, ChainError>`,
++that turns the DXF reader's lines, arcs and circles (#1860) into closed loops
++and open chains. No new dependency, no file I/O, no application state.
++Primitives and the join tolerance are in millimetres; the caller scales a
++document by its units first.
++
++- **Joining.** Curve ends within the join tolerance (default 0.01 mm, allowed
++  1e-5 mm to 10 mm) are clustered with a uniform grid and union-find. Ends
++  join only on the same layer, because the layer name is part of a chain's
++  identity. A gap wider than the tolerance is never bridged: the chain stays
++  open and reports both free ends. A bridged gap is reported as `max_gap`.
++- **Curves stay analytic.** A chain segment is the input primitive turned to
++  the walk direction (`reversed`, with the arc's start angle and sweep sign
++  rewritten). Nothing is flattened, snapped or healed, so a later operation
++  can still post G2/G3 from centre, radius and sweep sign.
++- **Canonical order.** A closed loop is walked counterclockwise (by its exact
++  signed area, arcs included) from its lowest joint in (x, y). An open chain
++  starts at its lower end. The result does not depend on the order or the
++  direction the primitives were drawn in.
++- **`ChainId`.** The 128-bit FNV-1a hash of a version tag, the layer name, the
++  closed flag and the curves in canonical order, each quantized to 1e-6 mm.
++  The minimum tolerance is above that quantum, so two joints of one chain
++  never share a quantized position and the canonical start is unique. The
++  value for a reference slot is pinned in a test, and checked there against a
++  DXF polyline of the same shape, because a project file may store it (#1862).
++- **Refusals are per chain and named.** `Err` is only for input nothing can be
++  read from: a bad tolerance, a non-finite, out-of-range or invalid primitive,
++  or a drawing over the limits. Everything else comes back in the result:
++  `closed`, `open`, and `rejected` (layer, input indices, `ChainError`):
++  `DuplicatePrimitive`, `DegenerateSegment`, `Branch`, `SelfCrossing`,
++  `ZeroArea`, `DuplicateChain`. `SketchChains::strict()` turns the first
++  rejection or ambiguous nesting into an `Err` for callers that want all or
++  nothing. Every input primitive ends in exactly one chain or one rejection.
++- **Branches are a diagnostic, not a traversal.** Three or more ends at one
++  joint reject the whole connected component with `Branch { at, degree }`.
++- **Self-crossing.** A closed loop is tested exactly, line against arc against
++  circle in closed form, over a watertight copy whose joint gaps carry straight
++  bridges. Contact within the tolerance of a joint between the two elements
++  that meet there is the joint itself; any other contact, touching included,
++  is `SelfCrossing { at }`.
++- **Nesting.** Depth is counted by an exact crossing-number test against the
++  arcs themselves. Even depth is `Outer`, odd is `Hole`, with the innermost
++  container as `parent`: the even-odd rule of `geo2d::Region`. Nesting is read
++  over every closed chain passed in, across layers; a caller that wants the
++  nesting of one layer passes only that layer's primitives.
++- **Crossing loops get no reading.** Two closed chains that cross or touch
++  keep their geometry and identity, but their `nesting` is
++  `Err(NestingAmbiguous)`, and so is that of every loop inside one of them.
++- **Limits.** Coordinates below 1e7 mm, at most 2,000,000 primitives, and a
++  budget of 200,000,000 pair tests per call. Over the budget the call returns
++  `TooComplex`; it does not hang.
++
++**Why.** A wrong outer-or-hole reading puts the cutter on the wrong side of a
++contour, so every doubtful case is refused or left without a reading instead
++of guessed. Partial results follow the Prime Directive's "prefer recoverable
++states": a stray scribble on one layer must not block the import of a clean
++part on another, and the rejection says which primitives and why.
++
++**Sources.** Fixed-radius neighbour search on a grid (Bentley, Stanat and
++Williams 1977); union-find (Tarjan 1975); FNV-1a (IETF draft-eastlake-fnv);
++sweep and prune with the widest-spread axis (Cohen, Lin, Manocha and Ponamgi
++1995; Ericson 2005); segment, line-circle and circle-circle contacts (O'Rourke
++1998; Schneider and Eberly 2003); crossing-number containment (Shimrat 1962;
++Haines 1994); area by Green's theorem. Each submodule names its own. No vendor
++code, file or output was consulted.
++
++**Considered and dropped.**
++- *Reuse `boundary_chains::group_runs`.* It joins point lists in pick order on
++  fixed quantized keys; it has no caller tolerance and no curve metadata (the
++  earlier attempt's finding on the issue).
++- *Nest with `geo2d::Region` / Clipper directly.* `Region::new` unions and
++  renormalizes its loops, so a result loop cannot be traced back to a
++  `ChainId`, and it needs flattened arcs, where chord error can flip a
++  near-tangent containment. The exact test uses the same even-odd rule; a
++  test compares its reading with `Region` over flattened copies.
++- *Deterministic traversal through a branch* (leftmost turn). It would pick
++  one of several loops for the user without saying so.
++- *Snap joined ends together.* It would move arc ends off their circles and
++  change centre or radius.
++- *`std` hashing for the id.* Its output is not stable across Rust releases.
++- *One global error for any bad chain.* See "Why".
++- *A plain x sweep for the crossing search.* A tall outline with finely
++  divided vertical sides kept every side open at once and ran into the budget
++  (pinned by a test).
++
++**Known limits.**
++- Two curves that meet at a tangent cusp (the path turns back on itself along
++  a shared tangent) can read as `SelfCrossing` when coordinate rounding makes
++  them cross a little way from the joint. Tangent continuations (fillets,
++  S-curves) are not affected and are pinned by a test.
++- Open chains are not tested for self-crossing: an engraved script letter may
++  cross itself.
++- There is no flattening helper; the operations that need polygons (#1867)
++  choose their own chord tolerance.
++
++**Cost to change later.** The id recipe is the expensive part: changing the
++quantum, the canonical order or the fed bytes changes every stored `ChainId`.
++The version tag in the hash (`camcraft-sketch-chain-v1`) exists so that such a
++change is a new, non-aliasing id space. Everything else is internal to the
++module.

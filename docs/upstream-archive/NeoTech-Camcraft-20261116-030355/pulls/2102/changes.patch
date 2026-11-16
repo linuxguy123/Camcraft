@@ -1,0 +1,1238 @@
+From 3d704d2c25a3bd4d662d31687f8dd9972c0557c5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 15 Nov 2026 18:22:38 -0800
+Subject: [PATCH] fix(sim): credit bounded 3D edge-break volumes
+
+Keep legacy cone records and add framed flat, ball and rounded caps.
+Credit only connected declared material and retain operation width bounds.
+Preserve framed records through project files and tilted work frames.
+
+Co-Authored-By: OpenAI Codex <noreply@openai.com>
+
+Fixes #1891
+---
+ crates/app/src/project/break_dto.rs       | 201 +++++++++++++++++++-
+ crates/app/src/stock_sim_breaks.rs        |   2 +-
+ crates/app/tests/edge_break_bound.rs      |  44 ++++-
+ crates/app/tests/edge_volume_bound.rs     |  52 ++++++
+ crates/cl/src/cl/edge_break.rs            |  46 +++--
+ crates/cl/src/cl/edge_volume.rs           | 209 +++++++++++++++++++++
+ crates/cl/src/cl/frame.rs                 |  23 ++-
+ crates/cl/src/cl/mod.rs                   |   2 +
+ crates/cl/tests/edge_volume.rs            | 215 ++++++++++++++++++++++
+ crates/motion/src/finishing3d/deburr.rs   |   2 +-
+ crates/motion/src/machining2d/chamfer.rs  |   1 +
+ crates/sim/src/stock_sim/edge_break.rs    |  11 +-
+ crates/sim/tests/edge_break_credit.rs     |   4 +-
+ crates/sim/tests/edge_volume_credit.rs    | 112 +++++++++++
+ docs/decisions/1891-edge-break-volumes.md |  65 +++++++
+ 15 files changed, 945 insertions(+), 44 deletions(-)
+ create mode 100644 crates/app/tests/edge_volume_bound.rs
+ create mode 100644 crates/cl/src/cl/edge_volume.rs
+ create mode 100644 crates/cl/tests/edge_volume.rs
+ create mode 100644 crates/sim/tests/edge_volume_credit.rs
+ create mode 100644 docs/decisions/1891-edge-break-volumes.md
+
+diff --git a/crates/app/src/project/break_dto.rs b/crates/app/src/project/break_dto.rs
+index e7a1b6de0..c9ba8a47e 100644
+--- a/crates/app/src/project/break_dto.rs
++++ b/crates/app/src/project/break_dto.rs
+@@ -7,7 +7,7 @@
+ 
+ use serde::{Deserialize, Serialize};
+ 
+-use crate::cl::{lattice, EdgeBreak};
++use crate::cl::{lattice, BreakFrame, BreakProfile, EdgeBreak, EdgeBreakVolume};
+ use crate::geometry::Point3;
+ 
+ /// One cached edge break: the edge polyline on the micron lattice, the
+@@ -17,14 +17,73 @@ pub struct EdgeBreakDto {
+     pub edge: Vec<[f64; 3]>,
+     pub depth: f64,
+     pub slope: f64,
++    /// Raw until validated: a corrupt extension drops only this record.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub volume: Option<serde_json::Value>,
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct VolumeDto {
++    width: f64,
++    frames: Vec<FrameDto>,
++    profile: ProfileDto,
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FrameDto {
++    outward: [f64; 3],
++    across: [f64; 3],
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
++enum ProfileDto {
++    Flat,
++    ConcaveBall { radius: f64 },
++    ConvexRound { radius: f64 },
++}
++
++impl VolumeDto {
++    fn from_volume(v: &EdgeBreakVolume) -> Self {
++        Self {
++            width: v.width,
++            frames: v.frames.iter().map(|f| FrameDto { outward: f.outward, across: f.across }).collect(),
++            profile: match v.profile {
++                BreakProfile::Flat => ProfileDto::Flat,
++                BreakProfile::ConcaveBall { radius } => ProfileDto::ConcaveBall { radius },
++                BreakProfile::ConvexRound { radius } => ProfileDto::ConvexRound { radius },
++            },
++        }
++    }
++
++    fn into_volume(self) -> EdgeBreakVolume {
++        EdgeBreakVolume {
++            width: self.width,
++            frames: self.frames.into_iter().map(|f| BreakFrame { outward: f.outward, across: f.across }).collect(),
++            profile: match self.profile {
++                ProfileDto::Flat => BreakProfile::Flat,
++                ProfileDto::ConcaveBall { radius } => BreakProfile::ConcaveBall { radius },
++                ProfileDto::ConvexRound { radius } => BreakProfile::ConvexRound { radius },
++            },
++        }
++    }
+ }
+ 
+ impl EdgeBreakDto {
+     pub(super) fn from_break(b: &EdgeBreak) -> Self {
+         EdgeBreakDto {
+-            edge: b.edge.iter().map(|p| [lattice(p.x), lattice(p.y), lattice(p.z)]).collect(),
++            // Framed caps need the original endpoints: snapping a short
++            // oblique edge would make its frame non-orthogonal on load.
++            edge: b.edge.iter().map(|p| {
++                if b.volume.is_some() { [p.x, p.y, p.z] } else { [lattice(p.x), lattice(p.y), lattice(p.z)] }
++            }).collect(),
+             depth: b.depth,
+             slope: b.slope,
++            // A serialization failure keeps an invalid extension rather
++            // than turning the record into a legacy cone.
++            volume: b.volume.as_ref().map(|v| serde_json::to_value(VolumeDto::from_volume(v)).unwrap_or(serde_json::Value::Bool(false))),
+         }
+     }
+ }
+@@ -32,12 +91,138 @@ impl EdgeBreakDto {
+ /// The breaks of a loaded path; a record that fails the sanity door is
+ /// dropped (its columns are then judged against the sharp model).
+ pub(super) fn load(dtos: &[EdgeBreakDto]) -> Vec<EdgeBreak> {
+-    dtos.iter()
+-        .map(|d| EdgeBreak {
+-            edge: d.edge.iter().map(|p| Point3::new(p[0], p[1], p[2])).collect(),
+-            depth: d.depth,
+-            slope: d.slope,
++    dtos.iter().enumerate()
++        .filter_map(|(index, d)| {
++            let volume = match &d.volume {
++                None => None,
++                Some(v) => match serde_json::from_value::<VolumeDto>(v.clone()) {
++                    Ok(v) => Some(v.into_volume()),
++                    Err(why) => {
++                        tracing::warn!(record = index, %why, "edge-break volume malformed - dropped, judged sharp");
++                        return None;
++                    }
++                },
++            };
++            let b = EdgeBreak {
++                edge: d.edge.iter().map(|p| Point3::new(p[0], p[1], p[2])).collect(),
++                depth: d.depth,
++                slope: d.slope,
++                volume,
++            };
++            if !b.is_sane() {
++                tracing::warn!(record = index, "edge-break record has invalid dimensions, profile or frame - dropped, judged sharp");
++                return None;
++            }
++            Some(b)
+         })
+-        .filter(EdgeBreak::is_sane)
+         .collect()
+ }
++
++#[cfg(test)]
++mod volume_tests {
++    use super::*;
++    use crate::cl::{BreakFrame, BreakProfile, EdgeBreakVolume};
++
++    #[test]
++    fn a_framed_break_survives_the_project_record_reader() {
++        let record: EdgeBreakDto = serde_json::from_value(serde_json::json!({
++            "edge": [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0]],
++            "depth": 0.5,
++            "slope": 0.0,
++            "volume": {
++                "width": 1.0,
++                "frames": [{"outward": [0.0, 0.0, 1.0], "across": [0.0, 1.0, 0.0]}],
++                "profile": {"kind": "flat"}
++            }
++        })).expect("the framed record is valid project JSON");
++        let loaded = load(&[record]);
++        assert_eq!(loaded.len(), 1, "a valid 3D edge break must survive loading");
++        assert!(loaded[0].is_sane());
++    }
++
++    fn framed_json() -> serde_json::Value {
++        serde_json::json!({
++            "edge": [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0]],
++            "depth": 0.5, "slope": 0.0,
++            "volume": { "width": 1.0,
++                "frames": [{"outward": [0.0, 0.0, 1.0], "across": [0.0, 1.0, 0.0]}],
++                "profile": {"kind": "flat"}
++            }
++        })
++    }
++
++    #[test]
++    fn legacy_records_keep_their_wire_shape_and_sanity() {
++        let old = serde_json::json!({
++            "edge": [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0]], "depth": 0.5, "slope": 1.0
++        });
++        let dto: EdgeBreakDto = serde_json::from_value(old.clone()).expect("legacy record");
++        let loaded = load(&[dto]);
++        assert_eq!(loaded.len(), 1);
++        assert!(loaded[0].volume.is_none());
++        assert_eq!(serde_json::to_value(EdgeBreakDto::from_break(&loaded[0])).expect("write"), old);
++        assert_eq!(loaded[0].floor_at(0.0, 0.25), Some((9.75, 10.0)));
++    }
++
++    #[test]
++    fn every_profile_round_trips_and_older_readers_reject_its_zero_slope() {
++        for kind in ["flat", "concave_ball", "convex_round"] {
++            let mut json = framed_json();
++            json["volume"]["profile"] = if kind == "flat" {
++                serde_json::json!({"kind": kind})
++            } else { serde_json::json!({"kind": kind, "radius": 0.75}) };
++            let dto: EdgeBreakDto = serde_json::from_value(json).expect("framed record");
++            let loaded = load(&[dto]);
++            assert_eq!(loaded.len(), 1);
++            let saved = EdgeBreakDto::from_break(&loaded[0]);
++            let text = serde_json::to_string(&saved).expect("write");
++            let saved: EdgeBreakDto = serde_json::from_str(&text).expect("read");
++            assert_eq!(load(&[saved]), loaded, "{kind}");
++            assert_eq!(loaded[0].slope, 0.0, "old readers must drop 3D records instead of applying a cone");
++        }
++    }
++
++    #[test]
++    fn malformed_extensions_drop_only_the_record_and_never_fall_back_to_a_cone() {
++        let payloads = [
++            serde_json::json!(false),
++            serde_json::json!({}),
++            serde_json::json!({"width":1,"frames":[],"profile":{"kind":"flat"}}),
++            serde_json::json!({"width":1,"frames":[{"outward":[0,0,1],"across":[0,1,0]}],"profile":{"kind":"unknown"}}),
++            serde_json::json!({"width":1,"frames":[{"outward":[0,1],"across":[0,1,0]}],"profile":{"kind":"flat"}}),
++            serde_json::json!({"width":1,"frames":[{"outward":[0,0,1],"across":[0,1,0]}],"profile":{"kind":"flat"},"extra":1}),
++            serde_json::json!({"width":1,"frames":[{"outward":[0,0,1],"across":[0,1,0],"extra":1}],"profile":{"kind":"flat"}}),
++            serde_json::json!({"width":1,"frames":[{"outward":[0,0,1],"across":[0,1,0]}],"profile":{"kind":"concave_ball","radius":0.75,"extra":1}}),
++        ];
++        for payload in payloads {
++            let mut json = framed_json();
++            json["volume"] = payload;
++            // Positive legacy slope is deliberate: corrupt extensions
++            // must not turn into a plausible vertical-axis declaration.
++            json["slope"] = 1.0.into();
++            let bad: EdgeBreakDto = serde_json::from_value(json).expect("raw record");
++            let good: EdgeBreakDto = serde_json::from_value(framed_json()).expect("good record");
++            let loaded = load(&[bad, good]);
++            assert_eq!(loaded.len(), 1);
++            assert_eq!(loaded[0].slope, 0.0);
++        }
++    }
++
++    #[test]
++    fn framed_endpoints_keep_precision_needed_for_short_oblique_edges() {
++        use crate::cl::TiltedFrame;
++        let frame = TiltedFrame::new(Point3::new(0.123456789, 0.234567891, 0.345678912), [1.0, 2.0, 3.0]).expect("frame");
++        let end = frame.to_world(Point3::new(0.0, 0.0, 0.000012345));
++        let b = EdgeBreak {
++            edge: vec![frame.origin, end], depth: 0.5, slope: 0.0,
++            volume: Some(EdgeBreakVolume {
++                width: 1.0, profile: BreakProfile::Flat,
++                frames: vec![BreakFrame { outward: frame.u, across: frame.v }],
++            }),
++        };
++        assert!(b.is_sane());
++        let dto = EdgeBreakDto::from_break(&b);
++        let dto = serde_json::from_str(&serde_json::to_string(&dto).expect("write")).expect("read");
++        assert_eq!(load(&[dto]), vec![b]);
++    }
++}
+diff --git a/crates/app/src/stock_sim_breaks.rs b/crates/app/src/stock_sim_breaks.rs
+index 9cc3cc4ed..ccb5d9b2e 100644
+--- a/crates/app/src/stock_sim_breaks.rs
++++ b/crates/app/src/stock_sim_breaks.rs
+@@ -46,7 +46,7 @@ pub fn bounded(name: &str, params: &OpParams, breaks: Vec<EdgeBreak>) -> Vec<Edg
+                     op = name,
+                     declared = w,
+                     record = b.width(),
+-                    "edge-break record wider than its operation declares - dropped, judged sharp"
++                    "edge-break record has invalid dimensions, profile or frame, or is wider than its operation declares - dropped, judged sharp"
+                 );
+             }
+             ok
+diff --git a/crates/app/tests/edge_break_bound.rs b/crates/app/tests/edge_break_bound.rs
+index 10c87af03..bc279f9ec 100644
+--- a/crates/app/tests/edge_break_bound.rs
++++ b/crates/app/tests/edge_break_bound.rs
+@@ -8,7 +8,7 @@
+ //! breaks::declared_width), app::project (the breaks key, read back).
+ //! Provenance: our own fixtures (#303's brick and chamfer).
+ 
+-use camcraft_app::cl::EdgeBreak;
++use camcraft_app::cl::{BreakFrame, BreakProfile, EdgeBreak, EdgeBreakVolume, Move, MoveKind};
+ use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
+ use camcraft_app::geometry::{cube, Point3};
+ use camcraft_app::operation::{self, Height, HeightReference, OpParams, OpType, SrcRef};
+@@ -128,11 +128,49 @@ fn the_bound_reads_the_ops_own_width() {
+     let chamfer = seeded(OpType::Chamfer2D);
+     let w = breaks::declared_width(&chamfer).expect("a chamfer declares a width");
+     let edge = vec![Point3::new(0.0, 0.0, 10.0), Point3::new(10.0, 0.0, 10.0)];
+-    let fits = EdgeBreak { edge: edge.clone(), depth: w, slope: 1.0 };
+-    let wide = EdgeBreak { edge: edge.clone(), depth: 3.0 * w, slope: 1.0 };
++    let fits = EdgeBreak { edge: edge.clone(), depth: w, slope: 1.0, volume: None };
++    let wide = EdgeBreak { edge: edge.clone(), depth: 3.0 * w, slope: 1.0, volume: None };
+     let kept = breaks::bounded("OP", &chamfer, vec![fits.clone(), wide]);
+     assert_eq!(kept, vec![fits.clone()], "only the record within the stated width");
+     let deburr = seeded(OpType::Deburr);
+     assert!(breaks::declared_width(&deburr).is_some(), "a deburr declares a width");
+     assert!(breaks::bounded("F", &seeded(OpType::Face), vec![fits]).is_empty(), "a face declares no break");
+ }
++
++#[test]
++fn a_framed_cap_verifies_after_loading_but_a_deeper_or_forged_cut_convicts() {
++    let world = chamfered_brick();
++    let e = model::find_by_name(&world, "OP").expect("op");
++    let mut cached = model::toolpath_of(&world, &e).expect("cache");
++    let width = breaks::declared_width(&seeded(OpType::Chamfer2D)).expect("width");
++    let depth = width / 4.0;
++    cached.path.moves = vec![Move {
++        rotary: None, kind: MoveKind::Feed,
++        from: Point3::new(-2.0, -10.0, 10.0 - depth),
++        to: Point3::new(2.0, -10.0, 10.0 - depth),
++        feed: Some(500.0), arc: None, axis: None,
++    }];
++    cached.path.breaks = vec![EdgeBreak {
++        edge: vec![Point3::new(-3.0, -10.0, 10.0), Point3::new(3.0, -10.0, 10.0)],
++        depth, slope: 0.0,
++        volume: Some(EdgeBreakVolume {
++            width, profile: BreakProfile::Flat,
++            frames: vec![BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] }],
++        }),
++    }];
++    e.entity_view(&world).set(camcraft_app::schema::Toolpath::new(cached.path, cached.warnings));
++    assert!(gouge(&world).is_none(), "an honest cap verifies");
++    let loaded = edited(&world, 1.0);
++    assert!(gouge(&loaded).is_none(), "the cap still verifies after loading");
++    sink(&world, depth);
++    assert!(gouge(&world).is_some(), "a cut below the cap is a real gouge");
++    let loaded = edited(&world, 10.0);
++    assert!(gouge(&loaded).is_some(), "an inflated cached depth cannot forgive the gouge");
++    let mut cached = model::toolpath_of(&world, &e).expect("cache");
++    cached.path.breaks[0].depth = width * 2.0;
++    cached.path.breaks[0].volume.as_mut().expect("volume").width = width * 4.0;
++    assert!(cached.path.breaks[0].is_sane(), "the forged record is geometrically sane but exceeds its operation");
++    e.entity_view(&world).set(camcraft_app::schema::Toolpath::new(cached.path, cached.warnings));
++    let loaded = edited(&world, 1.0);
++    assert!(gouge(&loaded).is_some(), "inflating width and depth together cannot evade the operation bound");
++}
+diff --git a/crates/app/tests/edge_volume_bound.rs b/crates/app/tests/edge_volume_bound.rs
+new file mode 100644
+index 000000000..569ba8692
+--- /dev/null
++++ b/crates/app/tests/edge_volume_bound.rs
+@@ -0,0 +1,52 @@
++//! Provenance: the cached-record operation bound from #529, extended for #1891.
++//! Gate map: covers app::stock_sim (breaks::bounded, declared_width).
++
++use camcraft_app::cl::{BreakFrame, BreakProfile, EdgeBreak, EdgeBreakVolume};
++use camcraft_app::geometry::Point3;
++use camcraft_app::operation::{self, Height, HeightReference, OpParams, OpType};
++use camcraft_app::stock_sim::breaks;
++
++fn params(ty: OpType) -> OpParams {
++    let base = OpParams::Face {
++        holes: Default::default(), tilt: None, stepover: 3.0,
++        clearance_z: Height::of(HeightReference::TopOfStock, 25.0),
++        cut_z: Height::of(HeightReference::TopOfStock, 0.0), top_z: None, stepdown: None,
++        feed: 1200.0, plunge_feed: 300.0, climb: true, blend_turns: false,
++    };
++    operation::retype_params(&base, ty.ordinal())
++}
++
++fn record(width: f64) -> EdgeBreak {
++    EdgeBreak {
++        edge: vec![Point3::new(0.0, 0.0, 10.0), Point3::new(10.0, 0.0, 10.0)],
++        depth: width / 2.0, slope: 0.0,
++        volume: Some(EdgeBreakVolume {
++            width, profile: BreakProfile::Flat,
++            frames: vec![BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] }],
++        }),
++    }
++}
++
++#[test]
++fn framed_records_obey_their_operations_width_and_kind() {
++    for ty in [OpType::Chamfer2D, OpType::Deburr] {
++        let params = params(ty);
++        let width = breaks::declared_width(&params).expect("width");
++        let good = record(width);
++        let wide = record(width * 2.0);
++        assert_eq!(breaks::bounded("edge op", &params, vec![good.clone(), wide]), vec![good]);
++    }
++    assert!(breaks::bounded("face", &params(OpType::Face), vec![record(0.1)]).is_empty());
++}
++
++#[test]
++fn corrupted_frames_and_excess_depth_are_dropped_before_verification() {
++    let params = params(OpType::Deburr);
++    let width = breaks::declared_width(&params).expect("width");
++    let good = record(width);
++    let mut deep = good.clone();
++    deep.depth = width * 1.01;
++    let mut frame = good.clone();
++    frame.volume.as_mut().expect("volume").frames[0].outward = [0.0, 0.0, 10.0];
++    assert_eq!(breaks::bounded("broken edge op", &params, vec![deep, frame, good.clone()]), vec![good]);
++}
+diff --git a/crates/cl/src/cl/edge_break.rs b/crates/cl/src/cl/edge_break.rs
+index a7ba84085..98c7109a1 100644
+--- a/crates/cl/src/cl/edge_break.rs
++++ b/crates/cl/src/cl/edge_break.rs
+@@ -1,5 +1,5 @@
+-//! The edge break an operation declares (#303): the bevel a vertical-
+-//! axis cone cuts when its apex rides `depth` below an edge.
++//! The edge break an operation declares (#303, #1891): a legacy
++//! vertical cone or an optional framed 3D cap (see [`super::EdgeBreakVolume`]).
+ //!
+ //! Provenance: the chamfer mill's cut law - a cone of half-angle `h`
+ //! from its axis, apex `depth` under the edge, meets the edge's level
+@@ -19,35 +19,53 @@
+ 
+ use crate::geometry::Point3;
+ 
+-/// One declared edge break: the edge as a polyline at the edge's own
+-/// height (a closed loop repeats its first point), the bevel's depth
+-/// at the edge, and its slope - the bevel rises `slope` mm per mm of
+-/// plan distance from the edge, so it meets the edge's level `width()`
+-/// mm out.
++/// One declared edge break, independent of the generated moves.
++/// Without `volume`, depth and slope describe the legacy vertical
++/// cone. A framed record instead states its maximum inward depth and
++/// full cross-edge width, with one local frame per polyline segment.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct EdgeBreak {
+     pub edge: Vec<Point3>,
+     pub depth: f64,
+     pub slope: f64,
++    /// A framed 3D cap, or the legacy vertical cone when absent.
++    /// Framed records use slope zero so older readers discard them.
++    pub volume: Option<super::EdgeBreakVolume>,
+ }
+ 
+ impl EdgeBreak {
+-    /// The bevel's plan width at the edge's level: `depth / slope`.
++    /// The framed cap's full cross-edge width, or the legacy bevel's
++    /// plan width at the edge's level (`depth / slope`).
+     #[must_use]
+     pub fn width(&self) -> f64 {
+-        self.depth / self.slope
++        self.volume.as_ref().map_or_else(|| self.depth / self.slope, |v| v.width)
+     }
+ 
+-    /// Finite, positive depth and slope, finite points: the door every
+-    /// reader checks before trusting the record.
++    /// Finite positive dimensions and points, and a valid legacy slope
++    /// or bounded orthonormal framed profile: every reader's safety door.
+     #[must_use]
+     pub fn is_sane(&self) -> bool {
+         self.depth.is_finite()
+             && self.depth > 0.0
+-            && self.slope.is_finite()
+-            && self.slope > 0.0
+             && !self.edge.is_empty()
+             && self.edge.iter().all(|p| p.is_finite())
++            && match &self.volume {
++                Some(v) => self.slope == 0.0 && v.is_sane(&self.edge, self.depth),
++                None => self.slope.is_finite() && self.slope > 0.0 && self.width().is_finite() && self.width() > 0.0,
++            }
++    }
++
++    /// The lowest connected declared surface below the model top.
++    /// An isolated volume below a boss cannot forgive cutting the boss.
++    #[must_use]
++    pub fn floor_below(&self, x: f64, y: f64, model_top: f64) -> Option<f64> {
++        if !self.is_sane() || !x.is_finite() || !y.is_finite() || !model_top.is_finite() {
++            return None;
++        }
++        match &self.volume {
++            Some(v) => v.floor_below(&self.edge, self.depth, Point3::new(x, y, model_top)),
++            None => self.floor_at(x, y).filter(|&(_, z)| model_top <= z).map(|(floor, _)| floor),
++        }
+     }
+ 
+     /// The declared bevel over the column at plan point `(x, y)`, with
+@@ -58,7 +76,7 @@ impl EdgeBreak {
+     /// the cone swept along the edge.
+     #[must_use]
+     pub fn floor_at(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+-        if !self.is_sane() {
++        if self.volume.is_some() || !self.is_sane() {
+             return None;
+         }
+         // (nearest plan distance, edge z there), and the lowest bevel.
+diff --git a/crates/cl/src/cl/edge_volume.rs b/crates/cl/src/cl/edge_volume.rs
+new file mode 100644
+index 000000000..3c38c1553
+--- /dev/null
++++ b/crates/cl/src/cl/edge_volume.rs
+@@ -0,0 +1,209 @@
++//! Provenance: our own swept orthonormal caps and analytic line/circle intersections, from elementary Euclidean geometry.
++
++use crate::geometry::Point3;
++
++/// Local outward bisector and cross-edge direction, one frame per segment.
++/// Together with the segment tangent these must be orthonormal.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct BreakFrame {
++    pub outward: [f64; 3],
++    pub across: [f64; 3],
++}
++
++/// Finished cross-section in bisector coordinates. Width is the full
++/// cross-edge span; depth is the maximum inward distance from the edge.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum BreakProfile {
++    Flat,
++    ConcaveBall { radius: f64 },
++    ConvexRound { radius: f64 },
++}
++
++/// A finite cap swept along a polyline. The actual part clips the cap:
++/// at across coordinate s, only 0 <= inward <= profile_depth(s) is
++/// declared. End planes stop at the selected segment endpoints.
++#[derive(Clone, Debug, PartialEq)]
++pub struct EdgeBreakVolume {
++    pub width: f64,
++    pub frames: Vec<BreakFrame>,
++    pub profile: BreakProfile,
++}
++
++impl EdgeBreakVolume {
++    pub(super) fn rotate(&mut self, frame: &super::TiltedFrame) {
++        let rotate = |v: [f64; 3]| std::array::from_fn(|i| {
++            v[0] * frame.u[i] + v[1] * frame.v[i] + v[2] * frame.axis[i]
++        });
++        for f in &mut self.frames {
++            f.outward = rotate(f.outward);
++            f.across = rotate(f.across);
++        }
++    }
++
++    pub(super) fn is_sane(&self, edge: &[Point3], depth: f64) -> bool {
++        if !self.width.is_finite() || self.width <= 0.0 || depth > self.width
++            || edge.len() < 2 || self.frames.len() != edge.len() - 1
++        {
++            return false;
++        }
++        if let Some(r) = self.radius()
++            && (!r.is_finite() || r < self.width / 2.0 || r <= 0.0 || sag(self.width / 2.0, r) > depth)
++        {
++            return false;
++        }
++        edge.windows(2).zip(&self.frames).all(|(seg, f)| {
++            let delta = seg[1] - seg[0];
++            let len = delta.x.hypot(delta.y).hypot(delta.z);
++            if !len.is_finite() || len <= 0.0 || !(len + self.width + depth).is_finite() {
++                return false;
++            }
++            let tangent = [delta.x / len, delta.y / len, delta.z / len];
++            unit(f.outward) && unit(f.across)
++                && dot(f.outward, f.across).abs() <= 1e-9
++                && dot(f.outward, tangent).abs() <= 1e-9
++                && dot(f.across, tangent).abs() <= 1e-9
++        })
++    }
++
++    fn radius(&self) -> Option<f64> {
++        match self.profile {
++            BreakProfile::Flat => None,
++            BreakProfile::ConcaveBall { radius } | BreakProfile::ConvexRound { radius } => Some(radius),
++        }
++    }
++
++    fn profile_depth(&self, s: f64, depth: f64) -> f64 {
++        match self.profile {
++            BreakProfile::Flat => depth,
++            BreakProfile::ConcaveBall { radius } => depth - sag(s, radius),
++            BreakProfile::ConvexRound { radius } => depth - sag(self.width / 2.0, radius) + sag(s, radius),
++        }
++    }
++
++    pub(super) fn floor_below(&self, edge: &[Point3], depth: f64, top: Point3) -> Option<f64> {
++        let mut spans = Vec::new();
++        for (seg, f) in edge.windows(2).zip(&self.frames) {
++            self.column_spans(seg[0], seg[1], *f, depth, top, &mut spans);
++        }
++        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
++        let mut bottom: f64 = 0.0;
++        for (lo, hi) in spans {
++            // Only numerical roundoff may join adjacent segments. A
++            // disconnected pocket never grants permission through a gap.
++            let slack = 64.0 * f64::EPSILON * self.width.max(depth).max(bottom);
++            if lo > bottom + slack {
++                break;
++            }
++            bottom = bottom.max(hi);
++        }
++        let floor = top.z - bottom;
++        (bottom > 0.0 && floor.is_finite()).then_some(floor)
++    }
++
++    fn column_spans(&self, a: Point3, b: Point3, f: BreakFrame, depth: f64, top: Point3, spans: &mut Vec<(f64, f64)>) {
++        let delta = b - a;
++        let len = delta.x.hypot(delta.y).hypot(delta.z);
++        let tangent = [delta.x / len, delta.y / len, delta.z / len];
++        let q = top - a;
++        let q = [q.x, q.y, q.z];
++        let (s, ds) = (dot(q, f.across), -f.across[2]);
++        let (d, dd) = (-dot(q, f.outward), f.outward[2]);
++        let half = self.width / 2.0;
++        let mut bounds = (0.0, len + self.width + depth);
++        if !clip(&mut bounds, dot(q, tangent), -tangent[2], 0.0, len)
++            || !clip(&mut bounds, s, ds, -half, half)
++            || !clip(&mut bounds, d, dd, 0.0, depth)
++        {
++            return;
++        }
++        let mut cuts = vec![bounds.0, bounds.1];
++        let speed = ds.hypot(dd);
++        if let Some(radius) = self.radius().filter(|_| speed > 0.0) {
++            let (base, sign) = match self.profile {
++                BreakProfile::ConcaveBall { .. } => (depth, 1.0),
++                _ => (depth - sag(half, radius), -1.0),
++            };
++            // Expand the circle about its surface, not its distant
++            // centre: subtracting R from a shallow sag loses the cut.
++            // Solve in cross-section distance, not column height:
++            // squaring tiny world-Z rates can underflow to zero.
++            let (rs, rd) = (ds / speed, dd / speed);
++            let e = d - base;
++            let aa = (rs * rs + rd * rd) / radius;
++            let bb = 2.0 * (s / radius * rs + e / radius * rd + sign * rd);
++            let cc = e * (e / radius + 2.0 * sign) + s * (s / radius);
++            if !(aa.is_finite() && bb.is_finite() && cc.is_finite()) {
++                return; // ill-conditioned records grant no credit
++            }
++            let mut roots = Vec::new();
++            if !circle_roots(aa, bb, cc, (bounds.0 * speed, bounds.1 * speed), &mut roots) {
++                return;
++            }
++            cuts.extend(roots.into_iter().map(|distance| distance / speed));
++        }
++        cuts.sort_by(f64::total_cmp);
++        for pair in cuts.windows(2) {
++            let (lo, hi) = (pair[0], pair[1]);
++            let mid = lo + (hi - lo) / 2.0;
++            if hi > lo && d + dd * mid <= self.profile_depth(s + ds * mid, depth) {
++                spans.push((lo, hi));
++            }
++        }
++    }
++}
++
++fn unit(v: [f64; 3]) -> bool {
++    v.iter().all(|x| x.is_finite()) && (dot(v, v) - 1.0).abs() <= 1e-9
++}
++
++fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++/// Stable circle sag, including R much larger than the break width.
++fn sag(s: f64, radius: f64) -> f64 {
++    let t = (s.abs() / radius).min(1.0);
++    s.abs() * t / (1.0 + ((1.0 - t) * (1.0 + t)).sqrt())
++}
++
++fn clip(bounds: &mut (f64, f64), value: f64, rate: f64, min: f64, max: f64) -> bool {
++    if !value.is_finite() {
++        return false;
++    }
++    if rate == 0.0 {
++        return value >= min && value <= max;
++    }
++    let (a, b) = ((min - value) / rate, (max - value) / rate);
++    bounds.0 = bounds.0.max(a.min(b));
++    bounds.1 = bounds.1.min(a.max(b));
++    bounds.0.is_finite() && bounds.1.is_finite() && bounds.1 > bounds.0
++}
++
++fn circle_roots(a: f64, b: f64, c: f64, bounds: (f64, f64), cuts: &mut Vec<f64>) -> bool {
++    let mut take = |h: f64| {
++        if h.is_finite() && h > bounds.0 && h < bounds.1 {
++            cuts.push(h);
++        }
++    };
++    if a == 0.0 {
++        if b != 0.0 {
++            take(-c / b);
++        }
++        return true;
++    }
++    let disc = b * b - 4.0 * a * c;
++    if !disc.is_finite() {
++        return false;
++    }
++    if disc < 0.0 {
++        return true;
++    }
++    let q = -0.5 * (b + disc.sqrt().copysign(b));
++    if q != 0.0 {
++        take(q / a);
++        take(c / q);
++    } else {
++        take(-b / (2.0 * a));
++    }
++    true
++}
+diff --git a/crates/cl/src/cl/frame.rs b/crates/cl/src/cl/frame.rs
+index e14629df5..af543a0bc 100644
+--- a/crates/cl/src/cl/frame.rs
++++ b/crates/cl/src/cl/frame.rs
+@@ -355,18 +355,17 @@ impl TiltedFrame {
+                 super::ProbeTouch { index, target: self.to_world(t.target), ..*t }
+             })
+             .collect();
+-        // Edge breaks (#303) ride an upright frame's translation; a
+-        // tilted cone's bevel is not the vertical law they state, and a
+-        // posed program is refused by the sim's verdict anyway.
+-        let breaks = if self.is_upright() {
+-            local
+-                .breaks
+-                .iter()
+-                .map(|b| super::EdgeBreak { edge: b.edge.iter().map(|p| self.to_world(*p)).collect(), ..b.clone() })
+-                .collect()
+-        } else {
+-            Vec::new()
+-        };
++        // Framed caps rotate as volumes; legacy vertical cones still
++        // declare nothing in a tilted frame.
++        let breaks = local.breaks.iter()
++            .filter(|b| self.is_upright() || b.volume.is_some())
++            .map(|b| {
++                let mut b = super::EdgeBreak { edge: b.edge.iter().map(|p| self.to_world(*p)).collect(), ..b.clone() };
++                if let Some(v) = &mut b.volume {
++                    v.rotate(self);
++                }
++                b
++            }).collect();
+         Toolpath { moves, cycles: local.cycles.clone(), notes, comps, threads: Vec::new(), probes, breaks, plasma: local.plasma.clone() }
+     }
+ 
+diff --git a/crates/cl/src/cl/mod.rs b/crates/cl/src/cl/mod.rs
+index 03769fab8..a1885773a 100644
+--- a/crates/cl/src/cl/mod.rs
++++ b/crates/cl/src/cl/mod.rs
+@@ -25,6 +25,7 @@
+ mod comp;
+ mod cycle;
+ mod edge_break;
++mod edge_volume;
+ mod frame;
+ mod moves;
+ mod path;
+@@ -40,6 +41,7 @@ mod touch;
+ pub use comp::{CompSide, CompSpan};
+ pub use cycle::{Cycle, CycleKind};
+ pub use edge_break::EdgeBreak;
++pub use edge_volume::{BreakFrame, BreakProfile, EdgeBreakVolume};
+ pub use frame::TiltedFrame;
+ pub use moves::{arc_chords, lattice, ArcMove, Move, MoveKind, MAX_ARC_CHORDS};
+ pub use path::{PathBuilder, Toolpath};
+diff --git a/crates/cl/tests/edge_volume.rs b/crates/cl/tests/edge_volume.rs
+new file mode 100644
+index 000000000..b2ffdc5ea
+--- /dev/null
++++ b/crates/cl/tests/edge_volume.rs
+@@ -0,0 +1,215 @@
++//! Provenance: analytic rigid-frame prism and circle fixtures for #1891.
++//! Gate map: covers camcraft_cl::cl (edge_break, edge_volume, frame).
++
++use camcraft_cl::cl::{BreakFrame, BreakProfile, EdgeBreak, EdgeBreakVolume, TiltedFrame, Toolpath};
++use camcraft_cl::geometry::Point3;
++
++fn p(x: f64, y: f64, z: f64) -> Point3 { Point3::new(x, y, z) }
++
++fn flat() -> EdgeBreak {
++    EdgeBreak {
++        edge: vec![p(-5.0, 0.0, 0.0), p(5.0, 0.0, 0.0)],
++        depth: 0.5,
++        slope: 0.0,
++        volume: Some(EdgeBreakVolume {
++            width: 1.0,
++            frames: vec![BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] }],
++            profile: BreakProfile::Flat,
++        }),
++    }
++}
++
++fn near(actual: Option<f64>, expected: f64) {
++    let actual = actual.expect("the column intersects a connected declared break");
++    assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
++}
++
++#[test]
++fn flat_volume_has_finite_width_depth_and_segment_ends() {
++    let b = flat();
++    assert!(b.is_sane());
++    assert_eq!(b.width(), 1.0);
++    near(b.floor_below(0.0, 0.0, 0.0), -0.5);
++    near(b.floor_below(5.0, 0.5, 0.0), -0.5);
++    for (x, y, z) in [(5.01, 0.0, 0.0), (0.0, 0.51, 0.0), (0.0, 0.0, 0.01), (0.0, 0.0, -0.51)] {
++        assert!(b.floor_below(x, y, z).is_none(), "outside column ({x},{y},{z}) was credited");
++    }
++    assert!(b.floor_below(f64::NAN, 0.0, 0.0).is_none());
++    assert!(b.floor_below(0.0, f64::INFINITY, 0.0).is_none());
++    assert!(b.floor_at(0.0, 0.0).is_none(), "a framed cap must not masquerade as a vertical cone");
++}
++
++#[test]
++fn concave_ball_and_convex_round_keep_their_circle_profiles() {
++    let radius = 0.75;
++    let sag = |s: f64| radius - (radius * radius - s * s).sqrt();
++    for s in [0.0, 0.1, 0.3, 0.49] {
++        let mut b = flat();
++        b.volume.as_mut().expect("volume").profile = BreakProfile::ConcaveBall { radius };
++        near(b.floor_below(0.0, s, 0.0), -(b.depth - sag(s)));
++        b.volume.as_mut().expect("volume").profile = BreakProfile::ConvexRound { radius };
++        near(b.floor_below(0.0, s, 0.0), -(b.depth - sag(0.5) + sag(s)));
++    }
++    let mut b = flat();
++    b.volume.as_mut().expect("volume").profile = BreakProfile::ConcaveBall { radius: 0.5 };
++    assert!(b.is_sane(), "R = w/2 is legal");
++    near(b.floor_below(0.0, 0.4, 0.0), -0.3);
++    for radius in [1e20, 1e100, 1e300] {
++        b.volume.as_mut().expect("volume").profile = BreakProfile::ConcaveBall { radius };
++        near(b.floor_below(0.0, 0.3, 0.0), -0.5);
++        b.volume.as_mut().expect("volume").profile = BreakProfile::ConvexRound { radius };
++        near(b.floor_below(0.0, 0.3, 0.0), -0.5);
++    }
++}
++
++#[test]
++fn vertical_oblique_and_steep_edges_use_the_local_frame() {
++    let mut b = flat();
++    b.edge = vec![p(0.0, 0.0, -5.0), p(0.0, 0.0, 5.0)];
++    b.volume.as_mut().expect("volume").frames[0].outward = [1.0, 0.0, 0.0];
++    near(b.floor_below(-0.25, 0.0, 0.0), -5.0);
++    for eps in [0.5, 1e-5, 1e-12] {
++        let t = (1.0_f64 - eps * eps).sqrt();
++        b.edge = vec![p(-5.0 * eps, 0.0, -5.0 * t), p(5.0 * eps, 0.0, 5.0 * t)];
++        b.volume.as_mut().expect("volume").frames[0].outward = [-t, 0.0, eps];
++        let expected = -(0.5 / eps).min(5.0 / t);
++        near(b.floor_below(0.0, 0.0, 0.0), expected);
++    }
++}
++
++#[test]
++fn oblique_circle_rays_hit_the_arc_before_its_box() {
++    let mut b = flat();
++    let cos = 0.75_f64.sqrt();
++    let volume = b.volume.as_mut().expect("volume");
++    volume.frames[0] = BreakFrame { outward: [0.0, 0.5, cos], across: [0.0, cos, -0.5] };
++    volume.profile = BreakProfile::ConcaveBall { radius: 0.75 };
++    let center = 0.75 - b.depth;
++    let h = -cos * center + (cos * cos * center * center + 2.0 * 0.75 * b.depth - b.depth * b.depth).sqrt();
++    near(b.floor_below(0.0, 0.0, 0.0), -h);
++    b.volume.as_mut().expect("volume").profile = BreakProfile::ConvexRound { radius: 0.75 };
++    let center = b.depth + (0.75_f64 * 0.75 - 0.25).sqrt();
++    let h = cos * center - (cos * cos * center * center - center * center + 0.75 * 0.75).sqrt();
++    near(b.floor_below(0.0, 0.0, 0.0), -h);
++}
++
++#[test]
++fn tiny_circle_direction_rates_do_not_underflow_into_extra_credit() {
++    let eps = 1e-200;
++    let length = 1e201;
++    let mut b = flat();
++    b.edge = vec![p(-length * eps, 0.0, -length), p(length * eps, 0.0, length)];
++    let v = b.volume.as_mut().expect("volume");
++    v.frames[0].outward = [-1.0, 0.0, eps];
++    v.profile = BreakProfile::ConcaveBall { radius: 0.5 };
++    assert!(b.is_sane());
++    let actual = b.floor_below(0.0, 0.25, 0.0).expect("intersecting cap");
++    let expected = -(0.25_f64 - 0.0625).sqrt() / eps;
++    assert!((actual / expected - 1.0).abs() < 1e-12, "extra credit: {actual:e} versus {expected:e}");
++}
++
++#[test]
++fn disconnected_lower_cap_does_not_extend_credit() {
++    let mut b = flat();
++    b.depth = 0.2;
++    let v = b.volume.as_mut().expect("volume");
++    v.width = 0.4;
++    b.edge = vec![p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(1.0, 0.0, -1.0), p(0.0, 0.0, -1.0)];
++    v.frames = vec![
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] },
++        BreakFrame { outward: [1.0, 0.0, 0.0], across: [0.0, 1.0, 0.0] },
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] },
++    ];
++    assert!(b.is_sane());
++    near(b.floor_below(0.5, 0.0, 0.0), -0.2);
++    assert!(b.floor_below(0.5, 0.0, 1.0).is_none(), "a detached record cannot forgive a boss");
++}
++
++#[test]
++fn framed_sanity_refuses_corruption_by_every_geometric_bound() {
++    let mut cases = Vec::new();
++    let b = flat();
++    for depth in [0.0, -1.0, f64::NAN, f64::INFINITY, 1.01] {
++        cases.push(EdgeBreak { depth, ..b.clone() });
++    }
++    for slope in [1.0, f64::NAN, f64::INFINITY] {
++        cases.push(EdgeBreak { slope, ..b.clone() });
++    }
++    for width in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.4] {
++        let mut bad = b.clone();
++        bad.volume.as_mut().expect("volume").width = width;
++        cases.push(bad);
++    }
++    for radius in [0.49, 0.0, -1.0, f64::NAN, f64::INFINITY] {
++        for profile in [BreakProfile::ConcaveBall { radius }, BreakProfile::ConvexRound { radius }] {
++            let mut bad = b.clone();
++            bad.volume.as_mut().expect("volume").profile = profile;
++            cases.push(bad);
++        }
++    }
++    for frame in [
++        BreakFrame { outward: [0.0, 0.0, 2.0], across: [0.0, 1.0, 0.0] },
++        BreakFrame { outward: [1.0, 0.0, 0.0], across: [0.0, 1.0, 0.0] },
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 0.0, 1.0] },
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, f64::NAN, 0.0] },
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [1.0, 0.0, 0.0] },
++        BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 2.0, 0.0] },
++        BreakFrame { outward: [f64::NAN, 0.0, 1.0], across: [0.0, 1.0, 0.0] },
++    ] {
++        let mut bad = b.clone();
++        bad.volume.as_mut().expect("volume").frames[0] = frame;
++        cases.push(bad);
++    }
++    let mut missing = b.clone();
++    missing.volume.as_mut().expect("volume").frames.clear();
++    cases.push(missing);
++    let mut extra = b.clone();
++    extra.volume.as_mut().expect("volume").frames.push(BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] });
++    cases.push(extra);
++    for edge in [vec![], vec![p(0.0, 0.0, 0.0)], vec![p(-f64::MAX, 0.0, 0.0), p(f64::MAX, 0.0, 0.0)]] {
++        cases.push(EdgeBreak { edge, ..b.clone() });
++    }
++    let mut shallow = b.clone();
++    shallow.depth = 0.1;
++    shallow.volume.as_mut().expect("volume").profile = BreakProfile::ConcaveBall { radius: 0.5 };
++    cases.push(shallow);
++    let mut huge = b.clone();
++    huge.depth = f64::MAX;
++    huge.volume.as_mut().expect("volume").width = f64::MAX;
++    cases.push(huge);
++    let mut collapsed = b.clone();
++    collapsed.edge[1] = collapsed.edge[0];
++    cases.push(collapsed);
++    let mut corrupt = b;
++    corrupt.edge[1].z = f64::INFINITY;
++    cases.push(corrupt);
++    for (i, bad) in cases.iter().enumerate() {
++        assert!(!bad.is_sane(), "case {i} survived sanity: {bad:?}");
++        assert!(bad.floor_below(0.0, 0.0, 0.0).is_none(), "case {i} credited material");
++    }
++}
++
++#[test]
++fn tilted_world_path_rotates_frames_and_keeps_legacy_refusal() {
++    let frame = TiltedFrame::from_angles(p(2.0, 3.0, 4.0), 25.0, 35.0).expect("frame");
++    let b = flat();
++    let path = Toolpath { breaks: vec![b.clone(), EdgeBreak { volume: None, slope: 1.0, ..b.clone() }], ..Toolpath::default() };
++    let world = frame.world_path(&path, 0.01);
++    assert_eq!(world.breaks.len(), 1, "framed volumes survive tilt; vertical cones still drop");
++    let mapped = &world.breaks[0];
++    assert!(mapped.is_sane(), "rotated record remains orthonormal");
++    assert_eq!(mapped.edge, b.edge.iter().map(|q| frame.to_world(*q)).collect::<Vec<_>>());
++    let top = frame.to_world(p(0.0, 0.0, 0.0));
++    assert!(mapped.floor_below(top.x, top.y, top.z).is_some());
++    let out = mapped.volume.as_ref().expect("volume").frames[0].outward;
++    for (a, e) in out.into_iter().zip(frame.axis) { assert!((a - e).abs() < 1e-12); }
++}
++
++#[test]
++fn legacy_cones_keep_their_law_and_reject_nonfinite_width() {
++    let legacy = EdgeBreak { volume: None, slope: 1.0, ..flat() };
++    assert!(legacy.is_sane());
++    assert_eq!(legacy.width(), 0.5);
++    assert_eq!(legacy.floor_at(0.0, 0.25), Some((-0.25, 0.0)));
++    assert!(!EdgeBreak { depth: f64::MAX, slope: f64::MIN_POSITIVE, ..legacy }.is_sane());
++}
+diff --git a/crates/motion/src/finishing3d/deburr.rs b/crates/motion/src/finishing3d/deburr.rs
+index 4ab36add5..dc8a1dba1 100644
+--- a/crates/motion/src/finishing3d/deburr.rs
++++ b/crates/motion/src/finishing3d/deburr.rs
+@@ -285,7 +285,7 @@ pub fn deburr(facets: &[Triangle], p: &DeburrParams) -> Result<Toolpath, GenErro
+     // window admitted, never read back off the moves.
+     path.breaks = runs
+         .iter()
+-        .map(|run| EdgeBreak { edge: run.clone(), depth: drop, slope })
++        .map(|run| EdgeBreak { edge: run.clone(), depth: drop, slope, volume: None })
+         .filter(EdgeBreak::is_sane)
+         .collect();
+     Ok(path)
+diff --git a/crates/motion/src/machining2d/chamfer.rs b/crates/motion/src/machining2d/chamfer.rs
+index c4dab4b3a..f814730ee 100644
+--- a/crates/motion/src/machining2d/chamfer.rs
++++ b/crates/motion/src/machining2d/chamfer.rs
+@@ -151,6 +151,7 @@ pub fn chamfer(region: &crate::geo2d::Region, p: &ChamferParams) -> Result<Toolp
+             edge: pass.iter().map(|q| Point3::new(q.x, q.y, p.top_z)).collect(),
+             depth: p.top_z - z,
+             slope,
++            volume: None,
+         })
+         .filter(EdgeBreak::is_sane)
+         .collect();
+diff --git a/crates/sim/src/stock_sim/edge_break.rs b/crates/sim/src/stock_sim/edge_break.rs
+index 3727dc3f5..cc9f538f3 100644
+--- a/crates/sim/src/stock_sim/edge_break.rs
++++ b/crates/sim/src/stock_sim/edge_break.rs
+@@ -38,9 +38,14 @@ pub fn credit_breaks(dev: &mut Deviation, dex: &Dexel, facets: &[Triangle], brea
+         let c = dex.center(ix, iy);
+         breaks
+             .iter()
+-            .filter_map(|b| b.floor_at(c.x, c.y))
+-            .filter(|&(_, edge_z)| p <= edge_z + tol)
+-            .map(|(f, _)| f)
++            .filter_map(|b| {
++                if b.volume.is_some() {
++                    b.floor_below(c.x, c.y, p)
++                } else {
++                    // Preserve the legacy cone's surface tolerance.
++                    b.floor_at(c.x, c.y).filter(|&(_, edge_z)| p <= edge_z + tol).map(|(f, _)| f)
++                }
++            })
+             .fold(f64::INFINITY, f64::min)
+     })
+ }
+diff --git a/crates/sim/tests/edge_break_credit.rs b/crates/sim/tests/edge_break_credit.rs
+index 7d0f806be..c70a14fdd 100644
+--- a/crates/sim/tests/edge_break_credit.rs
++++ b/crates/sim/tests/edge_break_credit.rs
+@@ -33,7 +33,7 @@ fn ride(tip_z: f64) -> Vec<Move> {
+ 
+ /// The break a 1 mm, 45-degree chamfer of that loop declares.
+ fn declared(edge: &[(f64, f64)]) -> EdgeBreak {
+-    EdgeBreak { edge: edge.iter().map(|&(x, y)| p(x, y, 10.0)).collect(), depth: 1.0, slope: 1.0 }
++    EdgeBreak { edge: edge.iter().map(|&(x, y)| p(x, y, 10.0)).collect(), depth: 1.0, slope: 1.0, volume: None }
+ }
+ 
+ fn cut(tip_z: f64) -> Dexel {
+@@ -107,7 +107,7 @@ fn a_sloped_edge_bevel_is_the_cone_swept_along_it() {
+     // An edge climbing 1 in 2 under a 90-degree cone: directly over the
+     // edge the bevel stands exactly `depth` under it; beside it, the
+     // swept cone's lowest point - checked against a brute-force sweep.
+-    let b = EdgeBreak { edge: vec![p(0.0, 0.0, 0.0), p(10.0, 0.0, 5.0)], depth: 1.0, slope: 1.0 };
++    let b = EdgeBreak { edge: vec![p(0.0, 0.0, 0.0), p(10.0, 0.0, 5.0)], depth: 1.0, slope: 1.0, volume: None };
+     let (f, z) = b.floor_at(5.0, 0.0).expect("on the edge");
+     assert!((f - 1.5).abs() < 1e-12 && (z - 2.5).abs() < 1e-12, "{f} {z}");
+     for (x, y) in [(5.0, 0.6), (2.0, 0.9), (9.5, 0.3), (0.0, 0.5)] {
+diff --git a/crates/sim/tests/edge_volume_credit.rs b/crates/sim/tests/edge_volume_credit.rs
+new file mode 100644
+index 000000000..584583320
+--- /dev/null
++++ b/crates/sim/tests/edge_volume_credit.rs
+@@ -0,0 +1,112 @@
++//! Provenance: analytic 3D break caps over a one-column sharp block (#1891).
++//! Gate map: covers camcraft_sim::stock_sim (edge_break, deviate).
++
++use camcraft_sim::cl::{BreakFrame, BreakProfile, EdgeBreak, EdgeBreakVolume};
++use camcraft_sim::geometry::{cube, Point3, Triangle};
++use camcraft_sim::stock_sim::{credit_breaks, deviate, Dexel};
++
++fn p(x: f64, y: f64, z: f64) -> Point3 { Point3::new(x, y, z) }
++
++fn record(profile: BreakProfile) -> EdgeBreak {
++    EdgeBreak {
++        edge: vec![p(-5.0, 0.0, 10.0), p(5.0, 0.0, 10.0)], depth: 0.5, slope: 0.0,
++        volume: Some(EdgeBreakVolume {
++            width: 1.0,
++            frames: vec![BreakFrame { outward: [0.0, 0.0, 1.0], across: [0.0, 1.0, 0.0] }], profile,
++        }),
++    }
++}
++
++fn part() -> Vec<Triangle> {
++    cube(p(-2.0, -2.0, 0.0), p(2.0, 2.0, 10.0)).facets.to_vec()
++}
++
++fn cut(x: f64, y: f64, z: f64) -> Dexel {
++    let mut d = Dexel::block(x - 0.0625, y - 0.0625, x + 0.0625, y + 0.0625, 10.0, 0.125).expect("stock");
++    d.cut_chord(p(x - 0.1, y, z), p(x + 0.1, y, z), 0.1);
++    d
++}
++
++#[test]
++fn flat_ball_and_multiple_rounded_passes_clear_only_their_declared_profile() {
++    for profile in [BreakProfile::Flat, BreakProfile::ConcaveBall { radius: 0.75 }, BreakProfile::ConvexRound { radius: 0.75 }] {
++        let b = record(profile);
++        for y in [0.0, 0.2, 0.4] {
++            let floor = b.floor_below(0.0, y, 10.0).expect("declared cap");
++            let mut d = cut(0.0, y, 10.0 - 0.05);
++            // Several passes remove the same rounded envelope: credit
++            // concerns the final metal, not the pass that reached it.
++            for fraction in [0.25, 0.5, 0.75, 1.0] {
++                let z = 10.0 + (floor - 10.0) * fraction;
++                d.cut_chord(p(-0.1, y, z), p(0.1, y, z), 0.1);
++            }
++            let facets = part();
++            let mut dev = deviate(&d, &facets, 0.01).expect("sharp verdict");
++            assert!(dev.gouge_cells > 0);
++            assert_eq!(credit_breaks(&mut dev, &d, &facets, std::slice::from_ref(&b)), 1);
++            assert!(dev.is_clean(), "profile {:?} at y={y}: {:?}", b.volume, dev);
++            assert_eq!(dev.gouge_volume, 0.0);
++            assert_eq!(dev.max_gouge_at, None);
++            let d = cut(0.0, y, floor - 0.125);
++            let mut dev = deviate(&d, &facets, 0.01).expect("deeper verdict");
++            credit_breaks(&mut dev, &d, &facets, std::slice::from_ref(&b));
++            assert_eq!(dev.gouge_cells, 1, "the profile forgave a real gouge");
++            assert!((dev.max_gouge - 0.125).abs() < 1e-9, "{:?}", dev);
++        }
++    }
++}
++
++#[test]
++fn vertical_and_oblique_breaks_clear_without_xy_projection() {
++    let mut vertical = record(BreakProfile::Flat);
++    vertical.edge = vec![p(0.0, 0.0, 8.0), p(0.0, 0.0, 10.0)];
++    vertical.volume.as_mut().expect("volume").frames[0].outward = [1.0, 0.0, 0.0];
++    let s = 0.5_f64.sqrt();
++    let mut oblique = record(BreakProfile::Flat);
++    oblique.edge = vec![p(-1.0, 0.0, 9.0), p(1.0, 0.0, 11.0)];
++    oblique.volume.as_mut().expect("volume").frames[0].outward = [-s, 0.0, s];
++    for (b, x, expected) in [(vertical, -0.25, 8.0), (oblique, 0.0, 10.0 - 0.5 / s)] {
++        let d = cut(x, 0.0, expected);
++        let facets = part();
++        let mut dev = deviate(&d, &facets, 0.01).expect("verdict");
++        assert_eq!(dev.gouge_cells, 1);
++        assert_eq!(credit_breaks(&mut dev, &d, &facets, &[b]), 1);
++        assert!(dev.is_clean(), "{:?}", dev);
++    }
++}
++
++#[test]
++fn undeclared_columns_bosses_and_detached_caps_keep_their_gouges() {
++    let b = record(BreakProfile::Flat);
++    for (x, y, z) in [(0.0, 0.6, 9.5), (0.0, 0.0, 9.5)] {
++        let mut b = b.clone();
++        if y == 0.0 {
++            for q in &mut b.edge { q.z -= 0.1; }
++        }
++        let facets = part();
++        let d = cut(x, y, z);
++        let mut dev = deviate(&d, &facets, 0.01).expect("verdict");
++        assert_eq!(credit_breaks(&mut dev, &d, &facets, &[b]), 0);
++        assert_eq!(dev.gouge_cells, 1);
++        assert!((dev.max_gouge - 0.5).abs() < 1e-9);
++    }
++    let facets = cube(p(-2.0, -2.0, 0.0), p(2.0, 2.0, 11.0)).facets.to_vec();
++    let d = cut(0.0, 0.0, 9.5);
++    let mut dev = deviate(&d, &facets, 0.01).expect("boss verdict");
++    assert_eq!(credit_breaks(&mut dev, &d, &facets, &[b]), 0);
++    assert!((dev.max_gouge - 1.5).abs() < 1e-9);
++}
++
++#[test]
++fn malformed_volume_and_mismatched_lattice_cannot_credit() {
++    let d = cut(0.0, 0.0, 9.5);
++    let facets = part();
++    let mut b = record(BreakProfile::Flat);
++    b.depth = 2.0;
++    let mut dev = deviate(&d, &facets, 0.01).expect("verdict");
++    assert_eq!(credit_breaks(&mut dev, &d, &facets, &[b]), 0);
++    assert_eq!(dev.gouge_cells, 1);
++    dev.cell *= 2.0;
++    assert_eq!(credit_breaks(&mut dev, &d, &facets, &[record(BreakProfile::Flat)]), 0);
++    assert_eq!(dev.gouge_cells, 1);
++}
+diff --git a/docs/decisions/1891-edge-break-volumes.md b/docs/decisions/1891-edge-break-volumes.md
+new file mode 100644
+index 000000000..c56d7c644
+--- /dev/null
++++ b/docs/decisions/1891-edge-break-volumes.md
+@@ -0,0 +1,65 @@
++## #1891 - Bounded 3D edge-break volumes beside legacy cones
++
++**Chosen.** Keep legacy vertical-cone records and add an optional framed
++volume. Each nondegenerate polyline segment has one outward bisector and
++one across-edge direction, both unit vectors and perpendicular to each
++other and the segment tangent. Frames rotate with a tilted work path.
++Legacy cones continue to drop when the frame tilts.
++
++**Dimensions and profiles.** A framed width is the full across-edge span,
++from `-width / 2` to `width / 2`. Depth is the maximum inward distance
++from the selected edge. Segment end planes bound the sweep; the actual
++part clips this cap. Width and depth must be finite and positive, and
++depth must not exceed width. The operation's own width still bounds each
++record through the existing #529 check, with its existing lattice slack.
++
++At across coordinate `s`, let `sag(s) = R - sqrt(R² - s²)`. A flat cap
++ends at the declared depth. A concave ball cap ends at `depth - sag(s)`.
++A convex rounded cap ends at `depth - sag(width / 2) + sag(s)`. Radius
++must be finite, positive and at least half the width. The edge sag must
++not exceed depth, so the full profile stays nonnegative. These explicit
++laws avoid inferring permission from the generated cutter moves.
++
++**Why analytic connected intervals.** Clip each world-Z column against
++the segment planes and profile, then join only the intervals connected
++to the model surface. A detached lower cap cannot forgive cutting the
++material above it, and a deeper disconnected interval cannot extend the
++credit through a gap. Cuts below the resulting surface remain gouges.
++This works for vertical and oblique edges without projecting their
++width onto XY. Legacy cones keep their existing surface tolerance.
++
++Circle intersections use exact quadratic roots rather than sampled
++profiles. The sag uses a rationalized expression to retain shallow arcs
++at large radii. The root calculation normalizes the column's direction
++in the cross-section before squaring it; tiny finite rates must not
++underflow into an unbounded arc credit.
++
++**Persistence and refusals.** The volume is an optional project-record
++extension. Framed records require a zero legacy slope, so older readers
++drop them and judge the sharp model instead of misreading them as cones.
++Existing 2D chamfer and v1 deburr records keep their wire shape and law.
++Framed endpoints retain full precision because micron snapping can make
++a short oblique segment disagree with its frame. Legacy endpoints still
++use their existing lattice.
++
++The extension is read as raw JSON before strict typed validation. A bad
++profile, unknown key, invalid dimension or corrupt frame drops that
++record, not the entire project and not merely its extension. Diagnostics
++identify the edge-break record and its index; the operation-bound warning
++names the operation. This preserves conservative verification without
++changing the unrelated project reader API or project version.
++
++**Dropped.** XY distance for 3D breaks loses vertical and oblique bounds.
++Sampled profiles can miss a boundary and forgive material between samples.
++Replacing all cone records would change existing chamfer/deburr behavior
++and require unnecessary migration. A project-version or process change
++is unnecessary because older readers reject the zero-slope extension
++safely. New 3D toolpath generators belong to the surrounding #1827 work;
++this issue adds the records and verification they consume. Existing
++generators, cutter moves and golden files keep their behavior.
++
++**Cost to change.** Moderate: the public CL record has an optional field
++and new frame/profile types. Changing the cap convention would require
++updating its geometry and project DTO conversion together. The wire
++format remains local to the edge-break DTO; no dependency change is
++needed.

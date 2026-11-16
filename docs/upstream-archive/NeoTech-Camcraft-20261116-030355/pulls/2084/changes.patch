@@ -1,0 +1,684 @@
+From 9462a2c5669875576308e4555822cf86ecca42a7 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Sun, 15 Nov 2026 15:42:07 -0800
+Subject: [PATCH] fix(import): stop a STEP pass after a few runaway faces
+
+Every face and edge meter of one shell's tessellation pass now shares one
+pass budget. Each meter counts its first refusal there; at PASS_TRIPS (3)
+trips the pass stops, every meter answers its fixed point, and the pass is
+refused by name, saying it stopped. A stopped pass is never continuous, so
+no coarser mesh is kept. A hostile shell of many runaway faces now costs at
+most 3 caps plus one per worker thread, not one cap per face.
+
+Meter moves to step_meter.rs (400-line law) beside the new Pass.
+
+Fixes #1599
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/geometry/import/mod.rs         |   1 +
+ crates/app/src/geometry/import/step.rs        |   8 +-
+ .../app/src/geometry/import/step_division.rs  |   9 +-
+ crates/app/src/geometry/import/step_guard.rs  | 102 +++-------
+ crates/app/src/geometry/import/step_meter.rs  | 185 ++++++++++++++++++
+ .../src/geometry/import/step_pass_tests.rs    | 121 ++++++++++++
+ crates/app/tests/import_step_guard.rs         |  19 +-
+ docs/decisions/1599-pass-eval-budget.md       |  55 ++++++
+ 8 files changed, 424 insertions(+), 76 deletions(-)
+ create mode 100644 crates/app/src/geometry/import/step_meter.rs
+ create mode 100644 crates/app/src/geometry/import/step_pass_tests.rs
+ create mode 100644 docs/decisions/1599-pass-eval-budget.md
+
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index 24e2ad911..4e97f5620 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -18,6 +18,7 @@ mod step_division;
+ mod step_edge3d;
+ mod step_outward;
+ mod step_guard;
++mod step_meter;
+ mod step_nearest;
+ mod step_pole;
+ pub mod step_depth;
+diff --git a/crates/app/src/geometry/import/step.rs b/crates/app/src/geometry/import/step.rs
+index 454b9c1c4..b7f206a58 100644
+--- a/crates/app/src/geometry/import/step.rs
++++ b/crates/app/src/geometry/import/step.rs
+@@ -298,10 +298,10 @@ fn shell_facets(
+         if let Some(i) = cshell.edges.iter().position(|e| e.curve.meter.refused()) {
+             return Err(PassError::Unconverged {
+                 continuous: false,
+-                refusal: ImportError::Step(format!(
++                refusal: super::step_meter::noted(guarded.stopped(), ImportError::Step(format!(
+                     "edge {} of {} in shell #{shell_id} could not be tessellated: its curve subdivision did not converge within {cap} evaluations (a discontinuous or degenerate curve) - re-export the model, or import an STL",
+                     i + 1, cshell.edges.len()
+-                )),
++                ))),
+             });
+         }
+         if let Some(trip) = guarded.tripped() {
+@@ -323,10 +323,10 @@ fn shell_facets(
+             let faces = cshell.faces.len();
+             // #1602: a boundary search that could not be answered soundly
+             // is refused in its own words, not as a runaway division.
+-            let refusal = match fault {
++            let refusal = super::step_meter::noted(guarded.stopped(), match fault {
+                 Some(f) => f.refusal(&super::step_guard::face_name(trip, faces, entity, Some(shell_id))),
+                 None => super::step_guard::refusal(trip, faces, entity, Some(shell_id), cap),
+-            };
++            });
+             return Err(PassError::Unconverged { continuous: trip.continuous, refusal });
+         }
+         let polys = meshed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+diff --git a/crates/app/src/geometry/import/step_division.rs b/crates/app/src/geometry/import/step_division.rs
+index e0c0d5283..e3a59ec45 100644
+--- a/crates/app/src/geometry/import/step_division.rs
++++ b/crates/app/src/geometry/import/step_division.rs
+@@ -153,8 +153,15 @@ pub(super) struct CurveGuard {
+ }
+ 
+ impl CurveGuard {
++    #[cfg(test)]
+     pub(super) fn new(inner: truck_stepio::r#in::alias::Curve3D, cap: u64) -> Self {
+-        Self { inner, meter: std::sync::Arc::new(super::step_guard::Meter::new(cap)), fallback: Point3::new(0.0, 0.0, 0.0) }
++        Self::in_pass(inner, cap, std::sync::Arc::default())
++    }
++
++    /// An edge curve whose meter shares `pass` with its shell's faces (#1599).
++    pub(super) fn in_pass(inner: truck_stepio::r#in::alias::Curve3D, cap: u64, pass: std::sync::Arc<super::step_meter::Pass>) -> Self {
++        let meter = std::sync::Arc::new(super::step_guard::Meter::in_pass(cap, pass));
++        Self { inner, meter, fallback: Point3::new(0.0, 0.0, 0.0) }
+     }
+ 
+     fn divide(&self, range: (f64, f64), tol: f64) -> Option<(Vec<f64>, Vec<Point3>)> {
+diff --git a/crates/app/src/geometry/import/step_guard.rs b/crates/app/src/geometry/import/step_guard.rs
+index 2f55c768c..3335dc558 100644
+--- a/crates/app/src/geometry/import/step_guard.rs
++++ b/crates/app/src/geometry/import/step_guard.rs
+@@ -35,7 +35,7 @@
+ //! and none is left behind.
+ 
+ use std::ops::Bound;
+-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
++use std::sync::atomic::Ordering;
+ use std::sync::Arc;
+ 
+ use truck_stepio::r#in::alias::{
+@@ -43,6 +43,8 @@ use truck_stepio::r#in::alias::{
+ };
+ use truck_topology::compress::{CompressedFace, CompressedShell};
+ 
++pub(super) use super::step_meter::Meter;
++use super::step_meter::Pass;
+ use super::step_nearest::Fault;
+ use super::step_stretch::Stretch;
+ use super::ImportError;
+@@ -65,70 +67,6 @@ use super::ImportError;
+ /// such a face is never refused once a pass has met.
+ pub const FACE_EVAL_CAP: u64 = 150_000_000;
+ 
+-/// One face's evaluation count for the current pass.
+-#[derive(Debug)]
+-pub(super) struct Meter {
+-    used: AtomicU64,
+-    cap: u64,
+-    /// Some pass of this import divided the surface over a range outside
+-    /// its own parameter range (#1568: sc_logo's face #836 was asked for u
+-    /// from -2e51, a trimming bound gone wild), where its continuity is not
+-    /// proven - a rational surface extrapolated can meet a pole. Sticky
+-    /// across passes: truck derives the range from each pass's tolerance,
+-    /// so the coarser pass whose mesh a fallback would keep may be the one
+-    /// that went wild while the finer pass that tripped stayed in range.
+-    outside: AtomicBool,
+-    /// A boundary search of this pass that could not be answered soundly
+-    /// (`step_nearest::Fault`, 0 for none): the face is refused by name.
+-    fault: AtomicU8,
+-}
+-
+-impl Meter {
+-    pub(super) fn new(cap: u64) -> Self {
+-        Self { used: AtomicU64::new(0), cap, outside: AtomicBool::new(false), fault: AtomicU8::new(0) }
+-    }
+-    /// Count one evaluation; `false` once the cap is spent.
+-    fn spend(&self) -> bool {
+-        self.used.fetch_add(1, Ordering::Relaxed) < self.cap
+-    }
+-    /// Count `n` evaluations done outside `subs` (a boundary search's own
+-    /// work, #1602); `false` once the cap is spent. Saturating, never wraps.
+-    pub(super) fn spend_many(&self, n: u64) -> bool {
+-        let mut used = self.used.load(Ordering::Relaxed);
+-        loop {
+-            let next = used.saturating_add(n);
+-            match self.used.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+-                Ok(_) => return next <= self.cap,
+-                Err(now) => used = now,
+-            }
+-        }
+-    }
+-    fn tripped(&self) -> bool {
+-        self.used.load(Ordering::Relaxed) > self.cap
+-    }
+-    /// Refuse the face for a boundary search fault. The first one stands.
+-    pub(super) fn flag(&self, fault: Fault) {
+-        let _ = self.fault.compare_exchange(0, fault as u8, Ordering::Relaxed, Ordering::Relaxed);
+-    }
+-    pub(super) fn fault(&self) -> Option<Fault> {
+-        Fault::from_code(self.fault.load(Ordering::Relaxed))
+-    }
+-    /// The pass is refused for this face: out of evaluations, or a fault.
+-    pub(super) fn refused(&self) -> bool {
+-        self.tripped() || self.fault().is_some()
+-    }
+-    /// Spend the whole budget at once: the face's division did not
+-    /// converge (#1602), so the pass is refused as for a runaway.
+-    pub(super) fn exhaust(&self) {
+-        self.used.fetch_max(self.cap.saturating_add(1), Ordering::Relaxed);
+-    }
+-    /// A new pass: the whole budget again. `outside` stays set.
+-    fn reset(&self) {
+-        self.used.store(0, Ordering::Relaxed);
+-        self.fault.store(0, Ordering::Relaxed);
+-    }
+-}
+-
+ /// A STEP surface whose evaluations are counted against a [`Meter`].
+ #[derive(Clone, Debug)]
+ pub(super) struct Metered {
+@@ -140,9 +78,14 @@ pub(super) struct Metered {
+ }
+ 
+ impl Metered {
++    #[cfg(test)]
+     pub(super) fn new(inner: Surface, cap: u64) -> Self {
++        Self::in_pass(inner, cap, Arc::default())
++    }
++    /// A face whose meter shares `pass` with its shell (#1599).
++    pub(super) fn in_pass(inner: Surface, cap: u64, pass: Arc<Pass>) -> Self {
+         let stretch = Stretch::of(&inner);
+-        Self { inner, meter: Arc::new(Meter::new(cap)), stretch }
++        Self { inner, meter: Arc::new(Meter::in_pass(cap, pass)), stretch }
+     }
+     /// The surface's own parameters for a point of the mesher's plane.
+     pub(super) fn own(&self, u: f64, v: f64) -> (f64, f64) {
+@@ -282,6 +225,8 @@ pub(super) struct Guarded {
+     meters: Vec<Arc<Meter>>,
+     kinds: Vec<&'static str>,
+     continuous: Vec<bool>,
++    /// The budget every face and edge of a pass shares (#1599).
++    pass: Arc<Pass>,
+ }
+ 
+ /// A face that ran past the cap in a pass, or whose boundary search was
+@@ -301,29 +246,44 @@ impl Guarded {
+         let mut meters = Vec::with_capacity(shell.faces.len());
+         let mut kinds = Vec::with_capacity(shell.faces.len());
+         let mut continuous = Vec::with_capacity(shell.faces.len());
++        let pass = Arc::<Pass>::default();
+         let faces = shell
+             .faces
+             .into_iter()
+             .map(|f| {
+                 kinds.push(kind(&f.surface));
+                 continuous.push(super::step_continuity::proven_continuous(&f.surface));
+-                let surface = Metered::new(f.surface, cap);
++                let surface = Metered::in_pass(f.surface, cap, Arc::clone(&pass));
+                 meters.push(Arc::clone(&surface.meter));
+                 CompressedFace { boundaries: f.boundaries, orientation: f.orientation, surface }
+             })
+             .collect();
+         let edges = shell.edges.into_iter().map(|e| truck_topology::compress::CompressedEdge {
+-            vertices: e.vertices, curve: super::step_division::CurveGuard::new(e.curve, cap),
++            vertices: e.vertices, curve: super::step_division::CurveGuard::in_pass(e.curve, cap, Arc::clone(&pass)),
+         }).collect();
+-        Self { shell: CompressedShell { vertices: shell.vertices, edges, faces }, meters, kinds, continuous }
++        Self { shell: CompressedShell { vertices: shell.vertices, edges, faces }, meters, kinds, continuous, pass }
+     }
+ 
+     /// Start a new pass: every face gets its whole budget again.
+     pub(super) fn reset(&self) {
++        self.pass.reset();
+         self.meters.iter().for_each(|m| m.reset());
+         self.shell.edges.iter().for_each(|e| e.curve.meter.reset());
+     }
+ 
++    /// The pass stopped after [`super::step_meter::PASS_TRIPS`] faces or
++    /// edges ran out (#1599): the faces it cut short were never judged, so
++    /// the pass is refused and no coarser mesh is kept.
++    pub(super) fn stopped(&self) -> bool {
++        self.pass.stopped()
++    }
++
++    /// The face meters, in face order.
++    #[cfg(test)]
++    pub(super) fn meters(&self) -> &[Arc<Meter>] {
++        &self.meters
++    }
++
+     /// The face to report for a pass in which faces ran past the cap. The
+     /// pass counts as continuous only if EVERY tripped face is proven and
+     /// was never divided outside its range; otherwise the first face that
+@@ -342,7 +302,9 @@ impl Guarded {
+             kind: self.kinds.get(index).copied().unwrap_or("surface"),
+             // Proven on the surface's own range only: a face any pass
+             // divided outside that range is not covered by the proof.
+-            continuous: self.continuous.get(index).copied().unwrap_or(false)
++            // A stopped pass cut other faces short: one of them may jump.
++            continuous: !self.stopped()
++                && self.continuous.get(index).copied().unwrap_or(false)
+                 && self.meters.get(index).is_some_and(|m| !m.outside.load(Ordering::Relaxed) && m.fault().is_none()),
+         }
+     }
+diff --git a/crates/app/src/geometry/import/step_meter.rs b/crates/app/src/geometry/import/step_meter.rs
+new file mode 100644
+index 000000000..b5ca70625
+--- /dev/null
++++ b/crates/app/src/geometry/import/step_meter.rs
+@@ -0,0 +1,185 @@
++//! The evaluation meters of one STEP tessellation pass: one per face and
++//! per edge curve (#1536, #1545), and the pass-wide budget they share
++//! (#1599), so a file of many runaway faces stops after a few of them.
++//!
++//! Provenance: our own design (a work budget on a parametric
++//! subdivision); nothing from any CAM vendor.
++
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
++use std::sync::Arc;
++
++use super::step_nearest::Fault;
++use super::ImportError;
++
++/// Faces and edges of one pass that may run out of evaluations before the
++/// whole pass stops (#1599).
++///
++/// Each runaway face spends a whole cap (`step_guard::FACE_EVAL_CAP`, 10-15
++/// s) before it trips, so without a pass-wide limit a hostile file of N
++/// runaway faces costs N caps divided by the core count. After this many
++/// trips every meter of the pass answers its fixed point, every face in
++/// flight ends within one sweep, and the pass is refused. A pass then
++/// spends at most this many caps plus less than one cap for each worker
++/// thread, whatever the face count. Three keeps every pass with one or two
++/// trips exactly as before: #1568's plane beside a jump (two trips) is
++/// still judged face by face.
++pub const PASS_TRIPS: u64 = 3;
++
++/// The budget all meters of one pass share: how many have tripped, and
++/// whether that stopped the pass.
++#[derive(Debug, Default)]
++pub(super) struct Pass {
++    trips: AtomicU64,
++    stopped: AtomicBool,
++}
++
++impl Pass {
++    /// One more meter ran out (or was refused); the trip that reaches
++    /// [`PASS_TRIPS`] stops the pass.
++    fn trip(&self) {
++        if self.trips.fetch_add(1, Ordering::Relaxed).saturating_add(1) >= PASS_TRIPS {
++            self.stopped.store(true, Ordering::Relaxed);
++        }
++    }
++    /// The pass ran out of trips: no meter evaluates anything more.
++    pub(super) fn stopped(&self) -> bool {
++        self.stopped.load(Ordering::Relaxed)
++    }
++    /// A new pass: no trips.
++    pub(super) fn reset(&self) {
++        self.trips.store(0, Ordering::Relaxed);
++        self.stopped.store(false, Ordering::Relaxed);
++    }
++}
++
++/// The refusal of a pass that the trip limit stopped says so (#1599): the
++/// named face is one of several, and the rest of the model was not judged.
++pub(super) fn noted(stopped: bool, refusal: ImportError) -> ImportError {
++    match refusal {
++        ImportError::Step(why) if stopped => ImportError::Step(format!(
++            "{why} (the tessellation stopped after {PASS_TRIPS} faces or edges ran out of evaluations; more of the model may be broken)"
++        )),
++        other => other,
++    }
++}
++
++/// One face's (or edge curve's) evaluation count for the current pass.
++#[derive(Debug)]
++pub(super) struct Meter {
++    pub(super) used: AtomicU64,
++    cap: u64,
++    /// Some pass of this import divided the surface over a range outside
++    /// its own parameter range (#1568: sc_logo's face #836 was asked for u
++    /// from -2e51, a trimming bound gone wild), where its continuity is not
++    /// proven - a rational surface extrapolated can meet a pole. Sticky
++    /// across passes: truck derives the range from each pass's tolerance,
++    /// so the coarser pass whose mesh a fallback would keep may be the one
++    /// that went wild while the finer pass that tripped stayed in range.
++    pub(super) outside: AtomicBool,
++    /// A boundary search of this pass that could not be answered soundly
++    /// (`step_nearest::Fault`, 0 for none): the face is refused by name.
++    fault: AtomicU8,
++    /// The pass budget this meter shares with the rest of its shell.
++    pass: Arc<Pass>,
++    /// This meter's trip is already counted in `pass` for this pass.
++    counted: AtomicBool,
++}
++
++impl Meter {
++    /// A meter with a pass of its own.
++    #[cfg(test)]
++    pub(super) fn new(cap: u64) -> Self {
++        Self::in_pass(cap, Arc::default())
++    }
++    /// A meter that shares `pass` with the other meters of its shell.
++    pub(super) fn in_pass(cap: u64, pass: Arc<Pass>) -> Self {
++        Self {
++            used: AtomicU64::new(0),
++            cap,
++            outside: AtomicBool::new(false),
++            fault: AtomicU8::new(0),
++            pass,
++            counted: AtomicBool::new(false),
++        }
++    }
++    /// Count this meter's refusal in the pass, once.
++    fn count_trip(&self) {
++        if !self.counted.swap(true, Ordering::Relaxed) {
++            self.pass.trip();
++        }
++    }
++    /// Count one evaluation; `false` once the cap is spent or the pass
++    /// stopped (#1599: a stopped pass counts nothing more).
++    pub(super) fn spend(&self) -> bool {
++        if self.pass.stopped() {
++            return false;
++        }
++        let ok = self.used.fetch_add(1, Ordering::Relaxed) < self.cap;
++        if !ok {
++            self.count_trip();
++        }
++        ok
++    }
++    /// Count `n` evaluations done outside `subs` (a boundary search's own
++    /// work, #1602); `false` once the cap is spent or the pass stopped.
++    /// Saturating, never wraps.
++    pub(super) fn spend_many(&self, n: u64) -> bool {
++        if self.pass.stopped() {
++            return false;
++        }
++        let mut used = self.used.load(Ordering::Relaxed);
++        loop {
++            let next = used.saturating_add(n);
++            match self.used.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
++                Ok(_) if next <= self.cap => return true,
++                Ok(_) => {
++                    self.count_trip();
++                    return false;
++                }
++                Err(now) => used = now,
++            }
++        }
++    }
++    pub(super) fn tripped(&self) -> bool {
++        self.used.load(Ordering::Relaxed) > self.cap
++    }
++    /// Refuse the face for a boundary search fault. The first one stands.
++    /// A search on a face the stopped pass cut short sees only the fixed
++    /// point (#1599); its fault is not the face's own and is not recorded.
++    pub(super) fn flag(&self, fault: Fault) {
++        if self.pass.stopped() && !self.refused() {
++            return;
++        }
++        let _ = self.fault.compare_exchange(0, fault as u8, Ordering::Relaxed, Ordering::Relaxed);
++        self.count_trip();
++    }
++    pub(super) fn fault(&self) -> Option<Fault> {
++        Fault::from_code(self.fault.load(Ordering::Relaxed))
++    }
++    /// The pass is refused for this face: out of evaluations, or a fault.
++    pub(super) fn refused(&self) -> bool {
++        self.tripped() || self.fault().is_some()
++    }
++    /// Spend the whole budget at once: the face's division did not
++    /// converge (#1602), so the pass is refused as for a runaway. A
++    /// division cut short because the pass stopped is not a runaway of its
++    /// own (#1599) and spends nothing.
++    pub(super) fn exhaust(&self) {
++        if self.pass.stopped() && !self.tripped() {
++            return;
++        }
++        self.used.fetch_max(self.cap.saturating_add(1), Ordering::Relaxed);
++        self.count_trip();
++    }
++    /// A new pass: the whole budget again. `outside` stays set. The shared
++    /// [`Pass`] is reset by its owner (`step_guard::Guarded::reset`).
++    pub(super) fn reset(&self) {
++        self.used.store(0, Ordering::Relaxed);
++        self.fault.store(0, Ordering::Relaxed);
++        self.counted.store(false, Ordering::Relaxed);
++    }
++}
++
++#[cfg(test)]
++#[path = "step_pass_tests.rs"]
++mod tests;
+diff --git a/crates/app/src/geometry/import/step_pass_tests.rs b/crates/app/src/geometry/import/step_pass_tests.rs
+new file mode 100644
+index 000000000..2ab01a31a
+--- /dev/null
++++ b/crates/app/src/geometry/import/step_pass_tests.rs
+@@ -0,0 +1,121 @@
++//! Unit tests of the pass-wide evaluation budget (#1599): a shell with
++//! many runaway faces stops after a few trips, not after every face.
++
++use super::super::step_guard::{Guarded, Trip};
++use super::*;
++use std::sync::atomic::Ordering;
++use truck_meshalgo::prelude::RobustMeshableShape;
++
++/// The `bspline_discontinuous.step` shell with its jumping face (face 6)
++/// copied `extra` more times: a hostile shell of many runaway faces.
++fn many_runaways(extra: usize, cap: u64) -> Guarded {
++    let text = include_str!("../../../../../testdata/models/bspline_discontinuous.step");
++    let exchange = truck_stepio::r#in::ruststep::parser::parse(text).expect("fixture parses");
++    let table = truck_stepio::r#in::Table::from_data_section(&exchange.data[0]);
++    let shell = table.shell.values().next().expect("one shell");
++    let mut cshell = table.to_compressed_shell(shell).expect("converts");
++    let jump = cshell.faces[5].clone();
++    cshell.faces.extend(std::iter::repeat_n(jump, extra));
++    Guarded::new(cshell, cap)
++}
++
++fn spent(g: &Guarded) -> u64 {
++    g.meters().iter().map(|m| m.used.load(Ordering::Relaxed)).sum()
++}
++
++/// #1599: the evaluations of one pass do not grow with the number of
++/// runaway faces. Every face in flight when the pass stops ends at once,
++/// so the pass spends at most `PASS_TRIPS` caps for the faces that
++/// tripped plus less than one cap for each worker thread.
++#[test]
++fn a_pass_with_many_runaway_faces_stops_after_a_few_trips() {
++    let cap = 200_000;
++    let threads = rayon::current_num_threads() as u64;
++    let extra = (2 * (PASS_TRIPS + threads) + 8) as usize;
++    let g = many_runaways(extra, cap);
++    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.shell.robust_triangulation(0.01)));
++    let used = spent(&g);
++    let bound = (PASS_TRIPS + threads) * (cap + 1);
++    assert!(used <= bound, "{} runaway faces spent {used} evaluations, bound {bound}", extra + 1);
++    assert!(g.stopped(), "the pass is marked stopped");
++    let trip = g.tripped().expect("a stopped pass is refused");
++    assert!(!trip.continuous, "a stopped pass never keeps a coarser mesh: {trip:?}");
++    assert_eq!(trip.kind, "B-spline surface", "the refusal names a face that ran out, not a stopped one");
++    // A new pass starts with the whole budget again.
++    g.reset();
++    assert!(!g.stopped() && g.tripped().is_none());
++}
++
++/// #1599: under `PASS_TRIPS` trips nothing changes - the one runaway face of
++/// the fixture trips alone and every other face divides to the end.
++#[test]
++fn a_pass_with_one_runaway_face_is_not_stopped() {
++    let g = many_runaways(0, 200_000);
++    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.shell.robust_triangulation(0.01)));
++    assert!(!g.stopped(), "one trip must not stop the pass");
++    assert_eq!(g.tripped(), Some(Trip { index: 5, kind: "B-spline surface", continuous: false }));
++}
++
++/// #1599: a trip counts once per meter, whatever way the meter was
++/// refused, and the pass stops at exactly `PASS_TRIPS`.
++#[test]
++fn the_pass_stops_at_the_trip_limit_and_a_stopped_meter_is_not_a_trip() {
++    let pass = std::sync::Arc::new(Pass::default());
++    let meters: Vec<Meter> = (0..PASS_TRIPS + 1).map(|_| Meter::in_pass(3, std::sync::Arc::clone(&pass))).collect();
++    for m in meters.iter().take(PASS_TRIPS as usize - 1) {
++        m.exhaust();
++        m.exhaust();
++        assert!(!m.spend_many(5), "a tripped meter spends no more");
++    }
++    assert!(!pass.stopped(), "{} trips do not stop the pass", PASS_TRIPS - 1);
++    let last = &meters[PASS_TRIPS as usize - 1];
++    assert!(!last.spend_many(4));
++    assert!(pass.stopped(), "the trip that reaches the limit stops the pass");
++    let healthy = &meters[PASS_TRIPS as usize];
++    assert!(!healthy.spend_many(1) && !healthy.spend(), "a stopped pass evaluates nothing more");
++    healthy.exhaust();
++    healthy.flag(super::super::step_nearest::Fault::Grid);
++    assert!(!healthy.refused(), "a meter stopped by the pass is not reported as a runaway");
++    assert_eq!(healthy.used.load(Ordering::Relaxed), 0);
++}
++
++/// #1599: proven faces (the fixture's planes) that trip until the pass
++/// stops are not a continuous trip: the faces the stop cut short were
++/// never judged, so no coarser mesh may be kept for the pass.
++#[test]
++fn a_stopped_pass_of_proven_faces_is_not_continuous() {
++    let g = many_runaways(0, 1_000);
++    g.meters()[0].exhaust();
++    assert_eq!(g.tripped(), Some(Trip { index: 0, kind: "elementary surface", continuous: true }), "one plane alone");
++    for m in g.meters().iter().take(PASS_TRIPS as usize) {
++        m.exhaust();
++    }
++    assert!(g.stopped());
++    assert_eq!(g.tripped(), Some(Trip { index: 0, kind: "elementary surface", continuous: false }));
++}
++
++/// #1599: the refusal of a stopped pass says the tessellation stopped and
++/// that more of the model may be broken; any other refusal is unchanged.
++#[test]
++fn the_refusal_of_a_stopped_pass_says_it_stopped() {
++    let why = || ImportError::Step("face #9 could not be tessellated".into());
++    let e = noted(true, why()).to_string();
++    assert!(e.contains("face #9 could not be tessellated"), "{e}");
++    assert!(e.contains(&format!("stopped after {PASS_TRIPS} faces or edges")), "{e}");
++    assert_eq!(noted(false, why()).to_string(), why().to_string());
++}
++
++/// #1599: an edge curve's division spends the same pass budget as the
++/// faces (#1545's curve meter): an edge trip counts, and a stopped pass
++/// stops the edges too.
++#[test]
++fn edge_trips_count_against_the_pass_budget() {
++    let g = many_runaways(0, 1_000);
++    let edges = &g.shell.edges;
++    assert!(edges.len() >= PASS_TRIPS as usize, "the fixture has enough edges");
++    for e in edges.iter().take(PASS_TRIPS as usize) {
++        e.curve.meter.exhaust();
++    }
++    assert!(g.stopped(), "edge trips stop the pass");
++    assert!(g.meters().iter().all(|m| !m.spend_many(1)), "faces of a stopped pass evaluate nothing");
++}
+diff --git a/crates/app/tests/import_step_guard.rs b/crates/app/tests/import_step_guard.rs
+index b8540e195..ab8aaef9d 100644
+--- a/crates/app/tests/import_step_guard.rs
++++ b/crates/app/tests/import_step_guard.rs
+@@ -15,7 +15,7 @@
+ //! in the same process waited behind it.
+ //!
+ //! Gate map (M4.4): covers app::geometry::import::step,
+-//! app::geometry::import::step_guard.
++//! app::geometry::import::step_guard, app::geometry::import::step_meter.
+ 
+ use std::path::{Path, PathBuf};
+ use std::sync::mpsc;
+@@ -144,3 +144,20 @@ fn a_finer_pass_that_runs_out_on_a_face_that_may_jump_is_refused() {
+     let err = r.expect_err("a smeared jump is never kept").to_string();
+     assert!(err.contains("face #53 (B-spline surface") && err.contains("did not converge"), "{err}");
+ }
++
++/// #1599: a hostile shell of many runaway faces (the fixture's jumping face
++/// #53 listed 40 more times) is refused by name after a few trips, not
++/// after every face: the pass-wide budget stops it, and the refusal says so.
++#[test]
++fn a_shell_of_many_runaway_faces_is_refused_after_a_few_trips() {
++    let text = std::fs::read_to_string(testdata("bspline_discontinuous.step")).expect("fixture");
++    let shell = "CLOSED_SHELL('', (#18, #25, #32, #39, #46, #53));";
++    assert!(text.contains(shell), "the fixture's shell line");
++    let hostile = text.replace(shell, &format!("CLOSED_SHELL('', (#18, #25, #32, #39, #46, #53{}));", ", #53".repeat(40)));
++    let r = within(HANG_BARRIER, move || {
++        step::with_face_eval_cap(100_000, || import::parse_model(hostile.as_bytes(), import::Format::Step))
++    });
++    let err = r.expect_err("refused").to_string();
++    assert!(err.contains("face #53 (B-spline surface") && err.contains("did not converge"), "{err}");
++    assert!(err.contains("stopped after 3 faces or edges"), "{err}");
++}
+diff --git a/docs/decisions/1599-pass-eval-budget.md b/docs/decisions/1599-pass-eval-budget.md
+new file mode 100644
+index 000000000..c3cf45498
+--- /dev/null
++++ b/docs/decisions/1599-pass-eval-budget.md
+@@ -0,0 +1,55 @@
++## #1599 - STEP import: a pass-wide evaluation budget for runaway faces
++
++**What was decided.** All face meters and edge-curve meters of one shell's
++tessellation pass share one `Pass` budget (`step_meter.rs`). Each meter
++counts its first refusal in the pass one time: a cap run out, a division
++that did not converge (`exhaust`), or a boundary-search fault. When
++`PASS_TRIPS` (3) meters have tripped, the pass stops. After the stop, each
++meter answers its fixed point, and each face in flight ends within one
++sweep. The pass is then refused. The refusal names the first face (or edge)
++that really tripped. It adds "the tessellation stopped after 3 faces or
++edges ran out of evaluations; more of the model may be broken".
++
++**Why.** Each runaway face spends a whole cap (150 M evaluations, 10-15 s)
++before it trips. A file with N runaway faces cost N caps divided by the
++core count. Now a pass spends at most 3 caps plus less than one cap for
++each worker thread, for any face count. The pin measures this bound on a
++shell with 31 runaway faces: 6.2 M evaluations before the change, at most
++2.2 M after.
++
++- The limit counts trips, not the summed evaluations of all faces. A
++  healthy model's total evaluations in a pass were never measured, and a
++  limit on that total could refuse a large healthy model. A trip happens
++  only on a face that spent its whole cap, so healthy models are not
++  affected.
++- 3 trips keeps each pass with one or two trips exactly as before. #1568's
++  case (a proven plane and a jump that trip in the same pass) is still
++  judged face by face.
++- A stopped pass is never "continuous". The faces that the stop cut short
++  were never judged. One of them can be a jump, and a coarser mesh would
++  smear that jump. Thus a refinement pass with 3 or more proven faces that
++  trip is now refused, where before it kept the coarser mesh. The heaviest
++  healthy face measured needs 28 M evaluations (cap 150 M), so 3 healthy
++  trips in one pass is not expected.
++- A meter that the stop cut short is not a trip. Its `exhaust` and its
++  search faults are not recorded, so the refusal never names a healthy face
++  as broken.
++- Edge curves (#1545's `CurveGuard`) share the same pass, as the issue
++  asks.
++
++**Considered and dropped.**
++- Stop the pass at the first trip that is not continuous. That refusal is
++  certain, but the named face would then depend on thread timing for a
++  shell with one or two runaways. The present refusals are deterministic,
++  and the trip limit keeps them so below 3 trips.
++- A limit on the summed evaluations of the pass: dropped for the reason
++  above.
++- A limit that scales with the face count: the time would then grow with
++  the face count, which the issue forbids.
++
++**Known limit.** Above the trip limit, the face that the refusal names can
++change from run to run (the threads decide which faces trip first). The
++model is refused on each run.
++
++**Cost to change later.** `PASS_TRIPS` is one constant. The pins read it,
++except the end-to-end pin's message text ("stopped after 3").
