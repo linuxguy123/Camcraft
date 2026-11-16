@@ -1,0 +1,1028 @@
+From 367f481856d59455d809a6082fca25b7a3e8e56b Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 20:14:33 +0100
+Subject: [PATCH] fix(ui): compute a chain selection's geometry once, not on
+ each frame
+
+A still frame with chains in an operation's selection took 0.4-1.6 s.
+Each frame content-hashed the facets, walked all the model's chains for
+each chain and each caller, and sliced the part at each ladder plane for
+each of three region_of calls.
+
+- model::features_of_shared: features keyed by the facet Arc allocation.
+- model::resolve_chain: chain lookup memo keyed by the Arc<Features>
+  allocation; all callers of feature::resolve_chain take it.
+- operation::pocket_memo: the pocket region on a part, keyed by its
+  exact input (loops, facets, planes, unit); refusals are kept too.
+- ui frame_memo::scene_scope: one region_of per operation per scene.
+
+A still frame is now about 6 ms headless on fig8.step.
+
+Fixes #2235
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/commands/operation/geometry.rs |   2 +-
+ crates/app/src/model.rs                       |   4 +-
+ crates/app/src/model/chain_memo.rs            |  97 ++++++++++
+ crates/app/src/model/geometry.rs              |  66 ++++++-
+ crates/app/src/operation/boundary_picks.rs    |   4 +-
+ crates/app/src/operation/contour_auto_pick.rs |   2 +-
+ crates/app/src/operation/heights_sel.rs       |   2 +-
+ crates/app/src/operation/mod.rs               |   2 +
+ crates/app/src/operation/pocket_memo.rs       | 146 +++++++++++++++
+ crates/app/src/operation/probe_pick.rs        |   2 +-
+ crates/app/src/operation/selection.rs         |   6 +-
+ crates/app/src/operation/slot_pick.rs         |   2 +-
+ crates/app/src/operation/stitch.rs            |   2 +-
+ crates/app/src/operation/wire_ruled.rs        |   2 +-
+ crates/app/src/pick/align.rs                  |   2 +-
+ crates/app/src/pick/circle.rs                 |   2 +-
+ crates/app/src/pick/feature_sel.rs            |   2 +-
+ crates/ui/src/egui_app/tests.rs               |   1 +
+ .../egui_app/tests/selection_frame_cost.rs    | 176 ++++++++++++++++++
+ crates/ui/src/egui_app/world.rs               |   3 +-
+ crates/ui/src/frame_memo.rs                   |  71 +++++++
+ crates/ui/src/interact.rs                     |   8 +-
+ crates/ui/src/lib.rs                          |   1 +
+ crates/ui/src/state.rs                        |   2 +-
+ docs/decisions/2235-selection-frame-cost.md   |  61 ++++++
+ 25 files changed, 645 insertions(+), 23 deletions(-)
+ create mode 100644 crates/app/src/model/chain_memo.rs
+ create mode 100644 crates/app/src/operation/pocket_memo.rs
+ create mode 100644 crates/ui/src/egui_app/tests/selection_frame_cost.rs
+ create mode 100644 crates/ui/src/frame_memo.rs
+ create mode 100644 docs/decisions/2235-selection-frame-cost.md
+
+diff --git a/crates/app/src/commands/operation/geometry.rs b/crates/app/src/commands/operation/geometry.rs
+index 76a9adcd9..48c4ede9b 100644
+--- a/crates/app/src/commands/operation/geometry.rs
++++ b/crates/app/src/commands/operation/geometry.rs
+@@ -109,7 +109,7 @@ fn valid_pick(world: &World, g: &GeoSel) -> Result<(), CommandError> {
+     };
+     let found = match g.feature {
+         FeatureSel::Face(id) => features.faces.iter().any(|f| f.id == id),
+-        FeatureSel::Chain(id) => feature::resolve_chain(&features, id).is_some(),
++        FeatureSel::Chain(id) => crate::model::resolve_chain(&features, id).is_some(),
+         FeatureSel::Patch(id) => feature::patches(&features).iter().any(|p| p.id == id),
+         FeatureSel::Vertex(id) => feature::resolve_vertex(&features, id).is_some(),
+     };
+diff --git a/crates/app/src/model.rs b/crates/app/src/model.rs
+index 64a16958b..d3523b95a 100644
+--- a/crates/app/src/model.rs
++++ b/crates/app/src/model.rs
+@@ -15,9 +15,11 @@ use crate::schema::{
+ };
+ use crate::stock::StockShape;
+ 
++mod chain_memo;
+ mod geometry;
+ 
+-pub use geometry::{features_of, features_of_local, geometry_signature};
++pub use chain_memo::{chain_walks, resolve_chain};
++pub use geometry::{feature_digests, features_of, features_of_local, features_of_shared, geometry_signature};
+ use crate::tools::Tool;
+ 
+ /// Create a named model entity at the origin with no geometry yet.
+diff --git a/crates/app/src/model/chain_memo.rs b/crates/app/src/model/chain_memo.rs
+new file mode 100644
+index 000000000..a11d824a5
+--- /dev/null
++++ b/crates/app/src/model/chain_memo.rs
+@@ -0,0 +1,97 @@
++//! Chain resolution memoized per feature set (#2235): `feature::
++//! resolve_chain` walks the whole model's chains (and its runs and lone
++//! edges) on every call, and the operation page, the overlay and the
++//! selection account call it per picked chain on every frame. Our own
++//! design notes; the `Weak` identity key is the law of
++//! `pick::feature_graph_shared`. No vendor material consulted.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::sync::{Arc, Weak};
++
++use crate::geometry::feature::{self, Chain, ChainId, Features};
++
++/// How many live feature sets the memo remembers.
++const CAP: usize = 32;
++
++/// One feature set (weak: it never keeps a model alive) and the answers
++/// already given for it.
++type Entry = (Weak<Features>, HashMap<ChainId, Option<Chain>>);
++
++thread_local! {
++    static MEMO: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
++    /// Real `feature::resolve_chain` walks on this thread - the counter
++    /// the #2235 pins read.
++    static WALKS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// [`feature::resolve_chain`] for a shared feature set, memoized by the
++/// set's allocation and the id. The held `Weak` keeps the address from
++/// being reused, and `Features` behind an `Arc` never changes, so a hit
++/// is the answer a fresh walk gives. Pure fuel: correctness is
++/// independent of hits.
++#[must_use]
++pub fn resolve_chain(features: &Arc<Features>, id: ChainId) -> Option<Chain> {
++    let key = Arc::downgrade(features);
++    let hit = MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        m.retain(|(w, _)| w.strong_count() > 0);
++        m.iter().find(|(w, _)| w.ptr_eq(&key)).and_then(|(_, map)| map.get(&id).cloned())
++    });
++    if let Some(answer) = hit {
++        return answer;
++    }
++    WALKS.with(|n| n.set(n.get().saturating_add(1)));
++    let answer = feature::resolve_chain(features, id);
++    MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        if let Some((_, map)) = m.iter_mut().find(|(w, _)| w.ptr_eq(&key)) {
++            map.insert(id, answer.clone());
++        } else {
++            if m.len() >= CAP {
++                m.remove(0);
++            }
++            m.push((key, HashMap::from([(id, answer.clone())])));
++        }
++    });
++    answer
++}
++
++/// How many real chain walks [`resolve_chain`] made on this thread.
++#[must_use]
++pub fn chain_walks() -> u64 {
++    WALKS.with(Cell::get)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use super::{chain_walks, resolve_chain};
++    use crate::geometry::feature::{self, features_of_facets};
++    use crate::geometry::{Point3, cube};
++
++    #[test]
++    fn a_hit_answers_what_a_fresh_walk_answers_and_walks_once() {
++        let tris = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 5.0)).facets;
++        let f = Arc::new(features_of_facets(&tris));
++        let ids: Vec<_> = feature::chains(&f).into_iter().map(|c| c.id).collect();
++        assert!(!ids.is_empty(), "a box has edge chains");
++        for &id in &ids {
++            let fresh = feature::resolve_chain(&f, id).map(|c| c.edges);
++            let before = chain_walks();
++            assert_eq!(resolve_chain(&f, id).map(|c| c.edges), fresh);
++            assert_eq!(resolve_chain(&f, id).map(|c| c.edges), fresh);
++            assert_eq!(chain_walks() - before, 1, "the second ask is a hit");
++        }
++        let before = chain_walks();
++        assert!(resolve_chain(&f, 12345).is_none());
++        assert!(resolve_chain(&f, 12345).is_none(), "a miss is remembered too");
++        assert_eq!(chain_walks() - before, 1);
++        // A new feature set (a landing) is a new key: it walks again.
++        let g = Arc::new(features_of_facets(&tris));
++        let before = chain_walks();
++        let _ = resolve_chain(&g, ids[0]);
++        assert_eq!(chain_walks() - before, 1, "another allocation never reads this one's answers");
++    }
++}
+diff --git a/crates/app/src/model/geometry.rs b/crates/app/src/model/geometry.rs
+index 4d6f7822c..3d7affb1b 100644
+--- a/crates/app/src/model/geometry.rs
++++ b/crates/app/src/model/geometry.rs
+@@ -27,10 +27,73 @@ thread_local! {
+ /// Feature topology (faces, loops, feature edges) of a model's LOCAL
+ /// facets, memoized by content. `None` only for a facet-less entity;
+ /// garbage facets still return complete (degenerate-tagged) features.
++///
++/// #2235: the per-frame callers (one or more per selected chain, every
++/// frame) hit [`features_of_shared`]'s allocation-keyed memo first, so
++/// a frame without a new facet landing hashes no facets.
+ #[must_use]
+ pub fn features_of(world: &World, entity: &Entity) -> Option<std::sync::Arc<Features>> {
+     let tris = facets_of(world, entity)?;
+-    Some(features_of_local(&tris))
++    Some(features_of_shared(&tris))
++}
++
++/// How many live meshes [`features_of_shared`] remembers.
++const SHARED_CAP: usize = 32;
++
++/// One allocation-keyed entry: the mesh (weak) and its features.
++type SharedEntry = (std::sync::Weak<[Triangle]>, std::sync::Arc<Features>);
++
++thread_local! {
++    /// Features keyed by the facet allocation itself (#2235), the law of
++    /// `pick::feature_graph_shared`: an entity's `Facets` is an immutable
++    /// `Arc<[Triangle]>` that every landing replaces, and the held `Weak`
++    /// keeps the allocation's address from being reused, so a live entry
++    /// at the same address IS the same bytes. Pure fuel: a miss falls
++    /// back to the content-digest cache.
++    static SHARED_FEATURES: std::cell::RefCell<Vec<SharedEntry>> =
++        const { std::cell::RefCell::new(Vec::new()) };
++    /// Content digests taken by [`features_of_local`] - the counter the
++    /// #2235 pins read (a frame without a landing takes none).
++    static DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// [`features_of_local`] memoized by the facet allocation: no content
++/// hash on a hit. The answer is the same `Features` the digest path
++/// gives for these bytes.
++#[must_use]
++pub fn features_of_shared(tris: &std::sync::Arc<[Triangle]>) -> std::sync::Arc<Features> {
++    if tris.is_empty() {
++        return std::sync::Arc::new(Features::default());
++    }
++    let key = std::sync::Arc::downgrade(tris);
++    let hit = SHARED_FEATURES.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        cache.retain(|(w, _)| w.strong_count() > 0);
++        let i = cache.iter().position(|(w, _)| w.ptr_eq(&key))?;
++        let entry = cache.remove(i);
++        let f = entry.1.clone();
++        cache.push(entry); // MRU bump
++        Some(f)
++    });
++    if let Some(f) = hit {
++        return f;
++    }
++    let f = features_of_local(tris);
++    SHARED_FEATURES.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.len() >= SHARED_CAP {
++            cache.remove(0);
++        }
++        cache.push((key, f.clone()));
++    });
++    f
++}
++
++/// How many content digests [`features_of_local`] took on this thread
++/// (#2235 pins: a frame with no facet landing takes none).
++#[must_use]
++pub fn feature_digests() -> u64 {
++    DIGESTS.with(std::cell::Cell::get)
+ }
+ 
+ /// The cache chokepoint, exposed for callers already holding the facets.
+@@ -39,6 +102,7 @@ pub fn features_of_local(tris: &[Triangle]) -> std::sync::Arc<Features> {
+     if tris.is_empty() {
+         return std::sync::Arc::new(Features::default());
+     }
++    DIGESTS.with(|n| n.set(n.get().saturating_add(1)));
+     let key = feature::digest_of(tris);
+     FEATURES_CACHE.with(|cache| {
+         let mut cache = cache.borrow_mut();
+diff --git a/crates/app/src/operation/boundary_picks.rs b/crates/app/src/operation/boundary_picks.rs
+index 04454425d..548da417a 100644
+--- a/crates/app/src/operation/boundary_picks.rs
++++ b/crates/app/src/operation/boundary_picks.rs
+@@ -253,7 +253,7 @@ pub fn toggle_run(world: &World, picks: &[GeoSel], hit: &GeoSel) -> (Vec<GeoSel>
+     let (Some(f), FeatureSel::Chain(hid)) = (found, hit.feature) else {
+         return (with(picks, hit), false);
+     };
+-    let Some(hit_edges) = feature::resolve_chain(&f, hid).map(|c| c.edges) else {
++    let Some(hit_edges) = crate::model::resolve_chain(&f, hid).map(|c| c.edges) else {
+         return (with(picks, hit), false);
+     };
+     let runs = feature::edge_runs(&f);
+@@ -306,7 +306,7 @@ pub fn extend_to_loop(world: &World, picks: &[GeoSel]) -> Result<Vec<GeoSel>, St
+     let mut want: Vec<u32> = Vec::new();
+     for g in &chains {
+         let FeatureSel::Chain(id) = g.feature else { continue };
+-        let c = feature::resolve_chain(&f, id).ok_or_else(|| format!("{} is no longer in the model - re-pick it", g.feature))?;
++        let c = crate::model::resolve_chain(&f, id).ok_or_else(|| format!("{} is no longer in the model - re-pick it", g.feature))?;
+         want.extend(c.edges);
+     }
+     let map = edge_map(&f);
+diff --git a/crates/app/src/operation/contour_auto_pick.rs b/crates/app/src/operation/contour_auto_pick.rs
+index 095d7f188..14d2f9b74 100644
+--- a/crates/app/src/operation/contour_auto_pick.rs
++++ b/crates/app/src/operation/contour_auto_pick.rs
+@@ -23,7 +23,7 @@ fn pick_span(
+         let Some(features) = model::features_of(world, &entity) else { continue };
+         let loc = opframe.pose_in_setup(world, &entity).unwrap_or_default();
+         let verts: Vec<[f64; 3]> = match g.feature {
+-            FeatureSel::Chain(cid) => match feature::resolve_chain(&features, cid) {
++            FeatureSel::Chain(cid) => match crate::model::resolve_chain(&features, cid) {
+                 Some(c) if c.closed || stitched.contains_key(&gi) => feature::chain_points(&features, &c),
+                 _ => Vec::new(),
+             },
+diff --git a/crates/app/src/operation/heights_sel.rs b/crates/app/src/operation/heights_sel.rs
+index e22ddf05a..121621f84 100644
+--- a/crates/app/src/operation/heights_sel.rs
++++ b/crates/app/src/operation/heights_sel.rs
+@@ -105,7 +105,7 @@ fn picks_z_range(world: &World, setup: Option<&str>, items: &[GeoSel]) -> Result
+                 take(feature::resolve_vertex(&features, vid).ok_or(gone)?);
+             }
+             FeatureSel::Chain(cid) => {
+-                let c = feature::resolve_chain(&features, cid).ok_or(gone)?;
++                let c = crate::model::resolve_chain(&features, cid).ok_or(gone)?;
+                 for p in feature::chain_points(&features, &c) {
+                     let w = transform_point(Point3::new(p[0], p[1], p[2]), loc.pos, loc.rot);
+                     lo = lo.min(w.z);
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 63d5b536a..60cd1994b 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -144,6 +144,8 @@ mod run_out;
+ use run_out::*;
+ mod area;
+ use area::*;
++mod pocket_memo;
++pub use pocket_memo::pocket_slices;
+ mod boundary;
+ pub use boundary::AreaCtx;
+ use boundary::AreaApplied;
+diff --git a/crates/app/src/operation/pocket_memo.rs b/crates/app/src/operation/pocket_memo.rs
+new file mode 100644
+index 000000000..e34d61adf
+--- /dev/null
++++ b/crates/app/src/operation/pocket_memo.rs
+@@ -0,0 +1,146 @@
++//! The pocket family's region on a part, memoized by its full input
++//! (#2235): `area::pocket_region_on_part` slices the part at every
++//! ladder plane, and the viewport asks for the open operation's region
++//! on every frame. Our own design notes (an exact-key memo of a pure
++//! function); no vendor material consulted.
++//!
++//! The key is the whole input, compared for equality - the loops, the
++//! part's facets, the planes and the unit - so a hit is the answer a
++//! fresh slice gives, with no revision counter to forget. The region
++//! and the two refusals the law names itself (`Invalid`, `Empty`) are
++//! kept; any other error is computed again on every call.
++
++use std::cell::{Cell, RefCell};
++use std::sync::Arc;
++
++use super::area::pocket_region_on_part;
++use super::*;
++use crate::units::Unit;
++
++/// How many inputs the memo remembers (each holds one part's facets).
++const CAP: usize = 4;
++
++/// A kept answer: the region, or a refusal by its words.
++#[derive(Clone)]
++enum Answer {
++    Region(Region),
++    Invalid(String),
++    Empty(String),
++}
++
++impl Answer {
++    fn of(r: &Result<Region, GenError>) -> Option<Self> {
++        match r {
++            Ok(region) => Some(Self::Region(region.clone())),
++            Err(GenError::Invalid(m)) => Some(Self::Invalid(m.clone())),
++            Err(GenError::Empty(m)) => Some(Self::Empty(m.clone())),
++            Err(_) => None,
++        }
++    }
++
++    fn into_result(self) -> Result<Region, GenError> {
++        match self {
++            Self::Region(r) => Ok(r),
++            Self::Invalid(m) => Err(GenError::Invalid(m)),
++            Self::Empty(m) => Err(GenError::Empty(m)),
++        }
++    }
++}
++
++struct Entry {
++    loops: Vec<Loop>,
++    part: Arc<[Triangle]>,
++    planes: Vec<f64>,
++    unit: Unit,
++    answer: Answer,
++}
++
++thread_local! {
++    static MEMO: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
++    /// Real slices on this thread - the counter the #2235 pins read.
++    static SLICES: Cell<u64> = const { Cell::new(0) };
++}
++
++/// [`pocket_region_on_part`], memoized by its exact input.
++pub(super) fn pocket_region_memo(
++    loops: Vec<Loop>,
++    part: &[Triangle],
++    planes: &[f64],
++    unit: Unit,
++) -> Result<Region, GenError> {
++    let hit = MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        let i = m.iter().position(|e| {
++            e.unit == unit && e.planes == planes && e.loops == loops && *e.part == *part
++        })?;
++        let entry = m.remove(i);
++        let answer = entry.answer.clone();
++        m.push(entry); // MRU bump
++        Some(answer)
++    });
++    if let Some(answer) = hit {
++        return answer.into_result();
++    }
++    SLICES.with(|n| n.set(n.get().saturating_add(1)));
++    let key = loops.clone();
++    let result = pocket_region_on_part(loops, part, planes, unit);
++    if let Some(answer) = Answer::of(&result) {
++        MEMO.with(|m| {
++            let mut m = m.borrow_mut();
++            if m.len() >= CAP {
++                m.remove(0);
++            }
++            m.push(Entry { loops: key, part: part.into(), planes: planes.to_vec(), unit, answer });
++        });
++    }
++    result
++}
++
++/// How many real part slices [`pocket_region_memo`] made on this thread.
++#[must_use]
++pub fn pocket_slices() -> u64 {
++    SLICES.with(Cell::get)
++}
++
++#[cfg(test)]
++mod law {
++    use super::*;
++    use crate::geometry::{Point3, cube};
++
++    fn ring(h: f64) -> Loop {
++        Loop::new(vec![Point2::new(-h, -h), Point2::new(h, -h), Point2::new(h, h), Point2::new(-h, h)]).expect("ring")
++    }
++
++    #[test]
++    fn a_hit_is_the_fresh_answer_and_any_changed_input_slices_again() {
++        // A 4x4 boss standing in a 20x20 pick: an island at every plane.
++        let part: Vec<Triangle> = cube(Point3::new(-2.0, -2.0, 0.0), Point3::new(2.0, 2.0, 10.0)).facets.to_vec();
++        let planes = [10.0, 5.0, 0.0];
++        let fresh = pocket_region_on_part(vec![ring(10.0)], &part, &planes, Unit::Millimeters).expect("region");
++        let n = pocket_slices();
++        let a = pocket_region_memo(vec![ring(10.0)], &part, &planes, Unit::Millimeters).expect("region");
++        let b = pocket_region_memo(vec![ring(10.0)], &part, &planes, Unit::Millimeters).expect("region");
++        assert_eq!(a, fresh, "the memo says what the fresh slice says");
++        assert_eq!(b, fresh);
++        assert_eq!(pocket_slices() - n, 1, "the second ask is a hit");
++
++        // A moved part (a landing), another pick, another plane: each slices.
++        let moved: Vec<Triangle> = cube(Point3::new(-3.0, -2.0, 0.0), Point3::new(2.0, 2.0, 10.0)).facets.to_vec();
++        let n = pocket_slices();
++        let c = pocket_region_memo(vec![ring(10.0)], &moved, &planes, Unit::Millimeters).expect("region");
++        assert_eq!(c, pocket_region_on_part(vec![ring(10.0)], &moved, &planes, Unit::Millimeters).expect("region"));
++        assert_ne!(c, fresh, "the moved boss moves the region");
++        let _ = pocket_region_memo(vec![ring(9.0)], &part, &planes, Unit::Millimeters);
++        let _ = pocket_region_memo(vec![ring(10.0)], &part, &[10.0, 0.0], Unit::Millimeters);
++        assert_eq!(pocket_slices() - n, 3, "no changed input reads a kept answer");
++
++        // A refusal is kept by its words and said again on a hit.
++        let n = pocket_slices();
++        let full = |r: Result<Region, GenError>| r.err().map(|e| e.to_string());
++        let first = full(pocket_region_memo(vec![ring(1.0)], &part, &planes, Unit::Millimeters));
++        let again = full(pocket_region_memo(vec![ring(1.0)], &part, &planes, Unit::Millimeters));
++        assert!(first.as_deref().is_some_and(|m| m.contains("fills the whole selection")), "{first:?}");
++        assert_eq!(first, again);
++        assert_eq!(pocket_slices() - n, 1);
++    }
++}
+diff --git a/crates/app/src/operation/probe_pick.rs b/crates/app/src/operation/probe_pick.rs
+index db97580da..7d5a25021 100644
+--- a/crates/app/src/operation/probe_pick.rs
++++ b/crates/app/src/operation/probe_pick.rs
+@@ -183,7 +183,7 @@ pub fn probe_seed(world: &World, sel: &GeoSel) -> Result<ProbeSeed, String> {
+     match sel.feature {
+         FeatureSel::Face(id) => face_seed(&cx, id),
+         FeatureSel::Chain(id) => {
+-            let chain = feature::resolve_chain(&cx.features, id)
++            let chain = crate::model::resolve_chain(&cx.features, id)
+                 .ok_or("the picked edge is no longer in the model - re-pick it")?;
+             if chain.closed {
+                 super::probe_pick_round::rim_seed(&cx, &chain)
+diff --git a/crates/app/src/operation/selection.rs b/crates/app/src/operation/selection.rs
+index 69ddf127e..b997083e9 100644
+--- a/crates/app/src/operation/selection.rs
++++ b/crates/app/src/operation/selection.rs
+@@ -133,7 +133,7 @@ pub(super) fn drive_chains(world: &World, items: &[GeoSel]) -> Result<Vec<Vec<Po
+         let label = format!("{} of '{}'", g.feature, g.entity);
+         match g.feature {
+             FeatureSel::Chain(cid) => {
+-                let Some(c) = feature::resolve_chain(&features, cid) else {
++                let Some(c) = crate::model::resolve_chain(&features, cid) else {
+                     return Err(GenError::Invalid(format!(
+                         "{label} is no longer in the model: re-pick it"
+                     )));
+@@ -348,7 +348,7 @@ pub(super) fn selection_geometry_in(
+                 }
+             }
+             FeatureSel::Chain(cid) => {
+-                let Some(c) = feature::resolve_chain(&features, cid) else {
++                let Some(c) = crate::model::resolve_chain(&features, cid) else {
+                     return Err(GenError::Invalid(format!(
+                         "{label} is no longer in the model: re-pick it"
+                     )));
+@@ -545,7 +545,7 @@ pub(super) fn selection_region(
+     // around the part, not a refusal).
+     let past_edge = matches!(area.containment, Some(Containment::On | Containment::Outside));
+     let region = match pocket_ladder(world, setup, items, params)? {
+-        Some((part, planes)) if !past_edge => pocket_region_on_part(loops, &part, &planes, crate::units::of(world))?,
++        Some((part, planes)) if !past_edge => super::pocket_memo::pocket_region_memo(loops, &part, &planes, crate::units::of(world))?,
+         _ => Region::new(loops)?,
+     };
+     // The area controls run after this, at the seam's call sites (the
+diff --git a/crates/app/src/operation/slot_pick.rs b/crates/app/src/operation/slot_pick.rs
+index 25ad0fb08..674b6fe03 100644
+--- a/crates/app/src/operation/slot_pick.rs
++++ b/crates/app/src/operation/slot_pick.rs
+@@ -51,7 +51,7 @@ pub fn slot_bound_of(world: &World, items: &[GeoSel]) -> Result<SlotBound, GenEr
+                 areas += 1;
+             }
+             FeatureSel::Chain(cid) => {
+-                let c = feature::resolve_chain(&features, cid).ok_or_else(gone)?;
++                let c = crate::model::resolve_chain(&features, cid).ok_or_else(gone)?;
+                 let pts: Vec<Point2> = feature::chain_points(&features, &c).iter().map(xy).collect();
+                 if c.closed {
+                     rings.push(Loop::new(pts).map_err(|_| {
+diff --git a/crates/app/src/operation/stitch.rs b/crates/app/src/operation/stitch.rs
+index 83a40bfc5..65e02d2da 100644
+--- a/crates/app/src/operation/stitch.rs
++++ b/crates/app/src/operation/stitch.rs
+@@ -83,7 +83,7 @@ pub(super) fn gather_runs(
+         let Some(features) = model::features_of(world, &entity) else {
+             continue;
+         };
+-        let Some(c) = feature::resolve_chain(&features, cid) else {
++        let Some(c) = crate::model::resolve_chain(&features, cid) else {
+             continue;
+         };
+         if c.closed {
+diff --git a/crates/app/src/operation/wire_ruled.rs b/crates/app/src/operation/wire_ruled.rs
+index 611f8f0f1..dd413e611 100644
+--- a/crates/app/src/operation/wire_ruled.rs
++++ b/crates/app/src/operation/wire_ruled.rs
+@@ -93,7 +93,7 @@ fn profile(world: &World, g: &GeoSel) -> Result<Picked, GenError> {
+             (ring.verts.iter().filter_map(|&vi| features.verts.get(vi as usize)).map(place).collect(), true)
+         }
+         FeatureSel::Chain(cid) => {
+-            let c = feature::resolve_chain(&features, cid).ok_or_else(gone)?;
++            let c = crate::model::resolve_chain(&features, cid).ok_or_else(gone)?;
+             (feature::chain_points(&features, &c).iter().map(place).collect(), c.closed)
+         }
+         _ => {
+diff --git a/crates/app/src/pick/align.rs b/crates/app/src/pick/align.rs
+index f40dd0940..83ec3cf81 100644
+--- a/crates/app/src/pick/align.rs
++++ b/crates/app/src/pick/align.rs
+@@ -221,7 +221,7 @@ pub(super) fn straight_edge(
+     let FeatureSel::Chain(cid) = g.feature else { return Err(gone(g)) };
+     let e = model::find_by_name(world, &g.entity).ok_or_else(|| gone(g))?;
+     let features = model::features_of(world, &e).ok_or_else(|| gone(g))?;
+-    let c = feature::resolve_chain(&features, cid).ok_or_else(|| gone(g))?;
++    let c = crate::model::resolve_chain(&features, cid).ok_or_else(|| gone(g))?;
+     if c.closed {
+         return Err(format!("{} of '{}' is a closed loop - pick one straight edge {role}", g.feature, g.entity));
+     }
+diff --git a/crates/app/src/pick/circle.rs b/crates/app/src/pick/circle.rs
+index cc8edae82..e59b5d844 100644
+--- a/crates/app/src/pick/circle.rs
++++ b/crates/app/src/pick/circle.rs
+@@ -169,7 +169,7 @@ pub fn circle_centre_in(
+     let gone = || CircleRefusal::Gone(format!("{} of '{}'", pick.feature, pick.entity));
+     let e = model::find_by_name(world, &pick.entity).ok_or_else(gone)?;
+     let graph = graph_of(world, &pick.entity).ok_or_else(gone)?;
+-    let run = feature::resolve_chain(&graph.features, id).ok_or_else(gone)?;
++    let run = crate::model::resolve_chain(&graph.features, id).ok_or_else(gone)?;
+     let local = circle_of_run(&graph.features, &run)?;
+     let loc = pose(world, &e).unwrap_or_default();
+     let c = transform_point(Point3::new(local.centre[0], local.centre[1], local.centre[2]), loc.pos, loc.rot);
+diff --git a/crates/app/src/pick/feature_sel.rs b/crates/app/src/pick/feature_sel.rs
+index b38669189..e0eb56c06 100644
+--- a/crates/app/src/pick/feature_sel.rs
++++ b/crates/app/src/pick/feature_sel.rs
+@@ -110,7 +110,7 @@ pub fn check_pickable(world: &World, g: &GeoSel) -> Result<(), String> {
+                 g.feature, g.entity
+             ))
+         }
+-        FeatureSel::Chain(id) => match feature::resolve_chain(&graph.features, id) {
++        FeatureSel::Chain(id) => match crate::model::resolve_chain(&graph.features, id) {
+             Some(c) if !is_feature_chain(&graph, &c) => Err(format!(
+                 "{} of '{}' runs along the mesh's own triangles, not a model edge - pick an edge where two \
+                  faces meet",
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 978bddafc..1a71bb743 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -82,6 +82,7 @@ fn empty_egui_meshes_are_filtered_before_gpu_submission() {
+ 
+ mod face_origin;
+ mod geo_row_hover;
++mod selection_frame_cost;
+ mod pick_mode;
+ mod spindle_row;
+ mod stock_size;
+diff --git a/crates/ui/src/egui_app/tests/selection_frame_cost.rs b/crates/ui/src/egui_app/tests/selection_frame_cost.rs
+new file mode 100644
+index 000000000..b46869aca
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/selection_frame_cost.rs
+@@ -0,0 +1,176 @@
++//! #2235: a chain selection on an open pocket costs its stitch, its chain
++//! walks and its part slices once - at the change - and never again on
++//! a frame where nothing changed. A selection change or a model landing
++//! is a new answer, equal to the fresh compute.
++//! Provenance: our own frame-cost law over our own shell; no vendor
++//! material consulted.
++
++use camcraft_app::commands::ImportModel;
++use camcraft_app::geometry::{Mesh, Point3, Triangle, feature};
++use camcraft_app::operation::{self, GeoSel, OpType};
++
++use super::*;
++
++const TOP: f64 = 10.0;
++
++/// Two triangles over the quad `a b c d` (counter-clockwise seen from
++/// the outward side).
++fn quad(t: &mut Vec<Triangle>, a: Point3, b: Point3, c: Point3, d: Point3) {
++    t.push(Triangle::new(a, b, c));
++    t.push(Triangle::new(a, c, d));
++}
++
++/// A square frame `o` wide and 10 high with a 20x20 hole through it
++/// (a pocket the part never fills), beside the seed.
++fn tray(o: f64) -> Vec<Triangle> {
++    let p = |x: f64, y: f64, z: f64| Point3::new(200.0 + x, y, z);
++    let mut t = Vec::new();
++    let (i0, i1) = (20.0, 40.0);
++    // Outer walls.
++    quad(&mut t, p(0.0, 0.0, 0.0), p(o, 0.0, 0.0), p(o, 0.0, TOP), p(0.0, 0.0, TOP));
++    quad(&mut t, p(o, 0.0, 0.0), p(o, o, 0.0), p(o, o, TOP), p(o, 0.0, TOP));
++    quad(&mut t, p(o, o, 0.0), p(0.0, o, 0.0), p(0.0, o, TOP), p(o, o, TOP));
++    quad(&mut t, p(0.0, o, 0.0), p(0.0, 0.0, 0.0), p(0.0, 0.0, TOP), p(0.0, o, TOP));
++    // The top (faces up) and bottom (faces down) annuli, four quads each.
++    for (z, up) in [(TOP, true), (0.0, false)] {
++        let ring = [(0.0, 0.0, i0, i0), (o, 0.0, i1, i0), (o, o, i1, i1), (0.0, o, i0, i1)];
++        for k in 0..4 {
++            let (ax, ay, ix, iy) = ring[k];
++            let (bx, by, jx, jy) = ring[(k + 1) % 4];
++            let (a, b, c, d) = (p(ax, ay, z), p(bx, by, z), p(jx, jy, z), p(ix, iy, z));
++            if up { quad(&mut t, a, b, c, d) } else { quad(&mut t, d, c, b, a) }
++        }
++    }
++    // The hole's walls (face inward).
++    quad(&mut t, p(i0, i0, 0.0), p(i0, i0, TOP), p(i1, i0, TOP), p(i1, i0, 0.0));
++    quad(&mut t, p(i1, i0, 0.0), p(i1, i0, TOP), p(i1, i1, TOP), p(i1, i1, 0.0));
++    quad(&mut t, p(i1, i1, 0.0), p(i1, i1, TOP), p(i0, i1, TOP), p(i0, i1, 0.0));
++    quad(&mut t, p(i0, i1, 0.0), p(i0, i1, TOP), p(i0, i0, TOP), p(i0, i0, 0.0));
++    t
++}
++
++/// The tray's top-rim chains: the cavity's (`inner`) or the outline's.
++fn rim(st: &State, inner: bool) -> Vec<GeoSel> {
++    let e = model::find_by_name(&st.world, "tray").expect("tray");
++    let f = model::features_of(&st.world, &e).expect("features");
++    feature::edge_runs(&f)
++        .into_iter()
++        .filter(|r| {
++            let pts = feature::chain_points(&f, r);
++            pts.iter().all(|q| (q[2] - TOP).abs() < 1e-9)
++                && pts.iter().all(|q| (q[0] > 215.0 && q[0] < 245.0) == inner)
++        })
++        .map(|r| GeoSel { entity: "tray".into(), feature: FeatureSel::Chain(r.id) })
++        .collect()
++}
++
++#[derive(Debug, PartialEq, Eq, Clone, Copy)]
++struct Counts {
++    regions: u64,
++    walks: u64,
++    digests: u64,
++    slices: u64,
++}
++
++fn counts() -> Counts {
++    Counts {
++        regions: crate::frame_memo::region_builds(),
++        walks: model::chain_walks(),
++        digests: model::feature_digests(),
++        slices: operation::pocket_slices(),
++    }
++}
++
++/// The region the overlay draws for `name`, against a fresh compute.
++fn drawn_is_fresh(st: &State, name: &str) -> Option<camcraft_app::geo2d::Region> {
++    let op = model::find_by_name(&st.world, name).and_then(|e| model::operation_of(&st.world, &e)).expect("op");
++    let drawn = crate::frame_memo::scene_scope(|| crate::frame_memo::region_of(&st.world, name, &op));
++    assert_eq!(drawn, operation::region_of(&st.world, &op), "the drawn region is the fresh one");
++    drawn
++}
++
++fn select(h: &mut Harness<'static, ShellUi>, name: &str, items: Vec<GeoSel>) {
++    let st = &mut h.state_mut().state;
++    st.pending.push_back(CommandKind::SetOperationGeometry { name: name.to_owned(), items });
++    st.drain_actions();
++    h.run_steps(2);
++}
++
++/// The tray beside the seed, a 2D Pocket open on its cavity rim.
++fn pocket_on_tray() -> (Harness<'static, ShellUi>, String) {
++    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui_state(frame, ShellUi::seeded());
++    h.run_steps(2);
++    let name = "Pocket2".to_owned();
++    {
++        let st = &mut h.state_mut().state;
++        st.history.execute(&st.world, ImportModel::from_mesh("tray", Mesh::from_facets(tray(60.0))));
++        let seed = model::find_by_name(&st.world, "Contour1").and_then(|e| model::operation_of(&st.world, &e)).expect("seed op");
++        st.pending.push_back(CommandKind::CreateOperation {
++            name: name.clone(),
++            tool: seed.tool.clone(),
++            src: SrcRef::Stock,
++            params: operation::retype_params(&seed.params, OpType::Pocket.ordinal()),
++        });
++        st.drain_actions();
++        crate::actions::target(st, UiTarget::Operation(name.clone()));
++    }
++    h.run_steps(2);
++    let items = rim(&h.state().state, true);
++    assert_eq!(items.len(), 4, "the cavity rim is four runs");
++    select(&mut h, &name, items);
++    (h, name)
++}
++
++#[test]
++fn frames_without_a_change_walk_digest_and_slice_nothing() {
++    let (mut h, name) = pocket_on_tray();
++    let region = drawn_is_fresh(&h.state().state, &name);
++    assert!(region.is_some(), "the cavity rim is a pocket region: {}", h.state().state.status);
++    h.run_steps(2);
++    let before = counts();
++    const N: u64 = 10;
++    for _ in 0..N {
++        h.step();
++    }
++    let after = counts();
++    assert_eq!(after.walks, before.walks, "no chain walk on a still frame");
++    assert_eq!(after.digests, before.digests, "no feature digest on a still frame");
++    assert_eq!(after.slices, before.slices, "no part slice on a still frame");
++    assert_eq!(after.regions - before.regions, N, "one region build per scene, not per caller");
++}
++
++#[test]
++fn a_selection_change_or_a_landing_is_a_new_answer() {
++    let (mut h, name) = pocket_on_tray();
++    let cavity = drawn_is_fresh(&h.state().state, &name);
++    h.run_steps(2);
++
++    // Another selection: the outline rim. The answer is computed again.
++    let before = counts();
++    let outline = rim(&h.state().state, false);
++    assert_eq!(outline.len(), 4, "the outline rim is four runs");
++    select(&mut h, &name, outline);
++    let after = counts();
++    assert!(after.walks > before.walks, "a new selection walks its chains");
++    assert!(after.slices > before.slices, "a new selection slices the part");
++    assert_ne!(drawn_is_fresh(&h.state().state, &name), cavity, "the region follows the selection");
++
++    // Back to the cavity, then a landing that widens the frame.
++    let items = rim(&h.state().state, true);
++    select(&mut h, &name, items);
++    let before = counts();
++    {
++        let st = &h.state().state;
++        let e = model::find_by_name(&st.world, "tray").expect("tray");
++        model::set_facets(&st.world, &e, tray(70.0).into());
++    }
++    h.run_steps(2);
++    let after = counts();
++    assert!(after.digests > before.digests, "new facets take a new digest");
++    assert!(after.walks > before.walks, "new features walk the chains again");
++    drawn_is_fresh(&h.state().state, &name);
++    let before = counts();
++    h.run_steps(3);
++    let after = counts();
++    assert_eq!((after.walks, after.digests, after.slices), (before.walks, before.digests, before.slices), "and the frames after it are still");
++}
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 823f5f5ca..ece3ebbb6 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -176,7 +176,8 @@ fn contour_params() -> OpParams {
+ /// upload.
+ #[must_use]
+ pub fn collect(state: &State) -> Scene {
+-    Scene { parts: collect_parts(state), overlay: collect_overlay(state) }
++    // #2235: one region build per operation for the whole scene.
++    crate::frame_memo::scene_scope(|| Scene { parts: collect_parts(state), overlay: collect_overlay(state) })
+ }
+ 
+ // ---------------------------------------------------------------- parts
+diff --git a/crates/ui/src/frame_memo.rs b/crates/ui/src/frame_memo.rs
+new file mode 100644
+index 000000000..3bc5691b0
+--- /dev/null
++++ b/crates/ui/src/frame_memo.rs
+@@ -0,0 +1,71 @@
++//! One scene collection, one region per operation (#2235): the region
++//! outline, the region fill and the height-plane gate each ask
++//! `operation::region_of` for the same selected operation while one
++//! scene is collected. Inside [`scene_scope`] the state is borrowed
++//! immutably, so the first answer is the answer for the whole scope;
++//! the memo is dropped when the scope ends and is never read outside
++//! one. Our own design notes; no vendor material consulted.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++
++use camcraft_app::geo2d::Region;
++use camcraft_app::operation;
++use camcraft_app::schema::Operation;
++use flecs_ecs::prelude::World;
++
++thread_local! {
++    /// `Some` while a scope is open: operation name -> its region.
++    static SCOPE: RefCell<Option<HashMap<String, Option<Region>>>> = const { RefCell::new(None) };
++    /// Real `region_of` calls made through [`region_of`] (#2235 pins).
++    static CALLS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// Run `f` with the per-scene region memo open. A nested call keeps
++/// the outer memo.
++pub fn scene_scope<R>(f: impl FnOnce() -> R) -> R {
++    let opened = SCOPE.with(|s| {
++        let mut s = s.borrow_mut();
++        if s.is_some() {
++            return false;
++        }
++        *s = Some(HashMap::new());
++        true
++    });
++    // The guard closes the scope on every exit, an unwind included, so a
++    // memo can never outlive the borrow it was filled under.
++    struct Close(bool);
++    impl Drop for Close {
++        fn drop(&mut self) {
++            if self.0 {
++                SCOPE.with(|s| *s.borrow_mut() = None);
++            }
++        }
++    }
++    let _close = Close(opened);
++    f()
++}
++
++/// [`operation::region_of`] for the operation named `name`, asked once
++/// per open scope (and on every call outside one).
++#[must_use]
++pub fn region_of(world: &World, name: &str, op: &Operation) -> Option<Region> {
++    let hit = SCOPE.with(|s| s.borrow().as_ref().and_then(|m| m.get(name).cloned()));
++    if let Some(region) = hit {
++        return region;
++    }
++    CALLS.with(|n| n.set(n.get().saturating_add(1)));
++    let region = operation::region_of(world, op);
++    SCOPE.with(|s| {
++        if let Some(m) = s.borrow_mut().as_mut() {
++            m.insert(name.to_owned(), region.clone());
++        }
++    });
++    region
++}
++
++/// How many real region builds [`region_of`] made on this thread.
++#[must_use]
++pub fn region_builds() -> u64 {
++    CALLS.with(Cell::get)
++}
+diff --git a/crates/ui/src/interact.rs b/crates/ui/src/interact.rs
+index f8d6c60d0..97c557c59 100644
+--- a/crates/ui/src/interact.rs
++++ b/crates/ui/src/interact.rs
+@@ -580,7 +580,7 @@ pub(crate) fn feature_segments(
+             }
+         }
+         FeatureSel::Chain(cid) => {
+-            let Some(chain) = feature::resolve_chain(&features, cid) else {
++            let Some(chain) = camcraft_app::model::resolve_chain(&features, cid) else {
+                 return;
+             };
+             let pts = feature::chain_points(&features, &chain);
+@@ -1143,7 +1143,7 @@ pub(crate) fn region_lines(state: &State) -> Vec<[f32; 6]> {
+             continue; // the region plane's source is gone - draw nothing
+                       // rather than an outline at a guessed level
+         };
+-        if let Some(region) = operation::region_of(&state.world, &op) {
++        if let Some(region) = crate::frame_memo::region_of(&state.world, &name, &op) {
+             for l in region.loops() {
+                 let pts = l.points();
+                 if pts.len() < 3 {
+@@ -1194,7 +1194,7 @@ pub(crate) fn shown_regions(state: &State) -> Vec<(f64, Option<Region>)> {
+         let Some(op) = model::operation_of(&state.world, &entity) else {
+             continue;
+         };
+-        let region = operation::region_of(&state.world, &op);
++        let region = crate::frame_memo::region_of(&state.world, &name, &op);
+         if let Some(z) = operation::region_z(&state.world, op.setup.as_deref(), Some(&op.src), &op.params)
+             && (region.is_some() || !operation::chains_of(&state.world, &op).is_empty())
+         {
+@@ -1763,7 +1763,7 @@ fn feature_lines(state: &State, items: &[GeoSel]) -> Vec<[f32; 6]> {
+                 }
+             }
+             FeatureSel::Chain(cid) => {
+-                let Some(chain) = feature::resolve_chain(&features, cid) else {
++                let Some(chain) = camcraft_app::model::resolve_chain(&features, cid) else {
+                     continue;
+                 };
+                 let pts = feature::chain_points(&features, &chain);
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 2bce12b15..43e30f4f1 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -40,6 +40,7 @@ pub mod egui_app;
+ pub mod feedback;
+ pub mod file_dialog;
+ pub mod file_pick;
++pub mod frame_memo;
+ pub mod incoming_view;
+ pub mod headless_gpu;
+ pub mod interact;
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index bff31b187..61f2aa4d8 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -2583,7 +2583,7 @@ impl State {
+                         let found = model::find_by_name(&self.world, &g.entity)
+                             .and_then(|e| model::features_of(&self.world, &e))
+                             .map(|f| {
+-                                let c = feature::resolve_chain(&f, id)?;
++                                let c = camcraft_app::model::resolve_chain(&f, id)?;
+                                 let pts = feature::chain_points(&f, &c);
+                                 Some((c, pts))
+                             })
+diff --git a/docs/decisions/2235-selection-frame-cost.md b/docs/decisions/2235-selection-frame-cost.md
+new file mode 100644
+index 000000000..6e9880c7a
+--- /dev/null
++++ b/docs/decisions/2235-selection-frame-cost.md
+@@ -0,0 +1,61 @@
++## #2235 - a chain selection costs its geometry once, not on each frame
++
++The maintainer's words (2026-11-16): "the performance needs to gget down
++under 10ms to be useable", and "caching to not have to redraw things should
++prob. be a strategy thru out the application to keep framerates stable and
++enough compute lefter over for things that matter.. Precalculation and
++cache is not something that will give us a penalty.. this is not game
++engine".
++
++**What was decided.** Three caches of derived values. None is a command
++and none is in the project file. Each key is the input itself, so a stale
++answer cannot occur:
++
++1. `model::features_of_shared` (app): the features of one model, keyed by
++   the allocation of its facet `Arc` (a `Weak` pointer compare). Each
++   landing (`set_facets`) makes a new allocation, so it is a new key. A
++   dead allocation is pruned. 32 entries.
++2. `model::resolve_chain` (app, `model/chain_memo.rs`): the chain for one
++   `ChainId`, keyed by the allocation of the `Arc<Features>` from item 1,
++   with one map of ids for each. A miss is kept as a miss. All the call
++   sites that took `feature::resolve_chain` now take this one. The change
++   in about 15 files is a signature ripple, not new logic.
++3. `operation::pocket_memo` (app): the pocket family's region on a part,
++   keyed by the exact input (loops, part facets, ladder planes, unit)
++   compared for equality. The region and the `Invalid` / `Empty` refusals
++   are kept; other errors are computed again. 4 entries.
++
++In the UI, `frame_memo::scene_scope` opens a memo for the time of one
++`world::collect`. Inside it, `region_lines` and `shown_regions` get the
++same region for an operation from one `region_of` call. The state is
++borrowed immutably for that scope, and the memo is dropped at the scope's
++end (also on an unwind).
++
++**Why.** Measured headless in release on the fig8.step part with 8-10 chains
++selected along its top edge: a still frame took 640-765 ms in the scene collect
++and 425-510 ms in the UI step. The cause was that each frame:
++
++- content-hashed all the facets in `features_of`;
++- walked all the model's chains (about 5 ms) in each `resolve_chain` call,
++  for each chain and each caller;
++- sliced the part at each ladder plane (about 15 ms) for each of three
++  `region_of` calls.
++
++After the caches, a frame is about 6 ms headless. A still frame makes no
++digest, no chain walk and no slice. The cost moves to the first frame
++after a selection change or a landing, which the maintainer accepts.
++
++**Dropped.**
++- A key on the document version counter. It is bumped by hand at about 70
++  sites, and one missed bump gives a stale overlay. An allocation key or
++  an equality key cannot miss a change.
++- A cache in the UI state, filled by the UI. That puts derived geometry
++  into the UI layer, and each new caller must remember to use it. The app
++  layer caches serve the GUI, MCP and the CLI.
++- A change to the hover and highlighter paths. That is #2201.
++
++**Cost to change later.** Each cache is one file with a counter that the
++pinning tests read (`chain_walks`, `feature_digests`, `pocket_slices`,
++`frame_memo::region_builds`). The pattern (key on the input or on its
++allocation, never on a hand-bumped counter) can be used again for other
++derived views.

@@ -1,0 +1,673 @@
+From 28d3295ba3f2e4e3e24c5600abb5b77059d5f1af Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Mon, 16 Nov 2026 19:49:34 +0100
+Subject: [PATCH] feat(ui,app): wire browser app tracing, dropped model bytes,
+ and inline CpuEye fallback
+
+Route camcraft_app tracing through a browser-safe subscriber without
+timestamps or ANSI escapes, and initialize it in camcraft_start. Support
+bare-name dropped model bytes in file_drop::take_drop using existing
+MESH_EXTENSIONS, too_big, and file_pick::deliver checks. Add
+CpuEye::inline and frame repaint polling while inline stock marching is
+pending.
+
+Refs #31
+---
+ crates/app/src/logging.rs                     |  25 +-
+ crates/app/tests/logging.rs                   |  16 ++
+ crates/ui/src/egui_app/file_drop.rs           |  76 +++++-
+ crates/ui/src/egui_app/shell_web.rs           |   6 +
+ crates/ui/src/egui_app/tests/browser_files.rs |  13 +
+ crates/ui/src/egui_app/tests/file_drop.rs     |  68 +++++
+ crates/ui/src/trace/cpu_eye.rs                | 244 ++++++++++++++----
+ crates/ui/src/trace/eye.rs                    |   6 +
+ docs/decisions/31-wasm-browser-runtime.md     |  28 ++
+ 9 files changed, 427 insertions(+), 55 deletions(-)
+ create mode 100644 docs/decisions/31-wasm-browser-runtime.md
+
+diff --git a/crates/app/src/logging.rs b/crates/app/src/logging.rs
+index 404caf478..fc8bb84d0 100644
+--- a/crates/app/src/logging.rs
++++ b/crates/app/src/logging.rs
+@@ -11,6 +11,7 @@
+ use std::path::Path;
+ use crate::clock::Instant;
+ 
++use tracing_subscriber::util::SubscriberInitExt as _;
+ use tracing_subscriber::EnvFilter;
+ 
+ /// Milliseconds since `started`, saturating at `u64::MAX` rather than
+@@ -43,13 +44,27 @@ pub fn filter_from_env() -> EnvFilter {
+         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+ }
+ 
++/// Build the `tracing` subscriber for `writer`. When `browser` is true
++/// (`wasm32`), timestamps and ANSI colour codes are omitted: `SystemTime::now()`
++/// panics on `wasm32-unknown-unknown` and browser consoles print plain text.
++pub fn dispatch<W>(writer: W, browser: bool) -> tracing::Dispatch
++where
++    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
++{
++    let base = tracing_subscriber::fmt()
++        .with_env_filter(filter_from_env())
++        .with_writer(writer)
++        .with_target(true);
++    if browser {
++        tracing::Dispatch::new(base.without_time().with_ansi(false).finish())
++    } else {
++        tracing::Dispatch::new(base.finish())
++    }
++}
++
+ /// Install the stderr subscriber. Safe to call more than once (a test
+ /// harness, a second entry point): only the first install wins, later
+ /// calls are no-ops.
+ pub fn init() {
+-    let _ = tracing_subscriber::fmt()
+-        .with_env_filter(filter_from_env())
+-        .with_writer(std::io::stderr)
+-        .with_target(true)
+-        .try_init();
++    let _ = dispatch(std::io::stderr, cfg!(target_arch = "wasm32")).try_init();
+ }
+diff --git a/crates/app/tests/logging.rs b/crates/app/tests/logging.rs
+index 4b25635ac..baaa10c17 100644
+--- a/crates/app/tests/logging.rs
++++ b/crates/app/tests/logging.rs
+@@ -177,3 +177,19 @@ fn a_budget_refusal_names_the_limit_that_fired_at_warn() {
+     assert!(refusal.contains("WARN"), "a refusal is a warning:\n{text}");
+     assert!(refusal.contains("passes"), "names the limit that fired:\n{text}");
+ }
++
++#[test]
++fn browser_subscriber_omits_timestamps_and_ansi_escapes() {
++    let out = Captured::default();
++    let dispatch = camcraft_app::logging::dispatch(out.clone(), true);
++    tracing::dispatcher::with_default(&dispatch, || {
++        tracing::warn!("browser tracing check");
++    });
++    let text = out.text();
++    assert!(text.contains("WARN") && text.contains("browser tracing check"), "{text}");
++    assert!(!text.contains('\x1b'), "browser console lines must omit ANSI escapes: {text:?}");
++    assert!(
++        text.trim_start().starts_with("WARN "),
++        "browser subscriber must omit SystemTime timestamps (which panic on wasm32): {text:?}"
++    );
++}
+diff --git a/crates/ui/src/egui_app/file_drop.rs b/crates/ui/src/egui_app/file_drop.rs
+index ed001f07d..7cf600603 100644
+--- a/crates/ui/src/egui_app/file_drop.rs
++++ b/crates/ui/src/egui_app/file_drop.rs
+@@ -50,15 +50,83 @@ pub(super) fn classify(paths: &[PathBuf]) -> Result<PathBuf, String> {
+ }
+ 
+ /// Once a frame: take a finished drop (queue the import or refuse it).
++/// Disk paths run through `classify` -> `CommandKind::ImportFile`;
++/// bare-name drops with bytes (browser drops, or in-memory drops) route
++/// through `file_pick`.
+ pub(super) fn take_drop(ui: &Ui, state: &mut State) {
+-    let files: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
++    let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+     if files.is_empty() {
+         return;
+     }
+-    match classify(&files) {
+-        Ok(path) => state.pending.push_back(CommandKind::ImportFile(path)),
+-        Err(msg) => state.refuse_drop(msg),
++    #[cfg(not(target_arch = "wasm32"))]
++    if files.len() != 1 || files[0].path().is_file() {
++        let paths: Vec<PathBuf> = files.iter().map(|f| f.path().to_path_buf()).collect();
++        match classify(&paths) {
++            Ok(path) => state.pending.push_back(CommandKind::ImportFile(path)),
++            Err(msg) => state.refuse_drop(msg),
++        }
++        return;
+     }
++    let [file] = files.as_slice() else {
++        state.refuse_drop(format!(
++            "drop refused: {} files were dropped; drop one model file at a time",
++            files.len()
++        ));
++        return;
++    };
++    let path = file.path().to_path_buf();
++    let name = label(&path);
++    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
++    if !MESH_EXTENSIONS.contains(&ext.as_str()) {
++        state.refuse_drop(format!(
++            "drop refused: {name} is not a model file (read: .{})",
++            MESH_EXTENSIONS.join(", .")
++        ));
++        return;
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    match file.bytes() {
++        Ok(bytes) => match check_drop_bytes(&name, Ok(bytes)) {
++            Ok(data) => deliver_model_bytes(ui.ctx(), name, Ok(data)),
++            Err(why) => state.refuse_drop(format!("drop refused: {why}")),
++        },
++        Err(why) => state.refuse_drop(format!("drop refused: {name} is not a readable file ({why})")),
++    }
++    #[cfg(target_arch = "wasm32")]
++    {
++        if let Some(wf) = file.web_file()
++            && let Some(why) = crate::file_pick::too_big(&name, wf.size())
++        {
++            state.refuse_drop(format!("drop refused: {why}"));
++            return;
++        }
++        state.status = format!("reading {name}…");
++        let file = std::sync::Arc::clone(file);
++        let ctx = ui.ctx().clone();
++        wasm_bindgen_futures::spawn_local(async move {
++            let bytes = check_drop_bytes(&name, file.bytes_async().await);
++            if let Err(why) = &bytes {
++                diag_warn!("file drop: {name}: {why}");
++            }
++            deliver_model_bytes(&ctx, name, bytes);
++        });
++    }
++}
++
++fn check_drop_bytes(name: &str, bytes: Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
++    bytes.and_then(|data| match crate::file_pick::too_big(name, data.len() as f64) {
++        Some(why) => Err(why),
++        None => Ok(data),
++    })
++}
++
++fn deliver_model_bytes(ctx: &egui::Context, name: String, bytes: Result<Vec<u8>, String>) {
++    crate::file_pick::deliver(crate::file_pick::PickedFile {
++        purpose: crate::file_pick::PickFor::Model,
++        name,
++        bytes,
++    });
++    ctx.request_repaint();
+ }
+ 
+ /// The hint over the viewport's rect while a file hovers the window.
+diff --git a/crates/ui/src/egui_app/shell_web.rs b/crates/ui/src/egui_app/shell_web.rs
+index 9babca272..49c8b33c9 100644
+--- a/crates/ui/src/egui_app/shell_web.rs
++++ b/crates/ui/src/egui_app/shell_web.rs
+@@ -42,6 +42,9 @@ type EyeSlot = Rc<RefCell<Option<Result<StockEye, String>>>>;
+ /// start-up itself runs on the browser's event loop.
+ #[wasm_bindgen]
+ pub fn camcraft_start(canvas_id: String) {
++    // Route camcraft-app's tracing events (and wgpu/eframe log lines) to
++    // stderr, which web/wasi_shim.js sends to console.warn without SystemTime.
++    camcraft_app::logging::init();
+     report("starting", "CamCraft is starting...");
+     wasm_bindgen_futures::spawn_local(async move {
+         match start(&canvas_id).await {
+@@ -249,6 +252,9 @@ impl eframe::App for WebShell {
+         });
+         view_pass::encode(&mut self.state, &mut self.view, &mut self.stock_eye, device, queue, &mut encoder);
+         queue.submit([encoder.finish()]);
++        if self.stock_eye.as_ref().is_some_and(StockEye::cpu_pending) {
++            ui.ctx().request_repaint();
++        }
+ 
+         // eframe keeps egui's own repaint timer; the document adds its own
+         // (queued commands, an import, a playing simulation).
+diff --git a/crates/ui/src/egui_app/tests/browser_files.rs b/crates/ui/src/egui_app/tests/browser_files.rs
+index dff6c3bba..1ee2b6f92 100644
+--- a/crates/ui/src/egui_app/tests/browser_files.rs
++++ b/crates/ui/src/egui_app/tests/browser_files.rs
+@@ -156,3 +156,16 @@ fn a_file_button_is_greyed_with_its_reason_in_the_browser() {
+     assert!(h.get_by_label("Load machine (.mch)").accesskit_node().is_disabled(), "greyed in the browser");
+     assert!(!h.get_by_label("Built-in").accesskit_node().is_disabled(), "a live button stays live");
+ }
++
++#[test]
++fn browser_shell_initializes_app_logging_and_repaints_pending_cpu_eye() {
++    let src = include_str!("../shell_web.rs");
++    assert!(
++        src.contains("camcraft_app::logging::init()"),
++        "shell_web must initialize camcraft_app logging so app tracing reaches the browser console"
++    );
++    assert!(
++        src.contains("cpu_pending"),
++        "shell_web must request a repaint while StockEye has a CPU march pending"
++    );
++}
+diff --git a/crates/ui/src/egui_app/tests/file_drop.rs b/crates/ui/src/egui_app/tests/file_drop.rs
+index 8365b92d9..483f80dfd 100644
+--- a/crates/ui/src/egui_app/tests/file_drop.rs
++++ b/crates/ui/src/egui_app/tests/file_drop.rs
+@@ -223,3 +223,71 @@ mod issue_2064_pins {
+         h.run_steps(2);
+     }
+ }
++
++#[derive(Debug)]
++struct BareDrop {
++    name: PathBuf,
++    data: Result<Vec<u8>, String>,
++}
++
++impl egui::DroppedFile for BareDrop {
++    fn path(&self) -> &Path {
++        &self.name
++    }
++    fn bytes(&self) -> Result<Vec<u8>, String> {
++        self.data.clone()
++    }
++}
++
++fn drop_bare(h: &mut Harness<'static, ShellUi>, name: &str, data: Result<Vec<u8>, String>) {
++    h.input_mut().dropped_files.push(std::sync::Arc::new(BareDrop {
++        name: PathBuf::from(name),
++        data,
++    }));
++    h.run_steps(2);
++    h.state_mut().state.settle();
++    h.run();
++}
++
++#[test]
++fn a_bare_name_dropped_mesh_with_bytes_imports_and_undoes() {
++    let mut h = shell_harness();
++    let before = names(&h);
++    assert!(!before.iter().any(|n| n == "cube"));
++    let bytes = std::fs::read(cube_path()).expect("cube.stl");
++    drop_bare(&mut h, "cube.stl", Ok(bytes));
++    assert!(
++        names(&h).iter().any(|n| n == "cube"),
++        "the bare-name dropped model is in the document: {}",
++        h.state().state.status
++    );
++    let st = &mut h.state_mut().state;
++    st.history.undo(&st.world);
++    assert_eq!(names(&h), before, "one undo removes the dropped model");
++}
++
++#[test]
++fn a_bare_name_drop_with_bad_extension_or_read_error_is_refused_by_name() {
++    let mut h = shell_harness();
++    let before = names(&h);
++    drop_bare(&mut h, "notes.txt", Ok(b"hello".to_vec()));
++    assert!(
++        h.state().state.status.contains("notes.txt is not a model file"),
++        "{}",
++        h.state().state.status
++    );
++    assert_eq!(names(&h), before);
++
++    drop_bare(&mut h, "unreadable.stl", Err("browser read error".into()));
++    let said = h.state().state.status.clone();
++    assert!(
++        said.contains("unreadable.stl") && said.contains("browser read error"),
++        "{said}"
++    );
++    assert_eq!(names(&h), before);
++
++    drop_bare(&mut h, "broken.step", Ok(b"this is not a STEP file".to_vec()));
++    let said = h.state().state.status.clone();
++    assert!(said.contains("import refused"), "{said}");
++    assert_eq!(names(&h), before);
++}
+diff --git a/crates/ui/src/trace/cpu_eye.rs b/crates/ui/src/trace/cpu_eye.rs
+index 9e687fa18..fc936518d 100644
+--- a/crates/ui/src/trace/cpu_eye.rs
++++ b/crates/ui/src/trace/cpu_eye.rs
+@@ -62,10 +62,25 @@ struct Shared {
+     published: Condvar,
+ }
+ 
+-/// The CPU eye's worker handle (see the module law).
++/// The CPU eye's worker handle (see the module law). Where OS threads are
++/// unavailable (`wasm32` or `ErrorKind::Unsupported`), it runs inline on
++/// the next `take` / `wait_picture` instead of refusing the fallback.
+ pub struct CpuEye {
+-    shared: Arc<Shared>,
+-    handle: Option<JoinHandle<()>>,
++    mode: Mode,
++}
++
++#[derive(Default)]
++struct Inline {
++    pending: Mutex<Option<CpuJob>>,
++    out: Mutex<Option<CpuPicture>>,
++}
++
++enum Mode {
++    Threaded {
++        shared: Arc<Shared>,
++        handle: Option<JoinHandle<()>>,
++    },
++    Inline(Box<Inline>),
+ }
+ 
+ fn lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+@@ -73,22 +88,56 @@ fn lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+ }
+ 
+ impl CpuEye {
+-    /// Start the worker; `Err` only when no thread spawns.
++    /// Start the worker; falls back to inline marching when threads are
++    /// unsupported (`wasm32`, or `ErrorKind::Unsupported`).
+     pub fn spawn() -> Result<Self, String> {
+-        let shared = Arc::new(Shared::default());
+-        let inner = Arc::clone(&shared);
+-        let handle = std::thread::Builder::new()
+-            .name("camcraft-cpu-eye".into())
+-            .spawn(move || run(&inner))
+-            .map_err(|e| format!("cpu eye: the worker would not start: {e}"))?;
+-        Ok(CpuEye { shared, handle: Some(handle) })
++        #[cfg(target_arch = "wasm32")]
++        {
++            return Ok(Self::inline());
++        }
++        #[cfg(not(target_arch = "wasm32"))]
++        {
++            let shared = Arc::new(Shared::default());
++            let inner = Arc::clone(&shared);
++            match std::thread::Builder::new()
++                .name("camcraft-cpu-eye".into())
++                .spawn(move || run(&inner))
++            {
++                Ok(handle) => Ok(CpuEye {
++                    mode: Mode::Threaded { shared, handle: Some(handle) },
++                }),
++                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
++                    diag_warn!("cpu eye: threads unsupported ({e}); marching inline");
++                    Ok(Self::inline())
++                }
++                Err(e) => Err(format!("cpu eye: the worker would not start: {e}")),
++            }
++        }
++    }
++
++    /// A thread-free CPU eye that marches the newest job on `take` or
++    /// `wait_picture` (#31).
++    #[must_use]
++    pub fn inline() -> Self {
++        CpuEye {
++            mode: Mode::Inline(Box::default()),
++        }
+     }
+ 
+     /// Ask for a march; the newest request wins over one not started.
+     pub fn request(&self, job: CpuJob) {
+-        if let Some(mut g) = lock(&self.shared.req) {
+-            g.job = Some(job);
+-            self.shared.wake.notify_one();
++        match &self.mode {
++            Mode::Threaded { shared, .. } => {
++                if let Some(mut g) = lock(&shared.req) {
++                    g.job = Some(job);
++                    shared.wake.notify_one();
++                }
++            }
++            Mode::Inline(inline) => {
++                if let Some(mut g) = lock(&inline.pending) {
++                    *g = Some(job);
++                }
++            }
+         }
+     }
+ 
+@@ -97,55 +146,119 @@ impl CpuEye {
+     #[must_use]
+     pub fn in_flight(&self, key: Key, fv: &Arc<FieldView>) -> bool {
+         let same = |k: Key, f: &Arc<FieldView>| k == key && Arc::ptr_eq(f, fv);
+-        lock(&self.shared.req).is_some_and(|g| {
+-            g.job.as_ref().is_some_and(|j| same(j.key, &j.fv)) || g.running.as_ref().is_some_and(|(k, f)| same(*k, f))
+-        })
++        match &self.mode {
++            Mode::Threaded { shared, .. } => lock(&shared.req).is_some_and(|g| {
++                g.job.as_ref().is_some_and(|j| same(j.key, &j.fv))
++                    || g.running.as_ref().is_some_and(|(k, f)| same(*k, f))
++            }),
++            Mode::Inline(inline) => {
++                lock(&inline.pending).is_some_and(|g| g.as_ref().is_some_and(|j| same(j.key, &j.fv)))
++            }
++        }
+     }
+ 
+-    /// The newest finished picture, never blocking. A lost worker
+-    /// answers `Err` by name under a `Key` nobody shows.
+-    pub fn take(&self) -> Option<CpuPicture> {
+-        match lock(&self.shared.out) {
+-            Some(mut g) => g.take().or_else(|| self.lost()),
+-            None => Some(lost_picture("cpu eye: the worker lost its output slot")),
++    /// Whether a march or finished picture is waiting to be drawn.
++    #[must_use]
++    pub fn is_pending(&self) -> bool {
++        match &self.mode {
++            Mode::Threaded { shared, .. } => {
++                lock(&shared.req).is_some_and(|g| g.job.is_some() || g.running.is_some())
++                    || lock(&shared.out).is_some_and(|g| g.is_some())
++            }
++            Mode::Inline(inline) => {
++                lock(&inline.pending).is_some_and(|g| g.is_some())
++                    || lock(&inline.out).is_some_and(|g| g.is_some())
++            }
+         }
+     }
+ 
+-    fn lost(&self) -> Option<CpuPicture> {
+-        self.handle.as_ref().filter(|h| h.is_finished()).map(|_| lost_picture("cpu eye: the worker stopped"))
++    /// The newest finished picture, never blocking on a worker thread.
++    /// In inline mode, marches the pending job here. A lost worker
++    /// answers `Err` by name under a `Key` nobody shows.
++    pub fn take(&self) -> Option<CpuPicture> {
++        match &self.mode {
++            Mode::Threaded { shared, handle } => match lock(&shared.out) {
++                Some(mut g) => g.take().or_else(|| lost(handle.as_ref())),
++                None => Some(lost_picture("cpu eye: the worker lost its output slot")),
++            },
++            Mode::Inline(inline) => {
++                if let Some(pic) = lock(&inline.out).and_then(|mut g| g.take()) {
++                    return Some(pic);
++                }
++                let job = lock(&inline.pending).and_then(|mut g| g.take())?;
++                Some(march_job(job))
++            }
++        }
+     }
+ 
+     /// Wait up to `timeout` for a picture to sit in the slot; tests
+     /// only - the UI never waits. True when one is there.
+     pub fn wait_picture(&self, timeout: Duration) -> bool {
+-        let Some(g) = lock(&self.shared.out) else { return false };
+-        match self.shared.published.wait_timeout_while(g, timeout, |s| s.is_none()) {
+-            Ok((g, _)) => g.is_some(),
+-            Err(_) => false,
++        match &self.mode {
++            Mode::Threaded { shared, .. } => {
++                let Some(g) = lock(&shared.out) else { return false };
++                match shared.published.wait_timeout_while(g, timeout, |s| s.is_none()) {
++                    Ok((g, _)) => g.is_some(),
++                    Err(_) => false,
++                }
++            }
++            Mode::Inline(inline) => {
++                if lock(&inline.out).is_some_and(|g| g.is_some()) {
++                    return true;
++                }
++                let Some(job) = lock(&inline.pending).and_then(|mut g| g.take()) else {
++                    return false;
++                };
++                let pic = march_job(job);
++                let Some(mut g) = lock(&inline.out) else { return false };
++                *g = Some(pic);
++                true
++            }
+         }
+     }
+ }
+ 
+ impl Drop for CpuEye {
+     fn drop(&mut self) {
+-        if let Some(mut g) = lock(&self.shared.req) {
+-            g.stop = true;
+-        }
+-        self.shared.wake.notify_all();
+-        if let Some(h) = self.handle.take()
+-            && h.join().is_err()
+-        {
+-            diag_warn!("cpu eye: the worker thread ended abnormally");
++        if let Mode::Threaded { shared, handle } = &mut self.mode {
++            if let Some(mut g) = lock(&shared.req) {
++                g.stop = true;
++            }
++            shared.wake.notify_all();
++            if let Some(h) = handle.take()
++                && h.join().is_err()
++            {
++                diag_warn!("cpu eye: the worker thread ended abnormally");
++            }
+         }
+     }
+ }
+ 
++fn lost(handle: Option<&JoinHandle<()>>) -> Option<CpuPicture> {
++    handle
++        .filter(|h| h.is_finished())
++        .map(|_| lost_picture("cpu eye: the worker stopped"))
++}
++
+ /// A lost worker's answer: an error under a key nobody shows, of no
+ /// field at all.
+ fn lost_picture(why: &str) -> CpuPicture {
+     CpuPicture { key: Key::NONE, fv: None, frame: Err(why.into()) }
+ }
+ 
++/// March one job on the caller's thread; shared by the worker and inline mode.
++fn march_job(job: CpuJob) -> CpuPicture {
++    let frame = match job.fv.stock.field() {
++        Some(stock) => {
++            let target = job.fv.target.as_ref().and_then(|t| t.field());
++            preview(stock, target, &job.cam, job.w, job.h, job.fv.tol)
++                .map_err(|e| format!("the CPU march refused the frame: {e}"))
++        }
++        None => Err("the field view holds no field to march".into()),
++    };
++    CpuPicture { key: job.key, fv: Some(job.fv), frame }
++}
++
+ /// The next job, or `None` to stop; waits while there is none.
+ fn next_job(shared: &Shared) -> Option<CpuJob> {
+     let mut g = lock(&shared.req)?;
+@@ -163,16 +276,9 @@ fn next_job(shared: &Shared) -> Option<CpuJob> {
+ 
+ fn run(shared: &Shared) {
+     while let Some(job) = next_job(shared) {
+-        let frame = match job.fv.stock.field() {
+-            Some(stock) => {
+-                let target = job.fv.target.as_ref().and_then(|t| t.field());
+-                preview(stock, target, &job.cam, job.w, job.h, job.fv.tol)
+-                    .map_err(|e| format!("the CPU march refused the frame: {e}"))
+-            }
+-            None => Err("the field view holds no field to march".into()),
+-        };
++        let pic = march_job(job);
+         if let Some(mut g) = lock(&shared.out) {
+-            *g = Some(CpuPicture { key: job.key, fv: Some(job.fv), frame });
++            *g = Some(pic);
+         }
+         if let Some(mut g) = lock(&shared.req) {
+             g.running = None;
+@@ -180,3 +286,49 @@ fn run(shared: &Shared) {
+         shared.published.notify_all();
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use camcraft_app::geometry::{cube, Point3};
++    use camcraft_app::stock_sim::{Backend, Stock, DEV_TOL, FIELD_BAND};
++
++    fn job() -> CpuJob {
++        let f = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 5.0));
++        let stock = Stock::from_facets(Backend::Field { band: FIELD_BAND }, &f.facets, 0.5).expect("stock");
++        let fv = Arc::new(FieldView {
++            stock,
++            target: None,
++            target_note: None,
++            cell: 0.5,
++            tol: DEV_TOL,
++            packed: None,
++        });
++        let cam = PreviewCamera::look_at(
++            Point3::new(-15.0, -15.0, 20.0),
++            Point3::new(5.0, 5.0, 2.5),
++            Point3::new(0.0, 0.0, 1.0),
++            0.5,
++        )
++        .expect("cam");
++        CpuJob { fv, cam, w: 16, h: 12, key: Key::NONE }
++    }
++
++    #[test]
++    fn inline_cpu_eye_marches_without_spawning_a_thread() {
++        let eye = CpuEye::inline();
++        let j = job();
++        let fv = Arc::clone(&j.fv);
++        assert!(!eye.is_pending());
++        eye.request(j);
++        assert!(eye.is_pending());
++        assert!(eye.in_flight(Key::NONE, &fv));
++        let pic = eye.take().expect("inline march returns a picture on take");
++        assert!(!eye.is_pending());
++        assert!(pic.frame.is_ok(), "inline march succeeds: {:?}", pic.frame.err());
++        let j2 = job();
++        eye.request(j2);
++        assert!(eye.wait_picture(Duration::from_millis(1)));
++        assert!(eye.take().is_some());
++    }
++}
+diff --git a/crates/ui/src/trace/eye.rs b/crates/ui/src/trace/eye.rs
+index 6bfd3fb92..6699ab3bd 100644
+--- a/crates/ui/src/trace/eye.rs
++++ b/crates/ui/src/trace/eye.rs
+@@ -129,6 +129,12 @@ impl StockEye {
+         self.cpu.as_ref().is_some_and(|c| c.wait_picture(timeout))
+     }
+ 
++    /// Whether the CPU fallback currently has a march pending or ready.
++    #[must_use]
++    pub fn cpu_pending(&self) -> bool {
++        self.cpu.as_ref().is_some_and(CpuEye::is_pending)
++    }
++
+     fn verdict_of(p: &crate::egui_app::colorvision::Semantic) -> [[f32; 3]; 4] {
+         [p.clean, p.rest, p.gouge, p.unjudged]
+     }
+diff --git a/docs/decisions/31-wasm-browser-runtime.md b/docs/decisions/31-wasm-browser-runtime.md
+new file mode 100644
+index 000000000..0bb770540
+--- /dev/null
++++ b/docs/decisions/31-wasm-browser-runtime.md
+@@ -0,0 +1,28 @@
++## #31 - Browser app diagnostics, dropped model bytes, and inline CpuEye fallback
++
++### What was decided
++
++- Add `camcraft_app::logging::dispatch(writer, browser)` using `.without_time().with_ansi(false)` for browser builds, and call `camcraft_app::logging::init()` in `camcraft_start`.
++- Route bare-name model drops in `file_drop::take_drop` through `check_drop_bytes` and `deliver_model_bytes`, reading in-memory or async browser bytes into `file_pick::deliver`.
++- Refactor `CpuEye` into `Mode::Threaded` and `Mode::Inline(Box<Inline>)` sharing `march_job`, falling back to inline on `wasm32` or `ErrorKind::Unsupported`.
++- Request frame repaint in `WebShell::ui` when `StockEye::cpu_pending` returns true.
++- Ship these slices under `Refs #31` without touching `PlayWorker` or `shell.rs`.
++
++### Why
++
++- `wasm32` lacks `SystemTime::now()`, OS threads, and local filesystem paths for dropped files.
++- Reusing `tracing_subscriber::fmt` without timestamps or ANSI codes writes diagnostics to stderr without new crate dependencies.
++- Boxing `Inline` satisfies `clippy::large_enum_variant` without suppressing the lint.
++- Handling bare-name byte drops in `take_drop` keeps `classify` and `MESH_EXTENSIONS` untouched so PR `#2150` stays conflict-free.
++- Deferring `PlayWorker` (`#2192`) and `shell.rs` (`#2110`, `#1330`) avoids stacking on blocked or unready PRs.
++
++### Considered and dropped
++
++- Adding `tracing-wasm` to `Cargo.toml`: dropped because Step 6 forbids dependency edits and stderr formatting already solves the panic.
++- Adding `#[allow(clippy::large_enum_variant)]` on `Mode`: dropped in favor of `Box<Inline>`.
++- Editing `file_drop::classify`: dropped because open PR `#2150` (`needs-maintainer`) modifies `classify` and `MESH_EXTENSIONS`.
++- Implementing inline `PlayWorker` playback here: dropped because open PR `#2192` edits `stock_play_worker.rs`.
++
++### Cost to change later
++
++- Low. All changes are local to four modules and covered by native unit and integration tests.

@@ -1,0 +1,564 @@
+From 0f2ddaf689d5a4ddfc0cd773da748912cc92a44e Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 21:37:01 +0100
+Subject: [PATCH] perf(app): walk the selection once per input for the page
+
+The Geometry tab asked operation::selection_account and the Contour
+fields asked operation::contour_auto_side on each frame. Each ask ran
+the full selection walk again: 4.2 ms and 4.1 ms per still frame in
+release on fig8 with ten top chains (#2238 probe, state b).
+
+The new operation/selection_memo.rs keeps one memo entry per input:
+the setup, the picks and the parameters by value, and each world read
+of the walk (facet allocation, pose, setup alignment, setup definition,
+machine kind, WCS pose and word, document unit). One miss runs the walk
+one time and keeps the notes, the door refusal and the Auto side.
+
+Generation, the pick doors and the region walk do not read this memo.
+They walk for themselves, so the side that the toolpath uses does not
+change.
+
+Pinned by contour_side_and_account_walk_once_per_input (every hit
+equals a fresh walk, across picks, undo, a side edit and a part move)
+and by the frame-cost probe (selections = 0 on still frames).
+
+Fixes #2248
+Fixes #2249
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/mod.rs               |   2 +
+ crates/app/src/operation/picks.rs             |  15 +-
+ crates/app/src/operation/selection.rs         |  14 +-
+ crates/app/src/operation/selection_memo.rs    | 210 ++++++++++++++++++
+ .../src/egui_app/tests/frame_cost_caches.rs   | 104 ++++++++-
+ .../ui/src/egui_app/tests/frame_cost_probe.rs |   8 +-
+ docs/decisions/2248-selection-walk.md         |  57 +++++
+ 7 files changed, 387 insertions(+), 23 deletions(-)
+ create mode 100644 crates/app/src/operation/selection_memo.rs
+ create mode 100644 docs/decisions/2248-selection-walk.md
+
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 60cd1994b..f89b4bddd 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -146,6 +146,8 @@ mod area;
+ use area::*;
+ mod pocket_memo;
+ pub use pocket_memo::pocket_slices;
++mod selection_memo;
++pub use selection_memo::{contour_auto_side_fresh, selection_account_fresh, selection_walks};
+ mod boundary;
+ pub use boundary::AreaCtx;
+ use boundary::AreaApplied;
+diff --git a/crates/app/src/operation/picks.rs b/crates/app/src/operation/picks.rs
+index e38580ce9..5c3640bde 100644
+--- a/crates/app/src/operation/picks.rs
++++ b/crates/app/src/operation/picks.rs
+@@ -78,13 +78,12 @@ pub fn selection_account(
+     if let Some(account) = super::probe_account(world, items, params) {
+         return account;
+     }
+-    let mut notes = Vec::new();
+-    match selection_geometry_impl(world, setup, items, params, Some(&mut notes)) {
+-        Ok(_) => (notes, None),
+-        // Other refusals stay `region_of`'s and generation's to make,
+-        // with detail; notes stay as far as the walk got.
+-        Err(err) => (notes, door_refusal(params, err)),
+-    }
++    // One walk per input, not per frame (#2248): the memo keys on the
++    // picks, the parameters and every world read of the walk. Other
++    // refusals stay `region_of`'s and generation's to make, with detail;
++    // notes stay as far as the walk got.
++    let a = super::selection_memo::answer(world, setup, items, params);
++    (a.notes, a.refusal)
+ }
+ 
+ /// The early flat-area refusal, decided at the pick/link/create doors.
+@@ -131,7 +130,7 @@ fn pocket_family(params: &OpParams) -> bool {
+     )
+ }
+ 
+-fn door_refusal(params: &OpParams, err: GenError) -> Option<String> {
++pub(super) fn door_refusal(params: &OpParams, err: GenError) -> Option<String> {
+     // #871: a door refusal that carried a ghost is the same sentence -
+     // the pick shows the words alone, so its ghost (and the spot it
+     // names) are dropped here, exactly as a plain refusal has none.
+diff --git a/crates/app/src/operation/selection.rs b/crates/app/src/operation/selection.rs
+index b997083e9..22cb5fd6d 100644
+--- a/crates/app/src/operation/selection.rs
++++ b/crates/app/src/operation/selection.rs
+@@ -90,17 +90,9 @@ pub fn contour_auto_side(
+ ) -> Option<bool> {
+     match src {
+         SrcRef::Stock | SrcRef::Entity(_) => Some(false),
+-        SrcRef::Selection(items) => {
+-            let (loops, _runs, auto) =
+-                selection_geometry_impl(world, setup, items, params, None).ok()?;
+-            match auto {
+-                _ if loops.is_empty() => None,
+-                machining2d::AutoSide::Inside => Some(true),
+-                machining2d::AutoSide::Outside => Some(false),
+-                // No verdict to quote: generation refuses it by name.
+-                machining2d::AutoSide::Undecided(_) => None,
+-            }
+-        }
++        // The display's ask, one walk per input (#2249): generation
++        // reads the side from its own walk in `job`, never from here.
++        SrcRef::Selection(items) => super::selection_memo::answer(world, setup, items, params).inside,
+     }
+ }
+ 
+diff --git a/crates/app/src/operation/selection_memo.rs b/crates/app/src/operation/selection_memo.rs
+new file mode 100644
+index 000000000..6d6e2e885
+--- /dev/null
++++ b/crates/app/src/operation/selection_memo.rs
+@@ -0,0 +1,210 @@
++//! The selection walk's display answers memoized per input (#2248,
++//! #2249): the Geometry tab asks for the selection account and the
++//! Contour fields for Auto's side on every frame, and each ask ran the
++//! whole walk ([`selection_geometry_impl`]) again. Our own design notes
++//! (`docs/decisions/2238-frame-cost-rule.md`); no vendor material
++//! consulted.
++//!
++//! The key is the input itself (rule 2): the setup, the picks and the
++//! parameters by value, and every world read the walk makes - for each
++//! picked entity and the setup's stock, the entity, its facet allocation
++//! (an immutable `Arc` every landing replaces), its pose and whether a
++//! setup alignment moves it; for the setup, its definition, its machine
++//! kind, its WCS pose and word, and the document unit. A hit is the
++//! answer a fresh walk gives. Generation, the verify check and the pick
++//! doors never read this memo (rule 6): they walk for themselves.
++
++use std::cell::{Cell, RefCell};
++use std::sync::{Arc, Weak};
++
++use flecs_ecs::prelude::Entity;
++
++use super::*;
++use crate::machine::Kind;
++use crate::schema::{Location, SetupDef};
++use crate::units::Unit;
++
++/// How many inputs the memo remembers: the open operation, the boundary
++/// summary's twin ask and a few recent picks.
++const CAP: usize = 8;
++
++/// A facet allocation, compared by address. The held `Weak` keeps the
++/// address from being reused while the entry lives.
++struct Tris(Weak<[Triangle]>);
++
++impl PartialEq for Tris {
++    fn eq(&self, other: &Self) -> bool {
++        self.0.ptr_eq(&other.0)
++    }
++}
++
++/// One entity the walk reads, as the world holds it now.
++#[derive(PartialEq)]
++struct Body {
++    name: String,
++    entity: Option<Entity>,
++    tris: Option<Tris>,
++    pose: Option<Location>,
++    part: bool,
++}
++
++/// Every world read of the walk, taken without walking.
++#[derive(PartialEq)]
++struct Reads {
++    effective: Option<String>,
++    def: Option<SetupDef>,
++    kind: Kind,
++    wcs: Option<Location>,
++    wcs_word: String,
++    unit: Unit,
++    bodies: Vec<Body>,
++}
++
++impl Reads {
++    fn of(world: &World, setup: Option<&str>, items: &[GeoSel]) -> Self {
++        let effective = crate::setup::effective(world, setup);
++        let def = effective.as_deref().and_then(|s| crate::setup::def_of(world, s));
++        let mut names: Vec<&str> = Vec::new();
++        for g in items {
++            if !names.contains(&g.entity.as_str()) {
++                names.push(&g.entity);
++            }
++        }
++        let stock = crate::setup::stock_entity_name(world, setup);
++        if !names.contains(&stock.as_str()) {
++            names.push(&stock);
++        }
++        let bodies = names
++            .into_iter()
++            .map(|name| {
++                let entity = model::find_by_name(world, name);
++                Body {
++                    name: name.to_owned(),
++                    entity,
++                    tris: entity.and_then(|e| model::facets_of(world, &e)).map(|t| Tris(Arc::downgrade(&t))),
++                    pose: entity.and_then(|e| model::transform_of(world, &e)),
++                    part: entity.is_some_and(|e| crate::setup_align::is_part(world, &e)),
++                }
++            })
++            .collect();
++        Self {
++            effective,
++            def,
++            kind: crate::setup_mount::kind_of_setup(world, setup),
++            wcs: crate::setup::wcs_entity(world, setup).and_then(|e| model::transform_of(world, &e)),
++            wcs_word: crate::setup::wcs_name(world, setup),
++            unit: crate::units::of(world),
++            bodies,
++        }
++    }
++}
++
++/// What the display asks of one walk.
++#[derive(Clone, Debug, PartialEq)]
++pub(super) struct Answer {
++    /// The walk's account of what the selection resolved to.
++    pub(super) notes: Vec<String>,
++    /// The early-door refusal the walk found (`door_refusal`).
++    pub(super) refusal: Option<String>,
++    /// Auto's side for a Contour: `Some(true)` inside, `None` when there
++    /// is no verdict to quote (see [`contour_auto_side`]).
++    pub(super) inside: Option<bool>,
++}
++
++impl Answer {
++    /// One real walk - what every miss runs, and what the pins compare a
++    /// hit against.
++    pub(super) fn fresh(world: &World, setup: Option<&str>, items: &[GeoSel], params: &OpParams) -> Self {
++        let mut notes = Vec::new();
++        match selection_geometry_impl(world, setup, items, params, Some(&mut notes)) {
++            Ok((loops, _runs, auto)) => {
++                let inside = match auto {
++                    _ if loops.is_empty() => None,
++                    machining2d::AutoSide::Inside => Some(true),
++                    machining2d::AutoSide::Outside => Some(false),
++                    // No verdict to quote: generation refuses it by name.
++                    machining2d::AutoSide::Undecided(_) => None,
++                };
++                Self { notes, refusal: None, inside }
++            }
++            Err(err) => Self { notes, refusal: super::picks::door_refusal(params, err), inside: None },
++        }
++    }
++}
++
++struct Entry {
++    setup: Option<String>,
++    items: Vec<GeoSel>,
++    params: OpParams,
++    reads: Reads,
++    answer: Answer,
++}
++
++thread_local! {
++    static MEMO: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
++    /// Real walks this memo ran on this thread - the counter the
++    /// #2248/#2249 pins read.
++    static WALKS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// [`Answer::fresh`], memoized by its full input.
++pub(super) fn answer(world: &World, setup: Option<&str>, items: &[GeoSel], params: &OpParams) -> Answer {
++    let reads = Reads::of(world, setup, items);
++    let hit = MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        let i = m.iter().position(|e| {
++            e.setup.as_deref() == setup && e.items == items && e.params == *params && e.reads == reads
++        })?;
++        let entry = m.remove(i);
++        let answer = entry.answer.clone();
++        m.push(entry); // MRU bump
++        Some(answer)
++    });
++    if let Some(answer) = hit {
++        return answer;
++    }
++    WALKS.with(|n| n.set(n.get().saturating_add(1)));
++    let answer = Answer::fresh(world, setup, items, params);
++    MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        if m.len() >= CAP {
++            m.remove(0);
++        }
++        m.push(Entry {
++            setup: setup.map(str::to_owned),
++            items: items.to_vec(),
++            params: params.clone(),
++            reads,
++            answer: answer.clone(),
++        });
++    });
++    answer
++}
++
++/// How many real walks the display memo ran on this thread
++/// ([`selection_account`] and [`contour_auto_side`] together).
++#[must_use]
++pub fn selection_walks() -> u64 {
++    WALKS.with(Cell::get)
++}
++
++/// [`contour_auto_side`] without the memo: one real walk. For the pins
++/// that prove a hit equals a fresh walk; generation never needs it (it
++/// reads the side from its own walk in `job`).
++#[must_use]
++pub fn contour_auto_side_fresh(world: &World, setup: Option<&str>, src: &SrcRef, params: &OpParams) -> Option<bool> {
++    match src {
++        SrcRef::Stock | SrcRef::Entity(_) => Some(false),
++        SrcRef::Selection(items) => Answer::fresh(world, setup, items, params).inside,
++    }
++}
++
++/// [`selection_account`] without the memo: one real walk, for the pins.
++#[must_use]
++pub fn selection_account_fresh(world: &World, setup: Option<&str>, items: &[GeoSel], params: &OpParams) -> (Vec<String>, Option<String>) {
++    if let Some(account) = super::probe_account(world, items, params) {
++        return account;
++    }
++    let a = Answer::fresh(world, setup, items, params);
++    (a.notes, a.refusal)
++}
+diff --git a/crates/ui/src/egui_app/tests/frame_cost_caches.rs b/crates/ui/src/egui_app/tests/frame_cost_caches.rs
+index 24192abb8..172cbaf79 100644
+--- a/crates/ui/src/egui_app/tests/frame_cost_caches.rs
++++ b/crates/ui/src/egui_app/tests/frame_cost_caches.rs
+@@ -7,9 +7,9 @@
+ //! material consulted.
+ 
+ use camcraft_app::geometry::feature;
+-use camcraft_app::operation::GeoSel;
++use camcraft_app::operation::{self, GeoSel, OpType};
+ 
+-use super::frame_cost_probe::{ADAPTIVE, adaptive_preview, fig8, run, top_chains};
++use super::frame_cost_probe::{ADAPTIVE, CONTOUR, adaptive_preview, create, fig8, run, top_chains};
+ use super::*;
+ 
+ fn chips(h: &Harness<'static, ShellUi>) -> Vec<(String, bool)> {
+@@ -62,3 +62,103 @@ fn pick_chips_group_the_welded_faces_once_and_follow_the_picks() {
+     assert_eq!(chips(&h), chips0, "after the undo the chips are the first ones");
+     assert_eq!(align(&h), align0, "after the undo the 3-2-1 answer is the first one");
+ }
++
++/// What the page shows for the open contour, through the memo, and what
++/// one fresh walk answers for the same document.
++#[derive(Debug, PartialEq)]
++struct Shown {
++    side: Option<bool>,
++    account: (Vec<String>, Option<String>),
++}
++
++fn contour_op(h: &Harness<'static, ShellUi>) -> camcraft_app::schema::Operation {
++    let st = &h.state().state;
++    model::find_by_name(&st.world, CONTOUR).and_then(|e| model::operation_of(&st.world, &e)).expect("the contour")
++}
++
++/// The memo's answer, asserted equal to a fresh walk's.
++fn shown(h: &Harness<'static, ShellUi>, why: &str) -> Shown {
++    let (st, op) = (&h.state().state, contour_op(h));
++    let SrcRef::Selection(items) = &op.src else { panic!("{why}: the contour has picks") };
++    let setup = op.setup.as_deref();
++    let memo = Shown {
++        side: operation::contour_auto_side(&st.world, setup, &op.src, &op.params),
++        account: operation::selection_account(&st.world, setup, items, &op.params),
++    };
++    let fresh = Shown {
++        side: operation::contour_auto_side_fresh(&st.world, setup, &op.src, &op.params),
++        account: operation::selection_account_fresh(&st.world, setup, items, &op.params),
++    };
++    assert_eq!(memo, fresh, "{why}: the cached side and account are the fresh walk's");
++    memo
++}
++
++/// Run `change`, then assert the page walked again and shows the fresh
++/// answer.
++fn changed(h: &mut Harness<'static, ShellUi>, why: &str, change: impl FnOnce(&mut State)) -> Shown {
++    let before = operation::selection_walks();
++    run(h, change);
++    assert!(operation::selection_walks() > before, "{why}: a changed input walks again");
++    shown(h, why)
++}
++
++fn set_contour(h: &mut Harness<'static, ShellUi>, why: &str, items: Vec<GeoSel>) -> Shown {
++    changed(h, why, |st| st.pending.push_back(CommandKind::SetOperationGeometry { name: CONTOUR.into(), items }))
++}
++
++/// An undo may land on an input the memo still holds: then it is a hit,
++/// and the hit must still be the fresh walk's answer.
++fn undo(h: &mut Harness<'static, ShellUi>, why: &str) -> Shown {
++    run(h, |st| st.pending.push_back(CommandKind::Undo));
++    shown(h, why)
++}
++
++/// #2248, #2249: the open contour's selection account and Auto side are
++/// one walk per input. A still frame walks nothing; each input change -
++/// the picks, the side, the part's pose - and each undo gives the answer
++/// a fresh walk gives, so the side the page names is the side the walk
++/// that generation runs would take.
++#[test]
++fn contour_side_and_account_walk_once_per_input() {
++    let mut h = fig8();
++    let chains = top_chains(&h.state().state);
++    assert!(chains.len() > 1, "fig8 has several top chains: {chains:?}");
++    create(&mut h, CONTOUR, OpType::Contour, chains.clone());
++    run(&mut h, |st| crate::actions::target(st, UiTarget::Operation(CONTOUR.into())));
++    let all = shown(&h, "all top chains");
++
++    // Still frames walk nothing, and the page shows the same answer.
++    h.run_steps(2);
++    let before = operation::selection_walks();
++    h.run_steps(3);
++    assert_eq!(operation::selection_walks() - before, 0, "a still frame walks no selection");
++    assert_eq!(shown(&h, "still"), all);
++
++    // Each top chain alone: a new pick is a new key.
++    let mut sides = Vec::new();
++    for (i, c) in chains.iter().enumerate() {
++        sides.push(set_contour(&mut h, &format!("top chain {i} alone"), vec![c.clone()]).side);
++    }
++    println!("auto side per top chain: {sides:?}; all chains: {:?}", all.side);
++    let back = undo(&mut h, "undo the last pick");
++    assert_eq!(back.side, sides[sides.len() - 2], "the undo shows the earlier pick's side");
++    // Back to the first picks: a hit or a walk, the answer is the first.
++    run(&mut h, |st| st.pending.push_back(CommandKind::SetOperationGeometry { name: CONTOUR.into(), items: chains.clone() }));
++    assert_eq!(shown(&h, "all chains again"), all);
++
++    // The side parameter: a named side is no Auto verdict.
++    let op = contour_op(&h);
++    let OpParams::Contour { .. } = &op.params else { panic!("a contour") };
++    let mut inside = op.params.clone();
++    if let OpParams::Contour { side, .. } = &mut inside {
++        *side = camcraft_app::machining2d::Side::Inside;
++    }
++    changed(&mut h, "side Inside", |st| st.pending.push_back(CommandKind::EditOperationParams { name: CONTOUR.into(), params: inside }));
++    assert_eq!(undo(&mut h, "undo side Inside"), all);
++
++    // The part's pose: a move reads new world points.
++    changed(&mut h, "fig8 moved", |st| {
++        st.pending.push_back(CommandKind::MoveModel { name: "fig8".into(), pos: [7.0, -3.0, 2.0], roll_deg: 0.0, pitch_deg: 0.0, yaw_deg: 30.0 });
++    });
++    assert_eq!(undo(&mut h, "undo the move"), all);
++}
+diff --git a/crates/ui/src/egui_app/tests/frame_cost_probe.rs b/crates/ui/src/egui_app/tests/frame_cost_probe.rs
+index 806e5af9e..149f54b6d 100644
+--- a/crates/ui/src/egui_app/tests/frame_cost_probe.rs
++++ b/crates/ui/src/egui_app/tests/frame_cost_probe.rs
+@@ -18,7 +18,7 @@ use crate::frame_cost::{self, Cost};
+ 
+ /// Still frames measured per state, after the warm-up frames.
+ const N: u32 = 6;
+-const CONTOUR: &str = "Probe contour";
++pub(super) const CONTOUR: &str = "Probe contour";
+ pub(super) const ADAPTIVE: &str = "Probe adaptive";
+ const FACE: &str = "Probe face";
+ 
+@@ -33,6 +33,7 @@ struct Counts {
+     digests: u64,
+     slices: u64,
+     patches: u64,
++    selections: u64,
+ }
+ 
+ fn counts() -> Counts {
+@@ -42,6 +43,7 @@ fn counts() -> Counts {
+         digests: model::feature_digests(),
+         slices: operation::pocket_slices(),
+         patches: model::patch_builds(),
++        selections: operation::selection_walks(),
+     }
+ }
+ 
+@@ -100,7 +102,7 @@ fn biggest_patch(st: &State) -> GeoSel {
+     GeoSel { entity: "fig8".into(), feature: FeatureSel::Patch(p.id) }
+ }
+ 
+-fn create(h: &mut Harness<'static, ShellUi>, name: &str, kind: OpType, items: Vec<GeoSel>) {
++pub(super) fn create(h: &mut Harness<'static, ShellUi>, name: &str, kind: OpType, items: Vec<GeoSel>) {
+     run(h, |st| {
+         let seed = model::find_by_name(&st.world, "Contour1").and_then(|e| model::operation_of(&st.world, &e)).expect("seed op");
+         st.pending.push_back(CommandKind::CreateOperation {
+@@ -146,6 +148,7 @@ fn still(h: &mut Harness<'static, ShellUi>) -> Probe {
+         digests: after.digests - before.digests,
+         slices: after.slices - before.slices,
+         patches: after.patches - before.patches,
++        selections: after.selections - before.selections,
+     };
+     let egui_delay =
+         h.output().viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |v| v.repaint_delay);
+@@ -223,6 +226,7 @@ fn still_frames_on_fig8_name_their_costs() {
+     for (name, p) in [("a", &a), ("b", &b), ("c", &c), ("d", &d), ("e", &e)] {
+         assert_eq!((p.delta.walks, p.delta.digests), (0, 0), "{name}: no chain walk, no digest on a still frame");
+         assert_eq!(p.delta.patches, 0, "{name}: no patch grouping on a still frame (#2247)");
++        assert_eq!(p.delta.selections, 0, "{name}: no selection walk for the page on a still frame (#2248, #2249)");
+         // Each piece of the scene is collected once per scene.
+         assert_eq!(calls(p, "scene/collect"), N, "{name}");
+         assert_eq!(calls(p, "scene/parts.models"), N, "{name}");
+diff --git a/docs/decisions/2248-selection-walk.md b/docs/decisions/2248-selection-walk.md
+new file mode 100644
+index 000000000..6ee36ab66
+--- /dev/null
++++ b/docs/decisions/2248-selection-walk.md
+@@ -0,0 +1,57 @@
++## #2248, #2249 - the selection walk runs once per input for the display
++
++**What was decided.** `operation::selection_account` and
++`operation::contour_auto_side` (app, `operation/selection_memo.rs`) read
++one memo of the selection walk. One miss runs the walk one time, with the
++notes on, and keeps three answers: the notes, the door refusal and the
++Auto side. The account and the side of the same operation share the
++entry, so the Geometry tab and the Contour fields cost one walk together.
++
++The key is the input itself (rule 2 of
++`docs/decisions/2238-frame-cost-rule.md`, first and second forms):
++
++- the setup name, the picks and the parameters, by value;
++- for each picked entity and the setup's stock: the entity, the
++  allocation of its `Facets` (an `Arc` that each landing replaces), its
++  `Location`, and whether a setup alignment moves it (`is_part`);
++- for the setup: the effective setup, its `SetupDef`, its machine kind,
++  its WCS pose and word;
++- the document unit.
++
++These are all the world reads of the walk (`selection_geometry_impl`,
++`stitch_open_runs`, `open_band`, `auto_side_of_picks`, `material_of`,
++`setup_problem`). A hit is the answer that a fresh walk gives.
++
++`operation::selection_walks()` counts the misses.
++`contour_auto_side_fresh` and `selection_account_fresh` walk without the
++memo, for the pins.
++
++**Safety line (rule 6).** Generation reads the side from its own walk in
++`job` (`selection_geometry_impl`), not from this memo. The pick doors
++(`selection_refusal`) and the region walk (`selection_geometry`) also walk
++for themselves. `region_of` reads the side through `contour_auto_side`,
++and `region_of` is a display answer (the viewport outline, the circular
++fit echo, the machined footprint). No gate calls it.
++
++**Why.** On fig8 with ten top chains, the walk cost 4.2 ms for the
++account and 4.1 ms for the side on each still frame in release (#2238
++probe, state b).
++
++**Dropped.**
++- A key on `doc_version`. Rule 2 forbids it, and the app layer does not
++  see it.
++- A key on the operation entity and a revision that
++  `SetOperationGeometry` bumps. A move of the part or an edit of the setup
++  changes the answer without that command, so the key must hold the
++  world reads.
++- A cache of the walk's geometry (`SelectionGeometry`). The display needs
++  only the three answers; `GenError` is not `Clone`, and a smaller entry
++  is cheaper to compare.
++- A cache for `region_of`'s own walk (`selection_geometry`). It is a
++  different answer (the region, not the account), it has its own probe
++  piece, and it gets its own cache by the same rule.
++
++**Cost to change later.** Small. The memo is a thread-local list of at
++most 8 entries. A new world read in the walk must be added to `Reads`;
++the pin `contour_side_and_account_walk_once_per_input` compares each hit
++with a fresh walk.

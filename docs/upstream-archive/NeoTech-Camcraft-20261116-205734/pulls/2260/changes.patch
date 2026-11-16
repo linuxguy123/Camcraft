@@ -1,0 +1,1783 @@
+From f37a111680aa81220db4873f202318269f8be81c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 16 Nov 2026 12:29:44 -0800
+Subject: [PATCH] fix(mcp): add AI batch undo, get_selection tool, and live
+ confirmation gate
+
+Add three AI chat safety mechanisms for #1942:
+- Add BatchCommand and History::begin_group/commit_group/cancel_group so a
+  multi-call AI chat turn folds into one Ctrl+Z / Ctrl+Y undo step.
+- Add the read-only get_selection MCP tool reading selected entities,
+  active setup/operation, viewport pick mode, and active geometry picks
+  while keeping ui -> app layering.
+- Add LiveGate, requires_approval, and answer_live_with at live MCP
+  dispatch, forbid auto-approval of posting and machine edits, share the
+  approval rule with AiChatState/transport, and bind Allow clicks to a
+  single-call ApprovedCall.
+
+Fixes #1942
+---
+ crates/app/src/commands/batch.rs              |  93 +++++++
+ crates/app/src/commands/mod.rs                |  53 +++-
+ crates/app/src/mcp/fallback.rs                |  30 +-
+ crates/app/src/mcp/live.rs                    | 193 ++++++++++++-
+ crates/app/src/mcp/mod.rs                     |   7 +-
+ crates/app/src/mcp/provider.rs                |   4 +-
+ crates/app/src/mcp/selection.rs               |  73 +++++
+ crates/app/src/mcp/tools.rs                   |   1 +
+ crates/app/src/script/mod.rs                  |   3 +
+ crates/app/tests/batch_undo.rs                | 170 ++++++++++++
+ crates/app/tests/mcp_live.rs                  | 256 +++++++++++++++++-
+ crates/ui/src/egui_app/ai_chat/state.rs       |  28 +-
+ crates/ui/src/egui_app/ai_chat/transport.rs   |  38 +--
+ crates/ui/src/egui_app/ai_chat/turn.rs        |  39 ++-
+ crates/ui/src/egui_app/ai_chat/worker.rs      |   7 +-
+ .../ui/src/egui_app/tests/ai_chat/safety.rs   | 231 +++++++++++++++-
+ crates/ui/src/mcp_host.rs                     |  15 +-
+ crates/ui/src/state.rs                        |  40 ++-
+ docs/decisions/1942-ai-chat-safety.md         |  18 ++
+ 19 files changed, 1218 insertions(+), 81 deletions(-)
+ create mode 100644 crates/app/src/commands/batch.rs
+ create mode 100644 crates/app/src/mcp/selection.rs
+ create mode 100644 crates/app/tests/batch_undo.rs
+ create mode 100644 docs/decisions/1942-ai-chat-safety.md
+
+diff --git a/crates/app/src/commands/batch.rs b/crates/app/src/commands/batch.rs
+new file mode 100644
+index 000000000..0755c9721
+--- /dev/null
++++ b/crates/app/src/commands/batch.rs
+@@ -0,0 +1,93 @@
++//! Labelled command batching (#1942): fold multiple commands into one
++//! `History` undo/redo step (`BatchCommand`), so a multi-call AI chat
++//! turn reverts in a single `Ctrl+Z`.
++//!
++//! Provenance: standard Command-pattern composite batching over our own
++//! `Command` trait; clean-room, no external code.
++
++use flecs_ecs::prelude::World;
++
++use super::{Command, HistoryEntry, next_history_id};
++
++pub(super) struct GroupFrame {
++    pub(super) label: String,
++    pub(super) start_len: usize,
++}
++
++pub(super) fn commit_frame(
++    frame: GroupFrame,
++    done: &mut Vec<HistoryEntry>,
++    saved: &mut Option<usize>,
++) -> bool {
++    if done.len() <= frame.start_len {
++        return false;
++    }
++    if let Some(s) = *saved {
++        if s == done.len() {
++            *saved = Some(frame.start_len + 1);
++        } else if s > frame.start_len {
++            *saved = None;
++        }
++    }
++    let commands: Vec<Box<dyn Command>> = done
++        .drain(frame.start_len..)
++        .map(|entry| entry.command)
++        .collect();
++    let batch = BatchCommand::new(frame.label.clone(), commands);
++    tracing::debug!(label = %frame.label, count = batch.len(), "commit_group");
++    done.push(HistoryEntry {
++        id: next_history_id(),
++        label: Some(frame.label),
++        command: Box::new(batch),
++    });
++    true
++}
++
++/// One undoable/redoable unit made of commands executed in order.
++pub struct BatchCommand {
++    label: String,
++    commands: Vec<Box<dyn Command>>,
++}
++
++impl BatchCommand {
++    /// Wrap `commands` (in execution order) under a human-readable `label`.
++    #[must_use]
++    pub fn new(label: impl Into<String>, commands: Vec<Box<dyn Command>>) -> Self {
++        Self {
++            label: label.into(),
++            commands,
++        }
++    }
++
++    /// The label given when the batch was opened.
++    #[must_use]
++    pub fn label(&self) -> &str {
++        &self.label
++    }
++
++    /// Number of inner commands grouped into this batch.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.commands.len()
++    }
++
++    /// True when the batch contains no commands.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.commands.is_empty()
++    }
++}
++
++impl Command for BatchCommand {
++    fn apply(&self, world: &World) {
++        for cmd in &self.commands {
++            cmd.apply(world);
++        }
++    }
++
++    fn invert(&self, world: &World) {
++        for cmd in self.commands.iter().rev() {
++            cmd.invert(world);
++        }
++    }
++}
+diff --git a/crates/app/src/commands/mod.rs b/crates/app/src/commands/mod.rs
+index 08e8965c3..6784f8cd4 100644
+--- a/crates/app/src/commands/mod.rs
++++ b/crates/app/src/commands/mod.rs
+@@ -5,6 +5,7 @@
+ 
+ // M13.2: workpiece material + the feeds-and-speeds suggestion.
+ pub mod accessory;
++pub mod batch;
+ pub mod builtin_vise;
+ pub mod cutting_data;
+ pub mod delete_entity;
+@@ -81,6 +82,7 @@ pub mod electrode;
+ use flecs_ecs::prelude::World;
+ 
+ pub use accessory::{AccessoryPlacement, InsertAccessory, SetAccessory};
++pub use batch::BatchCommand;
+ pub use builtin_vise::{InsertVise, SetVise, VisePlacement};
+ pub use cutting_data::{ApplyCuttingData, SetWorkMaterial};
+ pub use delete_entity::DeleteEntity;
+@@ -203,9 +205,12 @@ fn next_history_id() -> u64 {
+     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+ }
+ 
+-struct HistoryEntry {
+-    id: u64,
+-    command: Box<dyn Command>,
++use batch::GroupFrame;
++
++pub(super) struct HistoryEntry {
++    pub(super) id: u64,
++    pub(super) label: Option<String>,
++    pub(super) command: Box<dyn Command>,
+ }
+ 
+ /// Linear undo/redo over executed commands. Executing a fresh command clears
+@@ -220,6 +225,7 @@ struct HistoryEntry {
+ pub struct History {
+     done: Vec<HistoryEntry>,
+     redo: Vec<HistoryEntry>,
++    groups: Vec<GroupFrame>,
+     identity: u64,
+     saved: Option<usize>,
+ }
+@@ -229,6 +235,7 @@ impl Default for History {
+         Self {
+             done: Vec::new(),
+             redo: Vec::new(),
++            groups: Vec::new(),
+             saved: Some(0),
+             identity: next_history_id(),
+         }
+@@ -244,17 +251,56 @@ impl History {
+         command.apply(world);
+         self.done.push(HistoryEntry {
+             id: next_history_id(),
++            label: None,
+             command: Box::new(command),
+         });
+         self.redo.clear();
+     }
+ 
++    /// Begin a labelled undo group (`BatchCommand`) so commands executed
++    /// before [`Self::commit_group`] fold into one undo/redo step (#1942).
++    pub fn begin_group(&mut self, label: impl Into<String>) {
++        self.groups.push(GroupFrame {
++            label: label.into(),
++            start_len: self.done.len(),
++        });
++    }
++
++    /// Fold commands executed since the matching [`Self::begin_group`] into
++    /// one [`BatchCommand`] undo step. Empty groups add nothing and return `false`.
++    pub fn commit_group(&mut self) -> bool {
++        let Some(frame) = self.groups.pop() else {
++            return false;
++        };
++        batch::commit_frame(frame, &mut self.done, &mut self.saved)
++    }
++
++    /// Close the innermost open group without collapsing its commands into one batch.
++    pub fn cancel_group(&mut self) -> bool {
++        self.groups.pop().is_some()
++    }
++
++    /// True while an undo group opened by [`Self::begin_group`] is active.
++    #[must_use]
++    pub fn in_group(&self) -> bool {
++        !self.groups.is_empty()
++    }
++
++    /// Label of the top committed [`BatchCommand`], if any.
++    #[must_use]
++    pub fn top_label(&self) -> Option<&str> {
++        self.done.last().and_then(|entry| entry.label.as_deref())
++    }
++
+     pub fn undo(&mut self, world: &World) -> bool {
+         match self.done.pop() {
+             Some(command) => {
+                 tracing::debug!("undo");
+                 command.command.invert(world);
+                 self.redo.push(command);
++                for frame in &mut self.groups {
++                    frame.start_len = frame.start_len.min(self.done.len());
++                }
+                 true
+             }
+             None => false,
+@@ -284,6 +330,7 @@ impl History {
+         self.identity = next_history_id();
+         self.done.clear();
+         self.redo.clear();
++        self.groups.clear();
+         self.saved = Some(0);
+     }
+ 
+diff --git a/crates/app/src/mcp/fallback.rs b/crates/app/src/mcp/fallback.rs
+index 014576cd2..51e4fc25e 100644
+--- a/crates/app/src/mcp/fallback.rs
++++ b/crates/app/src/mcp/fallback.rs
+@@ -63,6 +63,23 @@ struct Proposal {
+     arguments: Value,
+ }
+ 
++/// Explicit read-only tool allowlist: a new tool is never trusted by name prefix.
++#[must_use]
++pub fn is_read_only_tool(name: &str) -> bool {
++    matches!(
++        name,
++        "get_job"
++            | "get_selection"
++            | "list_operation_types"
++            | "list_tool_catalog"
++            | "list_holder_library"
++            | "list_features"
++            | "get_operation_geometry"
++            | "get_tool_cutter_profile"
++            | "suggest_cutting_data"
++    )
++}
++
+ /// Accept exactly one object, optionally enclosed in one JSON code fence.
+ /// Reject surrounding prose or more than one proposal instead of guessing intent.
+ pub fn parse_prompt(text: &str) -> Result<PendingCall, String> {
+@@ -77,18 +94,7 @@ pub fn parse_prompt(text: &str) -> Result<PendingCall, String> {
+     };
+     let proposal: Proposal = serde_json::from_str(json).map_err(|e| format!("prompt JSON: {e}"))?;
+     schema_validation::arguments(&proposal.tool, &proposal.arguments)?;
+-    // An explicit read-only allowlist: a new tool is never trusted by its name prefix.
+-    let read_only = matches!(
+-        proposal.tool.as_str(),
+-        "get_job"
+-            | "list_operation_types"
+-            | "list_tool_catalog"
+-            | "list_holder_library"
+-            | "list_features"
+-            | "get_operation_geometry"
+-            | "get_tool_cutter_profile"
+-            | "suggest_cutting_data"
+-    );
++    let read_only = is_read_only_tool(&proposal.tool);
+     Ok(PendingCall {
+         call: ToolCall {
+             id: String::new(),
+diff --git a/crates/app/src/mcp/live.rs b/crates/app/src/mcp/live.rs
+index 19f7f8129..688fe20ab 100644
+--- a/crates/app/src/mcp/live.rs
++++ b/crates/app/src/mcp/live.rs
+@@ -8,6 +8,7 @@
+ //! (JSON-RPC 2.0 framed as the public MCP specification, 2025-06-18).
+ //! Clean-room, public sources only.
+ 
++use super::selection::SelectionContext;
+ use super::{tool_err, Server};
+ use crate::commands::History;
+ use crate::script::Env;
+@@ -25,6 +26,148 @@ const LIVE_REFUSED: &[(&str, &str)] = &[(
+ without the app's unsaved-changes prompt; ask the user to open the file (File > Open)",
+ )];
+ 
++/// Why a live MCP tool call requires explicit user approval before dispatch (#1942).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum GateKind {
++    /// G-code posting (`post`). Never auto-approved.
++    Posting,
++    /// Machine mount or machine definition edits (`load_machine`, `edit_machine`). Never auto-approved.
++    MachineEdit,
++    /// Setup post or workholding limit edits (`set_setup_post`, `set_workholding_max_rpm`, `set_setup_nose_to_axis`).
++    LimitEdit,
++    /// File writes (`save_project`, `export_tool_library`, `export_fixture_dxf` with `path`).
++    FileWrite,
++    /// File-path reads or arguments (`import_model`, `import_tool_library`, `set_tool_body`,
++    /// `set_lathe_tool_body`, `attach_tool_body_piece`, `import_dxf_fixture` with `path`,
++    /// or any tool call carrying a non-null `path` or `output` argument).
++    FilePathAccess,
++}
++
++impl GateKind {
++    /// G-code posting and machine edits are NEVER auto-approvable.
++    #[must_use]
++    pub const fn allows_auto_approve(self) -> bool {
++        !matches!(self, Self::Posting | Self::MachineEdit)
++    }
++}
++
++/// Classify whether a tool call requires explicit user approval at live dispatch.
++#[must_use]
++pub fn requires_approval(tool: &str, args: &Value) -> Option<GateKind> {
++    match tool {
++        "post" => Some(GateKind::Posting),
++        "load_machine" | "edit_machine" => Some(GateKind::MachineEdit),
++        "set_setup_post" | "set_workholding_max_rpm" | "set_setup_nose_to_axis" => {
++            Some(GateKind::LimitEdit)
++        }
++        "save_project" | "export_tool_library" => Some(GateKind::FileWrite),
++        "export_fixture_dxf" if has_non_null_arg(args, "path") => Some(GateKind::FileWrite),
++        "import_model"
++        | "import_tool_library"
++        | "set_tool_body"
++        | "set_lathe_tool_body"
++        | "attach_tool_body_piece" => Some(GateKind::FilePathAccess),
++        "import_dxf_fixture" if has_non_null_arg(args, "path") => Some(GateKind::FilePathAccess),
++        _ if has_non_null_arg(args, "path") || has_non_null_arg(args, "output") => {
++            Some(GateKind::FilePathAccess)
++        }
++        _ => None,
++    }
++}
++
++fn has_non_null_arg(args: &Value, key: &str) -> bool {
++    args.get(key).is_some_and(|v| !v.is_null())
++}
++
++fn normalize_args(args: Value) -> Value {
++    if args.is_null() { json!({}) } else { args }
++}
++
++/// Explicit single-call user approval binding exact tool name and arguments.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ApprovedCall {
++    tool: String,
++    arguments: Value,
++}
++
++impl ApprovedCall {
++    /// Bind user approval to one exact tool call and argument object.
++    #[must_use]
++    pub fn new(tool: impl Into<String>, arguments: Value) -> Self {
++        Self {
++            tool: tool.into(),
++            arguments: normalize_args(arguments),
++        }
++    }
++
++    fn matches(&self, tool: &str, args: &Value) -> bool {
++        self.tool == tool && self.arguments == normalize_args(args.clone())
++    }
++}
++
++/// Permission state evaluated before `answer_live` dispatches a gated tool.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct LiveGate {
++    /// Single-call explicit user approval from the UI Allow/Deny confirmation.
++    pub approved: Option<ApprovedCall>,
++    /// Optional caller opt-in for non-posting, non-machine file/limit tools.
++    /// G-code posting (`post`) and machine edits (`load_machine`, `edit_machine`)
++    /// ignore this flag and ALWAYS require explicit [`Self::approved`].
++    pub auto_approve_non_critical: bool,
++}
++
++impl LiveGate {
++    /// Construct a gate permitting one exact tool call approved by the user.
++    #[must_use]
++    pub fn allow_once(tool: impl Into<String>, arguments: Value) -> Self {
++        Self {
++            approved: Some(ApprovedCall::new(tool, arguments)),
++            auto_approve_non_critical: false,
++        }
++    }
++
++    /// Check whether `tool` with `args` is authorized under this gate.
++    pub fn check(&self, tool: &str, args: &Value) -> Result<(), String> {
++        let Some(kind) = requires_approval(tool, args) else {
++            return Ok(());
++        };
++        if self.approved.as_ref().is_some_and(|a| a.matches(tool, args)) {
++            return Ok(());
++        }
++        if self.auto_approve_non_critical && kind.allows_auto_approve() {
++            return Ok(());
++        }
++        Err(refusal_message(tool, kind))
++    }
++}
++
++fn refusal_message(tool: &str, kind: GateKind) -> String {
++    match kind {
++        GateKind::Posting => format!(
++            "{tool}: explicit user approval is required before posting G-code (auto-approval is forbidden)"
++        ),
++        GateKind::MachineEdit => format!(
++            "{tool}: explicit user approval is required before changing machine configuration (auto-approval is forbidden)"
++        ),
++        GateKind::LimitEdit => format!(
++            "{tool}: explicit user approval is required before changing post or workholding limits"
++        ),
++        GateKind::FileWrite => format!(
++            "{tool}: explicit user approval is required before writing files"
++        ),
++        GateKind::FilePathAccess => format!(
++            "{tool}: explicit user approval is required before accessing file-path arguments"
++        ),
++    }
++}
++
++/// Caller-supplied live gate and UI selection context for [`answer_live_with`].
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct LiveOptions {
++    pub gate: LiveGate,
++    pub selection: Option<SelectionContext>,
++}
++
+ /// What one live line did.
+ #[derive(Debug, Default)]
+ pub struct LiveAnswer {
+@@ -36,24 +179,45 @@ pub struct LiveAnswer {
+     pub tool: Option<String>,
+ }
+ 
+-/// Answer one wire line against `world` and `history`. `doc_path` is
+-/// the file the app has open, so a bare `save_project` saves over it the
+-/// way the app's Ctrl+S does. The world is shared by handle (a flecs
+-/// world clone is a reference, not a copy); the history is lent for the
+-/// call and handed back whatever happens - a refused or failed tool
+-/// included.
++/// Answer one wire line against `world` and `history` using the default
++/// unapproved [`LiveGate`] (blocking unconfirmed posting, file writes,
++/// file-path arguments, and machine/post/workholding limit edits).
+ pub fn answer_live(world: &World, history: &mut History, doc_path: Option<&Path>, line: &str) -> LiveAnswer {
++    answer_live_with(world, history, doc_path, line, &LiveOptions::default())
++}
++
++/// Answer one wire line against `world` and `history` with explicit live
++/// gate approvals and optional UI selection snapshot (#1942).
++pub fn answer_live_with(
++    world: &World,
++    history: &mut History,
++    doc_path: Option<&Path>,
++    line: &str,
++    options: &LiveOptions,
++) -> LiveAnswer {
+     let parsed = serde_json::from_str::<Value>(line.trim()).ok();
+-    let tool = parsed
++    let call_params = parsed
+         .as_ref()
+         .filter(|m| m.get("method").and_then(Value::as_str) == Some("tools/call"))
+-        .and_then(|m| m.get("params")?.get("name")?.as_str().map(str::to_owned));
+-    if let (Some(msg), Some(name)) = (&parsed, &tool)
+-        && let Some((_, why)) = LIVE_REFUSED.iter().find(|(n, _)| n == name)
+-        && let Some(id) = msg.get("id")
+-    {
+-        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": tool_err(why) });
+-        return LiveAnswer { reply: Some(reply.to_string()), tool: None };
++        .and_then(|m| m.get("params"));
++    let tool = call_params
++        .and_then(|p| p.get("name")?.as_str().map(str::to_owned));
++    let args = call_params
++        .and_then(|p| p.get("arguments").cloned())
++        .map_or_else(|| json!({}), normalize_args);
++    if let (Some(msg), Some(name)) = (&parsed, &tool) {
++        if let Some((_, why)) = LIVE_REFUSED.iter().find(|(n, _)| n == name) {
++            let reply = msg
++                .get("id")
++                .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": tool_err(why) }).to_string());
++            return LiveAnswer { reply, tool: None };
++        }
++        if let Err(why) = options.gate.check(name, &args) {
++            let reply = msg
++                .get("id")
++                .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": tool_err(&why) }).to_string());
++            return LiveAnswer { reply, tool: None };
++        }
+     }
+     let mut server = Server {
+         env: Env {
+@@ -64,6 +228,7 @@ pub fn answer_live(world: &World, history: &mut History, doc_path: Option<&Path>
+             doc_path: doc_path.map(Path::to_path_buf),
+             posted: None,
+             last_value: Value::Null,
++            selection: options.selection.clone(),
+         },
+     };
+     let reply = server.handle_line(line);
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 00fad6dfb..5e5a40b87 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -47,6 +47,7 @@ mod pockets;
+ // #1534: document and per-setup post options (`SetPostOptions` / `SetSetupPostOptions`).
+ mod post_options_tools;
+ mod render;
++mod selection;
+ mod setup_tools;
+ mod tool_delete;
+ mod tool_edit;
+@@ -70,7 +71,11 @@ mod workholding_tools;
+ // loopback socket, against the app's own document and History.
+ pub use bridge::bridge;
+ pub use listen::{port_from, Inbox, Request, Wake, IDLE_TIMEOUT};
+-pub use live::{answer_live, LiveAnswer};
++pub use live::{
++    answer_live, answer_live_with, requires_approval, ApprovedCall, GateKind, LiveAnswer,
++    LiveGate, LiveOptions,
++};
++pub use selection::{PickMode, SelectionContext};
+ 
+ use crate::script::Env;
+ 
+diff --git a/crates/app/src/mcp/provider.rs b/crates/app/src/mcp/provider.rs
+index 35201e3c5..e63db1826 100644
+--- a/crates/app/src/mcp/provider.rs
++++ b/crates/app/src/mcp/provider.rs
+@@ -4,7 +4,9 @@
+ use super::tools as registry;
+ use serde_json::{Value, json};
+ 
+-pub use super::fallback::{FallbackMode, PendingCall, parse_prompt, prompt_context, qa_context};
++pub use super::fallback::{
++    FallbackMode, PendingCall, is_read_only_tool, parse_prompt, prompt_context, qa_context,
++};
+ pub use super::provider_calls::{ToolCall, parse_calls, tool_result};
+ 
+ /// Select the wire format by endpoint, including Responses-only models.
+diff --git a/crates/app/src/mcp/selection.rs b/crates/app/src/mcp/selection.rs
+new file mode 100644
+index 000000000..ca525a34d
+--- /dev/null
++++ b/crates/app/src/mcp/selection.rs
+@@ -0,0 +1,73 @@
++//! The read-only `get_selection` MCP tool (#1942): returns currently
++//! selected entities (`SelectEntity`) and, when called from a live UI
++//! session, the active viewport pick mode (`state.geo_pick`) and
++//! geometry picks (`state.op_ui.geo`) passed via [`SelectionContext`].
++//!
++//! Provenance: our own read-only MCP view over `model::selected_names`,
++//! `setup::active`, and UI selection snapshots; clean-room, no external
++//! sources.
++
++use serde_json::{Map, Value, json};
++
++use super::pick::picks_view;
++use crate::model;
++use crate::operation::GeoSel;
++use crate::script::Env;
++use crate::setup;
++
++/// Active viewport pick mode mirrored from `crates/ui/src/state.rs`'s `GeoPick`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PickMode {
++    Model,
++    Face,
++    Edge,
++    Vertex,
++}
++
++impl PickMode {
++    /// Wire name returned by `get_selection`.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::Model => "model",
++            Self::Face => "face",
++            Self::Edge => "edge",
++            Self::Vertex => "vertex",
++        }
++    }
++}
++
++/// UI selection snapshot passed into [`super::answer_live_with`] without
++/// inverting the `ui -> app` dependency direction.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct SelectionContext {
++    pub pick_mode: Option<PickMode>,
++    pub geometry_picks: Vec<GeoSel>,
++    pub active_operation: Option<String>,
++}
++
++/// Read-only `get_selection` MCP handler.
++pub(super) fn get_selection(env: &mut Env, _a: &Map<String, Value>) -> Result<Value, String> {
++    let w = &env.world;
++    let selected_entities = model::selected_names(w);
++    let selected_op_in_world = selected_entities
++        .iter()
++        .find(|name| model::find_by_name(w, name).is_some_and(|e| model::is_operation(w, &e)));
++    let (pick_mode, geometry_picks, selected_operation) = match &env.selection {
++        Some(ctx) => (
++            ctx.pick_mode.map(PickMode::as_str),
++            picks_view(&ctx.geometry_picks),
++            ctx.active_operation
++                .clone()
++                .or_else(|| selected_op_in_world.cloned()),
++        ),
++        None => (None, Vec::new(), selected_op_in_world.cloned()),
++    };
++    Ok(json!({
++        "selected_entities": selected_entities,
++        "active_setup": setup::active(w),
++        "selected_operation": selected_operation,
++        "pick_mode": pick_mode,
++        "geometry_picks": geometry_picks,
++    }))
++}
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 4f98df2cf..74d712dd5 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -26,6 +26,7 @@ const TOOLS: &[Tool] = &[
+     Tool { name: "save_project", description: "Save the document as a .camproj file. Without a path, saves over the file last opened or saved.", schema: s_opt_path, run: save_project },
+     Tool { name: "import_model", description: "Import a mesh model (STL, STEP or OBJ) through the app's importers. A name already used by a model updates that model. A STEP model too large to import at full detail answers with reduced_fidelity: how closely its surfaces are approximated, in mm - gouge checks against it are stricter, and its operations are refused at the post when it is too coarse to check; import it again with a larger facet_budget to clear that. A STEP closed shell that meshes open imports incomplete: reduced_fidelity then says incomplete and names the hole, and every operation on the model is refused at the post. notes lists what the importer changed, e.g. a STEP face wound against its neighbours that was flipped, by name, or a closed STEP solid wound inward that was turned outward.", schema: s_import, run: import_model },
+     Tool { name: "get_job", description: "The whole document as JSON: setups, stock, work offsets, models (one imported at reduced fidelity carries reduced_fidelity), tools, and operations with their parameters and status.", schema: s_empty, run: job::get_job },
++    Tool { name: "get_selection", description: "Read currently selected entities, active setup, active operation, viewport pick mode (model, face, edge, vertex), and active geometry picks.", schema: s_empty, run: super::selection::get_selection },
+     Tool { name: "list_operation_types", description: "Every operation kind with its parameter fields, JSON types and default values, and the tool kinds it accepts.", schema: s_empty, run: job::list_operation_types },
+     Tool { name: "list_tool_catalog", description: "The built-in tool catalog: names and definitions add_tool can copy into the document.", schema: s_empty, run: job::list_tool_catalog },
+     Tool { name: "list_holder_library", description: "The built-in holder library: BT30, BT40 and CAT40 holders with ER collet or Weldon side-lock noses, and standalone ER11-ER40 chucks - names set_tool_holder takes, with their dimensions and the shanks they clamp.", schema: s_empty, run: holders::list_holder_library },
+diff --git a/crates/app/src/script/mod.rs b/crates/app/src/script/mod.rs
+index eb048ab59..49c2cdb11 100644
+--- a/crates/app/src/script/mod.rs
++++ b/crates/app/src/script/mod.rs
+@@ -75,6 +75,8 @@ pub(crate) struct Env {
+     /// pull (`cam.result()`, and the non-string read of a parked
+     /// object). One value pushed into the sandbox on demand.
+     pub last_value: Value,
++    /// Optional UI selection snapshot passed into live MCP calls (#1942).
++    pub selection: Option<crate::mcp::SelectionContext>,
+ }
+ 
+ /// The `cam` methods, as data: name, arity, TypeScript line, and the
+@@ -120,6 +122,7 @@ impl Env {
+             doc_path: None,
+             posted: None,
+             last_value: Value::Null,
++            selection: None,
+         }
+     }
+ }
+diff --git a/crates/app/tests/batch_undo.rs b/crates/app/tests/batch_undo.rs
+new file mode 100644
+index 000000000..3ec1ea344
+--- /dev/null
++++ b/crates/app/tests/batch_undo.rs
+@@ -0,0 +1,170 @@
++//! Labelled command batching (#1942): `BatchCommand`, `History::begin_group`,
++//! `History::commit_group`, `History::cancel_group`, clean/dirty tracking,
++//! empty groups, nested groups, and reverse-order undo.
++//!
++//! Gate map (M4.4): covers app::commands (batch, mod).
++
++use camcraft_app::commands::{
++    AddTool, BatchCommand, CreateOperation, History, SetStock,
++};
++use camcraft_app::model;
++use camcraft_app::operation::{OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::setup;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++fn face_params() -> OpParams {
++    camcraft_app::operation::seed_params(0)
++}
++
++#[test]
++fn begin_and_commit_group_folds_multi_command_turn_into_one_undo_step() {
++    let world = new_world();
++    let mut history = History::default();
++    assert!(!history.is_dirty());
++
++    history.begin_group("AI chat: setup and face");
++    assert!(history.in_group());
++
++    let stock_cmd = SetStock::new(
++        &world,
++        StockShape::Box {
++            dx: 80.0,
++            dy: 80.0,
++            dz: 20.0,
++        },
++        Location::default(),
++    )
++    .expect("valid stock");
++    history.execute(&world, stock_cmd);
++
++    let (_, tool) = catalog()
++        .into_iter()
++        .find(|(n, _)| *n == "EM-0400-2FL")
++        .expect("catalog tool");
++    let tool_cmd = AddTool::new(&world, "EM-0400-2FL", tool).expect("valid tool");
++    history.execute(&world, tool_cmd);
++
++    let op_cmd = CreateOperation::new(
++        &world,
++        "Face1",
++        "EM-0400-2FL",
++        SrcRef::Stock,
++        face_params(),
++    )
++    .expect("valid operation");
++    history.execute(&world, op_cmd);
++
++    assert!(history.commit_group());
++    assert!(!history.in_group());
++    assert_eq!(history.done_len(), 1);
++    assert_eq!(history.top_label(), Some("AI chat: setup and face"));
++    assert!(history.is_dirty());
++    assert!(model::find_by_name(&world, "Face1").is_some());
++    assert!(model::find_by_name(&world, "EM-0400-2FL").is_some());
++    assert!(setup::stock_entity(&world, None).is_some());
++
++    // One undo reverts all three commands in reverse order (op -> tool -> stock).
++    assert!(history.undo(&world));
++    assert_eq!(history.done_len(), 0);
++    assert!(!history.is_dirty());
++    assert!(model::find_by_name(&world, "Face1").is_none());
++    assert!(model::find_by_name(&world, "EM-0400-2FL").is_none());
++    assert!(setup::stock_entity(&world, None).and_then(|e| model::stock_def_of(&world, &e)).is_none());
++
++    // One redo brings all three back in forward order.
++    assert!(history.redo(&world));
++    assert_eq!(history.done_len(), 1);
++    assert!(history.is_dirty());
++    assert!(model::find_by_name(&world, "Face1").is_some());
++    assert!(model::find_by_name(&world, "EM-0400-2FL").is_some());
++    assert!(setup::stock_entity(&world, None).and_then(|e| model::stock_def_of(&world, &e)).is_some());
++}
++
++#[test]
++fn empty_and_nested_groups_and_direct_batch_command_behave_cleanly() {
++    let world = new_world();
++    let mut history = History::default();
++
++    // Empty group leaves no undo entry.
++    history.begin_group("empty");
++    assert!(!history.commit_group());
++    assert!(!history.in_group());
++    assert_eq!(history.done_len(), 0);
++    assert!(!history.is_dirty());
++
++    // Direct BatchCommand construction and nested group commit.
++    let (_, tool) = catalog()
++        .into_iter()
++        .find(|(n, _)| *n == "EM-0400-2FL")
++        .expect("catalog tool");
++    let batch = BatchCommand::new(
++        "direct",
++        vec![Box::new(AddTool::new(&world, "EM-0400-2FL", tool.clone()).expect("tool"))],
++    );
++    assert_eq!(batch.label(), "direct");
++    assert_eq!(batch.len(), 1);
++    assert!(!batch.is_empty());
++
++    history.begin_group("outer");
++    history.execute(
++        &world,
++        SetStock::new(
++            &world,
++            StockShape::Box {
++                dx: 50.0,
++                dy: 50.0,
++                dz: 10.0,
++            },
++            Location::default(),
++        )
++        .expect("stock"),
++    );
++    history.begin_group("inner");
++    history.execute(&world, batch);
++    assert!(history.commit_group());
++    assert!(history.in_group());
++    assert!(history.commit_group());
++    assert!(!history.in_group());
++    assert_eq!(history.done_len(), 1);
++    assert_eq!(history.top_label(), Some("outer"));
++
++    history.mark_clean();
++    assert!(!history.is_dirty());
++    assert!(history.undo(&world));
++    assert!(history.is_dirty());
++    assert!(model::find_by_name(&world, "EM-0400-2FL").is_none());
++    assert!(history.redo(&world));
++    assert!(!history.is_dirty());
++    assert!(model::find_by_name(&world, "EM-0400-2FL").is_some());
++}
++
++#[test]
++fn cancel_group_keeps_existing_commands_separate() {
++    let world = new_world();
++    let mut history = History::default();
++    history.begin_group("interrupted");
++    history.execute(
++        &world,
++        SetStock::new(
++            &world,
++            StockShape::Box {
++                dx: 40.0,
++                dy: 40.0,
++                dz: 10.0,
++            },
++            Location::default(),
++        )
++        .expect("stock"),
++    );
++    let (_, tool) = catalog()
++        .into_iter()
++        .find(|(n, _)| *n == "EM-0400-2FL")
++        .expect("catalog tool");
++    history.execute(&world, AddTool::new(&world, "EM-0400-2FL", tool).expect("tool"));
++    assert!(history.cancel_group());
++    assert!(!history.in_group());
++    assert_eq!(history.done_len(), 2);
++}
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index 55ae7a21b..4e92a8286 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -5,8 +5,13 @@
+ //! Gate map (M4.4): covers app::mcp (live, listen, bridge).
+ 
+ use camcraft_app::commands::History;
+-use camcraft_app::mcp::{answer_live, port_from, Inbox};
++use camcraft_app::mcp::provider::{FallbackMode, parse_prompt};
++use camcraft_app::mcp::{
++    answer_live, answer_live_with, port_from, Inbox, LiveGate, LiveOptions, PickMode,
++    SelectionContext,
++};
+ use camcraft_app::model;
++use camcraft_app::operation::{FeatureSel, GeoSel};
+ use camcraft_app::world::new_world;
+ 
+ use flecs_ecs::prelude::World;
+@@ -438,3 +443,252 @@ fn a_trickling_client_is_dropped_on_the_idle_schedule() {
+         assert!(text.contains(&format!("client {trickler_addr} dropped: idle")), "the log names the trickling client: {text}");
+     }
+ }
++
++#[test]
++fn get_selection_returns_selected_entities_and_empty_picks_headless() {
++    let world = new_world();
++    let mut history = History::default();
++    face_job(&world, &mut history);
++    History::execute_ephemeral(
++        &world,
++        camcraft_app::commands::SelectEntity::new(&world, Some("Face1")),
++    );
++
++    let answer = answer_live(&world, &mut history, None, &call(10, "get_selection", json!({})));
++    assert_eq!(answer.tool.as_deref(), Some("get_selection"));
++    let reply: Value = serde_json::from_str(&answer.reply.expect("reply")).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
++    let sc = &reply["result"]["structuredContent"];
++    assert_eq!(sc["selected_entities"], json!(["Face1"]));
++    assert_eq!(sc["selected_operation"], json!("Face1"));
++    assert_eq!(sc["geometry_picks"], json!([]));
++    assert!(sc["pick_mode"].is_null());
++}
++
++#[test]
++fn live_permission_gate_blocks_unapproved_post_file_writes_paths_and_machine_limits() {
++    let world = new_world();
++    let mut history = History::default();
++    face_job(&world, &mut history);
++    ok(&world, &mut history, 4, "generate", json!({}));
++    ok(&world, &mut history, 5, "add_setup", json!({ "name": "Setup1" }));
++
++    let tmp_dir = std::env::temp_dir().join(format!("camcraft-live-gate-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++    std::fs::create_dir_all(&tmp_dir).expect("temp dir");
++
++    let nc_path = tmp_dir.join("blocked.nc");
++    let proj_path = tmp_dir.join("blocked.camproj");
++    let tools_path = tmp_dir.join("blocked.camtools");
++    let dxf_path = tmp_dir.join("blocked.dxf");
++    let before_depth = history.done_len();
++
++    let blocked_calls = [
++        ("post", json!({ "output": nc_path.display().to_string() })),
++        ("save_project", json!({})),
++        ("save_project", json!({ "path": proj_path.display().to_string() })),
++        ("export_tool_library", json!({ "path": tools_path.display().to_string() })),
++        ("import_model", json!({ "path": tmp_dir.join("missing.stl").display().to_string() })),
++        ("import_tool_library", json!({ "path": tmp_dir.join("missing.camtools").display().to_string() })),
++        ("set_tool_body", json!({ "tool": "EM-0400-2FL", "path": tmp_dir.join("holder.step").display().to_string() })),
++        ("import_dxf_fixture", json!({ "kind": "extruded", "path": dxf_path.display().to_string() })),
++        ("export_fixture_dxf", json!({ "name": "MissingFixture", "path": dxf_path.display().to_string() })),
++        ("load_machine", json!({ "builtin": "VMC 3-axis" })),
++        ("edit_machine", json!({ "patch": { "model": "Injected" } })),
++        ("set_setup_post", json!({ "setup": "Setup1", "post": "Haas" })),
++        ("set_workholding_max_rpm", json!({ "setup": "Setup1", "max_rpm": 1500.0 })),
++        ("set_setup_nose_to_axis", json!({ "setup": "Setup1", "nose_to_axis": 250.0 })),
++    ];
++
++    for (idx, (tool, args)) in blocked_calls.iter().enumerate() {
++        let answer = answer_live(
++            &world,
++            &mut history,
++            Some(&proj_path),
++            &call(100 + idx as u64, tool, args.clone()),
++        );
++        let reply: Value = serde_json::from_str(&answer.reply.expect("reply")).expect("json");
++        assert_eq!(
++            reply["result"]["isError"],
++            json!(true),
++            "{tool} must be blocked without user approval: {reply}"
++        );
++        let msg = reply["result"]["content"][0]["text"]
++            .as_str()
++            .unwrap_or_default()
++            .to_lowercase();
++        assert!(
++            msg.contains("approval"),
++            "{tool} refusal should name explicit approval requirement: {msg}"
++        );
++    }
++
++    assert_eq!(history.done_len(), before_depth, "blocked calls must not mutate history");
++    assert!(!nc_path.exists(), "blocked post must not write NC file");
++    assert!(!proj_path.exists(), "blocked save_project must not write project file");
++    assert!(!tools_path.exists(), "blocked export_tool_library must not write tool library");
++    assert!(!dxf_path.exists(), "blocked export_fixture_dxf must not write DXF");
++    assert!(camcraft_app::machine::document_of(&world).1.is_none());
++    assert!(camcraft_app::setup_workholding::of(&world, Some("Setup1")).is_none());
++    assert!(camcraft_app::rotary_stack::stated(&world, Some("Setup1")).is_none());
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++}
++
++#[test]
++fn get_selection_reads_live_ui_selection_context_and_prompt_json_treats_it_read_only() {
++    let world = new_world();
++    let mut history = History::default();
++    face_job(&world, &mut history);
++    History::execute_ephemeral(
++        &world,
++        camcraft_app::commands::SelectEntity::new(&world, Some("Face1")),
++    );
++
++    let options = LiveOptions {
++        gate: LiveGate::default(),
++        selection: Some(SelectionContext {
++            pick_mode: Some(PickMode::Edge),
++            geometry_picks: vec![GeoSel {
++                entity: "Block".to_owned(),
++                feature: FeatureSel::Chain(0xABCD),
++            }],
++            active_operation: Some("Face1".to_owned()),
++        }),
++    };
++    let answer = answer_live_with(
++        &world,
++        &mut history,
++        None,
++        &call(20, "get_selection", json!({})),
++        &options,
++    );
++    let reply: Value = serde_json::from_str(&answer.reply.expect("reply")).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
++    let sc = &reply["result"]["structuredContent"];
++    assert_eq!(sc["pick_mode"], json!("edge"));
++    assert_eq!(sc["selected_entities"], json!(["Face1"]));
++    assert_eq!(sc["selected_operation"], json!("Face1"));
++    assert_eq!(
++        sc["geometry_picks"],
++        json!([{ "model": "Block", "id": "chain:0x000000000000abcd" }])
++    );
++
++    // PromptJson fallback treats get_selection as read-only (no confirmation required).
++    let pending = parse_prompt(r#"{"tool":"get_selection","arguments":{}}"#).expect("valid prompt");
++    assert!(!pending.requires_confirmation());
++    assert_eq!(
++        FallbackMode::for_capabilities(false, true),
++        FallbackMode::PromptJson
++    );
++}
++
++#[test]
++fn live_gate_allows_explicitly_approved_calls_and_never_auto_approves_post_or_machine_edits() {
++    let world = new_world();
++    let mut history = History::default();
++    face_job(&world, &mut history);
++    ok(&world, &mut history, 4, "generate", json!({}));
++    ok(&world, &mut history, 5, "add_setup", json!({ "name": "Setup1" }));
++
++    let tmp_dir = std::env::temp_dir().join(format!("camcraft-live-approve-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++    std::fs::create_dir_all(&tmp_dir).expect("temp dir");
++    let nc_path = tmp_dir.join("approved.nc");
++    let wrong_nc_path = tmp_dir.join("wrong.nc");
++    let proj_path = tmp_dir.join("approved.camproj");
++    let tools_path = tmp_dir.join("approved.camtools");
++
++    // Auto-approve flag NEVER approves G-code posting or machine edits.
++    let auto_only = LiveOptions {
++        gate: LiveGate {
++            approved: None,
++            auto_approve_non_critical: true,
++        },
++        selection: None,
++    };
++    for (idx, (tool, args)) in [
++        ("post", json!({ "output": nc_path.display().to_string() })),
++        ("load_machine", json!({ "builtin": "VMC 3-axis" })),
++        ("edit_machine", json!({ "patch": { "model": "Tampered" } })),
++    ]
++    .iter()
++    .enumerate()
++    {
++        let ans = answer_live_with(
++            &world,
++            &mut history,
++            None,
++            &call(200 + idx as u64, tool, args.clone()),
++            &auto_only,
++        );
++        let reply: Value = serde_json::from_str(&ans.reply.expect("reply")).expect("json");
++        assert_eq!(
++            reply["result"]["isError"],
++            json!(true),
++            "{tool} must NEVER be auto-approved: {reply}"
++        );
++        assert!(reply["result"]["content"][0]["text"]
++            .as_str()
++            .is_some_and(|t| t.contains("auto-approval is forbidden")));
++    }
++    assert!(!nc_path.exists());
++    assert!(camcraft_app::machine::document_of(&world).1.is_none());
++
++    // Approval bound to one argument object must not authorize different arguments.
++    let mismatched = LiveOptions {
++        gate: LiveGate::allow_once("post", json!({ "output": nc_path.display().to_string() })),
++        selection: None,
++    };
++    let ans = answer_live_with(
++        &world,
++        &mut history,
++        None,
++        &call(210, "post", json!({ "output": wrong_nc_path.display().to_string() })),
++        &mismatched,
++    );
++    let reply: Value = serde_json::from_str(&ans.reply.expect("reply")).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(true));
++    assert!(!wrong_nc_path.exists());
++
++    // Explicit per-call user approval lets each gated tool succeed.
++    for (idx, (tool, args)) in [
++        ("load_machine", json!({ "builtin": "VMC 3-axis" })),
++        ("edit_machine", json!({ "patch": { "model": "Approved Mill" } })),
++        ("set_setup_post", json!({ "setup": "Setup1", "post": "Haas" })),
++        ("set_workholding_max_rpm", json!({ "setup": "Setup1", "max_rpm": 2500.0 })),
++        ("set_setup_nose_to_axis", json!({ "setup": "Setup1", "nose_to_axis": 220.0 })),
++        ("save_project", json!({ "path": proj_path.display().to_string() })),
++        ("export_tool_library", json!({ "path": tools_path.display().to_string() })),
++        ("post", json!({ "output": nc_path.display().to_string() })),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let opts = LiveOptions {
++            gate: LiveGate::allow_once(tool, args.clone()),
++            selection: None,
++        };
++        let ans = answer_live_with(
++            &world,
++            &mut history,
++            None,
++            &call(300 + idx as u64, tool, args),
++            &opts,
++        );
++        let reply: Value = serde_json::from_str(&ans.reply.expect("reply")).expect("json");
++        assert_eq!(reply["result"]["isError"], json!(false), "{tool}: {reply}");
++    }
++
++    assert!(nc_path.exists(), "approved post wrote NC file");
++    assert!(proj_path.exists(), "approved save_project wrote project file");
++    assert!(tools_path.exists(), "approved export_tool_library wrote tool library");
++    assert_eq!(
++        camcraft_app::machine::document_of(&world).1.expect("machine").model,
++        "Approved Mill"
++    );
++    assert_eq!(camcraft_app::setup_workholding::of(&world, Some("Setup1")), Some(2500.0));
++    assert_eq!(camcraft_app::rotary_stack::stated(&world, Some("Setup1")), Some(220.0));
++
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++}
++
+diff --git a/crates/ui/src/egui_app/ai_chat/state.rs b/crates/ui/src/egui_app/ai_chat/state.rs
+index 5a43786bc..78f620909 100644
+--- a/crates/ui/src/egui_app/ai_chat/state.rs
++++ b/crates/ui/src/egui_app/ai_chat/state.rs
+@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
+ use std::sync::{Arc, mpsc};
+ 
+ use camcraft_app::commands::History;
+-use camcraft_app::mcp::Request;
++use camcraft_app::mcp::{ApprovedCall, Request};
+ use camcraft_app::model;
+ use flecs_ecs::prelude::World;
+ use serde_json::Value;
+@@ -31,6 +31,7 @@ pub struct AiChatState {
+     turns: Vec<ChatTurn>,
+     next_turn_id: u64,
+     pending_confirm: Option<ConfirmRequest>,
++    approved_call: Option<ApprovedCall>,
+     last_error: Option<String>,
+     worker: Option<(u64, WorkerHandle)>,
+     wake: Option<WakeFn>,
+@@ -62,6 +63,7 @@ impl AiChatState {
+             turns: Vec::new(),
+             next_turn_id: 1,
+             pending_confirm: None,
++            approved_call: None,
+             last_error: None,
+             worker: None,
+             wake: None,
+@@ -169,6 +171,7 @@ impl AiChatState {
+         self.prompt_draft.clear();
+         self.last_error = None;
+         self.pending_confirm = None;
++        self.approved_call = None;
+ 
+         let turn_id = self.next_turn_id;
+         self.next_turn_id += 1;
+@@ -226,6 +229,11 @@ impl AiChatState {
+         }
+     }
+ 
++    /// Take the single-call explicit approval granted when the user clicked Allow.
++    pub(crate) fn take_approved_call(&mut self) -> Option<ApprovedCall> {
++        self.approved_call.take()
++    }
++
+     /// Only the active, uncancelled turn may execute requests from its inbox.
+     pub(crate) fn accepts_mcp_requests(&self) -> bool {
+         self.worker
+@@ -242,7 +250,7 @@ impl AiChatState {
+     }
+ 
+     /// Drain pending worker events onto UI state without blocking.
+-    pub fn poll(&mut self, current_done_len: usize) {
++    pub fn poll(&mut self, history: &mut History) {
+         let mut events = Vec::new();
+         let mut disconnected_turn = None;
+         if let Some((turn_id, handle)) = &self.worker {
+@@ -258,7 +266,7 @@ impl AiChatState {
+             }
+         }
+         for ev in events {
+-            self.apply_event(ev, current_done_len);
++            self.apply_event(ev, history);
+         }
+         if let Some(turn_id) = disconnected_turn
+             && self.worker.as_ref().is_some_and(|(id, _)| *id == turn_id)
+@@ -266,12 +274,12 @@ impl AiChatState {
+             self.finish_turn(
+                 turn_id,
+                 TurnFinish::Failed("AI chat worker disconnected unexpectedly".to_owned()),
+-                current_done_len,
++                history,
+             );
+         }
+     }
+ 
+-    fn apply_event(&mut self, ev: WorkerEvent, current_done_len: usize) {
++    fn apply_event(&mut self, ev: WorkerEvent, history: &mut History) {
+         match ev {
+             WorkerEvent::AssistantText { turn_id, text } => {
+                 if let Some(turn) = self.turns.iter_mut().find(|t| t.id == turn_id) {
+@@ -297,16 +305,17 @@ impl AiChatState {
+                 self.pending_confirm = Some(req);
+             }
+             WorkerEvent::Finished { turn_id, status } => {
+-                self.finish_turn(turn_id, status, current_done_len);
++                self.finish_turn(turn_id, status, history);
+             }
+         }
+     }
+ 
+-    fn finish_turn(&mut self, turn_id: u64, status: TurnFinish, current_done_len: usize) {
++    fn finish_turn(&mut self, turn_id: u64, status: TurnFinish, history: &mut History) {
+         self.pending_confirm = None;
++        self.approved_call = None;
+         self.worker = None;
+         if let Some(turn) = self.turns.iter_mut().find(|t| t.id == turn_id)
+-            && let Some(err) = turn.finish(status, current_done_len)
++            && let Some(err) = turn.finish(status, history)
+         {
+             self.last_error = Some(err);
+         }
+@@ -315,6 +324,7 @@ impl AiChatState {
+     /// Deliver the user's inline Allow or Deny choice back to the waiting worker.
+     pub(crate) fn resolve_confirmation(&mut self, allow: bool) {
+         if let Some(req) = self.pending_confirm.take() {
++            self.approved_call = allow.then(|| ApprovedCall::new(req.tool_name, req.arguments));
+             let _ = req.decision_tx.send(allow);
+         }
+     }
+@@ -325,6 +335,7 @@ impl AiChatState {
+             handle.cancel.store(true, Ordering::Relaxed);
+         }
+         self.pending_confirm = None;
++        self.approved_call = None;
+     }
+ 
+     /// Revert all contiguous commands executed during `turn_id` when no later edits exist.
+@@ -354,6 +365,7 @@ impl AiChatState {
+     /// Cancel and join any running worker thread cleanly before shutdown or document reset.
+     pub fn shutdown(&mut self) {
+         self.pending_confirm = None;
++        self.approved_call = None;
+         if let Some((turn_id, handle)) = self.worker.take() {
+             handle.cancel.store(true, Ordering::Relaxed);
+             drop(handle);
+diff --git a/crates/ui/src/egui_app/ai_chat/transport.rs b/crates/ui/src/egui_app/ai_chat/transport.rs
+index 7dc1aacc9..36cd887bd 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport.rs
+@@ -5,7 +5,10 @@
+ use std::io::Cursor;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+-use camcraft_app::mcp::provider::{FallbackMode, Provider, prompt_context, qa_context, tools};
++use camcraft_app::mcp::provider::{
++    FallbackMode, Provider, is_read_only_tool, prompt_context, qa_context, tools,
++};
++use camcraft_app::mcp::requires_approval;
+ use serde_json::{Value, json};
+ 
+ /// Whether a preset targets a remote cloud API or a local/loopback model runtime.
+@@ -180,36 +183,19 @@ pub(crate) fn check_offline_policy(
+     Ok(())
+ }
+ 
+-/// Allowlist of read-only inspection/suggestion MCP tools that need no user confirmation.
+-fn is_read_only_tool(name: &str) -> bool {
+-    matches!(
+-        name,
+-        "get_job"
+-            | "list_operation_types"
+-            | "list_tool_catalog"
+-            | "list_holder_library"
+-            | "list_features"
+-            | "get_operation_geometry"
+-            | "get_tool_cutter_profile"
+-            | "suggest_cutting_data"
+-    )
+-}
+-
+ /// Guard deciding whether a tool invocation must wait for explicit inline Allow/Deny.
+ #[must_use]
+-pub(crate) fn requires_confirmation(tool_name: &str, mode: FallbackMode) -> bool {
++pub(crate) fn requires_confirmation(
++    tool_name: &str,
++    arguments: &Value,
++    mode: FallbackMode,
++) -> bool {
+     match mode {
+         FallbackMode::ReadOnly => true,
+         FallbackMode::PromptJson => !is_read_only_tool(tool_name),
+-        FallbackMode::Native => matches!(
+-            tool_name,
+-            "post"
+-                | "open_project"
+-                | "save_project"
+-                | "import_model"
+-                | "import_tool_library"
+-                | "export_tool_library"
+-        ),
++        FallbackMode::Native => {
++            tool_name == "open_project" || requires_approval(tool_name, arguments).is_some()
++        }
+     }
+ }
+ 
+diff --git a/crates/ui/src/egui_app/ai_chat/turn.rs b/crates/ui/src/egui_app/ai_chat/turn.rs
+index 187ad262b..ec55448b8 100644
+--- a/crates/ui/src/egui_app/ai_chat/turn.rs
++++ b/crates/ui/src/egui_app/ai_chat/turn.rs
+@@ -122,12 +122,32 @@ impl ChatTurn {
+         }
+     }
+ 
+-    /// Finalize this turn's terminal status and close its undo depth span.
+-    pub(super) fn finish(&mut self, status: TurnFinish, current_done_len: usize) -> Option<String> {
++    /// True when every executed command in this turn still sits contiguously
++    /// at the top of `history` and can be committed as one [`BatchCommand`].
++    #[must_use]
++    pub(super) fn can_commit_group(&self, history: &History) -> bool {
++        self.change_count > 0
++            && self.document_id == history.identity()
++            && self.expected_entries.as_ref() == Some(&history.done_entry_ids())
++            && history.done_len() == self.start_depth + self.change_count
++    }
++
++    /// Finalize this turn's terminal status and fold contiguous commands into one batch step.
++    pub(super) fn finish(&mut self, status: TurnFinish, history: &mut History) -> Option<String> {
++        let contiguous = self.can_commit_group(history);
++        if contiguous && history.in_group() {
++            let _ = history.commit_group();
++        } else {
++            let _ = history.cancel_group();
++        }
+         // Only record an undo span when every post-turn command belongs to this turn contiguously.
+-        self.end_depth = (self.change_count > 0
+-            && current_done_len == self.start_depth + self.change_count)
+-            .then_some(current_done_len);
++        if contiguous {
++            self.end_depth = Some(history.done_len());
++            self.expected_entries = Some(history.done_entry_ids());
++        } else {
++            self.end_depth = None;
++            self.expected_entries = None;
++        }
+         match status {
+             TurnFinish::Completed => {
+                 self.status = TurnStatus::Completed;
+@@ -156,13 +176,16 @@ impl ChatTurn {
+                 "cannot undo AI turn: later document edits exist or turn already undone".to_owned(),
+             );
+         }
+-        let steps = self.change_count;
+-        for _ in 0..steps {
++        let undo_steps = self
++            .end_depth
++            .unwrap_or(self.start_depth)
++            .saturating_sub(self.start_depth);
++        for _ in 0..undo_steps {
+             let _ = history.undo(world);
+         }
+         self.undone = true;
+         *doc_version += 1;
+-        Ok(format!("undid AI turn ({steps} changes)"))
++        Ok(format!("undid AI turn ({} changes)", self.change_count))
+     }
+ }
+ 
+diff --git a/crates/ui/src/egui_app/ai_chat/worker.rs b/crates/ui/src/egui_app/ai_chat/worker.rs
+index c2353c899..bc846460b 100644
+--- a/crates/ui/src/egui_app/ai_chat/worker.rs
++++ b/crates/ui/src/egui_app/ai_chat/worker.rs
+@@ -300,9 +300,10 @@ fn run_turn_steps(
+                 },
+             );
+ 
+-            let needs_confirm = pending_call
+-                .as_ref()
+-                .map_or_else(|| requires_confirmation(&call.name, effective_mode), PendingCall::requires_confirmation);
++            let needs_confirm = pending_call.as_ref().map_or_else(
++                || requires_confirmation(&call.name, &call.arguments, effective_mode),
++                PendingCall::requires_confirmation,
++            );
+             if needs_confirm {
+                 match wait_confirmation(input, &card_id, &call, cancel, tx)? {
+                     ConfirmOutcome::Cancelled => return Ok(true),
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/safety.rs b/crates/ui/src/egui_app/tests/ai_chat/safety.rs
+index 7dc6be0e3..6290e2ff3 100644
+--- a/crates/ui/src/egui_app/tests/ai_chat/safety.rs
++++ b/crates/ui/src/egui_app/tests/ai_chat/safety.rs
+@@ -142,7 +142,8 @@ fn undo_turn_reverts_multi_tool_turn_changes_in_one_click_and_guards_later_edits
+     submit_prompt(&mut h, "Set stock and add Face op");
+     pump_until_idle(&mut h);
+ 
+-    assert_eq!(h.state().state.history.done_len(), pre_depth + 3);
++    // #1942: multi-call AI turn commits as one BatchCommand entry while reporting 3 changes.
++    assert_eq!(h.state().state.history.done_len(), pre_depth + 1);
+     assert!(has_op_row(&h.state().state, "Face1"));
+     assert!(
+         h.query_all_by_label_contains("3 changes").next().is_some()
+@@ -276,3 +277,231 @@ fn prompt_json_fallback_gates_mutating_proposals_behind_allow_deny() {
+             .is_some()
+     );
+ }
++
++#[test]
++fn one_ctrl_z_reverts_multi_call_ai_chat_turn() {
++    let mut h = blank_harness();
++    h.run();
++    toggle_ai_chat_via_view_door(&mut h);
++
++    let transport = ScriptedTransport::new(vec![
++        Ok(TransportOutput::AssistantResponse {
++            text: String::new(),
++            envelope: json!({
++                "content": [
++                    { "type": "tool_use", "id": "b1", "name": "set_stock", "input": { "box": { "dx": 80.0, "dy": 80.0, "dz": 20.0 } } }
++                ]
++            }),
++            fallback_override: None,
++        }),
++        Ok(TransportOutput::AssistantResponse {
++            text: String::new(),
++            envelope: json!({
++                "content": [
++                    { "type": "tool_use", "id": "b2", "name": "add_tool", "input": { "catalog": "EM-0400-2FL" } },
++                    { "type": "tool_use", "id": "b3", "name": "add_operation", "input": { "kind": "Face", "tool": "EM-0400-2FL" } }
++                ]
++            }),
++            fallback_override: None,
++        }),
++        Ok(TransportOutput::AssistantResponse {
++            text: "Ready.".to_owned(),
++            envelope: json!({
++                "content": [{ "type": "text", "text": "Ready." }]
++            }),
++            fallback_override: None,
++        }),
++    ]);
++    h.state_mut().state.ai_chat.set_transport(transport);
++    let pre_depth = h.state().state.history.done_len();
++
++    submit_prompt(&mut h, "Set stock, add tool, and add Face op");
++    pump_until_idle(&mut h);
++
++    assert_eq!(
++        h.state().state.history.done_len(),
++        pre_depth + 1,
++        "a multi-call AI chat turn must commit as one batch undo step"
++    );
++    assert!(has_op_row(&h.state().state, "Face1"));
++
++    h.input_mut()
++        .events
++        .push(super::super::Event::ModifiersChanged(super::super::Modifiers::COMMAND));
++    h.input_mut().events.push(super::super::Event::Key {
++        key: super::super::Key::Z,
++        physical_key: None,
++        pressed: true,
++        repeat: false,
++        modifiers: super::super::Modifiers::COMMAND,
++    });
++    h.run_steps(2);
++
++    assert_eq!(
++        h.state().state.history.done_len(),
++        pre_depth,
++        "one Ctrl+Z must revert the whole multi-call AI turn"
++    );
++    assert!(!has_op_row(&h.state().state, "Face1"));
++    assert!(
++        camcraft_app::model::find_by_name(&h.state().state.world, "EM-0400-2FL").is_none(),
++        "Ctrl+Z must also revert the tool added in the same chat turn"
++    );
++    assert!(
++        camcraft_app::setup::stock_entity(&h.state().state.world, None)
++            .and_then(|e| camcraft_app::model::stock_def_of(&h.state().state.world, &e))
++            .is_none(),
++        "Ctrl+Z must also revert the stock set in the same chat turn"
++    );
++
++    // One Ctrl+Y brings the whole batch turn back.
++    h.input_mut()
++        .events
++        .push(super::super::Event::ModifiersChanged(super::super::Modifiers::COMMAND));
++    h.input_mut().events.push(super::super::Event::Key {
++        key: super::super::Key::Y,
++        physical_key: None,
++        pressed: true,
++        repeat: false,
++        modifiers: super::super::Modifiers::COMMAND,
++    });
++    h.run_steps(2);
++    assert_eq!(h.state().state.history.done_len(), pre_depth + 1);
++    assert!(has_op_row(&h.state().state, "Face1"));
++}
++
++#[test]
++fn get_selection_mcp_tool_reads_ui_geo_picks_pick_mode_and_selected_entities() {
++    let mut h = super::super::shell_harness();
++    h.run();
++    {
++        let st = &mut h.state_mut().state;
++        st.run(CommandKind::Select(Some("Block".to_owned())));
++        st.geo_pick = super::super::GeoPick::Face;
++        st.op_ui.geo = vec![camcraft_app::operation::GeoSel {
++            entity: "Block".to_owned(),
++            feature: super::super::FeatureSel::Face(0x1234),
++        }];
++    }
++
++    let req_line = json!({
++        "jsonrpc": "2.0",
++        "id": 77,
++        "method": "tools/call",
++        "params": { "name": "get_selection", "arguments": {} }
++    })
++    .to_string();
++    let (req, rx) = camcraft_app::mcp::Request::pair(req_line);
++    h.state_mut()
++        .state
++        .mcp
++        .get_or_insert_with(|| {
++            let (tx, inbox) = camcraft_app::mcp::Inbox::channel();
++            tx.send(req).expect("send");
++            inbox
++        });
++    crate::mcp_host::pump(&mut h.state_mut().state);
++
++    let reply_line = rx.try_recv().expect("reply").expect("jsonrpc line");
++    let reply: Value = serde_json::from_str(&reply_line).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
++    let sc = &reply["result"]["structuredContent"];
++    assert_eq!(sc["pick_mode"], json!("face"));
++    assert_eq!(sc["selected_entities"], json!(["Block"]));
++    assert_eq!(
++        sc["geometry_picks"],
++        json!([{ "model": "Block", "id": "face:0x0000000000001234" }])
++    );
++}
++
++#[test]
++fn machine_and_limit_edits_require_confirmation_and_unapproved_live_dispatch_blocks() {
++    let mut h = blank_harness();
++    h.run();
++    seed_postable_face_job(&mut h);
++    toggle_ai_chat_via_view_door(&mut h);
++
++    let transport = ScriptedTransport::new(vec![
++        Ok(TransportOutput::AssistantResponse {
++            text: String::new(),
++            envelope: json!({
++                "content": [{ "type": "tool_use", "id": "m1", "name": "load_machine", "input": { "builtin": "VMC 3-axis" } }]
++            }),
++            fallback_override: None,
++        }),
++        Ok(TransportOutput::AssistantResponse {
++            text: "Machine change cancelled.".to_owned(),
++            envelope: json!({
++                "content": [{ "type": "text", "text": "Machine change cancelled." }]
++            }),
++            fallback_override: None,
++        }),
++        Ok(TransportOutput::AssistantResponse {
++            text: String::new(),
++            envelope: json!({
++                "content": [{ "type": "tool_use", "id": "m2", "name": "load_machine", "input": { "builtin": "VMC 3-axis" } }]
++            }),
++            fallback_override: None,
++        }),
++        Ok(TransportOutput::AssistantResponse {
++            text: "Machine loaded after approval.".to_owned(),
++            envelope: json!({
++                "content": [{ "type": "text", "text": "Machine loaded after approval." }]
++            }),
++            fallback_override: None,
++        }),
++    ]);
++    h.state_mut().state.ai_chat.set_transport(transport);
++
++    submit_prompt(&mut h, "Load VMC 3-axis");
++    pump_until_confirm(&mut h);
++    assert!(h.query_by_label("Tool: load_machine").is_some());
++    assert!(camcraft_app::machine::document_of(&h.state().state.world).1.is_none());
++
++    h.get_by_role_and_label(Role::Button, "Deny").click();
++    pump_until_idle(&mut h);
++    assert!(camcraft_app::machine::document_of(&h.state().state.world).1.is_none());
++
++    submit_prompt(&mut h, "Load VMC 3-axis again");
++    pump_until_confirm(&mut h);
++    h.get_by_role_and_label(Role::Button, "Allow").click();
++    pump_until_idle(&mut h);
++    assert!(camcraft_app::machine::document_of(&h.state().state.world).1.is_some());
++
++    // Even if a request arrives directly on ai_mcp_inbox while a turn is active without
++    // user confirmation in the UI, the live permission gate at answer_live must block it.
++    let tmp_dir = std::env::temp_dir().join(format!("camcraft-ai-live-bypass-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++    std::fs::create_dir_all(&tmp_dir).expect("temp dir");
++    let nc_path = tmp_dir.join("bypass.nc");
++
++    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let saw_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let blocking = Arc::new(super::BlockingTransport {
++        started: Arc::clone(&started),
++        saw_cancel: Arc::clone(&saw_cancel),
++    });
++    h.state_mut().state.ai_chat.set_transport(blocking);
++    submit_prompt(&mut h, "Hold turn open");
++
++    let bypass_line = json!({
++        "jsonrpc": "2.0",
++        "id": 999,
++        "method": "tools/call",
++        "params": { "name": "post", "arguments": { "output": nc_path.display().to_string() } }
++    })
++    .to_string();
++    let (req, rx) = camcraft_app::mcp::Request::pair(bypass_line);
++    h.state().state.ai_mcp_tx.send(req).expect("send");
++    crate::mcp_host::pump(&mut h.state_mut().state);
++
++    let reply_line = rx.try_recv().expect("reply").expect("jsonrpc");
++    let reply: Value = serde_json::from_str(&reply_line).expect("json");
++    assert_eq!(reply["result"]["isError"], json!(true), "unapproved live post must be blocked: {reply}");
++    assert!(!nc_path.exists(), "blocked bypass must not write NC file");
++
++    h.state_mut().state.ai_chat.cancel();
++    pump_until_idle(&mut h);
++    let _ = std::fs::remove_dir_all(&tmp_dir);
++}
++
+diff --git a/crates/ui/src/mcp_host.rs b/crates/ui/src/mcp_host.rs
+index f7a2dee39..4a75f1403 100644
+--- a/crates/ui/src/mcp_host.rs
++++ b/crates/ui/src/mcp_host.rs
+@@ -30,11 +30,24 @@ pub fn pump(state: &mut State) {
+ 
+ fn answer_request(state: &mut State, request: camcraft_app::mcp::Request, track_ai_turn: bool) {
+     let before_entries = state.history.done_entry_ids();
+-    let answer = camcraft_app::mcp::answer_live(
++    let approved = if track_ai_turn {
++        state.ai_chat.take_approved_call()
++    } else {
++        None
++    };
++    let options = camcraft_app::mcp::LiveOptions {
++        gate: camcraft_app::mcp::LiveGate {
++            approved,
++            auto_approve_non_critical: false,
++        },
++        selection: Some(state.selection_context()),
++    };
++    let answer = camcraft_app::mcp::answer_live_with(
+         &state.world,
+         &mut state.history,
+         state.project_path.as_deref(),
+         request.line(),
++        &options,
+     );
+     if track_ai_turn {
+         state.ai_chat.note_mcp_execution(&before_entries, &state.history);
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 342b7bad9..515b7b20a 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -2958,10 +2958,30 @@ impl State {
+         self.ai_chat.set_wake(wake);
+     }
+ 
++    /// Snapshot active viewport pick mode and geometry picks (#1942) for the
++    /// live `get_selection` MCP tool while keeping `ui -> app` layering.
++    #[must_use]
++    pub fn selection_context(&self) -> camcraft_app::mcp::SelectionContext {
++        let pick_mode = match self.geo_pick {
++            GeoPick::Model => camcraft_app::mcp::PickMode::Model,
++            GeoPick::Face => camcraft_app::mcp::PickMode::Face,
++            GeoPick::Edge => camcraft_app::mcp::PickMode::Edge,
++            GeoPick::Vertex => camcraft_app::mcp::PickMode::Vertex,
++        };
++        camcraft_app::mcp::SelectionContext {
++            pick_mode: Some(pick_mode),
++            geometry_picks: self.op_ui.geo.clone(),
++            active_operation: (!self.op_ui.name.is_empty()).then(|| self.op_ui.name.clone()),
++        }
++    }
++
+     pub(crate) fn submit_ai_prompt(&mut self) {
+         if self.ai_chat.is_running() {
+             return;
+         }
++        while self.history.in_group() {
++            let _ = self.history.cancel_group();
++        }
+         // Each turn owns a fresh receiver. Old worker senders cannot reach a later turn.
+         self.reset_ai_inbox();
+         let snapshot = if self.ai_chat.selected_preset().fallback_mode
+@@ -2979,6 +2999,14 @@ impl State {
+             None,
+             snapshot,
+         );
++        if self.ai_chat.is_running() {
++            let label = self
++                .ai_chat
++                .turns()
++                .last()
++                .map_or_else(|| "AI chat turn".to_owned(), |t| format!("AI chat: {}", t.prompt));
++            self.history.begin_group(label);
++        }
+     }
+ 
+     fn reset_ai_inbox(&mut self) {
+@@ -3021,10 +3049,10 @@ impl State {
+         while let Some(action) = self.pending.pop_front() {
+             self.run(action);
+         }
+-        self.ai_chat.poll(self.history.done_len());
++        self.ai_chat.poll(&mut self.history);
+         // #183: an agent's live calls, after the user's own clicks.
+         crate::mcp_host::pump(self);
+-        self.ai_chat.poll(self.history.done_len());
++        self.ai_chat.poll(&mut self.history);
+         self.poll_import();
+         // #31: a file the browser's picker has read since the last frame.
+         self.take_picked_files();
+@@ -3066,6 +3094,14 @@ impl State {
+     }
+ 
+     pub(crate) fn run(&mut self, action: CommandKind) {
++        let before_entries = self.history.done_entry_ids();
++        self.run_action(action);
++        if self.history.in_group() && self.history.done_entry_ids() != before_entries {
++            self.history.cancel_group();
++        }
++    }
++
++    fn run_action(&mut self, action: CommandKind) {
+         // Whatever ran, the banner shows only the newest outcome: a later
+         // command (even a successful one) retires an old refusal.
+         self.feedback = None;
+diff --git a/docs/decisions/1942-ai-chat-safety.md b/docs/decisions/1942-ai-chat-safety.md
+new file mode 100644
+index 000000000..7f82c5f30
+--- /dev/null
++++ b/docs/decisions/1942-ai-chat-safety.md
+@@ -0,0 +1,18 @@
++## #1942 - AI chat batch undo, `get_selection` MCP tool, and live confirmation gate
++
++**What was decided.**
++1. **Batch undo (`crates/app/src/commands/batch.rs`, `commands/mod.rs`, `ui/egui_app/ai_chat/turn.rs`, `ui/state.rs`)**: added `BatchCommand` plus stackable `History::begin_group(label)`, `History::commit_group()`, and `History::cancel_group()`. Submitting an AI chat prompt opens a labelled group; when the turn finishes contiguously (`ChatTurn::can_commit_group`), `commit_group` folds every command executed during the turn into one `BatchCommand` entry on `History::done` (preserving clean/dirty `saved` tracking). A single `Ctrl+Z` (or card `Undo turn`) reverts the whole turn, and one `Ctrl+Y` redoes it. Manual UI commands that mutate `History` while an AI turn is open (`State::run`) cancel the open group so user edits and AI edits never fold together. Existing test `undo_turn_reverts_multi_tool_turn_changes_in_one_click_and_guards_later_edits` (#2094) was updated from `pre_depth + 3` to `pre_depth + 1` to match one batch entry per turn while preserving `turn.change_count` (`"3 changes"`).
++2. **`get_selection` MCP tool (`crates/app/src/mcp/selection.rs`, `tools.rs`, `fallback.rs`, `script/mod.rs`, `ui/state.rs`, `ui/mcp_host.rs`)**: added the read-only `get_selection` tool to the MCP `TOOLS` table and explicit `is_read_only_tool` allowlist. Headlessly it reads `model::selected_names`, `setup::active`, and any selected operation from `World`. When called through `mcp_host::pump`, `State::selection_context()` populates an app-owned `SelectionContext { pick_mode, geometry_picks, active_operation }` passed via `LiveOptions` into `Env::selection`, reporting `geo_pick` (`model`/`face`/`edge`/`vertex`) and `op_ui.geo` picks without inverting the `ui -> app` dependency direction.
++3. **Live permission gate (`crates/app/src/mcp/live.rs`, `ui/egui_app/ai_chat/{state,transport,worker}.rs`, `ui/mcp_host.rs`)**: added `answer_live_with(..., &LiveOptions)` and made `answer_live` fail closed (`&LiveOptions::default()`). `requires_approval(tool, args)` classifies `post` (`Posting`), `load_machine`/`edit_machine` (`MachineEdit`), `set_setup_post`/`set_workholding_max_rpm`/`set_setup_nose_to_axis` (`LimitEdit`), file writes (`save_project`, `export_tool_library`, `export_fixture_dxf` with `path`), and file-path accesses (`import_model`, `import_tool_library`, `set_tool_body`, `set_lathe_tool_body`, `attach_tool_body_piece`, `import_dxf_fixture` with `path`, or any call carrying non-null `path`/`output`). `Posting` and `MachineEdit` return `false` from `GateKind::allows_auto_approve` so they can never be auto-approved. Clicking `Allow` in `AiChatState` records a one-shot `ApprovedCall` consumed by `mcp_host` for that exact `(tool, arguments)` pair, and `transport::requires_confirmation` shares `requires_approval` and `app::mcp::provider::is_read_only_tool` instead of maintaining a duplicate list.
++
++**Why.**
++- Before this change, a multi-tool AI chat turn pushed N separate `History` entries (requiring multiple `Ctrl+Z` presses), `FallbackMode::Native` skipped confirmation on `load_machine`, `edit_machine`, `set_setup_post`, `set_workholding_max_rpm`, `set_setup_nose_to_axis`, and path-taking tools, and direct/bridge calls to `answer_live` had no permission gate at all.
++- Running MCP tools immediately during a turn and folding `done[start_len..]` into `BatchCommand` at commit avoids deferring world mutations that later steps in the same turn (such as `generate`, `get_job`, or `post`) depend on.
++
++**Dropped.**
++- Staging AI commands in a side buffer until turn end: rejected because multi-step tool calls read back earlier tool effects on the live `World`.
++- Keeping the confirmation check solely in `crates/ui/src/egui_app/ai_chat/transport.rs`: rejected because `answer_live` and loopback MCP clients must enforce the gate at dispatch time as well.
++- Importing `camcraft-ui` pick structs into `camcraft-app` for `get_selection`: rejected to keep `ui -> app` layering intact.
++
++**Cost to change later.**
++- Localized to `commands/batch.rs`, `mcp/{live,selection}.rs`, and `ui/{mcp_host,state,egui_app/ai_chat}`. Keeping `answer_live` delegating to `&LiveOptions::default()` keeps existing 4-argument callers source-compatible while defaulting unapproved dispatch to blocked.

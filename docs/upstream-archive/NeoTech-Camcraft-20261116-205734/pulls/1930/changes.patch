@@ -1,0 +1,202 @@
+From d49e8f12b7ad7b62272731edd4fd8975cda9cc2f Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 15 Nov 2026 07:51:20 -0800
+Subject: [PATCH] fix(kernel): retry machining meshes at a finer chord
+
+Retry once after a finite deviation refusal, without changing the requested
+tolerance or the mesh acceptance checks. Pin the Solidcraft sample at the
+app chord and retain refusal when one finer plan is insufficient.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #1463
+---
+ crates/kernel/src/machining_mesh.rs    | 73 ++++++++++++++++----------
+ crates/kernel/tests/machining_mesh.rs  | 56 ++++++++++++++++++++
+ docs/decisions/1463-solidcraft-mesh.md | 26 +++++++++
+ 3 files changed, 127 insertions(+), 28 deletions(-)
+ create mode 100644 docs/decisions/1463-solidcraft-mesh.md
+
+diff --git a/crates/kernel/src/machining_mesh.rs b/crates/kernel/src/machining_mesh.rs
+index c85847cc4..a19cac3c3 100644
+--- a/crates/kernel/src/machining_mesh.rs
++++ b/crates/kernel/src/machining_mesh.rs
+@@ -211,34 +211,51 @@ pub fn machining_mesh(
+             why: format!("under a millionth of the body's {size:.3e} mm size"),
+         });
+     }
+-    if stop.is_cancelled() {
+-        return Err(MeshRefusal::TimedOut("before planning"));
+-    }
+-    let tol = MeshTolerance::chord(tol_mm);
+-    let planned = catch_unwind(AssertUnwindSafe(|| {
+-        solidcore_tess::plan(record, &tol, size)
+-    }))
+-    .map_err(|_| MeshRefusal::Planner("the planner panicked".into()))?;
+-    let (plan, stats) = planned.map_err(|e| MeshRefusal::Planner(e.to_string()))?;
+-    if stop.is_cancelled() {
+-        return Err(MeshRefusal::TimedOut("planning"));
+-    }
+-    let notes = judge_stats(&stats)?;
+-    let planned_tris: usize = plan.faces.iter().map(|f| f.triangles.len()).sum();
+-    if planned_tris > MAX_MACHINING_TRIANGLES {
+-        return Err(MeshRefusal::TooLarge(planned_tris));
+-    }
+-    let deviation = mesh_deviation::measure(&plan, record, stop).map_err(|e| match e {
+-        Unmeasured::Cancelled => MeshRefusal::TimedOut("measuring"),
+-        other => MeshRefusal::Unmeasured(other),
+-    })?;
+-    // A NaN deviation is refused too.
+-    if deviation.largest().is_nan() || deviation.largest() > tol_mm {
+-        return Err(MeshRefusal::Deviation {
+-            measured: deviation.largest(),
+-            tol: tol_mm,
+-            face: deviation.worst_face,
+-        });
++    let mut chord = tol_mm;
++    let (plan, deviation, mut notes) = loop {
++        if stop.is_cancelled() {
++            return Err(MeshRefusal::TimedOut("before planning"));
++        }
++        let tol = MeshTolerance::chord(chord);
++        let planned = catch_unwind(AssertUnwindSafe(|| {
++            solidcore_tess::plan(record, &tol, size)
++        }))
++        .map_err(|_| MeshRefusal::Planner("the planner panicked".into()))?;
++        let (plan, stats) = planned.map_err(|e| MeshRefusal::Planner(e.to_string()))?;
++        if stop.is_cancelled() {
++            return Err(MeshRefusal::TimedOut("planning"));
++        }
++        let notes = judge_stats(&stats)?;
++        let planned_tris: usize = plan.faces.iter().map(|f| f.triangles.len()).sum();
++        if planned_tris > MAX_MACHINING_TRIANGLES {
++            return Err(MeshRefusal::TooLarge(planned_tris));
++        }
++        let deviation = mesh_deviation::measure(&plan, record, stop).map_err(|e| match e {
++            Unmeasured::Cancelled => MeshRefusal::TimedOut("measuring"),
++            other => MeshRefusal::Unmeasured(other),
++        })?;
++        // A NaN deviation is refused too.
++        if deviation.largest().is_nan() || deviation.largest() > tol_mm {
++            // The display planner uses normal-distance samples; spline faces
++            // are checked here by the stricter parametric distance. Try one
++            // finer plan, keeping the requested tolerance and every verdict.
++            let finer = (chord * 0.5).max(size * MIN_TOL_FRACTION);
++            if chord == tol_mm && finer < chord && deviation.largest().is_finite() {
++                chord = finer;
++                continue;
++            }
++            return Err(MeshRefusal::Deviation {
++                measured: deviation.largest(),
++                tol: tol_mm,
++                face: deviation.worst_face,
++            });
++        }
++        break (plan, deviation, notes);
++    };
++    if chord < tol_mm {
++        notes.push(format!(
++            "replanned at {chord:e} mm chord to meet the requested {tol_mm:e} mm measured tolerance"
++        ));
+     }
+     let mesh = evaluate(&plan, record.faces.len())?;
+     let (positions, triangles, tri_face) = weld(&mesh);
+diff --git a/crates/kernel/tests/machining_mesh.rs b/crates/kernel/tests/machining_mesh.rs
+index 2a25e6326..0fd9c374b 100644
+--- a/crates/kernel/tests/machining_mesh.rs
++++ b/crates/kernel/tests/machining_mesh.rs
+@@ -24,6 +24,62 @@ use solidcore_tess::{
+ /// The app's chord cap (#689), mm.
+ const TOL: f64 = 0.005;
+ 
++#[test]
++fn solidcraft_sample_meshes_within_the_app_chord() {
++    let bytes = include_bytes!("../../../testdata/models/solidcraft_for_beginners.sc");
++    let imported = camcraft_kernel::solidcraft::import_solidcraft(
++        &mut SolidcoreKernel::default(),
++        bytes,
++        &CancelToken::new(),
++    )
++    .expect("the Solidcraft sample must import as a checked solid");
++    let mesh = machining_mesh(&imported.solid, TOL, &CancelToken::new())
++        .expect("the Solidcraft sample must mesh at the app chord");
++    println!("Solidcraft sample: {:?}", mesh.report);
++    assert_eq!(mesh.report.tolerance_mm, TOL);
++    assert_eq!(mesh.report.open_sides, 0);
++    assert!(mesh.report.deviation.largest() <= TOL);
++    assert!(mesh.report.deviation.samples > 0);
++    assert!(mesh.report.volume > 0.0);
++    assert_eq!(mesh.report.faces, imported.solid.record.faces.len());
++    assert!(
++        mesh.report
++            .notes
++            .iter()
++            .any(|note| note.contains("replanned"))
++    );
++    for face in 0..imported.solid.record.faces.len() {
++        assert!(
++            mesh.tri_face.contains(&(face as u32)),
++            "missing face {face}"
++        );
++    }
++}
++
++#[test]
++fn solidcraft_sample_still_refuses_an_out_of_tolerance_mesh() {
++    let bytes = include_bytes!("../../../testdata/models/solidcraft_for_beginners.sc");
++    let imported = camcraft_kernel::solidcraft::import_solidcraft(
++        &mut SolidcoreKernel::default(),
++        bytes,
++        &CancelToken::new(),
++    )
++    .expect("the Solidcraft sample must import as a checked solid");
++    match machining_mesh(&imported.solid, 0.1, &CancelToken::new()) {
++        Err(MeshRefusal::Deviation {
++            measured,
++            tol,
++            face,
++        }) => {
++            println!("coarse sample: face {face:?}, measured {measured}, tolerance {tol}");
++            assert!(measured > tol);
++            assert_eq!(tol, 0.1);
++            assert!(face.is_some());
++        }
++        other => panic!("the coarse sample must remain refused: {other:?}"),
++    }
++}
++
+ fn solid(file: &str) -> StepSolid {
+     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+         .join("../../testdata/models")
+diff --git a/docs/decisions/1463-solidcraft-mesh.md b/docs/decisions/1463-solidcraft-mesh.md
+new file mode 100644
+index 000000000..350cf3786
+--- /dev/null
++++ b/docs/decisions/1463-solidcraft-mesh.md
+@@ -0,0 +1,26 @@
++## #1463 - Retry the machining mesh at half the chord
++
++**Decided:** If a finite measured deviation exceeds the requested tolerance,
++try one more plan at half the chord. Keep the existing floor of one millionth
++of the body size. Keep the caller's tolerance and all planner-statistics,
++triangle-budget, deviation, topology, volume and cancellation checks.
++Record the finer chord in the mesh report when the retry succeeds.
++
++**Why:** The display planner measures normal distance at triangle midpoints
++and centroids. The verifier uses denser samples and a conservative parametric
++distance on rational-spline faces. The two measures can disagree.
++At 0.005 mm, nine rational-spline faces of the Solidcraft sample fail.
++Face 50 has the largest measured deviation, 0.00684674657 mm.
++Planning at 0.0025 mm reduces that maximum to 0.00323090453 mm.
++The accepted mesh has all 53 faces, 279,600 triangles and no open sides.
++A 0.1 mm request still fails after the retry: face 36 measures 0.13365682857 mm.
++These sampled checks do not prove the continuous closest-surface distance.
++
++**Dropped:** Always planning finer would charge every input for the retry.
++Relaxing the verifier would weaken the machining guarantee.
++A new closest-point solver or dependency update exceeds this fix's scope.
++Unlimited retries would remove the bound on repeated planning.
++
++**Cost to change later:** Change the bounded refinement policy and rerun the
++sample, refusal and old-code mutation checks. Do not infer that other
++previously refused models now pass.

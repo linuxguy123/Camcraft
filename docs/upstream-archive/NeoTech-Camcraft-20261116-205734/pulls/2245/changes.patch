@@ -1,0 +1,1454 @@
+From 5b23f102bb1dcafed7b9d398debdc902b789bd24 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Mon, 16 Nov 2026 11:20:24 -0800
+Subject: [PATCH] feat(post): add G93 inverse-time feed solver and section mode
+ markers
+
+Emit explicit `PARAM SectionMode` (`3-axis`, `3+2 indexed`,
+`simultaneous 5-axis`) markers per milling operation stream while
+leaving `post::dump`, legacy `.cl` inputs, and 3-axis `.nc` programs
+unchanged. Add the shared pure-Rust `G93` inverse-time feed solver in
+`camcraft_post::post::g93` (re-exported via `rotary_cap` and
+`kinematics`) handling part-space cutting chord duration, linear and
+rotary `max_normal_speed` ceilings, pure-rotary reorientations,
+zero-motion duplicate skipping, safe `F` clamping/formatting, and G20/G21
+unit invariance.
+
+Fixes #1966
+---
+ crates/app/src/posting.rs               |   3 +
+ crates/app/src/posting_section_mode.rs  | 181 ++++++++++++
+ crates/app/tests/section_mode.rs        | 247 ++++++++++++++++
+ crates/post/src/kinematics/mod.rs       |   3 +
+ crates/post/src/post/g93.rs             | 378 ++++++++++++++++++++++++
+ crates/post/src/post/mod.rs             |   3 +
+ crates/post/src/post/rotary_cap.rs      |   6 +
+ crates/post/src/post/section_mode.rs    | 144 +++++++++
+ crates/post/tests/g93_feed.rs           | 337 +++++++++++++++++++++
+ docs/decisions/1966-g93-section-mode.md |  18 ++
+ 10 files changed, 1320 insertions(+)
+ create mode 100644 crates/app/src/posting_section_mode.rs
+ create mode 100644 crates/app/tests/section_mode.rs
+ create mode 100644 crates/post/src/post/g93.rs
+ create mode 100644 crates/post/src/post/section_mode.rs
+ create mode 100644 crates/post/tests/g93_feed.rs
+ create mode 100644 docs/decisions/1966-g93-section-mode.md
+
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index 1b74f8122..89e9a11dd 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -628,6 +628,8 @@ pub mod nose;
+ pub mod index_swing;
+ #[path = "posting_swing_standing.rs"]
+ pub mod swing_standing;
++#[path = "posting_section_mode.rs"]
++mod section_mode;
+ pub(crate) use wcs_rotation::{offset_frame, OffsetFrame};
+ pub use mounts::{
+     machine_checks, machine_value_for, machine_value_of, post_mounts, post_mounts_script,
+@@ -1318,6 +1320,7 @@ pub(crate) fn op_streams_by(world: &World, by_post: bool) -> Result<Vec<(String,
+             post::ask_reverse_spindle(&mut records);
+         }
+         setup_change::ask(&changes, name, &mut records);
++        section_mode::insert(&op.params, &posted, &mut records);
+         streams.push((name.clone(), records));
+     }
+     Ok(streams)
+diff --git a/crates/app/src/posting_section_mode.rs b/crates/app/src/posting_section_mode.rs
+new file mode 100644
+index 000000000..9323976bf
+--- /dev/null
++++ b/crates/app/src/posting_section_mode.rs
+@@ -0,0 +1,181 @@
++// Provenance: clean-room classifier mapping operation kinematics intent to `PARAM SectionMode`.
++
++//! Emit `PARAM SectionMode` per operation stream (`3-axis`, `3+2 indexed`, `simultaneous 5-axis`).
++
++use crate::cl::{is_vertical, Toolpath};
++use crate::operation::OpParams;
++use crate::post::{self, cnc::Record, SectionMode};
++
++/// Classify an operation and its posted toolpath into an explicit [`SectionMode`],
++/// returning `None` for non-milling sections (turning, plasma, EDM, live-tool).
++#[must_use]
++pub fn classify(params: &OpParams, path: &Toolpath) -> Option<SectionMode> {
++    match params {
++        // Planar operations support an explicit 3+2 index (`tilt`).
++        OpParams::Face { .. }
++        | OpParams::Contour { .. }
++        | OpParams::Pocket { .. }
++        | OpParams::Adaptive2D { .. }
++        | OpParams::Offset2D { .. }
++        | OpParams::Engrave { .. }
++        | OpParams::Chamfer2D { .. }
++        | OpParams::Circular { .. }
++        | OpParams::Slot { .. }
++        | OpParams::Trace { .. } => Some(if params.tilt().is_some() {
++            SectionMode::Indexed3Plus2
++        } else {
++            SectionMode::ThreeAxis
++        }),
++
++        // Continuous multi-axis simultaneous operations.
++        OpParams::Contour5D { .. }
++        | OpParams::Parallel5D { .. }
++        | OpParams::Swarf { .. }
++        | OpParams::AdvancedSwarf { .. }
++        | OpParams::Flow5D { .. }
++        | OpParams::MultiAxisContour { .. }
++        | OpParams::MultiAxisRough { .. }
++        | OpParams::RotaryContour { .. }
++        | OpParams::RotaryParallel { .. }
++        | OpParams::RotaryOffset { .. } => {
++            if post::dialect::states_live_tool(path) {
++                None
++            } else {
++                Some(SectionMode::Simultaneous5Axis)
++            }
++        }
++
++        // Fixed-vertical 3-axis milling/hole/probe kinds.
++        OpParams::TrochoidalSlot { .. }
++        | OpParams::Pocket3D { .. }
++        | OpParams::Finish3D { .. }
++        | OpParams::Bore { .. }
++        | OpParams::Thread { .. }
++        | OpParams::Probe { .. } => Some(SectionMode::ThreeAxis),
++
++        OpParams::Deburr { .. } => {
++            let leans = path
++                .moves
++                .iter()
++                .any(|m| m.axis.is_some_and(|a| !is_vertical(&a)));
++            Some(if leans {
++                SectionMode::Simultaneous5Axis
++            } else {
++                SectionMode::ThreeAxis
++            })
++        }
++
++        OpParams::Drill { cross, .. } => {
++            if !cross.is_empty() || post::dialect::states_live_tool(path) {
++                None
++            } else {
++                Some(SectionMode::ThreeAxis)
++            }
++        }
++
++        // Non-milling (turning, plasma, wire/sinker EDM) stay unannotated.
++        OpParams::Facing { .. }
++        | OpParams::ProfileRough { .. }
++        | OpParams::ProfileFinish { .. }
++        | OpParams::GrooveRough { .. }
++        | OpParams::GrooveFinish { .. }
++        | OpParams::Part { .. }
++        | OpParams::Threading { .. }
++        | OpParams::Chamfering { .. }
++        | OpParams::TaperTurning { .. }
++        | OpParams::MultiPassTurning { .. }
++        | OpParams::FormTurning { .. }
++        | OpParams::BoringTurning { .. }
++        | OpParams::PlasmaProfile(_)
++        | OpParams::WireContour(_)
++        | OpParams::SinkerBurn(_)
++        | OpParams::SinkerSideBurn(_) => None,
++    }
++}
++
++/// Annotate a generated operation record stream with `PARAM SectionMode` before `SECTION`.
++pub fn insert(params: &OpParams, path: &Toolpath, records: &mut Vec<Record>) {
++    if let Some(mode) = classify(params, path) {
++        post::set_section_mode(records, mode);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::cl::{Move, MoveKind};
++    use crate::geometry::Point3;
++    use crate::machining2d::FaceHoles;
++    use crate::operation::{Height, Tilt};
++
++    fn sample_face(tilt: Option<Tilt>) -> OpParams {
++        OpParams::Face {
++            stepover: 3.0,
++            clearance_z: Height::fixed(10.0),
++            cut_z: Height::fixed(0.0),
++            top_z: None,
++            stepdown: None,
++            feed: 500.0,
++            plunge_feed: 100.0,
++            climb: true,
++            blend_turns: false,
++            holes: FaceHoles::default(),
++            tilt,
++        }
++    }
++
++    #[test]
++    fn classifies_3axis_3plus2_and_simultaneous_distinctly() {
++        let empty = Toolpath::default();
++        assert_eq!(classify(&sample_face(None), &empty), Some(SectionMode::ThreeAxis));
++        assert_eq!(
++            classify(
++                &sample_face(Some(Tilt { a_deg: 0.0, b_deg: 45.0, origin: [0.0; 3] })),
++                &empty
++            ),
++            Some(SectionMode::Indexed3Plus2)
++        );
++        let sim = OpParams::Flow5D {
++            tolerance: 0.1,
++            stepover: Some(2.0),
++            clearance_z: Height::fixed(20.0),
++            retract_z: None,
++            top_z: Height::fixed(10.0),
++            bottom_z: Height::fixed(0.0),
++            feed: 500.0,
++            plunge_feed: 100.0,
++            climb: true,
++            lead_deg: 10.0,
++            lag_deg: 0.0,
++            max_tilt_deg: 45.0,
++            shank_avoid: false,
++        };
++        assert_eq!(classify(&sim, &empty), Some(SectionMode::Simultaneous5Axis));
++
++        // Live-tool turning (rotary field populated on Move) stays unannotated.
++        let mut live_path = Toolpath::default();
++        let mut m = Move::new(
++            MoveKind::Feed,
++            Point3::ZERO,
++            Point3::new(1.0, 0.0, 0.0),
++            Some(400.0),
++        );
++        m.rotary = Some(15.0);
++        live_path.moves.push(m);
++        let rotary_op = OpParams::RotaryContour {
++            tolerance: 0.05,
++            clearance_z: Height::fixed(25.0),
++            retract_z: None,
++            top_z: Height::fixed(15.0),
++            bottom_z: Height::fixed(10.0),
++            feed: 400.0,
++            plunge_feed: 100.0,
++            climb: true,
++            lead_deg: 0.0,
++            lag_deg: 0.0,
++            max_tilt_deg: 45.0,
++        };
++        assert_eq!(classify(&rotary_op, &empty), Some(SectionMode::Simultaneous5Axis));
++        assert_eq!(classify(&rotary_op, &live_path), None);
++    }
++}
+diff --git a/crates/app/tests/section_mode.rs b/crates/app/tests/section_mode.rs
+new file mode 100644
+index 000000000..955ab3984
+--- /dev/null
++++ b/crates/app/tests/section_mode.rs
+@@ -0,0 +1,247 @@
++//! Pinning tests for explicit section mode metadata (#1966):
++//! `3-axis`, `3+2 indexed`, and `simultaneous 5-axis` must be emitted as distinct
++//! `PARAM SectionMode ...` markers in `.cnc` streams while leaving legacy `.cl`
++//! / `Dump::default()` and 3-axis `.nc` programs unchanged.
++//!
++//! Gate map (M4.4): covers app::posting, app::posting_section_mode, post::section_mode, post::cnc, app::operation.
++
++use std::path::Path;
++
++use camcraft_app::commands::{
++    AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock,
++};
++use camcraft_app::geometry::{Mesh, Point3, Triangle, cube};
++use camcraft_app::machining2d::{FaceHoles, Lead, PocketStrategy, Side};
++use camcraft_app::machining3d::Entry3D;
++use camcraft_app::post::cnc::{self, Record};
++use camcraft_app::post::{self, Dump};
++use camcraft_app::posting;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::{Tool, catalog};
++use camcraft_app::world::new_world;
++use camcraft_app::{links::Links, operation::{Height, OpParams, SrcRef, Tilt}};
++use flecs_ecs::prelude::World;
++use serde_json::Value;
++
++fn catalog_tool(name: &str) -> Tool {
++    catalog()
++        .into_iter()
++        .find(|(n, _)| *n == name)
++        .map(|(_, t)| t)
++        .expect("catalog entry")
++}
++
++fn add_tool(world: &World, history: &mut History, name: &str) {
++    let cmd = AddTool::new(world, name, catalog_tool(name)).expect("catalog tool");
++    history.execute(world, cmd);
++}
++
++fn section_mode_param(records: &[Record]) -> Option<String> {
++    records.iter().find_map(|r| match r {
++        Record::Param { name, value } if name == "SectionMode" => match value {
++            Value::String(s) => Some(s.clone()),
++            other => Some(other.to_string()),
++        },
++        _ => None,
++    })
++}
++
++fn hill_mesh() -> Mesh {
++    const TAU: f64 = std::f64::consts::TAU;
++    let (radius, polar_max, n_lat, n_lon) = (12.0, std::f64::consts::FRAC_PI_4, 4usize, 12usize);
++    let mut facets = Vec::new();
++    let ring = |k: usize| -> Vec<Point3> {
++        let ph = polar_max * k as f64 / n_lat as f64;
++        let (z, rr) = (radius * ph.cos(), radius * ph.sin());
++        (0..n_lon)
++            .map(|j| {
++                let th = TAU * j as f64 / n_lon as f64;
++                Point3::new(rr * th.cos(), rr * th.sin(), z)
++            })
++            .collect()
++    };
++    let apex = Point3::new(0.0, 0.0, radius);
++    let first = ring(1);
++    for j in 0..n_lon {
++        facets.push(Triangle::new(apex, first[j], first[(j + 1) % n_lon]));
++    }
++    for k in 1..n_lat {
++        let ra = ring(k);
++        let rb = ring(k + 1);
++        for j in 0..n_lon {
++            let j2 = (j + 1) % n_lon;
++            facets.push(Triangle::new(ra[j], rb[j], rb[j2]));
++            facets.push(Triangle::new(ra[j], rb[j2], ra[j2]));
++        }
++    }
++    let rim = ring(n_lat);
++    let center = Point3::new(0.0, 0.0, radius * polar_max.cos());
++    for j in 0..n_lon {
++        facets.push(Triangle::new(center, rim[j], rim[(j + 1) % n_lon]));
++    }
++    Mesh::from_facets(facets)
++}
++
++fn make_face_world() -> World {
++    let world = new_world();
++    let mut history = History::default();
++    let stock_cmd = SetStock::new(
++        &world,
++        StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 },
++        Location::default(),
++    )
++    .expect("box stock");
++    history.execute(&world, stock_cmd);
++    add_tool(&world, &mut history, "EM-0400-2FL");
++    let params = OpParams::Face {
++        holes: FaceHoles::default(),
++        blend_turns: false,
++        tilt: None,
++        stepover: 15.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(19.5),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    };
++    let op = CreateOperation::new(&world, "Face3X", "EM-0400-2FL", SrcRef::Stock, params)
++        .expect("create face");
++    history.execute(&world, op);
++    let gen_cmd = GenerateOperation::new(&world, "Face3X").expect("generate face");
++    history.execute(&world, gen_cmd);
++    world
++}
++
++fn make_tilted_pocket_world() -> World {
++    let world = new_world();
++    let mut history = History::default();
++    add_tool(&world, &mut history, "EM-0600-4FL");
++    let block = cube(Point3::new(0.0, 0.0, -20.0), Point3::new(40.0, 30.0, -10.0));
++    history.execute(&world, ImportModel::from_mesh("part", block));
++    let params = OpParams::Pocket {
++        rest: None,
++        blend_radius: None,
++        links: Links::PLANAR,
++        tilt: Some(Tilt { a_deg: 0.0, b_deg: 90.0, origin: [0.0; 3] }),
++        stepover: 6.0,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(70.0),
++        retract_z: Some(Height::fixed(60.0)),
++        top_z: Height::fixed(40.0),
++        bottom_z: Height::fixed(25.0),
++        stepdown: 15.0,
++        feed: 800.0,
++        plunge_feed: 100.0,
++        climb: true,
++        strategy: PocketStrategy::Zigzag,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        optimal_load: camcraft_app::load::DEFAULT_OPTIMAL_LOAD,
++        blend_turns: false,
++    };
++    let op = CreateOperation::new(&world, "Tilt32", "EM-0600-4FL", SrcRef::Entity("part".into()), params)
++        .expect("create tilted pocket");
++    history.execute(&world, op);
++    let gen_cmd = GenerateOperation::new(&world, "Tilt32").expect("generate tilted pocket");
++    history.execute(&world, gen_cmd);
++    world
++}
++
++fn make_parallel5d_world() -> World {
++    let world = new_world();
++    let mut history = History::default();
++    add_tool(&world, &mut history, "BN-0600");
++    history.execute(&world, ImportModel::from_mesh("hill", hill_mesh()));
++    let stock_cmd = SetStock::new(
++        &world,
++        StockShape::FromModel { source: "hill".into() },
++        Location::default(),
++    )
++    .expect("from-model stock");
++    history.execute(&world, stock_cmd);
++    let params = OpParams::Contour5D {
++        tolerance: 0.25,
++        clearance_z: Height::fixed(25.0),
++        retract_z: None,
++        top_z: Height::fixed(11.0),
++        bottom_z: Height::fixed(9.0),
++        feed: 500.0,
++        plunge_feed: 100.0,
++        climb: true,
++        lead_deg: 15.0,
++        lag_deg: 0.0,
++        max_tilt_deg: 60.0,
++        shank_avoid: false,
++    };
++    let op = CreateOperation::new(&world, "Sim5X", "BN-0600", SrcRef::Entity("hill".into()), params)
++        .expect("create contour5d");
++    history.execute(&world, op);
++    let gen_cmd = GenerateOperation::new(&world, "Sim5X").expect("generate contour5d");
++    history.execute(&world, gen_cmd);
++    world
++}
++
++#[test]
++fn three_axis_tilted_3_plus_2_and_simultaneous_5axis_emit_distinct_section_modes() {
++    let face_world = make_face_world();
++    let tilt_world = make_tilted_pocket_world();
++    let sim_world = make_parallel5d_world();
++
++    let face_streams = posting::op_streams(&face_world).expect("face op streams");
++    let tilt_streams = posting::op_streams(&tilt_world).expect("tilt op streams");
++    let sim_streams = posting::op_streams(&sim_world).expect("5axis op streams");
++
++    assert_eq!(face_streams.len(), 1);
++    assert_eq!(tilt_streams.len(), 1);
++    assert_eq!(sim_streams.len(), 1);
++
++    let face_mode = section_mode_param(&face_streams[0].1);
++    let tilt_mode = section_mode_param(&tilt_streams[0].1);
++    let sim_mode = section_mode_param(&sim_streams[0].1);
++
++    assert_eq!(face_mode.as_deref(), Some("3-axis"));
++    assert_eq!(tilt_mode.as_deref(), Some("3+2 indexed"));
++    assert_eq!(sim_mode.as_deref(), Some("simultaneous 5-axis"));
++    assert_ne!(tilt_mode, sim_mode, "3+2 indexed and simultaneous 5-axis must never share one mode");
++
++    // Round-trip through .cnc serialize/parse preserves PARAM SectionMode and passes section boundaries.
++    for (_, recs) in [&face_streams[0], &tilt_streams[0], &sim_streams[0]] {
++        let text = cnc::serialize(recs);
++        let reparsed = cnc::parse(&text).expect("valid .cnc stream");
++        assert_eq!(section_mode_param(&reparsed), section_mode_param(recs));
++    }
++
++    // 3-axis .nc output posted by an existing mill script must remain identical
++    // with or without the PARAM SectionMode marker.
++    let fanuc_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/posts/fanuc.cps");
++    let fanuc = std::fs::read_to_string(&fanuc_path).expect("fanuc.cps");
++    let with_mode_text = cnc::serialize(&face_streams[0].1);
++    let without_mode: Vec<Record> = face_streams[0]
++        .1
++        .iter()
++        .filter(|r| !matches!(r, Record::Param { name, .. } if name == "SectionMode"))
++        .cloned()
++        .collect();
++    let without_mode_text = cnc::serialize(&without_mode);
++    let mch = posting::default_machine();
++    let posted_with = post::post(&fanuc, &mch, &with_mode_text).expect("post with SectionMode");
++    let posted_without = post::post(&fanuc, &mch, &without_mode_text).expect("post without SectionMode");
++    assert_eq!(posted_with.program, posted_without.program);
++}
++
++#[test]
++fn dump_default_and_legacy_cl_streams_do_not_synthesize_section_mode() {
++    let cl_text = "; HSMW CL v1\nRapid X 0 Y 0 Z 5000\nFeed X 10000 Y 0 Z 0 F 600\nEND\n";
++    let parsed = cnc::parse(cl_text).expect("legacy .cl parses");
++    assert_eq!(section_mode_param(&parsed), None);
++
++    let tp = camcraft_app::cl::Toolpath::default();
++    let dumped = post::dump(&tp, &Dump::default());
++    assert_eq!(section_mode_param(&dumped), None);
++
++    // Ensure Contour with no tilt is also classified as 3-axis when posted, distinct from Lead/Side warnings.
++    let _unused = (Side::Outside, Lead::None);
++}
+diff --git a/crates/post/src/kinematics/mod.rs b/crates/post/src/kinematics/mod.rs
+index 631682acc..78114ad78 100644
+--- a/crates/post/src/kinematics/mod.rs
++++ b/crates/post/src/kinematics/mod.rs
+@@ -13,6 +13,9 @@ mod tests;
+ mod travel;
+ mod types;
+ 
++pub use crate::post::g93::{
++    solve_g93_solved_moves, AxisSpeedLimits, G93Decision, G93Error, G93Options, G93Timing,
++};
+ pub use math::{forward_machine, forward_part, validate_trunnion};
+ pub use path::{solve_path, solve_toolpath};
+ pub use solve::{analytical_branches, AcSolver};
+diff --git a/crates/post/src/post/g93.rs b/crates/post/src/post/g93.rs
+new file mode 100644
+index 000000000..4bb13482c
+--- /dev/null
++++ b/crates/post/src/post/g93.rs
+@@ -0,0 +1,378 @@
++// Provenance: clean-room RS-274D inverse-time feed (G93) solver from first-principles kinematics.
++
++//! Shared `G93` inverse-time feed (`F = 1 / dt_min`, `min^-1`) solver.
++//!
++//! Used across multi-axis kinematics validation and post processors so linear,
++//! rotary, and simultaneous 5-axis feed timing stays consistent with machine
++//! `max_normal_speed` ceilings while leaving part-space cutting feed exact.
++
++use crate::cl::MoveKind;
++use crate::kinematics::SolvedMove;
++use crate::machine::Machine;
++use thiserror::Error;
++
++/// Unit system in which caller-supplied [`G93SegmentInput`] linear quantities are expressed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LinearUnit {
++    Mm,
++    Inch,
++}
++
++impl LinearUnit {
++    /// Conversion multiplier from this unit (or `/min`) into mm (or mm/min).
++    #[must_use]
++    pub const fn to_mm_scale(self) -> f64 {
++        match self {
++            Self::Mm => 1.0,
++            Self::Inch => 25.4,
++        }
++    }
++}
++
++/// Machine normal-feed speed ceilings (`max_normal_speed`) in canonical units.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct AxisSpeedLimits {
++    /// Maximum normal feed speed `[X, Y, Z]` in mm/min (`None` = unstated).
++    pub linear_mm_per_min: [Option<f64>; 3],
++    /// Maximum normal feed speed `[A, B, C]` in deg/min (`None` = unstated).
++    pub rotary_deg_per_min: [Option<f64>; 3],
++}
++
++impl AxisSpeedLimits {
++    /// Extract `[X, Y, Z]` linear (`mm/min`) and `[A, B, C]` rotary (`deg/min`)
++    /// `max_normal_speed` limits from a parsed [`Machine`].
++    #[must_use]
++    pub fn from_machine(machine: &Machine) -> Self {
++        let mut limits = Self::default();
++        for axis in &machine.axes {
++            let Some(feed) = axis.feed else {
++                continue;
++            };
++            if axis.rotary {
++                if axis.name.eq_ignore_ascii_case("A") {
++                    limits.rotary_deg_per_min[0] = Some(feed);
++                } else if axis.name.eq_ignore_ascii_case("B") {
++                    limits.rotary_deg_per_min[1] = Some(feed);
++                } else if axis.name.eq_ignore_ascii_case("C") {
++                    limits.rotary_deg_per_min[2] = Some(feed);
++                }
++            } else if axis.name.eq_ignore_ascii_case("X") {
++                limits.linear_mm_per_min[0] = Some(feed);
++            } else if axis.name.eq_ignore_ascii_case("Y") {
++                limits.linear_mm_per_min[1] = Some(feed);
++            } else if axis.name.eq_ignore_ascii_case("Z") {
++                limits.linear_mm_per_min[2] = Some(feed);
++            }
++        }
++        limits
++    }
++}
++
++/// Solver tolerances, clamp bounds, and pure-rotary fallback policy.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct G93Options {
++    /// Lower finite `F` clamp (`min^-1`). Default `0.001`.
++    pub f_min: f64,
++    /// Upper finite `F` clamp (`min^-1`). Default `60_000.0`.
++    pub f_max: f64,
++    /// Linear zero-motion tolerance (mm). Default `1e-9`.
++    pub pos_eps_mm: f64,
++    /// Rotary zero-motion tolerance (deg). Default `1e-7`.
++    pub ang_eps_deg: f64,
++    /// Optional fallback speed (`deg/min`) for pure rotary reorientations (`ds_tip == 0`)
++    /// when stated machine axis limits are absent.
++    pub rotary_only_deg_per_min: Option<f64>,
++}
++
++impl Default for G93Options {
++    fn default() -> Self {
++        Self {
++            f_min: 0.001,
++            f_max: 60_000.0,
++            pos_eps_mm: 1e-9,
++            ang_eps_deg: 1e-7,
++            rotary_only_deg_per_min: None,
++        }
++    }
++}
++
++/// One segment handed to [`solve_g93_segment`].
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct G93SegmentInput {
++    pub kind: MoveKind,
++    /// Part-space start tool tip (mm, or linear units when passed to [`solve_g93_segment_in_units`]).
++    pub tip_from: [f64; 3],
++    /// Part-space end tool tip.
++    pub tip_to: [f64; 3],
++    /// Machine-space linear start `[X, Y, Z]` (includes pivot/RTCP slide motion).
++    pub machine_xyz_from: [f64; 3],
++    /// Machine-space linear end `[X, Y, Z]`.
++    pub machine_xyz_to: [f64; 3],
++    /// Unwrapped commanded rotary start `[A, B, C]` (deg).
++    pub rotary_deg_from: [f64; 3],
++    /// Unwrapped commanded rotary end `[A, B, C]` (deg).
++    pub rotary_deg_to: [f64; 3],
++    /// Programmed cutting feed (`mm/min`, or linear units/min with [`solve_g93_segment_in_units`]).
++    pub feed_mm_per_min: Option<f64>,
++}
++
++impl G93SegmentInput {
++    /// Construct a [`G93SegmentInput`] from an IK [`SolvedMove`].
++    #[must_use]
++    pub fn from_solved_move(m: &SolvedMove) -> Self {
++        Self {
++            kind: m.kind,
++            tip_from: m.tip_from,
++            tip_to: m.tip_to,
++            machine_xyz_from: m.from.xyz,
++            machine_xyz_to: m.to.xyz,
++            rotary_deg_from: [m.from.a_deg, 0.0, m.from.c_deg],
++            rotary_deg_to: [m.to.a_deg, 0.0, m.to.c_deg],
++            feed_mm_per_min: m.feed,
++        }
++    }
++}
++
++/// Solved `G93` inverse-time breakdown for one non-rapid, non-empty feed block.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct G93Timing {
++    /// Part-space tip chord length `||tip_1 - tip_0||` (mm).
++    pub ds_tip_mm: f64,
++    /// Minimum block time requested by programmed tip feed (minutes).
++    pub dt_cut_min: f64,
++    /// Minimum block time imposed by stated linear/rotary `max_normal_speed` limits (minutes).
++    pub dt_lim_min: f64,
++    /// Governing block duration `max(dt_cut_min, dt_lim_min)` (minutes).
++    pub dt_min: f64,
++    /// Final clamped inverse-time word `F = clamp(1 / dt_min, f_min, f_max)` (`min^-1`).
++    pub f_inv_min: f64,
++}
++
++/// Result of solving one motion segment for `G93` posting.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum G93Decision {
++    /// Non-rapid segment carrying active motion and a finite inverse-time `F` word.
++    Feed(G93Timing),
++    /// Rapid move: executed in `G94` (`G0`), never emits a `G93` `F` word.
++    Rapid,
++    /// Zero-motion duplicate move within linear/rotary tolerances; caller should skip emitting it.
++    Skip,
++}
++
++/// Refusal reasons when inputs or limits are invalid.
++#[derive(Clone, Debug, Error, PartialEq)]
++pub enum G93Error {
++    #[error("G93 requires finite coordinates and angles (invalid {field})")]
++    NonFiniteCoordinate { field: &'static str },
++    #[error("G93 feed move requires a finite positive FeedRate, got {0:?}")]
++    InvalidFeedRate(Option<f64>),
++    #[error("G93 axis {axis} max_normal_speed must be finite and > 0, got {limit}")]
++    InvalidAxisLimit { axis: &'static str, limit: f64 },
++    #[error("G93 options invalid: {0}")]
++    InvalidOptions(&'static str),
++    #[error("G93 rotary-only reorientation has no positive FeedRate or stated axis speed limit ({context})")]
++    MissingFeedAndLimits { context: &'static str },
++}
++
++fn validate_vec3(v: [f64; 3], field: &'static str) -> Result<(), G93Error> {
++    if v.iter().all(|x| x.is_finite()) {
++        Ok(())
++    } else {
++        Err(G93Error::NonFiniteCoordinate { field })
++    }
++}
++
++fn check_axes(names: [&'static str; 3], vals: [Option<f64>; 3]) -> Result<(), G93Error> {
++    for (axis, lim) in names.into_iter().zip(vals) {
++        if let Some(limit) = lim
++            && (!limit.is_finite() || limit <= 0.0)
++        {
++            return Err(G93Error::InvalidAxisLimit { axis, limit });
++        }
++    }
++    Ok(())
++}
++
++fn validate_limits(limits: &AxisSpeedLimits) -> Result<(), G93Error> {
++    check_axes(["X", "Y", "Z"], limits.linear_mm_per_min)?;
++    check_axes(["A", "B", "C"], limits.rotary_deg_per_min)
++}
++
++fn validate_options(opts: &G93Options) -> Result<(), G93Error> {
++    if !opts.f_min.is_finite() || opts.f_min <= 0.0 {
++        return Err(G93Error::InvalidOptions("f_min must be finite and > 0"));
++    }
++    if !opts.f_max.is_finite() || opts.f_max < opts.f_min {
++        return Err(G93Error::InvalidOptions("f_max must be finite and >= f_min"));
++    }
++    if !opts.pos_eps_mm.is_finite() || opts.pos_eps_mm < 0.0 {
++        return Err(G93Error::InvalidOptions("pos_eps_mm must be finite and >= 0"));
++    }
++    if !opts.ang_eps_deg.is_finite() || opts.ang_eps_deg < 0.0 {
++        return Err(G93Error::InvalidOptions("ang_eps_deg must be finite and >= 0"));
++    }
++    if let Some(r) = opts.rotary_only_deg_per_min
++        && (!r.is_finite() || r <= 0.0)
++    {
++        return Err(G93Error::InvalidOptions(
++            "rotary_only_deg_per_min must be finite and > 0 when set",
++        ));
++    }
++    Ok(())
++}
++
++/// Solve one segment in canonical mm / mm/min / deg / deg/min units.
++pub fn solve_g93_segment(
++    seg: &G93SegmentInput,
++    limits: &AxisSpeedLimits,
++    opts: &G93Options,
++) -> Result<G93Decision, G93Error> {
++    validate_options(opts)?;
++    validate_limits(limits)?;
++    validate_vec3(seg.tip_from, "tip_from")?;
++    validate_vec3(seg.tip_to, "tip_to")?;
++    validate_vec3(seg.machine_xyz_from, "machine_xyz_from")?;
++    validate_vec3(seg.machine_xyz_to, "machine_xyz_to")?;
++    validate_vec3(seg.rotary_deg_from, "rotary_deg_from")?;
++    validate_vec3(seg.rotary_deg_to, "rotary_deg_to")?;
++
++    if seg.kind == MoveKind::Rapid {
++        return Ok(G93Decision::Rapid);
++    }
++
++    let dx_t = seg.tip_to[0] - seg.tip_from[0];
++    let dy_t = seg.tip_to[1] - seg.tip_from[1];
++    let dz_t = seg.tip_to[2] - seg.tip_from[2];
++    let ds_tip = (dx_t * dx_t + dy_t * dy_t + dz_t * dz_t).sqrt();
++
++    let d_xyz = [
++        (seg.machine_xyz_to[0] - seg.machine_xyz_from[0]).abs(),
++        (seg.machine_xyz_to[1] - seg.machine_xyz_from[1]).abs(),
++        (seg.machine_xyz_to[2] - seg.machine_xyz_from[2]).abs(),
++    ];
++    let d_rot = [
++        (seg.rotary_deg_to[0] - seg.rotary_deg_from[0]).abs(),
++        (seg.rotary_deg_to[1] - seg.rotary_deg_from[1]).abs(),
++        (seg.rotary_deg_to[2] - seg.rotary_deg_from[2]).abs(),
++    ];
++    let max_d_xyz = d_xyz.into_iter().fold(0.0_f64, f64::max);
++    let max_d_rot = d_rot.into_iter().fold(0.0_f64, f64::max);
++
++    if ds_tip <= opts.pos_eps_mm && max_d_xyz <= opts.pos_eps_mm && max_d_rot <= opts.ang_eps_deg {
++        return Ok(G93Decision::Skip);
++    }
++
++    let mut dt_lim = 0.0_f64;
++    for i in 0..3 {
++        if d_xyz[i] > opts.pos_eps_mm
++            && let Some(v_max) = limits.linear_mm_per_min[i]
++        {
++            dt_lim = dt_lim.max(d_xyz[i] / v_max);
++        }
++        if d_rot[i] > opts.ang_eps_deg
++            && let Some(w_max) = limits.rotary_deg_per_min[i]
++        {
++            dt_lim = dt_lim.max(d_rot[i] / w_max);
++        }
++    }
++
++    let dt_cut = if ds_tip > opts.pos_eps_mm {
++        let Some(v_prog) = seg.feed_mm_per_min.filter(|v| v.is_finite() && *v > 0.0) else {
++            return Err(G93Error::InvalidFeedRate(seg.feed_mm_per_min));
++        };
++        ds_tip / v_prog
++    } else if max_d_rot > opts.ang_eps_deg {
++        if let Some(rot_rate) = opts.rotary_only_deg_per_min {
++            max_d_rot / rot_rate
++        } else if dt_lim > 0.0 {
++            0.0
++        } else if let Some(v_prog) = seg.feed_mm_per_min.filter(|v| v.is_finite() && *v > 0.0) {
++            max_d_rot / v_prog
++        } else {
++            return Err(G93Error::MissingFeedAndLimits {
++                context: "pure rotary motion with no FeedRate or rotary max_normal_speed",
++            });
++        }
++    } else if let Some(v_prog) = seg.feed_mm_per_min.filter(|v| v.is_finite() && *v > 0.0) {
++        max_d_xyz / v_prog
++    } else if dt_lim > 0.0 {
++        0.0
++    } else {
++        return Err(G93Error::InvalidFeedRate(seg.feed_mm_per_min));
++    };
++
++    let dt_min = dt_cut.max(dt_lim);
++    let f_raw = if dt_min > 0.0 { 1.0 / dt_min } else { opts.f_max };
++    let f_inv_min = if f_raw.is_finite() {
++        f_raw.clamp(opts.f_min, opts.f_max)
++    } else {
++        opts.f_max
++    };
++
++    Ok(G93Decision::Feed(G93Timing {
++        ds_tip_mm: ds_tip,
++        dt_cut_min: dt_cut,
++        dt_lim_min: dt_lim,
++        dt_min,
++        f_inv_min,
++    }))
++}
++
++/// Solve a segment expressed in `unit` (`Mm` for G21, `Inch` for G20), proving unit invariance.
++pub fn solve_g93_segment_in_units(
++    unit: LinearUnit,
++    seg: &G93SegmentInput,
++    limits: &AxisSpeedLimits,
++    opts: &G93Options,
++) -> Result<G93Decision, G93Error> {
++    let scale = unit.to_mm_scale();
++    let scaled_seg = G93SegmentInput {
++        kind: seg.kind,
++        tip_from: seg.tip_from.map(|v| v * scale),
++        tip_to: seg.tip_to.map(|v| v * scale),
++        machine_xyz_from: seg.machine_xyz_from.map(|v| v * scale),
++        machine_xyz_to: seg.machine_xyz_to.map(|v| v * scale),
++        rotary_deg_from: seg.rotary_deg_from,
++        rotary_deg_to: seg.rotary_deg_to,
++        feed_mm_per_min: seg.feed_mm_per_min.map(|v| v * scale),
++    };
++    let scaled_limits = AxisSpeedLimits {
++        linear_mm_per_min: limits.linear_mm_per_min.map(|opt| opt.map(|v| v * scale)),
++        rotary_deg_per_min: limits.rotary_deg_per_min,
++    };
++    solve_g93_segment(&scaled_seg, &scaled_limits, opts)
++}
++
++/// Solve an entire sequence of IK [`SolvedMove`]s into `(source_index, G93Decision)` pairs.
++pub fn solve_g93_solved_moves(
++    moves: &[SolvedMove],
++    limits: &AxisSpeedLimits,
++    opts: &G93Options,
++) -> Result<Vec<(usize, G93Decision)>, G93Error> {
++    let mut out = Vec::with_capacity(moves.len());
++    for m in moves {
++        let seg = G93SegmentInput::from_solved_move(m);
++        let decision = solve_g93_segment(&seg, limits, opts)?;
++        out.push((m.source_index, decision));
++    }
++    Ok(out)
++}
++
++/// Format an `F` inverse-time word by flooring to 4 decimal places (`min^-1`)
++/// so rounding never shortens `dt_min` above a machine speed limit.
++#[must_use]
++pub fn format_g93_feed_word(f_inv_min: f64) -> String {
++    if !f_inv_min.is_finite() || f_inv_min <= 0.0 {
++        return "0".to_string();
++    }
++    let scaled = (f_inv_min * 10_000.0 + 1e-12).floor() / 10_000.0;
++    let safe = if scaled <= 0.0 { 0.0001 } else { scaled };
++    let mut s = format!("{safe:.4}");
++    while s.contains('.') && s.ends_with('0') {
++        s.pop();
++    }
++    if s.ends_with('.') {
++        s.pop();
++    }
++    s
++}
+diff --git a/crates/post/src/post/mod.rs b/crates/post/src/post/mod.rs
+index a82eff113..a1e3eed81 100644
+--- a/crates/post/src/post/mod.rs
++++ b/crates/post/src/post/mod.rs
+@@ -34,6 +34,7 @@ mod coolant;
+ pub mod dialect;
+ pub mod engine;
+ pub mod explain;
++pub mod g93;
+ pub mod invert;
+ pub mod js;
+ pub mod machine;
+@@ -43,6 +44,7 @@ mod options_parse;
+ pub mod probe_rec;
+ mod program;
+ pub mod rotary_cap;
++pub mod section_mode;
+ pub mod work_offset;
+ pub mod units;
+ 
+@@ -50,6 +52,7 @@ pub use after_op::AfterOperation;
+ pub use coolant::CoolantMode;
+ pub use engine::{LineInfo, PostOutput, TraceBlock};
+ pub use js::ProgramId;
++pub use section_mode::{read_section_mode, set_section_mode, SectionMode, SectionModeError};
+ 
+ use crate::cl::{MoveKind, Toolpath};
+ use cnc::{CycleRec, MoveRec, Record};
+diff --git a/crates/post/src/post/rotary_cap.rs b/crates/post/src/post/rotary_cap.rs
+index 8e04cfc18..351bbe7ea 100644
+--- a/crates/post/src/post/rotary_cap.rs
++++ b/crates/post/src/post/rotary_cap.rs
+@@ -155,3 +155,9 @@ function rotaryFeedWord(v, inch) {
+   return "F" + s;
+ }
+ "#;
++
++/// Shared Rust G93 inverse-time solver re-exported alongside the G94 JS rotary cap.
++pub use super::g93::{
++    format_g93_feed_word, solve_g93_segment, solve_g93_segment_in_units, solve_g93_solved_moves,
++    AxisSpeedLimits, G93Decision, G93Error, G93Options, G93SegmentInput, G93Timing, LinearUnit,
++};
+diff --git a/crates/post/src/post/section_mode.rs b/crates/post/src/post/section_mode.rs
+new file mode 100644
+index 000000000..56def3914
+--- /dev/null
++++ b/crates/post/src/post/section_mode.rs
+@@ -0,0 +1,144 @@
++// Provenance: clean-room intermediate `.cnc` section kinematics mode marker (`PARAM SectionMode`).
++
++//! Explicit section kinematics mode (`3-axis`, `3+2 indexed`, `simultaneous 5-axis`).
++//!
++//! Emitted before `SECTION` by [`set_section_mode`] and decoded cleanly by
++//! [`read_section_mode`]. Unrecognized `SectionMode` values are refused by
++//! name rather than guessed.
++
++use super::cnc::Record;
++use serde_json::{json, Value};
++use std::fmt;
++use thiserror::Error;
++
++/// Kinematics execution mode carried by a post section (`PARAM SectionMode`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum SectionMode {
++    /// Planar/3D prismatic operation with fixed vertical tool axis (`3-axis`).
++    ThreeAxis,
++    /// Planar operation indexed to one fixed rotary orientation (`3+2 indexed`).
++    Indexed3Plus2,
++    /// Continuous synchronized multi-axis motion (`simultaneous 5-axis`).
++    Simultaneous5Axis,
++}
++
++impl SectionMode {
++    /// Parameter key written in `.cnc` streams (`PARAM SectionMode ...`).
++    pub const PARAM_NAME: &'static str = "SectionMode";
++    pub const THREE_AXIS_STR: &'static str = "3-axis";
++    pub const INDEXED_3_PLUS_2_STR: &'static str = "3+2 indexed";
++    pub const SIMULTANEOUS_5_AXIS_STR: &'static str = "simultaneous 5-axis";
++
++    /// Canonical wire string written after `PARAM SectionMode`.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::ThreeAxis => Self::THREE_AXIS_STR,
++            Self::Indexed3Plus2 => Self::INDEXED_3_PLUS_2_STR,
++            Self::Simultaneous5Axis => Self::SIMULTANEOUS_5_AXIS_STR,
++        }
++    }
++
++    /// Parse one canonical `SectionMode` string, refusing any unknown value by name.
++    pub fn parse(raw: &str) -> Result<Self, SectionModeError> {
++        match raw.trim() {
++            Self::THREE_AXIS_STR => Ok(Self::ThreeAxis),
++            Self::INDEXED_3_PLUS_2_STR => Ok(Self::Indexed3Plus2),
++            Self::SIMULTANEOUS_5_AXIS_STR => Ok(Self::Simultaneous5Axis),
++            other => Err(SectionModeError::InvalidValue { got: other.to_string() }),
++        }
++    }
++
++    #[must_use]
++    pub const fn is_3_plus_2(self) -> bool {
++        matches!(self, Self::Indexed3Plus2)
++    }
++
++    #[must_use]
++    pub const fn is_simultaneous(self) -> bool {
++        matches!(self, Self::Simultaneous5Axis)
++    }
++}
++
++impl fmt::Display for SectionMode {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++/// Refusal returned when a `PARAM SectionMode` value cannot be decoded safely.
++#[derive(Clone, Debug, Error, PartialEq, Eq)]
++pub enum SectionModeError {
++    #[error(
++        "SectionMode {got:?} is unknown (expected \"3-axis\", \"3+2 indexed\", or \"simultaneous 5-axis\")"
++    )]
++    InvalidValue { got: String },
++}
++
++/// Insert (or update) `PARAM SectionMode <mode>` directly before `SECTION`.
++pub fn set_section_mode(records: &mut Vec<Record>, mode: SectionMode) {
++    let val = json!(mode.as_str());
++    for rec in records.iter_mut() {
++        if let Record::Param { name, value } = rec
++            && name == SectionMode::PARAM_NAME
++        {
++            *value = val;
++            return;
++        }
++    }
++    let at = records
++        .iter()
++        .position(|r| matches!(r, Record::Section { begin: true }))
++        .unwrap_or(records.len());
++    records.insert(
++        at,
++        Record::Param {
++            name: SectionMode::PARAM_NAME.to_string(),
++            value: val,
++        },
++    );
++}
++
++/// Decode `PARAM SectionMode` if present in `records`, refusing unrecognized values by name.
++pub fn read_section_mode(records: &[Record]) -> Result<Option<SectionMode>, SectionModeError> {
++    for r in records {
++        if let Record::Param { name, value } = r
++            && name == SectionMode::PARAM_NAME
++        {
++            return match value {
++                Value::String(s) => SectionMode::parse(s).map(Some),
++                other => Err(SectionModeError::InvalidValue { got: other.to_string() }),
++            };
++        }
++    }
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::post::cnc;
++
++    #[test]
++    fn round_trips_all_three_modes_and_refuses_unknown_value() {
++        for mode in [
++            SectionMode::ThreeAxis,
++            SectionMode::Indexed3Plus2,
++            SectionMode::Simultaneous5Axis,
++        ] {
++            let mut recs = vec![Record::Section { begin: true }, Record::Section { begin: false }];
++            set_section_mode(&mut recs, mode);
++            let txt = cnc::serialize(&recs);
++            let parsed = cnc::parse(&txt).expect("valid stream");
++            assert_eq!(read_section_mode(&parsed), Ok(Some(mode)));
++        }
++        let bad = vec![Record::Param {
++            name: SectionMode::PARAM_NAME.into(),
++            value: json!("5axis-magic"),
++        }];
++        assert!(matches!(
++            read_section_mode(&bad),
++            Err(SectionModeError::InvalidValue { .. })
++        ));
++    }
++}
+diff --git a/crates/post/tests/g93_feed.rs b/crates/post/tests/g93_feed.rs
+new file mode 100644
+index 000000000..69def032d
+--- /dev/null
++++ b/crates/post/tests/g93_feed.rs
+@@ -0,0 +1,337 @@
++//! Pinning tests for the shared G93 inverse-time feed solver (#1966).
++//!
++//! Provenance: clean-room tests against RS-274D G93 (`F = 1 / dt_min`, min^-1).
++//! Gate map (M4.4): covers post::post, post::g93, post::rotary_cap, post::kinematics, post::machine.
++
++use std::path::Path;
++
++use camcraft_post::cl::MoveKind;
++use camcraft_post::kinematics::{
++    AcTrunnionConfig, PathMove, PathOptions, SolvedMove, solve_path,
++};
++use camcraft_post::machine::parse_mch;
++use camcraft_post::post::g93::{
++    AxisSpeedLimits, G93Decision, G93Error, G93Options, G93SegmentInput, LinearUnit,
++    format_g93_feed_word, solve_g93_segment, solve_g93_segment_in_units, solve_g93_solved_moves,
++};
++
++fn trunnion_cfg() -> AcTrunnionConfig {
++    AcTrunnionConfig {
++        c_offset: [0.0, 0.0, -50.0],
++        wcs_offset: [0.0, 0.0, 20.0],
++        ..AcTrunnionConfig::default()
++    }
++}
++
++#[test]
++fn part_space_tip_distance_sets_dt_cut_even_when_pivot_inflates_machine_xyz() {
++    // Part tip moves 10 mm along +X at 1000 mm/min => dt_cut = 0.01 min, F = 100 min^-1.
++    // Meanwhile, a simultaneous tilt swings the machine X slide by 25 mm.
++    // Because no axis ceiling is exceeded (limits = unstated), F must reflect
++    // part-space ||tip_1 - tip_0|| / v_prog = 10 / 1000 = 0.01 min -> F = 100.
++    let seg = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [0.0, 0.0, 0.0],
++        tip_to: [10.0, 0.0, 0.0],
++        machine_xyz_from: [0.0, 0.0, 120.0],
++        machine_xyz_to: [25.0, 0.0, 120.0],
++        rotary_deg_from: [0.0, 0.0, 0.0],
++        rotary_deg_to: [5.0, 0.0, 0.0],
++        feed_mm_per_min: Some(1000.0),
++    };
++    let res = solve_g93_segment(&seg, &AxisSpeedLimits::default(), &G93Options::default())
++        .expect("unconstrained G93 segment");
++    let G93Decision::Feed(timing) = res else {
++        panic!("expected Feed, got {res:?}");
++    };
++    assert!((timing.ds_tip_mm - 10.0).abs() < 1e-12);
++    assert!((timing.dt_cut_min - 0.01).abs() < 1e-12);
++    assert!((timing.dt_lim_min - 0.0).abs() < 1e-12);
++    assert!((timing.dt_min - 0.01).abs() < 1e-12);
++    assert!((timing.f_inv_min - 100.0).abs() < 1e-9);
++}
++
++#[test]
++fn rotary_and_linear_max_normal_speed_ceilings_clamp_dt_min_upward() {
++    // Tip moves 2 mm at 1000 mm/min => dt_cut = 0.002 min (would be F500).
++    // Rotary A moves 30 deg with max_normal_speed = 1500 deg/min => dt_lim_A = 0.02 min (F50).
++    // dt_min must be max(0.002, 0.02) = 0.02 min => F = 50 min^-1.
++    let limits = AxisSpeedLimits {
++        linear_mm_per_min: [Some(5000.0), Some(5000.0), Some(3000.0)],
++        rotary_deg_per_min: [Some(1500.0), None, Some(3000.0)],
++    };
++    let seg_rot = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [0.0, 0.0, 0.0],
++        tip_to: [2.0, 0.0, 0.0],
++        machine_xyz_from: [0.0, 0.0, 0.0],
++        machine_xyz_to: [2.0, 0.0, 0.0],
++        rotary_deg_from: [0.0, 0.0, 0.0],
++        rotary_deg_to: [30.0, 0.0, 0.0],
++        feed_mm_per_min: Some(1000.0),
++    };
++    let G93Decision::Feed(t_rot) = solve_g93_segment(&seg_rot, &limits, &G93Options::default())
++        .expect("rotary-capped segment")
++    else {
++        panic!("expected Feed");
++    };
++    assert!((t_rot.dt_cut_min - 0.002).abs() < 1e-12);
++    assert!((t_rot.dt_lim_min - 0.02).abs() < 1e-12);
++    assert!((t_rot.dt_min - 0.02).abs() < 1e-12);
++    assert!((t_rot.f_inv_min - 50.0).abs() < 1e-9);
++
++    // Pivot swing moves machine Z by 30 mm while tip moves only 1 mm at 1000 mm/min.
++    // Linear Z limit is 1500 mm/min => dt_lim_Z = 30 / 1500 = 0.02 min => F = 50 min^-1.
++    let lin_limits = AxisSpeedLimits {
++        linear_mm_per_min: [Some(5000.0), Some(5000.0), Some(1500.0)],
++        rotary_deg_per_min: [None, None, None],
++    };
++    let seg_lin = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [0.0, 0.0, 0.0],
++        tip_to: [1.0, 0.0, 0.0],
++        machine_xyz_from: [0.0, 0.0, 0.0],
++        machine_xyz_to: [1.0, 0.0, 30.0],
++        rotary_deg_from: [0.0, 0.0, 0.0],
++        rotary_deg_to: [10.0, 0.0, 0.0],
++        feed_mm_per_min: Some(1000.0),
++    };
++    let G93Decision::Feed(t_lin) = solve_g93_segment(&seg_lin, &lin_limits, &G93Options::default())
++        .expect("linear-capped segment")
++    else {
++        panic!("expected Feed");
++    };
++    assert!((t_lin.dt_min - 0.02).abs() < 1e-12);
++    assert!((t_lin.f_inv_min - 50.0).abs() < 1e-9);
++}
++
++#[test]
++fn rotary_only_reorientation_uses_limit_or_fallback_and_never_divides_by_zero() {
++    // Pure rotary index on spot: tip does not move in part space (ds_tip == 0),
++    // C rotates 90 deg, Z compensates by 0 here.
++    let limits = AxisSpeedLimits {
++        linear_mm_per_min: [None; 3],
++        rotary_deg_per_min: [None, None, Some(1800.0)],
++    };
++    let seg = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [10.0, 0.0, 5.0],
++        tip_to: [10.0, 0.0, 5.0],
++        machine_xyz_from: [10.0, 0.0, 5.0],
++        machine_xyz_to: [10.0, 0.0, 5.0],
++        rotary_deg_from: [0.0, 0.0, 0.0],
++        rotary_deg_to: [0.0, 0.0, 90.0],
++        feed_mm_per_min: Some(500.0),
++    };
++    let G93Decision::Feed(t1) = solve_g93_segment(&seg, &limits, &G93Options::default())
++        .expect("rotary-only with axis limit")
++    else {
++        panic!("expected Feed");
++    };
++    // 90 deg / 1800 deg/min = 0.05 min => F = 20.
++    assert!((t1.dt_min - 0.05).abs() < 1e-12);
++    assert!((t1.f_inv_min - 20.0).abs() < 1e-9);
++
++    // Unstated machine limits + explicit configured rotary_only_deg_per_min: 90 deg / 900 = 0.1 min -> F10.
++    let opts = G93Options {
++        rotary_only_deg_per_min: Some(900.0),
++        ..G93Options::default()
++    };
++    let G93Decision::Feed(t2) = solve_g93_segment(&seg, &AxisSpeedLimits::default(), &opts)
++        .expect("rotary-only with configured angular speed")
++    else {
++        panic!("expected Feed");
++    };
++    assert!((t2.dt_min - 0.1).abs() < 1e-12);
++    assert!((t2.f_inv_min - 10.0).abs() < 1e-9);
++
++    // Unstated limits and no configured angular speed: uses finite v_prog fallback (90 / 500 = 0.18 min -> F = 5.555...).
++    let G93Decision::Feed(t3) = solve_g93_segment(&seg, &AxisSpeedLimits::default(), &G93Options::default())
++        .expect("rotary-only with v_prog fallback")
++    else {
++        panic!("expected Feed");
++    };
++    assert!(t3.f_inv_min.is_finite() && (t3.f_inv_min - (500.0 / 90.0)).abs() < 1e-9);
++
++    // Rotary-only with NEITHER feed NOR limits MUST refuse cleanly, never return NaN/Inf.
++    let no_speed = G93SegmentInput { feed_mm_per_min: None, ..seg };
++    let err = solve_g93_segment(&no_speed, &AxisSpeedLimits::default(), &G93Options::default())
++        .expect_err("rotary-only without feed or rotary limits must refuse");
++    assert!(matches!(err, G93Error::MissingFeedAndLimits { .. }));
++}
++
++#[test]
++fn duplicate_zero_motion_skips_and_bounds_clamp_and_bad_inputs_refuse() {
++    let dup = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [1.0, 2.0, 3.0],
++        tip_to: [1.0, 2.0, 3.0],
++        machine_xyz_from: [1.0, 2.0, 3.0],
++        machine_xyz_to: [1.0, 2.0, 3.0],
++        rotary_deg_from: [15.0, 0.0, 45.0],
++        rotary_deg_to: [15.0, 0.0, 45.0],
++        feed_mm_per_min: Some(1000.0),
++    };
++    assert_eq!(
++        solve_g93_segment(&dup, &AxisSpeedLimits::default(), &G93Options::default())
++            .expect("zero-motion duplicate skips"),
++        G93Decision::Skip
++    );
++
++    // Tiny move clamping to f_max.
++    let tiny = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [0.0, 0.0, 0.0],
++        tip_to: [1e-5, 0.0, 0.0],
++        machine_xyz_from: [0.0, 0.0, 0.0],
++        machine_xyz_to: [1e-5, 0.0, 0.0],
++        rotary_deg_from: [0.0; 3],
++        rotary_deg_to: [0.0; 3],
++        feed_mm_per_min: Some(10_000.0),
++    };
++    let opts = G93Options::default();
++    let G93Decision::Feed(clamped_hi) = solve_g93_segment(&tiny, &AxisSpeedLimits::default(), &opts)
++        .expect("tiny move clamps")
++    else {
++        panic!("expected Feed");
++    };
++    assert!((clamped_hi.f_inv_min - opts.f_max).abs() < 1e-12);
++
++    // Very slow / huge move clamping to f_min (and word never truncates F0.001 to 0).
++    let huge = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [0.0, 0.0, 0.0],
++        tip_to: [5000.0, 0.0, 0.0],
++        machine_xyz_from: [0.0, 0.0, 0.0],
++        machine_xyz_to: [5000.0, 0.0, 0.0],
++        rotary_deg_from: [0.0; 3],
++        rotary_deg_to: [0.0; 3],
++        feed_mm_per_min: Some(1.0),
++    };
++    let G93Decision::Feed(clamped_lo) = solve_g93_segment(&huge, &AxisSpeedLimits::default(), &opts)
++        .expect("very slow move clamps to f_min")
++    else {
++        panic!("expected Feed");
++    };
++    assert!((clamped_lo.f_inv_min - opts.f_min).abs() < 1e-12);
++    assert_eq!(format_g93_feed_word(clamped_lo.f_inv_min), "0.001");
++
++    // Floor formatting never rounds upward into a speed violation.
++    assert_eq!(format_g93_feed_word(12.34569), "12.3456");
++
++    // Non-positive or non-finite feed rate refuses by name.
++    let bad_feed = G93SegmentInput { feed_mm_per_min: Some(0.0), ..huge };
++    let err = solve_g93_segment(&bad_feed, &AxisSpeedLimits::default(), &opts)
++        .expect_err("zero feed refuses");
++    assert!(matches!(err, G93Error::InvalidFeedRate(_)));
++
++    let neg_limit = AxisSpeedLimits {
++        linear_mm_per_min: [Some(-10.0), None, None],
++        rotary_deg_per_min: [None; 3],
++    };
++    let err_lim = solve_g93_segment(&huge, &neg_limit, &opts).expect_err("negative axis limit refuses");
++    assert!(matches!(err_lim, G93Error::InvalidAxisLimit { axis: "X", .. }));
++
++    let bad_rot = AxisSpeedLimits {
++        linear_mm_per_min: [None; 3],
++        rotary_deg_per_min: [None, Some(0.0), None],
++    };
++    assert!(matches!(
++        solve_g93_segment(&huge, &bad_rot, &opts),
++        Err(G93Error::InvalidAxisLimit { axis: "B", .. })
++    ));
++    let bad_opt = G93Options { f_min: 10.0, f_max: 5.0, ..G93Options::default() };
++    assert!(matches!(
++        solve_g93_segment(&huge, &AxisSpeedLimits::default(), &bad_opt),
++        Err(G93Error::InvalidOptions(_))
++    ));
++    assert_eq!(format_g93_feed_word(50.0), "50");
++    assert_eq!(format_g93_feed_word(1e-7), "0.0001");
++}
++
++#[test]
++fn g20_inch_and_g21_mm_produce_identical_g93_f_and_integrates_with_ik_and_mch() {
++    let tip0_mm = [25.4, 0.0, 0.0];
++    let tip1_mm = [50.8, 25.4, 0.0]; // 1" in X, 1" in Y => sqrt(2)" = 35.9210... mm
++    let xyz0_mm = [25.4, 0.0, 127.0];
++    let xyz1_mm = [50.8, 38.1, 127.0];
++    let rot0 = [0.0, 0.0, 0.0];
++    let rot1 = [15.0, 0.0, 30.0];
++
++    let seg_mm = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: tip0_mm,
++        tip_to: tip1_mm,
++        machine_xyz_from: xyz0_mm,
++        machine_xyz_to: xyz1_mm,
++        rotary_deg_from: rot0,
++        rotary_deg_to: rot1,
++        feed_mm_per_min: Some(508.0), // 20 ipm
++    };
++    let limits_mm = AxisSpeedLimits {
++        linear_mm_per_min: [Some(2540.0), Some(1270.0), Some(2540.0)],
++        rotary_deg_per_min: [Some(600.0), None, Some(1200.0)],
++    };
++    let opts = G93Options::default();
++    let res_mm = solve_g93_segment_in_units(LinearUnit::Mm, &seg_mm, &limits_mm, &opts).expect("mm");
++
++    let seg_in = G93SegmentInput {
++        kind: MoveKind::Feed,
++        tip_from: [1.0, 0.0, 0.0],
++        tip_to: [2.0, 1.0, 0.0],
++        machine_xyz_from: [1.0, 0.0, 5.0],
++        machine_xyz_to: [2.0, 1.5, 5.0],
++        rotary_deg_from: rot0,
++        rotary_deg_to: rot1,
++        feed_mm_per_min: Some(20.0), // ipm when unit = Inch
++    };
++    let limits_in = AxisSpeedLimits {
++        linear_mm_per_min: [Some(100.0), Some(50.0), Some(100.0)], // ipm when unit = Inch
++        rotary_deg_per_min: [Some(600.0), None, Some(1200.0)],     // deg/min stays deg/min
++    };
++    let res_in = solve_g93_segment_in_units(LinearUnit::Inch, &seg_in, &limits_in, &opts).expect("inch");
++
++    let (G93Decision::Feed(t_mm), G93Decision::Feed(t_in)) = (res_mm, res_in) else {
++        panic!("expected Feed in both units");
++    };
++    assert!(
++        (t_mm.f_inv_min - t_in.f_inv_min).abs() < 1e-12,
++        "G20 F={} must equal G21 F={}",
++        t_in.f_inv_min,
++        t_mm.f_inv_min
++    );
++
++    // Load real machine definitions and integrate with kinematics::solve_path.
++    let mch_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/machines/tilthead.mch");
++    let mch = parse_mch(&std::fs::read_to_string(&mch_path).expect("tilthead.mch")).expect("parse mch");
++    let mch_limits = AxisSpeedLimits::from_machine(&mch);
++    assert_eq!(mch_limits.linear_mm_per_min, [Some(5000.0), Some(5000.0), Some(3000.0)]);
++    assert_eq!(mch_limits.rotary_deg_per_min, [Some(2000.0), Some(2000.0), None]);
++
++    let path_moves = vec![
++        PathMove {
++            kind: MoveKind::Rapid,
++            feed: None,
++            from_tip: [10.0, 0.0, 20.0],
++            to_tip: [10.0, 0.0, 10.0],
++            from_axis: [0.0, 0.0, 1.0],
++            to_axis: [0.0, 0.0, 1.0],
++            safe_retract: false,
++        },
++        PathMove {
++            kind: MoveKind::Feed,
++            feed: Some(600.0),
++            from_tip: [10.0, 0.0, 10.0],
++            to_tip: [20.0, 5.0, 10.0],
++            from_axis: [0.0, 0.0, 1.0],
++            to_axis: [0.0, (25.0_f64).to_radians().sin(), (25.0_f64).to_radians().cos()],
++            safe_retract: false,
++        },
++    ];
++    let cfg = trunnion_cfg();
++    let solved: Vec<SolvedMove> = solve_path(&cfg, &path_moves, &PathOptions::default()).expect("ik path");
++    let g93_out = solve_g93_solved_moves(&solved, &mch_limits, &opts).expect("g93 over solved path");
++    assert_eq!(g93_out.len(), solved.len());
++    assert_eq!(g93_out[0].1, G93Decision::Rapid);
++    assert!(matches!(g93_out[1].1, G93Decision::Feed(t) if t.f_inv_min > 0.0 && t.f_inv_min.is_finite()));
++}
+diff --git a/docs/decisions/1966-g93-section-mode.md b/docs/decisions/1966-g93-section-mode.md
+new file mode 100644
+index 000000000..8b9de8ffc
+--- /dev/null
++++ b/docs/decisions/1966-g93-section-mode.md
+@@ -0,0 +1,18 @@
++## #1966 - G93 inverse-time feed solver and explicit SectionMode markers
++
++- **What was decided**:
++  1. Emit `PARAM SectionMode <mode>` (`"3-axis"`, `"3+2 indexed"`, `"simultaneous 5-axis"`) per generated milling operation stream via [`post::set_section_mode`] (called from `crates/app/src/posting.rs` -> `posting_section_mode::insert`), leaving `Dump::default()` and `post::dump` untouched and keeping turning/plasma/EDM/live-tool operations unannotated.
++  2. Implement the shared `G93` inverse-time feed solver in `crates/post/src/post/g93.rs` (`dt_cut = ||tip_1 - tip_0|| / v_prog`, `dt_lim = max(|d_k| / v_k_max)` over linear `[X, Y, Z]` mm/min and rotary `[A, B, C]` deg/min limits, `dt_min = max(dt_cut, dt_lim)`, `F = clamp(1 / dt_min, f_min, f_max)` with `f_min = 0.001`, `f_max = 60_000.0`, floor-formatted to 4 decimals).
++  3. For pure rotary reorientations (`ds_tip <= eps`, `max_d_rot > eps`), honor `rotary_only_deg_per_min`, else stated rotary/linear axis `max_normal_speed` limits, else programmed `v_prog`, and refuse cleanly via `G93Error::MissingFeedAndLimits` if neither feed nor limit exists; return `G93Decision::Skip` for duplicate zero-motion moves.
++
++- **Why**:
++  - Adding `set_section_mode` as a helper invoked by `app::posting` (matching `ask_reverse_spindle`) avoids modifying `Dump`/`dump()`, `js.rs`, or `engine.rs` (preventing merge conflicts with open PRs `#468`, `#1681`, `#2115`, `#2136`) while preserving byte-identical legacy `.cl` / `Dump::default()` streams and 3-axis `.nc` programs.
++  - Extracting `AxisSpeedLimits` from `Machine::axes` (`max_normal_speed` scaled by `parse_mch`) and computing `dt_cut` strictly in part tip coordinates ensures `G93` `F` words (`min^-1`) remain identical under `G20` (inch) and `G21` (mm) and prevent pivot-compensation lever arms or slow rotary axes from overspeeding.
++  - Flooring the formatted `F` word to 4 decimals prevents rounding upward into a machine speed violation.
++
++- **What was considered and dropped**:
++  - Adding a `section_mode` field to `post::Dump` — dropped because several open PRs modify `Dump`, and direct `post::dump(&tp, &Dump::default())` streams used by `.cl` and recorded golden suites must remain byte-identical.
++  - Re-wrapping rotary deltas `(rot_1 - rot_0)` mod 360 inside `g93.rs` — dropped because `kinematics::solve_path` outputs unwrapped continuous joint targets where `|to - from|` is the true physical travel (a 270 deg rewind must be timed for 270 deg, not 90 deg).
++
++- **Cost to change later**:
++  - Low: `SectionMode` values and `G93Options` defaults are centralized in `crates/post/src/post/{section_mode,g93}.rs`, and downstream `.cps` wiring (#1968/#1969) consumes them directly without breaking existing callers.
