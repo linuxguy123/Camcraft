@@ -1,0 +1,2767 @@
+From d6723de2784333908f0357801b337ed2fe9e5fc6 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 16:19:59 +0100
+Subject: [PATCH 1/4] feat(sim): calculate the playback stock removal before
+ playback
+
+The traced playback worker now cuts the whole program once when the
+transport starts, and keeps keyframes of the cut stock at a fixed
+stride. A jump forward or back then restores the keyframe at or before
+the playhead and cuts at most one stride, so playback no longer lags
+behind a long jump.
+
+- Keyframes are held to a 512 MiB budget (at most 1024, at least 64
+  moves apart); past the budget the store thins and the stride doubles.
+- The transport shows the progress and a Cancel button. A cancelled,
+  stopped or refused calculation is "incomplete" by name; the moves
+  after the last keyframe are cut live.
+- The stamp is the document version: each command retires the worker
+  and frees its keyframes.
+- Display only: the Deviate verdict and the post gate are unchanged
+  (pinned).
+
+Fixes #2181
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/stock_play.rs                |  24 +-
+ crates/app/src/stock_play_precalc.rs        | 112 ++++++++++
+ crates/app/src/stock_play_worker.rs         |  45 +++-
+ crates/app/src/stock_play_worker_precalc.rs |  96 ++++++++
+ crates/app/tests/stock_play_precalc.rs      | 230 ++++++++++++++++++++
+ crates/ui/src/actions.rs                    |   4 +-
+ crates/ui/src/egui_app/shell.rs             |   1 +
+ crates/ui/src/lib.rs                        |   3 +
+ crates/ui/src/play_precalc.rs               |  47 ++++
+ crates/ui/src/play_precalc_tests.rs         |  86 ++++++++
+ docs/decisions/2181-sim-precalc.md          |  56 +++++
+ 11 files changed, 687 insertions(+), 17 deletions(-)
+ create mode 100644 crates/app/src/stock_play_precalc.rs
+ create mode 100644 crates/app/src/stock_play_worker_precalc.rs
+ create mode 100644 crates/app/tests/stock_play_precalc.rs
+ create mode 100644 crates/ui/src/play_precalc.rs
+ create mode 100644 crates/ui/src/play_precalc_tests.rs
+ create mode 100644 docs/decisions/2181-sim-precalc.md
+
+diff --git a/crates/app/src/stock_play.rs b/crates/app/src/stock_play.rs
+index 6601c75e8..c6a3dd143 100644
+--- a/crates/app/src/stock_play.rs
++++ b/crates/app/src/stock_play.rs
+@@ -42,7 +42,7 @@ use crate::stock_view::{build_stock, build_target, display_inputs, FieldView, DE
+ pub const MAX_CHECKPOINTS: usize = 32;
+ 
+ /// The smallest checkpoint stride, in moves.
+-const MIN_STRIDE: usize = 64;
++pub const MIN_STRIDE: usize = 64;
+ 
+ /// Where each op's moves sit on the global move count: what the UI
+ /// needs to turn a playhead into a move index, without the moves.
+@@ -159,6 +159,10 @@ pub struct FieldPlay {
+     /// The partial bricks of the last picture taken: the next take
+     /// re-sends them, whatever stands there now.
+     ghost: HashSet<[i32; 3]>,
++    /// Moves cut since the build: the replay law's yardstick (#2181).
++    moves_cut: usize,
++    /// Cut-layer bytes the checkpoints hold (#2181, `precalc`).
++    key_bytes: usize,
+ }
+ 
+ impl FieldPlay {
+@@ -216,6 +220,8 @@ impl FieldPlay {
+             partial: None,
+             partial_bricks: HashSet::new(),
+             ghost: HashSet::new(),
++            moves_cut: 0,
++            key_bytes: 0,
+         })
+     }
+ 
+@@ -243,11 +249,7 @@ impl FieldPlay {
+         self.checkpoints.len()
+     }
+ 
+-    /// The global move index the playhead `p` stands at, or `None`
+-    /// when the plan holds no op of that name. An op's timeline is its
+-    /// moves, one segment each, behind at most one connector rapid (the
+-    /// air between programs, cut by nothing): a span one longer than
+-    /// the op's moves carries that connector, and it is not a move.
++    /// `PlayIndex::index_at` on this playback's plan.
+     #[must_use]
+     pub fn index_at(&self, p: &Progress) -> Option<usize> {
+         self.index.index_at(p)
+@@ -303,7 +305,10 @@ impl FieldPlay {
+         }
+         // The move in flight changes: its partial picture goes.
+         self.drop_partial();
+-        if k < self.at {
++        // Back, or forward past a whole stride to a checkpoint ahead
++        // (a precalculated keyframe, #2181): restore, then cut the rest.
++        let ahead = self.floor_checkpoint(k) > self.at && k - self.at > self.stride;
++        if k < self.at || ahead {
+             let (at, snap) = self
+                 .checkpoints
+                 .iter()
+@@ -387,6 +392,7 @@ impl FieldPlay {
+                 (None, None) => self.cur.simulate_display(std::slice::from_ref(&sim)),
+             };
+             cut.map_err(|e| format!("playback could not cut {}: {e}", op.name))?;
++            self.moves_cut = self.moves_cut.saturating_add(b - a);
+         }
+         Ok(())
+     }
+@@ -395,3 +401,7 @@ impl FieldPlay {
+ #[path = "stock_play_head.rs"]
+ mod head;
+ pub use head::{progress, settle_frac, Progress};
++
++#[path = "stock_play_precalc.rs"]
++mod precalc;
++pub use precalc::{Precalc, MAX_KEYFRAMES, PRECALC_BUDGET};
+diff --git a/crates/app/src/stock_play_precalc.rs b/crates/app/src/stock_play_precalc.rs
+new file mode 100644
+index 000000000..68b830522
+--- /dev/null
++++ b/crates/app/src/stock_play_precalc.rs
+@@ -0,0 +1,112 @@
++//! The stock removal calculated before playback (#2181): the whole
++//! program is cut once, keyframes of the cut stock are kept at a fixed
++//! stride, and playback then replays from the nearest keyframe instead
++//! of cutting the program as the playhead moves. Provenance: the M7.1
++//! field engine's order-free subtraction (any prefix of the program is
++//! cut exactly by its own moves, so a keyframe plus the rest of the
++//! moves IS the live cut) and plain keyframe thinning (halve the
++//! keyframes, double the stride) for the memory bound. Nothing from
++//! vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Display only.** The keyframes are the playback picture's
++//!   checkpoints and nothing else reads them. The Deviate verdict and
++//!   the checks that block the post are walked elsewhere, unchanged.
++//! - **Memory is bounded by a budget, never by the program.** The
++//!   keyframes' cut layers are summed as they are kept; past the budget
++//!   every other keyframe goes and the stride doubles, so the store
++//!   never holds more than the budget (at worst only the uncut stock).
++//! - **Incomplete is said, never shown as done.** A cancelled or failed
++//!   calculation is `Precalc::Incomplete` by name; the keyframes it made
++//!   stay valid (each is an exact prefix) and the moves past them are
++//!   cut live, as before #2181.
++
++use super::FieldPlay;
++
++/// The keyframe store's memory budget: 512 MiB of cut layers.
++pub const PRECALC_BUDGET: usize = 512 << 20;
++
++/// Keyframes at most: the stride is at least the program over this.
++pub const MAX_KEYFRAMES: usize = 1024;
++
++/// Where the calculation before playback stands.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Precalc {
++    /// Not asked: playback cuts as the playhead moves.
++    Off,
++    /// Cutting: `done` of `total` moves have keyframes behind them.
++    Running { done: usize, total: usize },
++    /// Every move is calculated: a seek cuts at most `stride` moves.
++    Ready { keys: usize, bytes: usize, stride: usize, secs: f64 },
++    /// Stopped at `done` of `total` moves, and why: past `done` the
++    /// playback cuts live.
++    Incomplete { done: usize, total: usize, why: String },
++}
++
++impl FieldPlay {
++    /// The checkpoint stride, in moves.
++    #[must_use]
++    pub const fn stride(&self) -> usize {
++        self.stride
++    }
++
++    /// Moves cut since the build (the replay law's yardstick: a seek
++    /// after the calculation adds at most one stride).
++    #[must_use]
++    pub const fn moves_cut(&self) -> usize {
++        self.moves_cut
++    }
++
++    /// Cut-layer bytes the keyframes hold (bounded by the budget).
++    #[must_use]
++    pub const fn keyframe_bytes(&self) -> usize {
++        self.key_bytes
++    }
++
++    /// Start the calculation: back to the uncut stock, keyframes every
++    /// `total / keys` moves (at least `min_stride`), the dirty ledger off
++    /// (no picture is taken while it runs).
++    pub fn begin_precalc(&mut self, keys: usize, min_stride: usize) -> Result<(), String> {
++        self.drop_partial();
++        self.checkpoints.truncate(1);
++        let (_, uncut) = self.checkpoints.first().ok_or("playback lost its uncut stock")?;
++        self.cur = uncut.clone();
++        self.at = 0;
++        self.key_bytes = 0;
++        self.stride = self.total.div_ceil(keys.max(1)).max(min_stride.max(1));
++        self.set_batched(true);
++        self.restored = true;
++        Ok(())
++    }
++
++    /// Cut one stride and keep its keyframe, thinning the store to
++    /// `budget` bytes; `Ok(true)` when the whole program is calculated.
++    pub fn precalc_step(&mut self, budget: usize) -> Result<bool, String> {
++        if self.at >= self.total {
++            return Ok(true);
++        }
++        let to = (self.at / self.stride).saturating_add(1).saturating_mul(self.stride).min(self.total);
++        self.cut(self.at, to)?;
++        self.at = to;
++        self.key_bytes = self.key_bytes.saturating_add(cut_bytes(&self.cur));
++        self.checkpoints.push((to, self.cur.clone()));
++        while self.key_bytes > budget && self.checkpoints.len() > 1 {
++            self.thin();
++        }
++        Ok(self.at >= self.total)
++    }
++
++    /// Halve the keyframes: double the stride and keep only those on it.
++    fn thin(&mut self) {
++        self.stride = self.stride.saturating_mul(2);
++        let stride = self.stride.max(1);
++        self.checkpoints.retain(|(n, _)| n % stride == 0);
++        self.key_bytes = self.checkpoints.iter().map(|(_, s)| cut_bytes(s)).fold(0, usize::saturating_add);
++    }
++}
++
++/// What one keyframe's clone copies (the mesh layer is shared).
++fn cut_bytes(s: &crate::stock_sim::Stock) -> usize {
++    s.field().map_or(0, crate::stock_sim::SdfField::cut_layer_bytes)
++}
+diff --git a/crates/app/src/stock_play_worker.rs b/crates/app/src/stock_play_worker.rs
+index 573b29b5f..af6974d32 100644
+--- a/crates/app/src/stock_play_worker.rs
++++ b/crates/app/src/stock_play_worker.rs
+@@ -35,19 +35,26 @@
+ //!   the worker cuts whole moves as above, and on landing cuts the
+ //!   travelled part on a copy (`FieldPlay::seek_to`). A fraction-only
+ //!   change costs one stock copy and one partial sweep - no re-cut.
++//! - **The removal is calculated before playback (#2181).** See
++//!   `stock_play_worker_precalc`: keyframes first, then a far target
++//!   restores the one at or before it and cuts at most one stride.
+ //! - **Refuse, never crash.** A build or cut failure is published as
+ //!   `Err` and the worker ends; a poisoned lock reads as a lost worker
+ //!   by name. Dropping the handle stops and joins the thread: no
+ //!   playback outlives its document.
+ 
+ use std::collections::HashSet;
+-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+ use std::thread::JoinHandle;
+ use crate::clock::Instant;
+ use std::time::Duration;
+ 
+-use crate::stock_play::{settle_frac, FieldPlay, PlayIndex, PlaySeed};
++use crate::stock_play::{settle_frac, FieldPlay, PlayIndex, PlaySeed, Precalc};
++
++#[path = "stock_play_worker_precalc.rs"]
++mod precalc;
++use precalc::{precalc, refuse, set_precalc};
+ use crate::stock_view::{CutLayer, FieldView, Packed, PackedBase};
+ use crate::stock_sim::preview::{pack_cut, pack_cut_patch, LatticeMeta};
+ 
+@@ -98,6 +105,9 @@ struct Shared {
+     wake: Condvar,
+     out: Mutex<Slot>,
+     published: Condvar,
++    /// The calculation before playback (#2181) and the UI's cancel.
++    precalc: Mutex<Option<Precalc>>,
++    cancel: AtomicBool,
+ }
+ 
+ /// The playback worker's handle (see the module law).
+@@ -120,12 +130,19 @@ impl PlayWorker {
+     /// Start a worker over `seed` (the fields are built on the worker,
+     /// so the call returns at once). `Err` only when no thread spawns.
+     pub fn spawn(seed: PlaySeed) -> Result<Self, String> {
++        Self::start(seed, None)
++    }
++
++    fn start(seed: PlaySeed, budget: Option<usize>) -> Result<Self, String> {
+         let index = seed.index();
+         let shared = Arc::new(Shared::default());
++        if budget.is_some() {
++            set_precalc(&shared, Precalc::Running { done: 0, total: index.total() });
++        }
+         let inner = Arc::clone(&shared);
+         let handle = std::thread::Builder::new()
+             .name("camcraft-playback".into())
+-            .spawn(move || run(&inner, seed))
++            .spawn(move || run(&inner, seed, budget))
+             .map_err(|e| format!("playback worker would not start: {e}"))?;
+         Ok(PlayWorker { shared, index, handle: Some(handle), shown: AtomicUsize::new(usize::MAX), shown_frac: AtomicU64::new(0) })
+     }
+@@ -198,6 +215,9 @@ impl PlayWorker {
+     /// A paused playhead at its displayed target needs no redraw timer.
+     #[must_use]
+     pub fn needs_poll(&self) -> bool {
++        if matches!(self.precalc(), Precalc::Running { .. }) {
++            return true;
++        }
+         let total = self.index.total();
+         let target = lock(&self.shared.req).map(|g| {
+             let k = g.target.min(total);
+@@ -317,11 +337,16 @@ fn snapshot(shared: &Shared, play: &mut FieldPlay, base: Option<&Arc<PackedBase>
+     PlayFrame { at: play.at(), frac: play.frac(), view: Arc::new(view) }
+ }
+ 
+-fn run(shared: &Shared, seed: PlaySeed) {
++fn run(shared: &Shared, seed: PlaySeed, budget: Option<usize>) {
+     let mut play = match FieldPlay::from_seed(seed) {
+         Ok(p) => p,
+-        Err(e) => return publish(shared, Err(e)),
++        Err(e) => return refuse(shared, budget, e),
+     };
++    if let Some(budget) = budget
++        && !precalc(shared, &mut play, budget)
++    {
++        return;
++    }
+     let base = {
+         let v = play.view();
+         PackedBase::of(&v.stock, v.target.as_deref()).map(|(b, _)| Arc::new(b))
+@@ -334,10 +359,12 @@ fn run(shared: &Shared, seed: PlaySeed) {
+         // is not a play step); a play step cuts a frame's worth of moves.
+         let jump = k > play.at() && (play.batched() || k > play.at().saturating_add(JUMP_MOVES));
+         play.set_batched(jump);
+-        // A backward target restores its checkpoint first (no cutting),
+-        // then walks forward in chunks like any other.
+-        let step = if k < play.at() {
+-            play.floor_checkpoint(k)
++        // A backward target, or a keyframe more than a stride ahead
++        // (#2181), restores its checkpoint first (no cutting), then
++        // walks forward in chunks like any other.
++        let floor = play.floor_checkpoint(k);
++        let step = if k < play.at() || (floor > play.at() && k - play.at() > play.stride()) {
++            floor
+         } else if jump {
+             k.min(play.next_boundary())
+         } else {
+diff --git a/crates/app/src/stock_play_worker_precalc.rs b/crates/app/src/stock_play_worker_precalc.rs
+new file mode 100644
+index 000000000..c28a89f15
+--- /dev/null
++++ b/crates/app/src/stock_play_worker_precalc.rs
+@@ -0,0 +1,96 @@
++//! The playback worker's calculation before playback (#2181): drives
++//! `FieldPlay::precalc_step` stride by stride on the worker thread,
++//! with its state and the UI's cancel on the shared handle. Provenance:
++//! the worker's own latest-wins mailbox (`stock_play_worker`); nothing
++//! from vendor binaries.
++//!
++//! A worker started with `spawn_precalc` first cuts the whole program
++//! once, keeping keyframes (`stock_play_precalc`); its progress is
++//! `precalc()` and the UI may `cancel_precalc()`. Requests wait until
++//! it ends. A cancel or a stop leaves `Precalc::Incomplete` by name,
++//! and the moves past the last keyframe are cut live.
++
++use std::sync::atomic::Ordering;
++
++use super::{lock, publish, PlayWorker, Shared};
++use crate::clock::Instant;
++use crate::stock_play::{FieldPlay, PlaySeed, Precalc, MAX_KEYFRAMES, MIN_STRIDE};
++
++impl PlayWorker {
++    /// Where the calculation before playback stands (`Off` when the
++    /// worker was spawned without one; a lost lock reads incomplete).
++    #[must_use]
++    pub fn precalc(&self) -> Precalc {
++        match lock(&self.shared.precalc) {
++            Some(g) => g.clone().unwrap_or(Precalc::Off),
++            None => Precalc::Incomplete { done: 0, total: self.index.total(), why: "the calculation lost its state".into() },
++        }
++    }
++
++    /// Stop the calculation where it stands; playback goes on, cutting
++    /// live past the last keyframe.
++    pub fn cancel_precalc(&self) {
++        self.shared.cancel.store(true, Ordering::Relaxed);
++        self.shared.wake.notify_all();
++    }
++
++    /// `spawn`, but the worker first calculates the whole removal with
++    /// keyframes held to `budget` bytes (the module law).
++    pub fn spawn_precalc(seed: PlaySeed, budget: usize) -> Result<Self, String> {
++        Self::start(seed, Some(budget))
++    }
++}
++
++/// A playback that would not build: with a calculation asked, that is
++/// an incomplete calculation by name; then the refusal is published.
++pub(super) fn refuse(shared: &Shared, budget: Option<usize>, e: String) {
++    if budget.is_some() {
++        set_precalc(shared, Precalc::Incomplete { done: 0, total: 0, why: e.clone() });
++    }
++    publish(shared, Err(e));
++}
++
++pub(super) fn set_precalc(shared: &Shared, p: Precalc) {
++    if let Some(mut g) = lock(&shared.precalc) {
++        *g = Some(p);
++    }
++}
++
++/// The calculation before playback (the module law): `false` when the
++/// worker must end (stopped, or a cut refused and published).
++pub(super) fn precalc(shared: &Shared, play: &mut FieldPlay, budget: usize) -> bool {
++    let total = play.total();
++    let t0 = Instant::now();
++    if let Err(e) = play.begin_precalc(MAX_KEYFRAMES, MIN_STRIDE) {
++        set_precalc(shared, Precalc::Incomplete { done: 0, total, why: e.clone() });
++        publish(shared, Err(e));
++        return false;
++    }
++    loop {
++        if lock(&shared.req).is_none_or(|g| g.stop) {
++            set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: "stopped".into() });
++            return false;
++        }
++        if shared.cancel.load(Ordering::Relaxed) {
++            set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: "cancelled".into() });
++            break;
++        }
++        match play.precalc_step(budget) {
++            Ok(true) => {
++                let p = Precalc::Ready { keys: play.checkpoints(), bytes: play.keyframe_bytes(), stride: play.stride(), secs: t0.elapsed().as_secs_f64() };
++                tracing::info!("playback precalculated: {p:?}");
++                set_precalc(shared, p);
++                break;
++            }
++            Ok(false) => set_precalc(shared, Precalc::Running { done: play.at(), total }),
++            Err(e) => {
++                set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: e.clone() });
++                publish(shared, Err(e));
++                return false;
++            }
++        }
++    }
++    // The ledger starts fresh from the next (whole) picture.
++    play.set_batched(false);
++    true
++}
+diff --git a/crates/app/tests/stock_play_precalc.rs b/crates/app/tests/stock_play_precalc.rs
+new file mode 100644
+index 000000000..733a56db2
+--- /dev/null
++++ b/crates/app/tests/stock_play_precalc.rs
+@@ -0,0 +1,230 @@
++//! #2181: the stock removal calculated before playback. After the
++//! calculation the stock at each program position IS the live cut's,
++//! bit for bit; a jump forward or back replays from a keyframe and cuts
++//! at most one stride; the keyframe store stays inside its memory
++//! budget; a stopped calculation is "incomplete" by name and the live
++//! cut takes over; and the post gate reads the same before and after.
++//! Provenance: our own fixtures over the M7.1 field engine; nothing
++//! from vendor binaries.
++//!
++//! Gate map (M4.4): covers app::stock_play_precalc, app::stock_play_worker_precalc, app::stock_play, app::stock_play_worker.
++
++use std::time::{Duration, Instant};
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
++use camcraft_app::geometry::{cube, Point3, IDENTITY_Q};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_play::{FieldPlay, PlaySeed, Precalc, PRECALC_BUDGET};
++use camcraft_app::stock_play_worker::PlayWorker;
++use camcraft_app::stock_sim::preview::pack_cut;
++use camcraft_app::stock_sim::Stock;
++use camcraft_app::stock_view::{field_view_with, PackedBase};
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++/// A staged face over a `side` x `side` block: the `stock_play` suite's
++/// fixture with the density as a parameter.
++fn faced_doc(side: f64, stepover: f64, stepdown: Option<f64>) -> World {
++    let world = new_world();
++    let mut history = History::default();
++    let half = side / 2.0;
++    let loc = Location { pos: Point3::ZERO, rot: IDENTITY_Q };
++    let cmd = SetStock::new(&world, StockShape::Box { dx: side, dy: side, dz: 20.0 }, loc);
++    history.execute(&world, cmd.expect("box stock"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "EM-0400-2FL").map(|(_, t)| t).expect("catalog entry");
++    history.execute(&world, AddTool::new(&world, "EM-0400-2FL", tool).expect("catalog tool"));
++    let (lo, hi) = (Point3::new(-half, -half, 0.0), Point3::new(half, half, 14.0));
++    history.execute(&world, ImportModel::from_mesh("part", cube(lo, hi)));
++    let params = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(14.0),
++        top_z: stepdown.map(|_| Height::fixed(19.0)),
++        stepdown,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        blend_turns: false,
++    };
++    let cmd = CreateOperation::new(&world, "Face1", "EM-0400-2FL", SrcRef::Stock, params);
++    history.execute(&world, cmd.expect("create face"));
++    history.execute(&world, GenerateOperation::new(&world, "Face1").expect("generate face"));
++    world
++}
++
++/// ~1 mm cells over the 12 mm block: several bricks, a second or two
++/// of debug cutting.
++const CELLS: f64 = 12.0 * 12.0 * 20.0;
++
++fn small() -> World {
++    faced_doc(12.0, 1.5, Some(2.5))
++}
++
++/// The cut layer as bits, packed on one shared lattice.
++fn bits(s: &Stock, base: &PackedBase) -> Vec<u32> {
++    pack_cut(s.field().expect("a field stock"), &base.meta).iter().map(|x| x.to_bits()).collect()
++}
++
++fn precalculated(world: &World, keys: usize, min_stride: usize, budget: usize) -> FieldPlay {
++    let mut play = FieldPlay::from_seed(PlaySeed::gather(world, false, CELLS).expect("seed")).expect("play");
++    play.begin_precalc(keys, min_stride).expect("begin");
++    while !play.precalc_step(budget).expect("a stride cuts") {}
++    play
++}
++
++#[test]
++fn the_precalculated_stock_is_the_live_cut_at_every_position() {
++    let world = small();
++    let mut live = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("live");
++    let base = PackedBase::of(&live.view().stock, None).expect("packs").0;
++    let mut pre = precalculated(&world, 8, 1, PRECALC_BUDGET);
++    let total = pre.total();
++    assert!(total > 16 && pre.checkpoints() > 4, "a program with keyframes: {total} moves, {} keys", pre.checkpoints());
++    // Every position, in an order that mixes forward and backward jumps.
++    let mut ks: Vec<usize> = (0..=total).collect();
++    ks.sort_by_key(|k| (k * 7919) % (total + 1));
++    for k in ks {
++        live.seek(k).expect("live cut");
++        pre.seek(k).expect("replay");
++        assert_eq!(bits(&pre.view().stock, &base), bits(&live.view().stock, &base), "move {k}: the replay IS the live cut");
++    }
++}
++
++#[test]
++fn a_jump_after_the_calculation_cuts_at_most_one_stride() {
++    let world = small();
++    let mut play = precalculated(&world, 8, 1, PRECALC_BUDGET);
++    let (total, stride) = (play.total(), play.stride());
++    assert!(stride < total / 4, "keyframes are dense enough to mean something: stride {stride} of {total}");
++    let full = field_view_with(&world, CELLS).expect("deviate view");
++    let base = PackedBase::of(&full.stock, None).expect("packs").0;
++    assert_eq!(bits(&play.view().stock, &base), bits(&full.stock, &base), "the calculation ends at the Deviate picture");
++    for k in [total / 5, 4 * total / 5, 1, total - 1, total / 2, 0, total] {
++        let before = play.moves_cut();
++        play.seek(k).expect("jump");
++        let cut = play.moves_cut() - before;
++        assert!(cut <= stride, "a jump to {k} cut {cut} moves, more than one stride ({stride}): no new full calculation");
++    }
++    assert_eq!(bits(&play.view().stock, &base), bits(&full.stock, &base), "and the end is still the end");
++}
++
++#[test]
++fn the_keyframes_stay_within_the_memory_budget() {
++    let world = small();
++    let roomy = precalculated(&world, 64, 1, PRECALC_BUDGET);
++    let one = roomy.keyframe_bytes() / roomy.checkpoints().max(1);
++    assert!(one > 0, "a keyframe costs bytes");
++    // A budget of about three average keyframes: the store thins.
++    let budget = one * 3;
++    let tight = precalculated(&world, 64, 1, budget);
++    assert!(tight.keyframe_bytes() <= budget, "{} bytes held over a {budget} budget", tight.keyframe_bytes());
++    assert!(tight.checkpoints() < roomy.checkpoints() && tight.stride() > roomy.stride(), "thinning doubles the stride");
++    assert_eq!(tight.at(), tight.total(), "a thinned calculation still runs to the end");
++    // Nothing fits: only the uncut stock stays, and replay still works.
++    let none = precalculated(&world, 64, 1, 0);
++    assert_eq!((none.checkpoints(), none.keyframe_bytes()), (1, 0), "a zero budget keeps only the uncut stock");
++}
++
++#[test]
++fn a_stopped_calculation_leaves_exact_keyframes_and_cuts_the_rest_live() {
++    let world = small();
++    let mut play = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("play");
++    play.begin_precalc(8, 1).expect("begin");
++    assert!(!play.precalc_step(PRECALC_BUDGET).expect("one stride"), "one stride is not the program");
++    let total = play.total();
++    play.seek(total).expect("the rest cuts live");
++    let full = field_view_with(&world, CELLS).expect("deviate view");
++    let base = PackedBase::of(&full.stock, None).expect("packs").0;
++    assert_eq!(bits(&play.view().stock, &base), bits(&full.stock, &base), "a partial calculation never changes the picture");
++}
++
++fn wait_precalc(w: &PlayWorker) -> Precalc {
++    let t0 = Instant::now();
++    loop {
++        let p = w.precalc();
++        if !matches!(p, Precalc::Running { .. }) || t0.elapsed() > Duration::from_secs(120) {
++            return p;
++        }
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++fn frame_at(w: &PlayWorker, k: usize) -> Stock {
++    w.request(k);
++    let (mut seen, t0) = (w.published(), Instant::now());
++    while t0.elapsed() < Duration::from_secs(120) {
++        if let Some(f) = w.take() {
++            let f = f.expect("the worker cuts the face program");
++            if f.at == k {
++                return f.view.stock.clone();
++            }
++        }
++        seen = w.wait_published(seen, Duration::from_millis(100));
++    }
++    panic!("no frame at move {k}");
++}
++
++#[test]
++fn the_worker_calculates_first_then_replays_and_the_post_gate_is_unchanged() {
++    // A program longer than the worker's minimum stride (64 moves).
++    let world = faced_doc(24.0, 0.8, Some(2.5));
++    let gate_before = camcraft_app::posting::verification_gate(&world);
++    let w = PlayWorker::spawn_precalc(PlaySeed::gather(&world, false, CELLS).expect("seed"), PRECALC_BUDGET).expect("worker");
++    assert!(w.needs_poll(), "the UI polls while the calculation runs");
++    let total = w.index().total();
++    assert!(total > 128, "two strides at least: {total}");
++    let Precalc::Ready { keys, bytes, stride, .. } = wait_precalc(&w) else { panic!("the calculation finishes: {:?}", w.precalc()) };
++    assert!(keys > 2 && bytes <= PRECALC_BUDGET && stride < total, "keys {keys}, bytes {bytes}, stride {stride}");
++    let mut live = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("live");
++    let base = PackedBase::of(&live.view().stock, None).expect("packs").0;
++    for k in [total / 2, total / 7, total, 1] {
++        live.seek(k).expect("live");
++        assert_eq!(bits(&frame_at(&w, k), &base), bits(&live.view().stock, &base), "move {k}: the worker's replay IS the live cut");
++    }
++    drop(w);
++    assert_eq!(camcraft_app::posting::verification_gate(&world), gate_before, "playback is display only: the post gate reads the same");
++}
++
++#[test]
++fn a_cancelled_calculation_is_incomplete_by_name_and_playback_goes_on() {
++    let world = faced_doc(24.0, 0.8, Some(2.5));
++    let w = PlayWorker::spawn_precalc(PlaySeed::gather(&world, false, CELLS).expect("seed"), PRECALC_BUDGET).expect("worker");
++    w.cancel_precalc();
++    let total = w.index().total();
++    match wait_precalc(&w) {
++        Precalc::Incomplete { done, why, .. } => {
++            assert_eq!(why, "cancelled");
++            assert!(done < total, "a cancel stops before the end: {done} of {total}");
++        }
++        // The calculation may finish before the cancel is read: that
++        // is a whole store, never a partial one shown as whole.
++        Precalc::Ready { .. } => {}
++        p => panic!("a cancel ends the calculation: {p:?}"),
++    }
++    assert!(!matches!(w.precalc(), Precalc::Running { .. }));
++    let full = field_view_with(&world, CELLS).expect("deviate view");
++    let base = PackedBase::of(&full.stock, None).expect("packs").0;
++    assert_eq!(bits(&frame_at(&w, total), &base), bits(&full.stock, &base), "past a cancel the live cut still reaches the end");
++    assert_eq!(PlayWorker::spawn(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("worker").precalc(), Precalc::Off);
++}
++
++/// The reading for the PR (#2181): calculation time and keyframe memory
++/// on the dense face the playback bench uses.
++#[test]
++#[ignore = "heavy lane (playback precalc reading): the dense 100 mm face, release ~1 min - run with --release -- --ignored --nocapture"]
++fn precalc_reading_on_the_dense_face() {
++    let world = faced_doc(100.0, 0.5, Some(0.5));
++    let seed = PlaySeed::gather(&world, false, camcraft_app::stock_view::DEFAULT_TEXELS).expect("seed");
++    let w = PlayWorker::spawn_precalc(seed, PRECALC_BUDGET).expect("worker");
++    let t0 = Instant::now();
++    let p = wait_precalc(&w);
++    println!("moves {}; {p:?}; wall {:.2} s", w.index().total(), t0.elapsed().as_secs_f64());
++    let Precalc::Ready { bytes, .. } = p else { panic!("the calculation finishes: {p:?}") };
++    assert!(bytes <= PRECALC_BUDGET);
++}
+diff --git a/crates/ui/src/actions.rs b/crates/ui/src/actions.rs
+index c9265d4b1..a077c9712 100644
+--- a/crates/ui/src/actions.rs
++++ b/crates/ui/src/actions.rs
+@@ -187,7 +187,9 @@ fn follow_playhead(state: &mut State, judged: bool) -> Result<(), String> {
+     use camcraft_app::stock_view::DEFAULT_TEXELS;
+     if state.field_play.is_none() {
+         let seed = PlaySeed::gather(&state.world, judged, DEFAULT_TEXELS)?;
+-        state.field_play = Some(PlayWorker::spawn(seed)?);
++        // #2181: the removal is calculated once before playback, then
++        // replayed from keyframes (the transport row shows the progress).
++        state.field_play = Some(PlayWorker::spawn_precalc(seed, camcraft_app::stock_play::PRECALC_BUDGET)?);
+     }
+     let sc = crate::egui_app::shell::cached_script(state);
+     let t = state.sim.as_ref().map_or(0.0, |s| s.t);
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index f6ce34322..c57e1bc1a 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -351,6 +351,7 @@ fn viewport_panel(
+                 });
+             }
+         });
++        crate::play_precalc::transport_row(ui, state);
+         if stop {
+             state.sim = None;
+         } else if !sc.is_empty()
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index e2e19ac3a..9a233a2c4 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -18,6 +18,7 @@
+ pub mod diag;
+ 
+ pub mod actions;
++pub mod play_precalc;
+ pub mod align_pick_viz;
+ pub(crate) mod machine_modes;
+ mod axis_note;
+@@ -81,6 +82,8 @@ mod helix_view_tests;
+ #[cfg(test)]
+ mod field_view_tests;
+ #[cfg(test)]
++mod play_precalc_tests;
++#[cfg(test)]
+ mod machined_tests;
+ #[cfg(test)]
+ mod play_bench_tests;
+diff --git a/crates/ui/src/play_precalc.rs b/crates/ui/src/play_precalc.rs
+new file mode 100644
+index 000000000..c443bd74f
+--- /dev/null
++++ b/crates/ui/src/play_precalc.rs
+@@ -0,0 +1,47 @@
++//! The transport's line for the stock removal calculated before
++//! playback (#2181): progress while it runs, a Cancel button, and the
++//! word "incomplete" when it stopped early. Provenance: our own
++//! transport bar (`egui_app::shell`); nothing from vendor binaries.
++//!
++//! The line is display state only: no command, nothing undoable, and
++//! nothing that the Deviate verdict or the post gate reads.
++
++use camcraft_app::stock_play::Precalc;
++
++use crate::state::State;
++
++/// The sentence for a calculation state, or `None` when there is
++/// nothing to say (no calculation, or a finished one).
++#[must_use]
++pub fn precalc_readout(p: &Precalc) -> Option<String> {
++    let pct = |done: usize, total: usize| done.saturating_mul(100).checked_div(total).unwrap_or(100);
++    match p {
++        Precalc::Off | Precalc::Ready { .. } => None,
++        Precalc::Running { done, total } => {
++            Some(format!("Calculating the stock removal: {}% - playback starts when it is done", pct(*done, *total)))
++        }
++        Precalc::Incomplete { done, total, why } => Some(format!(
++            "Stock removal incomplete ({why} at {}%) - the stock after that point is calculated during playback",
++            pct(*done, *total)
++        )),
++    }
++}
++
++/// Draw the line under the transport bar, when there is one.
++pub(crate) fn transport_row(ui: &mut egui::Ui, state: &State) {
++    let Some(play) = state.field_play.as_ref() else {
++        return;
++    };
++    let p = play.precalc();
++    let Some(text) = precalc_readout(&p) else {
++        return;
++    };
++    ui.horizontal(|ui| {
++        ui.label(text);
++        if matches!(p, Precalc::Running { .. })
++            && ui.button("Cancel").on_hover_text("Stop the calculation and calculate the stock during playback").clicked()
++        {
++            play.cancel_precalc();
++        }
++    });
++}
+diff --git a/crates/ui/src/play_precalc_tests.rs b/crates/ui/src/play_precalc_tests.rs
+new file mode 100644
+index 000000000..bedc745cf
+--- /dev/null
++++ b/crates/ui/src/play_precalc_tests.rs
+@@ -0,0 +1,86 @@
++//! #2181: the transport line of the stock removal calculated before
++//! playback, and its stamp - an edit of the operation retires the
++//! stored calculation and starts a new one. Provenance: our own
++//! fixtures (a staged face) over the M7.1 field engine.
++//!
++//! Gate map (M4.4): covers ui::play_precalc, ui::actions::ensure_field_view (precalc stamp).
++
++use camcraft_app::commands::{AddTool, CreateOperation, EditOperationParams, GenerateOperation, SetStock};
++use camcraft_app::geometry::{Point3, IDENTITY_Q};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_play::Precalc;
++use camcraft_app::tools::catalog;
++
++use crate::actions::ensure_field_view;
++use crate::play_precalc::precalc_readout;
++use crate::state::{Sim, State};
++
++fn face(stepover: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(14.0),
++        top_z: Some(Height::fixed(19.0)),
++        stepdown: Some(2.5),
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        blend_turns: false,
++    }
++}
++
++fn faced_state() -> State {
++    let mut state = State::new();
++    let w = &state.world;
++    let loc = Location { pos: Point3::ZERO, rot: IDENTITY_Q };
++    let cmd = SetStock::new(w, StockShape::Box { dx: 12.0, dy: 12.0, dz: 20.0 }, loc).expect("box stock");
++    state.history.execute(w, cmd);
++    let tool = catalog().into_iter().find(|(n, _)| *n == "EM-0400-2FL").map(|(_, t)| t).expect("tool");
++    state.history.execute(w, AddTool::new(w, "EM-0400-2FL", tool).expect("add tool"));
++    let cmd = CreateOperation::new(w, "Face1", "EM-0400-2FL", SrcRef::Stock, face(1.5)).expect("create face");
++    state.history.execute(w, cmd);
++    state.history.execute(w, GenerateOperation::new(w, "Face1").expect("generate"));
++    state.doc_version += 1;
++    state
++}
++
++#[test]
++fn the_readout_says_progress_and_incomplete_and_nothing_when_done() {
++    assert_eq!(precalc_readout(&Precalc::Off), None);
++    let ready = Precalc::Ready { keys: 4, bytes: 1, stride: 64, secs: 0.5 };
++    assert_eq!(precalc_readout(&ready), None, "a finished calculation is not news");
++    let running = precalc_readout(&Precalc::Running { done: 50, total: 200 }).expect("a line");
++    assert!(running.contains("25%"), "{running}");
++    let stopped = Precalc::Incomplete { done: 100, total: 200, why: "cancelled".into() };
++    let line = precalc_readout(&stopped).expect("a line");
++    assert!(line.contains("incomplete") && line.contains("cancelled") && line.contains("50%"), "{line}");
++    let empty = precalc_readout(&Precalc::Running { done: 0, total: 0 }).expect("a line");
++    assert!(empty.contains("100%"), "an empty program does not divide by zero: {empty}");
++}
++
++#[test]
++fn an_edit_of_the_operation_retires_the_stored_calculation() {
++    let mut state = faced_state();
++    state.sim = Some(Sim::new());
++    ensure_field_view(&mut state);
++    let play = state.field_play.as_ref().expect("the transport starts a playback worker");
++    assert_ne!(play.precalc(), Precalc::Off, "the worker calculates before playback");
++    let before = play.index().total();
++    // A frame later, the same document: the same worker stays.
++    ensure_field_view(&mut state);
++    assert_eq!(state.field_play.as_ref().map(|p| p.index().total()), Some(before));
++    // Halve the stepover: more passes, a different program.
++    let w = &state.world;
++    state.history.execute(w, EditOperationParams::new(w, "Face1", face(0.75)).expect("edit"));
++    state.history.execute(w, GenerateOperation::new(w, "Face1").expect("regenerate"));
++    state.doc_version += 1;
++    ensure_field_view(&mut state);
++    let play = state.field_play.as_ref().expect("a new worker for the new program");
++    let after = play.index().total();
++    assert!(after > before, "the stored calculation was for {before} moves; the edited program has {after}");
++    assert_ne!(play.precalc(), Precalc::Off, "and it calculates again");
++}
+diff --git a/docs/decisions/2181-sim-precalc.md b/docs/decisions/2181-sim-precalc.md
+new file mode 100644
+index 000000000..442e210a3
+--- /dev/null
++++ b/docs/decisions/2181-sim-precalc.md
+@@ -0,0 +1,56 @@
++## #2181 - The stock removal of playback is calculated before playback
++
++**Decided.** When the transport starts the traced playback, the
++playback worker first cuts the whole program once. It keeps keyframes of
++the cut stock (`FieldPlay` checkpoints) at a fixed stride. After that,
++each playhead position is shown from the keyframe at or before it, plus
++at most one stride of cutting. A jump forward or back never cuts the
++program again.
++
++- **Where:** in the existing playback worker (`stock_play_worker`), at
++  the first Play of a document version. No new thread, no new cache.
++- **Stamp:** `State::doc_version`. Each command increments it, so an
++  edit of an operation, a tool, the stock, a fixture or a setup retires
++  the worker and its keyframes (the worker is dropped and its thread is
++  joined). An operation delete is a command too: the keyframes are freed
++  with the worker. A stale calculation cannot be shown.
++- **Memory:** a budget of 512 MiB of keyframe cut layers
++  (`PRECALC_BUDGET`), at most 1024 keyframes (`MAX_KEYFRAMES`), at least
++  64 moves between keyframes (`MIN_STRIDE`). Past the budget the store
++  thins: every second keyframe goes and the stride doubles. At worst only
++  the uncut stock stays and playback cuts live, as before.
++- **Cancel and failure:** the transport shows the progress and a Cancel
++  button. A cancel, a stop or a refused cut gives `Precalc::Incomplete`
++  with the reason, and the line says "incomplete". The keyframes made
++  before the stop are exact prefixes of the program, so they stay. The
++  moves after the last keyframe are cut live.
++- **Display only:** the keyframes feed only the playback picture. The
++  Deviate verdict and the post gate (`posting::verification_gate`) are
++  calculated elsewhere and do not change. A test pins the gate result
++  before and after a calculation.
++
++**Why.** The field engine cuts order-free: a prefix of the program is
++cut exactly by its own moves. A keyframe plus the remaining moves is
++therefore bit-identical to the live cut (pinned at every position on a
++small face). The checkpoint store and its backward restore existed; the
++change adds the calculation pass, a forward restore, a byte budget and
++the state readout. This is the smallest change that removes the lag of
++a long jump without a second simulation path.
++
++**Dropped.**
++- One stored state for each move: memory grows with the program; a
++  dense face has hundreds of thousands of moves.
++- Copy-on-write sharing of field bricks between keyframes (denser
++  keyframes for the same memory): it changes the simulation crate's
++  storage and is a separate slice.
++- A calculation directly after Generate: it costs time for documents
++  that are never played, and each edit would start it again.
++- Frames shown while the calculation runs: the worker serves no request
++  until the calculation ends (the sheet stands, the line shows the
++  progress). Serving frames during the calculation needs a second field.
++- Pausing the transport until the calculation ends: the transport keeps
++  its own clock; the picture follows when the calculation is done.
++
++**Cost to change later.** The budget and the keyframe count are
++constants in `crates/app/src/stock_play_precalc.rs`. Moving the start to
++Generate needs only a different call site of `PlayWorker::spawn_precalc`.
+
+From dd90ab9af5519e282de63517208e82a53e3ee31d Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 21:50:34 +0100
+Subject: [PATCH 2/4] fix(sim): keep the keyframe budget after a cancel; move
+ the store to sim
+
+Review fixes for PR #2192:
+- The keyframe store (camcraft_sim::play_keys::Keyframes) has one
+  insertion path, offer. The calculation and the live seek both use it,
+  so the byte budget and the thinning also hold when live playback seeks
+  after a cancel. Pinned by a_live_seek_after_a_cancel_keeps_the_byte_budget.
+- The store, Precalc and the calculation loop (play_precalc::drive) move
+  to camcraft-sim; app keeps the methods of FieldPlay and PlayWorker and
+  re-exports the sim items. The full move of those types is #2268.
+- The transport row draws through precalc_row; structural kittest tests
+  check the progress text, Cancel, the incomplete text and no row when
+  ready, and the shell draws the row from a live worker.
+
+Refs #2181
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/stock_play.rs                  |  41 ++---
+ crates/app/src/stock_play_precalc.rs          | 133 ++++++-------
+ crates/app/src/stock_play_worker_precalc.rs   |  96 +++++-----
+ crates/app/tests/stock_play_precalc.rs        |  41 ++++-
+ crates/sim/src/lib.rs                         |   3 +
+ crates/sim/src/play_keys.rs                   | 174 ++++++++++++++++++
+ crates/sim/src/play_precalc.rs                |  84 +++++++++
+ crates/sim/tests/play_keys.rs                 | 143 ++++++++++++++
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ .../src/egui_app/tests/transport_precalc.rs   | 105 +++++++++++
+ crates/ui/src/play_precalc.rs                 |  27 ++-
+ docs/decisions/2181-sim-precalc.md            |  18 +-
+ 12 files changed, 711 insertions(+), 156 deletions(-)
+ create mode 100644 crates/sim/src/play_keys.rs
+ create mode 100644 crates/sim/src/play_precalc.rs
+ create mode 100644 crates/sim/tests/play_keys.rs
+ create mode 100644 crates/ui/src/egui_app/tests/transport_precalc.rs
+
+diff --git a/crates/app/src/stock_play.rs b/crates/app/src/stock_play.rs
+index c6a3dd143..9f730a238 100644
+--- a/crates/app/src/stock_play.rs
++++ b/crates/app/src/stock_play.rs
+@@ -135,9 +135,9 @@ pub struct FieldPlay {
+     ops: Vec<PlayOp>,
+     index: PlayIndex,
+     total: usize,
+-    stride: usize,
+-    /// (moves cut, the stock after them), ascending; [0] is uncut.
+-    checkpoints: Vec<(usize, Stock)>,
++    /// The checkpoints: the stock after each kept move count, ascending;
++    /// key 0 is uncut (`camcraft_sim::play_keys`, #2181).
++    keys: Keyframes<Stock>,
+     cur: Stock,
+     at: usize,
+     /// A checkpoint replaced `cur` since the last `take_dirty`: its
+@@ -161,8 +161,6 @@ pub struct FieldPlay {
+     ghost: HashSet<[i32; 3]>,
+     /// Moves cut since the build: the replay law's yardstick (#2181).
+     moves_cut: usize,
+-    /// Cut-layer bytes the checkpoints hold (#2181, `precalc`).
+-    key_bytes: usize,
+ }
+ 
+ impl FieldPlay {
+@@ -206,8 +204,7 @@ impl FieldPlay {
+             ops,
+             index,
+             total,
+-            stride,
+-            checkpoints: vec![(0, stock.clone())],
++            keys: Keyframes::new(stock.clone(), stride, MAX_CHECKPOINTS),
+             cur: stock,
+             at: 0,
+             restored: true,
+@@ -221,7 +218,6 @@ impl FieldPlay {
+             partial_bricks: HashSet::new(),
+             ghost: HashSet::new(),
+             moves_cut: 0,
+-            key_bytes: 0,
+         })
+     }
+ 
+@@ -246,7 +242,7 @@ impl FieldPlay {
+     /// Snapshots held (bounded by `MAX_CHECKPOINTS` + 1).
+     #[must_use]
+     pub fn checkpoints(&self) -> usize {
+-        self.checkpoints.len()
++        self.keys.len()
+     }
+ 
+     /// `PlayIndex::index_at` on this playback's plan.
+@@ -265,14 +261,14 @@ impl FieldPlay {
+     /// to `k` restarts cutting from (0 when none is nearer).
+     #[must_use]
+     pub fn floor_checkpoint(&self, k: usize) -> usize {
+-        self.checkpoints.iter().rev().find(|(n, _)| *n <= k).map_or(0, |c| c.0)
++        self.keys.floor_at(k)
+     }
+ 
+     /// The next checkpoint boundary past `at` (the end at the latest):
+     /// a jump cuts checkpoint to checkpoint, one batch per stride.
+     #[must_use]
+     pub fn next_boundary(&self) -> usize {
+-        (self.at / self.stride.max(1)).saturating_add(1).saturating_mul(self.stride).min(self.total)
++        self.keys.next_boundary(self.at, self.total)
+     }
+ 
+     /// Jump mode on or off (M13.1 leftover): on, the field keeps no
+@@ -307,30 +303,24 @@ impl FieldPlay {
+         self.drop_partial();
+         // Back, or forward past a whole stride to a checkpoint ahead
+         // (a precalculated keyframe, #2181): restore, then cut the rest.
+-        let ahead = self.floor_checkpoint(k) > self.at && k - self.at > self.stride;
++        let ahead = self.floor_checkpoint(k) > self.at && k - self.at > self.keys.stride();
+         if k < self.at || ahead {
+-            let (at, snap) = self
+-                .checkpoints
+-                .iter()
+-                .rev()
+-                .find(|(n, _)| *n <= k)
+-                .ok_or("playback lost its uncut stock")?;
++            let (at, snap) = self.keys.floor(k).ok_or("playback lost its uncut stock")?;
+             self.cur = snap.clone();
+             self.at = *at;
+             self.restored = true;
+             // The snapshot carries the ledger mode of its own time.
+             self.cur.set_dirty_tracking(!self.batched);
+         }
+-        // Forward in stride-sized runs, snapshotting each boundary
+-        // passed for the first time.
++        // Forward in stride-sized runs, offering each boundary passed
++        // to the store: its count cap and byte budget decide (#2181).
+         while self.at < k {
+-            let boundary = (self.at / self.stride + 1).saturating_mul(self.stride);
++            let boundary = (self.at / self.keys.stride()).saturating_add(1).saturating_mul(self.keys.stride());
+             let to = k.min(boundary);
+             self.cut(self.at, to)?;
+             self.at = to;
+-            let last = self.checkpoints.last().map_or(0, |c| c.0);
+-            if to == boundary && to > last && self.checkpoints.len() <= MAX_CHECKPOINTS {
+-                self.checkpoints.push((to, self.cur.clone()));
++            if to == boundary {
++                self.keys.offer(to, &self.cur);
+             }
+         }
+         Ok(true)
+@@ -404,4 +394,5 @@ pub use head::{progress, settle_frac, Progress};
+ 
+ #[path = "stock_play_precalc.rs"]
+ mod precalc;
+-pub use precalc::{Precalc, MAX_KEYFRAMES, PRECALC_BUDGET};
++pub(crate) use precalc::PrecalcPlay;
++pub use camcraft_sim::play_keys::{Keyframes, Precalc, MAX_KEYFRAMES, PRECALC_BUDGET};
+diff --git a/crates/app/src/stock_play_precalc.rs b/crates/app/src/stock_play_precalc.rs
+index 68b830522..e98211e93 100644
+--- a/crates/app/src/stock_play_precalc.rs
++++ b/crates/app/src/stock_play_precalc.rs
+@@ -1,54 +1,21 @@
+-//! The stock removal calculated before playback (#2181): the whole
+-//! program is cut once, keyframes of the cut stock are kept at a fixed
+-//! stride, and playback then replays from the nearest keyframe instead
+-//! of cutting the program as the playhead moves. Provenance: the M7.1
+-//! field engine's order-free subtraction (any prefix of the program is
+-//! cut exactly by its own moves, so a keyframe plus the rest of the
+-//! moves IS the live cut) and plain keyframe thinning (halve the
+-//! keyframes, double the stride) for the memory bound. Nothing from
+-//! vendor binaries.
+-//!
+-//! ## The laws here
+-//!
+-//! - **Display only.** The keyframes are the playback picture's
+-//!   checkpoints and nothing else reads them. The Deviate verdict and
+-//!   the checks that block the post are walked elsewhere, unchanged.
+-//! - **Memory is bounded by a budget, never by the program.** The
+-//!   keyframes' cut layers are summed as they are kept; past the budget
+-//!   every other keyframe goes and the stride doubles, so the store
+-//!   never holds more than the budget (at worst only the uncut stock).
+-//! - **Incomplete is said, never shown as done.** A cancelled or failed
+-//!   calculation is `Precalc::Incomplete` by name; the keyframes it made
+-//!   stay valid (each is an exact prefix) and the moves past them are
+-//!   cut live, as before #2181.
++//! `FieldPlay`'s side of the calculation before playback (#2181): the
++//! accessors and the `PrecalcCut` seam that `camcraft_sim::play_precalc`
++//! drives. The keyframe store, its budget and thinning, the `Precalc`
++//! state and the loop are the sim crate's (`play_keys`,
++//! `play_precalc`); only the methods of this app type stay here, since
++//! `FieldPlay` itself is app's (#2192 review). Provenance: our own seam;
++//! nothing from vendor binaries.
+ 
+ use super::FieldPlay;
+-
+-/// The keyframe store's memory budget: 512 MiB of cut layers.
+-pub const PRECALC_BUDGET: usize = 512 << 20;
+-
+-/// Keyframes at most: the stride is at least the program over this.
+-pub const MAX_KEYFRAMES: usize = 1024;
+-
+-/// Where the calculation before playback stands.
+-#[derive(Clone, Debug, PartialEq)]
+-pub enum Precalc {
+-    /// Not asked: playback cuts as the playhead moves.
+-    Off,
+-    /// Cutting: `done` of `total` moves have keyframes behind them.
+-    Running { done: usize, total: usize },
+-    /// Every move is calculated: a seek cuts at most `stride` moves.
+-    Ready { keys: usize, bytes: usize, stride: usize, secs: f64 },
+-    /// Stopped at `done` of `total` moves, and why: past `done` the
+-    /// playback cuts live.
+-    Incomplete { done: usize, total: usize, why: String },
+-}
++use crate::stock_sim::Stock;
++use camcraft_sim::play_keys::{Keyframes, Precalc, MAX_KEYFRAMES};
++use camcraft_sim::play_precalc::PrecalcCut;
+ 
+ impl FieldPlay {
+     /// The checkpoint stride, in moves.
+     #[must_use]
+     pub const fn stride(&self) -> usize {
+-        self.stride
++        self.keys.stride()
+     }
+ 
+     /// Moves cut since the build (the replay law's yardstick: a seek
+@@ -58,55 +25,75 @@ impl FieldPlay {
+         self.moves_cut
+     }
+ 
+-    /// Cut-layer bytes the keyframes hold (bounded by the budget).
++    /// Cut-layer bytes the keyframes hold (within the budget once a
++    /// calculation set one, live seeks included).
+     #[must_use]
+     pub const fn keyframe_bytes(&self) -> usize {
+-        self.key_bytes
++        self.keys.bytes()
++    }
++
++    /// The checkpoint store (read only).
++    #[must_use]
++    pub const fn keyframes(&self) -> &Keyframes<Stock> {
++        &self.keys
+     }
+ 
+     /// Start the calculation: back to the uncut stock, keyframes every
+-    /// `total / keys` moves (at least `min_stride`), the dirty ledger off
+-    /// (no picture is taken while it runs).
+-    pub fn begin_precalc(&mut self, keys: usize, min_stride: usize) -> Result<(), String> {
++    /// `total / keys` moves (at least `min_stride`) within `budget`
++    /// bytes from here on, the dirty ledger off (no picture is taken
++    /// while it runs).
++    pub fn begin_precalc(&mut self, keys: usize, min_stride: usize, budget: usize) -> Result<(), String> {
+         self.drop_partial();
+-        self.checkpoints.truncate(1);
+-        let (_, uncut) = self.checkpoints.first().ok_or("playback lost its uncut stock")?;
+-        self.cur = uncut.clone();
++        let uncut = self.keys.floor(0).ok_or("playback lost its uncut stock")?.1.clone();
++        let stride = self.total.div_ceil(keys.max(1)).max(min_stride.max(1));
++        self.keys.restart(stride, keys.max(MAX_KEYFRAMES), budget);
++        self.cur = uncut;
+         self.at = 0;
+-        self.key_bytes = 0;
+-        self.stride = self.total.div_ceil(keys.max(1)).max(min_stride.max(1));
+         self.set_batched(true);
+         self.restored = true;
+         Ok(())
+     }
+ 
+-    /// Cut one stride and keep its keyframe, thinning the store to
+-    /// `budget` bytes; `Ok(true)` when the whole program is calculated.
+-    pub fn precalc_step(&mut self, budget: usize) -> Result<bool, String> {
++    /// Cut one stride and offer its keyframe to the store (its budget
++    /// thins it); `Ok(true)` when the whole program is calculated.
++    pub fn precalc_step(&mut self) -> Result<bool, String> {
+         if self.at >= self.total {
+             return Ok(true);
+         }
+-        let to = (self.at / self.stride).saturating_add(1).saturating_mul(self.stride).min(self.total);
++        let to = self.keys.next_boundary(self.at, self.total);
+         self.cut(self.at, to)?;
+         self.at = to;
+-        self.key_bytes = self.key_bytes.saturating_add(cut_bytes(&self.cur));
+-        self.checkpoints.push((to, self.cur.clone()));
+-        while self.key_bytes > budget && self.checkpoints.len() > 1 {
+-            self.thin();
+-        }
++        self.keys.offer(to, &self.cur);
+         Ok(self.at >= self.total)
+     }
++}
+ 
+-    /// Halve the keyframes: double the stride and keep only those on it.
+-    fn thin(&mut self) {
+-        self.stride = self.stride.saturating_mul(2);
+-        let stride = self.stride.max(1);
+-        self.checkpoints.retain(|(n, _)| n % stride == 0);
+-        self.key_bytes = self.checkpoints.iter().map(|(_, s)| cut_bytes(s)).fold(0, usize::saturating_add);
+-    }
++/// The worker's calculation drives the playback through this seam.
++pub(crate) struct PrecalcPlay<'a> {
++    pub play: &'a mut FieldPlay,
++    pub keys: usize,
++    pub min_stride: usize,
++    pub budget: usize,
+ }
+ 
+-/// What one keyframe's clone copies (the mesh layer is shared).
+-fn cut_bytes(s: &crate::stock_sim::Stock) -> usize {
+-    s.field().map_or(0, crate::stock_sim::SdfField::cut_layer_bytes)
++impl PrecalcCut for PrecalcPlay<'_> {
++    fn total(&self) -> usize {
++        self.play.total()
++    }
++
++    fn done(&self) -> usize {
++        self.play.at()
++    }
++
++    fn begin(&mut self) -> Result<(), String> {
++        self.play.begin_precalc(self.keys, self.min_stride, self.budget)
++    }
++
++    fn step(&mut self) -> Result<bool, String> {
++        self.play.precalc_step()
++    }
++
++    fn ready(&self, secs: f64) -> Precalc {
++        Precalc::Ready { keys: self.play.checkpoints(), bytes: self.play.keyframe_bytes(), stride: self.play.stride(), secs }
++    }
+ }
+diff --git a/crates/app/src/stock_play_worker_precalc.rs b/crates/app/src/stock_play_worker_precalc.rs
+index c28a89f15..4882c382e 100644
+--- a/crates/app/src/stock_play_worker_precalc.rs
++++ b/crates/app/src/stock_play_worker_precalc.rs
+@@ -1,20 +1,23 @@
+-//! The playback worker's calculation before playback (#2181): drives
+-//! `FieldPlay::precalc_step` stride by stride on the worker thread,
+-//! with its state and the UI's cancel on the shared handle. Provenance:
+-//! the worker's own latest-wins mailbox (`stock_play_worker`); nothing
+-//! from vendor binaries.
++//! The playback worker's mailbox for the calculation before playback
++//! (#2181): the UI's progress read and cancel on the shared handle, and
++//! the owner seam that `camcraft_sim::play_precalc::drive` reports to.
++//! The loop, its ends and the keyframe store are the sim crate's; only
++//! `PlayWorker`'s own state stays here (#2192 review). Provenance: the
++//! worker's own latest-wins mailbox (`stock_play_worker`); nothing from
++//! vendor binaries.
+ //!
+ //! A worker started with `spawn_precalc` first cuts the whole program
+-//! once, keeping keyframes (`stock_play_precalc`); its progress is
+-//! `precalc()` and the UI may `cancel_precalc()`. Requests wait until
+-//! it ends. A cancel or a stop leaves `Precalc::Incomplete` by name,
+-//! and the moves past the last keyframe are cut live.
++//! once, keeping keyframes; its progress is `precalc()` and the UI may
++//! `cancel_precalc()`. Requests wait until it ends. A cancel or a stop
++//! leaves `Precalc::Incomplete` by name, and the moves past the last
++//! keyframe are cut live, within the same byte budget.
+ 
+ use std::sync::atomic::Ordering;
+ 
+ use super::{lock, publish, PlayWorker, Shared};
+ use crate::clock::Instant;
+-use crate::stock_play::{FieldPlay, PlaySeed, Precalc, MAX_KEYFRAMES, MIN_STRIDE};
++use crate::stock_play::{FieldPlay, PlaySeed, Precalc, PrecalcPlay, MAX_KEYFRAMES, MIN_STRIDE};
++use camcraft_sim::play_precalc::{drive, PrecalcEnd, PrecalcOwner};
+ 
+ impl PlayWorker {
+     /// Where the calculation before playback stands (`Off` when the
+@@ -35,7 +38,7 @@ impl PlayWorker {
+     }
+ 
+     /// `spawn`, but the worker first calculates the whole removal with
+-    /// keyframes held to `budget` bytes (the module law).
++    /// keyframes held to `budget` bytes (the sim crate's law).
+     pub fn spawn_precalc(seed: PlaySeed, budget: usize) -> Result<Self, String> {
+         Self::start(seed, Some(budget))
+     }
+@@ -56,41 +59,48 @@ pub(super) fn set_precalc(shared: &Shared, p: Precalc) {
+     }
+ }
+ 
+-/// The calculation before playback (the module law): `false` when the
+-/// worker must end (stopped, or a cut refused and published).
+-pub(super) fn precalc(shared: &Shared, play: &mut FieldPlay, budget: usize) -> bool {
+-    let total = play.total();
+-    let t0 = Instant::now();
+-    if let Err(e) = play.begin_precalc(MAX_KEYFRAMES, MIN_STRIDE) {
+-        set_precalc(shared, Precalc::Incomplete { done: 0, total, why: e.clone() });
+-        publish(shared, Err(e));
+-        return false;
++/// The worker as the calculation's owner.
++struct Owner<'a> {
++    shared: &'a Shared,
++    t0: Instant,
++}
++
++impl PrecalcOwner for Owner<'_> {
++    fn stopped(&self) -> bool {
++        lock(&self.shared.req).is_none_or(|g| g.stop)
++    }
++
++    fn cancelled(&self) -> bool {
++        self.shared.cancel.load(Ordering::Relaxed)
++    }
++
++    fn elapsed(&self) -> f64 {
++        self.t0.elapsed().as_secs_f64()
+     }
+-    loop {
+-        if lock(&shared.req).is_none_or(|g| g.stop) {
+-            set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: "stopped".into() });
+-            return false;
++
++    fn report(&self, p: Precalc) {
++        if matches!(p, Precalc::Ready { .. }) {
++            tracing::info!("playback precalculated: {p:?}");
+         }
+-        if shared.cancel.load(Ordering::Relaxed) {
+-            set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: "cancelled".into() });
+-            break;
++        set_precalc(self.shared, p);
++    }
++}
++
++/// Run the calculation on the worker: `false` when the worker must end
++/// (stopped, or a cut refused and published).
++pub(super) fn precalc(shared: &Shared, play: &mut FieldPlay, budget: usize) -> bool {
++    let owner = Owner { shared, t0: Instant::now() };
++    let end = drive(&mut PrecalcPlay { play: &mut *play, keys: MAX_KEYFRAMES, min_stride: MIN_STRIDE, budget }, &owner);
++    match end {
++        PrecalcEnd::Play => {
++            // The ledger starts fresh from the next (whole) picture.
++            play.set_batched(false);
++            true
+         }
+-        match play.precalc_step(budget) {
+-            Ok(true) => {
+-                let p = Precalc::Ready { keys: play.checkpoints(), bytes: play.keyframe_bytes(), stride: play.stride(), secs: t0.elapsed().as_secs_f64() };
+-                tracing::info!("playback precalculated: {p:?}");
+-                set_precalc(shared, p);
+-                break;
+-            }
+-            Ok(false) => set_precalc(shared, Precalc::Running { done: play.at(), total }),
+-            Err(e) => {
+-                set_precalc(shared, Precalc::Incomplete { done: play.at(), total, why: e.clone() });
+-                publish(shared, Err(e));
+-                return false;
+-            }
++        PrecalcEnd::Stopped => false,
++        PrecalcEnd::Refused(e) => {
++            publish(shared, Err(e));
++            false
+         }
+     }
+-    // The ledger starts fresh from the next (whole) picture.
+-    play.set_batched(false);
+-    true
+ }
+diff --git a/crates/app/tests/stock_play_precalc.rs b/crates/app/tests/stock_play_precalc.rs
+index 733a56db2..aca248e12 100644
+--- a/crates/app/tests/stock_play_precalc.rs
++++ b/crates/app/tests/stock_play_precalc.rs
+@@ -7,7 +7,7 @@
+ //! Provenance: our own fixtures over the M7.1 field engine; nothing
+ //! from vendor binaries.
+ //!
+-//! Gate map (M4.4): covers app::stock_play_precalc, app::stock_play_worker_precalc, app::stock_play, app::stock_play_worker.
++//! Gate map (M4.4): covers app::stock_play_precalc, app::stock_play_worker_precalc, app::stock_play, app::stock_play_worker, camcraft_sim::play_keys, camcraft_sim::play_precalc.
+ 
+ use std::time::{Duration, Instant};
+ 
+@@ -73,8 +73,8 @@ fn bits(s: &Stock, base: &PackedBase) -> Vec<u32> {
+ 
+ fn precalculated(world: &World, keys: usize, min_stride: usize, budget: usize) -> FieldPlay {
+     let mut play = FieldPlay::from_seed(PlaySeed::gather(world, false, CELLS).expect("seed")).expect("play");
+-    play.begin_precalc(keys, min_stride).expect("begin");
+-    while !play.precalc_step(budget).expect("a stride cuts") {}
++    play.begin_precalc(keys, min_stride, budget).expect("begin");
++    while !play.precalc_step().expect("a stride cuts") {}
+     play
+ }
+ 
+@@ -135,8 +135,8 @@ fn the_keyframes_stay_within_the_memory_budget() {
+ fn a_stopped_calculation_leaves_exact_keyframes_and_cuts_the_rest_live() {
+     let world = small();
+     let mut play = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("play");
+-    play.begin_precalc(8, 1).expect("begin");
+-    assert!(!play.precalc_step(PRECALC_BUDGET).expect("one stride"), "one stride is not the program");
++    play.begin_precalc(8, 1, PRECALC_BUDGET).expect("begin");
++    assert!(!play.precalc_step().expect("one stride"), "one stride is not the program");
+     let total = play.total();
+     play.seek(total).expect("the rest cuts live");
+     let full = field_view_with(&world, CELLS).expect("deviate view");
+@@ -144,6 +144,37 @@ fn a_stopped_calculation_leaves_exact_keyframes_and_cuts_the_rest_live() {
+     assert_eq!(bits(&play.view().stock, &base), bits(&full.stock, &base), "a partial calculation never changes the picture");
+ }
+ 
++/// The #2192 review case: the calculation stops after it thinned once,
++/// then live playback seeks over the whole program. Each keyframe the
++/// live cut keeps is counted against the same budget, and the replay is
++/// still the live cut.
++#[test]
++fn a_live_seek_after_a_cancel_keeps_the_byte_budget() {
++    let world = small();
++    let roomy = precalculated(&world, 64, 1, PRECALC_BUDGET);
++    let budget = roomy.keyframe_bytes() / roomy.checkpoints().max(1) * 3;
++    assert!(budget > 0, "a keyframe costs bytes");
++    let mut play = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("play");
++    play.begin_precalc(64, 1, budget).expect("begin");
++    let first = play.stride();
++    while play.stride() == first {
++        assert!(!play.precalc_step().expect("a stride cuts"), "the budget thins before the end");
++    }
++    // Cancelled here: from now on the playback cuts live.
++    let (total, done) = (play.total(), play.at());
++    assert!(done < total, "the stop is before the end: {done} of {total}");
++    let mut live = FieldPlay::from_seed(PlaySeed::gather(&world, false, CELLS).expect("seed")).expect("live");
++    let base = PackedBase::of(&live.view().stock, None).expect("packs").0;
++    for k in [total, 0, total / 2, total, total / 3, 1, total] {
++        play.seek(k).expect("live cut past the cancel");
++        live.seek(k).expect("live");
++        let held = play.keyframes().held_bytes();
++        assert_eq!(play.keyframe_bytes(), held, "move {k}: every keyframe the live cut kept is counted");
++        assert!(held <= budget, "move {k}: {held} bytes in {} keyframes over a {budget} budget", play.checkpoints());
++        assert_eq!(bits(&play.view().stock, &base), bits(&live.view().stock, &base), "move {k}: the replay IS the live cut");
++    }
++}
++
+ fn wait_precalc(w: &PlayWorker) -> Precalc {
+     let t0 = Instant::now();
+     loop {
+diff --git a/crates/sim/src/lib.rs b/crates/sim/src/lib.rs
+index 990a4d319..ed88988d6 100644
+--- a/crates/sim/src/lib.rs
++++ b/crates/sim/src/lib.rs
+@@ -17,6 +17,9 @@ pub mod chuck;
+ pub mod fixture;
+ // #339: a fixture's closed mesh as the narrow phase of the steel laws.
+ pub mod fixture_mesh;
++// #2181: the playback keyframes and the calculation before playback.
++pub mod play_keys;
++pub mod play_precalc;
+ pub mod sim;
+ pub mod solid_rest;
+ pub mod stock_sim;
+diff --git a/crates/sim/src/play_keys.rs b/crates/sim/src/play_keys.rs
+new file mode 100644
+index 000000000..4f2b288af
+--- /dev/null
++++ b/crates/sim/src/play_keys.rs
+@@ -0,0 +1,174 @@
++//! The playback keyframe store (#2181): snapshots of the cut stock at
++//! a fixed move stride, kept within a count cap and, once a calculation
++//! before playback asks for one, a byte budget. Provenance: plain
++//! periodic snapshotting with keyframe thinning (halve the keyframes,
++//! double the stride) for the memory bound; the order-free field
++//! subtraction (any prefix of the program is cut exactly by its own
++//! moves) makes each kept keyframe exact. Nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Display only.** The keyframes are the playback picture's
++//!   checkpoints and nothing else reads them. The Deviate verdict and
++//!   the checks that block the post are walked elsewhere, unchanged.
++//! - **One insertion path.** Every keyframe enters through `offer`, the
++//!   calculation's and the live playback's alike, so the count cap and
++//!   the byte budget hold whoever cuts (the #2192 review: a live seek
++//!   after a cancel once added keyframes past the budget).
++//! - **Memory is bounded by a budget, never by the program.** With a
++//!   budget, the kept keyframes' bytes are summed as they are offered;
++//!   past the budget every other keyframe goes and the stride doubles,
++//!   so the store never holds more than the budget (at worst only the
++//!   uncut stock, which is key 0 and is never thinned).
++//! - **Incomplete is said, never shown as done.** A cancelled or failed
++//!   calculation is `Precalc::Incomplete` by name; the keyframes it made
++//!   stay valid (each is an exact prefix) and the moves past them are
++//!   cut live.
++
++use crate::stock_sim::{SdfField, Stock};
++
++/// The keyframe store's memory budget: 512 MiB of cut layers.
++pub const PRECALC_BUDGET: usize = 512 << 20;
++
++/// Keyframes at most in a calculation: its stride is at least the
++/// program over this.
++pub const MAX_KEYFRAMES: usize = 1024;
++
++/// Where the calculation before playback stands.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Precalc {
++    /// Not asked: playback cuts as the playhead moves.
++    Off,
++    /// Cutting: `done` of `total` moves have keyframes behind them.
++    Running { done: usize, total: usize },
++    /// Every move is calculated: a seek cuts at most `stride` moves.
++    Ready { keys: usize, bytes: usize, stride: usize, secs: f64 },
++    /// Stopped at `done` of `total` moves, and why: past `done` the
++    /// playback cuts live.
++    Incomplete { done: usize, total: usize, why: String },
++}
++
++/// What one kept keyframe costs, in bytes.
++pub trait KeyCost {
++    /// The bytes a clone of this value holds of its own.
++    fn key_bytes(&self) -> usize;
++}
++
++impl KeyCost for Stock {
++    /// A clone copies the cut layers only (the mesh layer is shared).
++    fn key_bytes(&self) -> usize {
++        self.field().map_or(0, SdfField::cut_layer_bytes)
++    }
++}
++
++/// The keyframes: `(moves cut, the value after them)`, ascending; key 0
++/// is the uncut value and always stays.
++#[derive(Clone, Debug)]
++pub struct Keyframes<T> {
++    keys: Vec<(usize, T)>,
++    stride: usize,
++    /// Keyframes past key 0 at most.
++    cap: usize,
++    /// The byte budget, once a calculation set one.
++    budget: Option<usize>,
++    /// Bytes the kept keyframes hold.
++    bytes: usize,
++}
++
++impl<T: KeyCost + Clone> Keyframes<T> {
++    /// The uncut value alone, a stride, a count cap and no byte budget.
++    pub fn new(uncut: T, stride: usize, cap: usize) -> Self {
++        Keyframes { keys: vec![(0, uncut)], stride: stride.max(1), cap, budget: None, bytes: 0 }
++    }
++
++    /// Back to the uncut value with a new stride, count cap and byte
++    /// budget (the calculation's start); the budget stays from here on.
++    pub fn restart(&mut self, stride: usize, cap: usize, budget: usize) {
++        self.keys.truncate(1);
++        self.stride = stride.max(1);
++        self.cap = cap;
++        self.budget = Some(budget);
++        self.bytes = 0;
++    }
++
++    /// The stride, in moves.
++    #[must_use]
++    pub const fn stride(&self) -> usize {
++        self.stride
++    }
++
++    /// Keyframes held, key 0 included.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.keys.len()
++    }
++
++    /// Never true: key 0 always stays.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.keys.is_empty()
++    }
++
++    /// Bytes the kept keyframes hold (within the budget, when set).
++    #[must_use]
++    pub const fn bytes(&self) -> usize {
++        self.bytes
++    }
++
++    /// The bytes the kept keyframes hold, summed again from them: the
++    /// audit of `bytes` (a walk over the keys; not for a frame loop).
++    #[must_use]
++    pub fn held_bytes(&self) -> usize {
++        self.keys.iter().map(|(_, s)| s.key_bytes()).fold(0, usize::saturating_add)
++    }
++
++    /// The byte budget, once a calculation set one.
++    #[must_use]
++    pub const fn budget(&self) -> Option<usize> {
++        self.budget
++    }
++
++    /// The newest keyframe at or before `k`.
++    #[must_use]
++    pub fn floor(&self, k: usize) -> Option<&(usize, T)> {
++        self.keys.iter().rev().find(|(n, _)| *n <= k)
++    }
++
++    /// The move index of `floor(k)` (0 when none is nearer).
++    #[must_use]
++    pub fn floor_at(&self, k: usize) -> usize {
++        self.floor(k).map_or(0, |c| c.0)
++    }
++
++    /// The first stride boundary past `at`, clamped to `total`.
++    #[must_use]
++    pub fn next_boundary(&self, at: usize, total: usize) -> usize {
++        (at / self.stride).saturating_add(1).saturating_mul(self.stride).min(total)
++    }
++
++    /// Keep `value` as the keyframe at move `at`, when it is past the
++    /// last one and the count cap has room; then thin to the budget.
++    /// `true` when it was kept and survived the thinning.
++    pub fn offer(&mut self, at: usize, value: &T) -> bool {
++        let last = self.keys.last().map_or(0, |c| c.0);
++        if at <= last || self.keys.len() > self.cap {
++            return false;
++        }
++        self.bytes = self.bytes.saturating_add(value.key_bytes());
++        self.keys.push((at, value.clone()));
++        if let Some(budget) = self.budget {
++            while self.bytes > budget && self.keys.len() > 1 {
++                self.thin();
++            }
++        }
++        self.keys.last().is_some_and(|c| c.0 == at)
++    }
++
++    /// Halve the keyframes: double the stride and keep only those on it.
++    fn thin(&mut self) {
++        self.stride = self.stride.saturating_mul(2).max(1);
++        let stride = self.stride;
++        self.keys.retain(|(n, _)| n % stride == 0);
++        self.bytes = self.held_bytes();
++    }
++}
+diff --git a/crates/sim/src/play_precalc.rs b/crates/sim/src/play_precalc.rs
+new file mode 100644
+index 000000000..e5d03d75f
+--- /dev/null
++++ b/crates/sim/src/play_precalc.rs
+@@ -0,0 +1,84 @@
++//! The calculation before playback (#2181): cut the whole program once,
++//! stride by stride, keeping keyframes (`play_keys`), with a stop, a
++//! cancel and a progress report. Provenance: a plain cooperative work
++//! loop over our own playback cut; nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Display only.** The loop drives the playback picture's cut and
++//!   nothing else; the verdict and the post gate never read it.
++//! - **Every end is said by name.** Each stride reports `Running`; the
++//!   end reports `Ready`, or `Incomplete` with "cancelled", "stopped"
++//!   or the cut's own refusal. No end is silent.
++//! - **A cancel keeps playback; a stop or a refusal ends it.** After a
++//!   cancel the keyframes made so far stay valid and the rest is cut
++//!   live; a stop is the owner going away; a refusal is published.
++
++use crate::play_keys::Precalc;
++
++/// The playback cut, as the calculation drives it.
++pub trait PrecalcCut {
++    /// Moves in the whole program.
++    fn total(&self) -> usize;
++    /// Moves the calculation has cut so far.
++    fn done(&self) -> usize;
++    /// Back to the uncut stock, keyframes and budget set.
++    fn begin(&mut self) -> Result<(), String>;
++    /// Cut one stride and offer its keyframe; `Ok(true)` at the end.
++    fn step(&mut self) -> Result<bool, String>;
++    /// The finished store's reading, `secs` after the start.
++    fn ready(&self, secs: f64) -> Precalc;
++}
++
++/// How the calculation ended.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum PrecalcEnd {
++    /// Ready, or cancelled: playback goes on.
++    Play,
++    /// The owner stopped: playback ends, nothing to publish.
++    Stopped,
++    /// The cut refused: playback ends and the refusal is published.
++    Refused(String),
++}
++
++/// The owner's side of the loop: what it asks and where it hears.
++pub trait PrecalcOwner {
++    /// The owner went away (the worker is dropped).
++    fn stopped(&self) -> bool;
++    /// The user cancelled the calculation.
++    fn cancelled(&self) -> bool;
++    /// Seconds since the start (the owner holds the clock).
++    fn elapsed(&self) -> f64;
++    /// The calculation's state, after each change.
++    fn report(&self, p: Precalc);
++}
++
++/// Run the calculation to an end (the module law).
++pub fn drive(cut: &mut impl PrecalcCut, owner: &impl PrecalcOwner) -> PrecalcEnd {
++    let total = cut.total();
++    if let Err(e) = cut.begin() {
++        owner.report(Precalc::Incomplete { done: 0, total, why: e.clone() });
++        return PrecalcEnd::Refused(e);
++    }
++    loop {
++        if owner.stopped() {
++            owner.report(Precalc::Incomplete { done: cut.done(), total, why: "stopped".into() });
++            return PrecalcEnd::Stopped;
++        }
++        if owner.cancelled() {
++            owner.report(Precalc::Incomplete { done: cut.done(), total, why: "cancelled".into() });
++            return PrecalcEnd::Play;
++        }
++        match cut.step() {
++            Ok(true) => {
++                owner.report(cut.ready(owner.elapsed()));
++                return PrecalcEnd::Play;
++            }
++            Ok(false) => owner.report(Precalc::Running { done: cut.done(), total }),
++            Err(e) => {
++                owner.report(Precalc::Incomplete { done: cut.done(), total, why: e.clone() });
++                return PrecalcEnd::Refused(e);
++            }
++        }
++    }
++}
+diff --git a/crates/sim/tests/play_keys.rs b/crates/sim/tests/play_keys.rs
+new file mode 100644
+index 000000000..3a40f5973
+--- /dev/null
++++ b/crates/sim/tests/play_keys.rs
+@@ -0,0 +1,143 @@
++//! #2181 / #2192 review: the playback keyframe store and the
++//! calculation before playback, on plain values. Every insertion counts
++//! against the budget (the calculation's and the live playback's), the
++//! thinning doubles the stride, and every end of the calculation is
++//! said by name. Provenance: our own fixtures; nothing from vendor
++//! binaries.
++//!
++//! Gate map (M4.4): covers camcraft_sim::play_keys, camcraft_sim::play_precalc.
++
++use std::cell::{Cell, RefCell};
++
++use camcraft_sim::play_keys::{KeyCost, Keyframes, Precalc};
++use camcraft_sim::play_precalc::{drive, PrecalcCut, PrecalcEnd, PrecalcOwner};
++
++/// A keyframe that costs its own number of bytes.
++#[derive(Clone, Debug)]
++struct Key(usize);
++
++impl KeyCost for Key {
++    fn key_bytes(&self) -> usize {
++        self.0
++    }
++}
++
++#[test]
++fn without_a_budget_the_count_cap_alone_holds() {
++    let mut k = Keyframes::new(Key(0), 4, 2);
++    assert!(k.offer(4, &Key(10)) && k.offer(8, &Key(10)));
++    assert!(!k.offer(12, &Key(10)), "the cap of 2 keyframes past key 0 is full");
++    assert!(!k.offer(8, &Key(10)), "a keyframe at or before the last one is refused");
++    assert_eq!((k.len(), k.bytes(), k.held_bytes(), k.stride()), (3, 20, 20, 4));
++    assert_eq!((k.floor_at(11), k.floor_at(3), k.next_boundary(5, 7)), (8, 0, 7));
++}
++
++#[test]
++fn a_budget_thins_every_insertion_from_then_on() {
++    let mut k = Keyframes::new(Key(0), 1, 32);
++    k.restart(1, 1024, 25);
++    // The callers offer on the stride, as the live seek does.
++    for at in 1..=40 {
++        if at % k.stride() != 0 {
++            continue;
++        }
++        k.offer(at, &Key(10));
++        assert_eq!(k.bytes(), k.held_bytes(), "at {at}: each kept keyframe is counted");
++        assert!(k.bytes() <= 25, "at {at}: {} bytes over the budget", k.bytes());
++    }
++    assert!(k.stride() > 1 && k.len() > 1, "thinning doubled the stride: {} keys, stride {}", k.len(), k.stride());
++    assert_eq!(k.floor_at(0), 0, "key 0 stays");
++}
++
++#[test]
++fn a_zero_budget_keeps_only_key_zero() {
++    let mut k = Keyframes::new(Key(0), 2, 32);
++    k.restart(2, 1024, 0);
++    for at in (2..=20).step_by(2) {
++        assert!(!k.offer(at, &Key(1)));
++    }
++    assert_eq!((k.len(), k.bytes()), (1, 0));
++}
++
++/// A program of `total` moves cut `stride` at a time; `fail_at` refuses.
++struct Prog {
++    total: usize,
++    at: usize,
++    stride: usize,
++    fail_at: Option<usize>,
++}
++
++impl PrecalcCut for Prog {
++    fn total(&self) -> usize {
++        self.total
++    }
++    fn done(&self) -> usize {
++        self.at
++    }
++    fn begin(&mut self) -> Result<(), String> {
++        self.at = 0;
++        Ok(())
++    }
++    fn step(&mut self) -> Result<bool, String> {
++        if self.fail_at.is_some_and(|f| self.at >= f) {
++            return Err("refused".into());
++        }
++        self.at = (self.at + self.stride).min(self.total);
++        Ok(self.at >= self.total)
++    }
++    fn ready(&self, secs: f64) -> Precalc {
++        Precalc::Ready { keys: 1, bytes: 0, stride: self.stride, secs }
++    }
++}
++
++#[derive(Default)]
++struct Owner {
++    stop_after: Option<usize>,
++    cancel_after: Option<usize>,
++    reports: RefCell<Vec<Precalc>>,
++    asked: Cell<usize>,
++}
++
++impl PrecalcOwner for Owner {
++    fn stopped(&self) -> bool {
++        self.asked.set(self.asked.get() + 1);
++        self.stop_after.is_some_and(|n| self.asked.get() > n)
++    }
++    fn cancelled(&self) -> bool {
++        self.cancel_after.is_some_and(|n| self.asked.get() > n)
++    }
++    fn elapsed(&self) -> f64 {
++        0.5
++    }
++    fn report(&self, p: Precalc) {
++        self.reports.borrow_mut().push(p);
++    }
++}
++
++fn last(o: &Owner) -> Precalc {
++    o.reports.borrow().last().cloned().unwrap_or(Precalc::Off)
++}
++
++#[test]
++fn the_calculation_says_each_end_by_name() {
++    let mut p = Prog { total: 10, at: 0, stride: 3, fail_at: None };
++    let o = Owner::default();
++    assert_eq!(drive(&mut p, &o), PrecalcEnd::Play);
++    assert_eq!(last(&o), Precalc::Ready { keys: 1, bytes: 0, stride: 3, secs: 0.5 });
++    assert!(o.reports.borrow().iter().any(|r| matches!(r, Precalc::Running { done: 3, total: 10 })));
++
++    let mut p = Prog { total: 10, at: 0, stride: 3, fail_at: None };
++    let o = Owner { cancel_after: Some(1), ..Owner::default() };
++    assert_eq!(drive(&mut p, &o), PrecalcEnd::Play, "a cancel keeps playback");
++    assert_eq!(last(&o), Precalc::Incomplete { done: 3, total: 10, why: "cancelled".into() });
++
++    let mut p = Prog { total: 10, at: 0, stride: 3, fail_at: None };
++    let o = Owner { stop_after: Some(2), ..Owner::default() };
++    assert_eq!(drive(&mut p, &o), PrecalcEnd::Stopped);
++    assert_eq!(last(&o), Precalc::Incomplete { done: 6, total: 10, why: "stopped".into() });
++
++    let mut p = Prog { total: 10, at: 0, stride: 3, fail_at: Some(3) };
++    let o = Owner::default();
++    assert_eq!(drive(&mut p, &o), PrecalcEnd::Refused("refused".into()));
++    assert_eq!(last(&o), Precalc::Incomplete { done: 3, total: 10, why: "refused".into() });
++}
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index b9778e258..9fad5c610 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -104,6 +104,8 @@ mod lathe_view;
+ // #1997: the orbit pivot ignores the work envelope; open frames the part.
+ mod camera_target;
+ mod structural;
++// #2181: the transport row of the calculation before playback.
++mod transport_precalc;
+ mod stock_fit;
+ mod ribbon_rows;
+ mod theme_op_tabs_tree;
+diff --git a/crates/ui/src/egui_app/tests/transport_precalc.rs b/crates/ui/src/egui_app/tests/transport_precalc.rs
+new file mode 100644
+index 000000000..314801bff
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/transport_precalc.rs
+@@ -0,0 +1,105 @@
++//! #2181 / #2192 review: the structural twin of the transport row for
++//! the stock removal calculated before playback. The row is drawn and
++//! read back through AccessKit: the progress text and a Cancel that
++//! works while the calculation runs, the "incomplete" text without
++//! Cancel after it stopped, and no row when it is done or not asked.
++//! The shell case draws the row from a live playback worker.
++//! Provenance: our own tests over our own transport row; no HSMWorks
++//! material involved.
++
++use egui_kittest::kittest::NodeT;
++
++use super::*;
++
++use camcraft_app::stock_play::Precalc;
++
++use crate::play_precalc::{precalc_row, CANCEL};
++use crate::state::Sim;
++
++/// The row alone, over a fixed state; the count is Cancel's clicks.
++fn row(p: Precalc) -> Harness<'static, (Precalc, usize)> {
++    Harness::builder().with_size(Vec2::new(900.0, 60.0)).build_ui_state(
++        |ui, st: &mut (Precalc, usize)| {
++            if precalc_row(ui, &st.0) {
++                st.1 += 1;
++            }
++        },
++        (p, 0),
++    )
++}
++
++#[test]
++fn the_running_row_shows_progress_and_its_cancel_works() {
++    let mut h = row(Precalc::Running { done: 50, total: 200 });
++    h.run();
++    assert!(
++        h.query_by_label_contains("Calculating the stock removal: 25%").is_some(),
++        "the row says the progress"
++    );
++    let cancel = h.get_by_role_and_label(egui::accesskit::Role::Button, CANCEL);
++    assert!(!cancel.accesskit_node().is_disabled(), "Cancel is enabled while the calculation runs");
++    cancel.click();
++    h.run();
++    assert_eq!(h.state().1, 1, "one click on Cancel is one cancel");
++}
++
++#[test]
++fn the_incomplete_row_says_so_and_has_no_cancel() {
++    let mut h = row(Precalc::Incomplete { done: 100, total: 200, why: "cancelled".into() });
++    h.run();
++    assert!(
++        h.query_by_label_contains("Stock removal incomplete (cancelled at 50%)").is_some(),
++        "the row says the calculation is incomplete, and why"
++    );
++    assert!(h.query_by_label(CANCEL).is_none(), "nothing runs: nothing to cancel");
++}
++
++#[test]
++fn no_row_when_the_calculation_is_done_or_not_asked() {
++    for p in [Precalc::Off, Precalc::Ready { keys: 4, bytes: 1, stride: 64, secs: 0.5 }] {
++        let mut h = row(p.clone());
++        h.run();
++        assert!(h.query_by_label_contains("Calculating").is_none(), "{p:?}: no progress text");
++        assert!(h.query_by_label_contains("Stock removal").is_none(), "{p:?}: no incomplete text");
++        assert!(h.query_by_label(CANCEL).is_none(), "{p:?}: no Cancel");
++    }
++}
++
++/// The row the shell draws under the transport: present exactly while
++/// the live worker has something to say, and its Cancel ends the run.
++#[test]
++fn the_shell_draws_the_row_from_the_live_worker() {
++    let mut h = shell_harness();
++    h.state_mut().state.sim = Some(Sim { t: 0.0, playing: false, speed: 1.0 });
++    crate::actions::ensure_field_view(&mut h.state_mut().state);
++    assert!(h.state().state.field_play.is_some(), "the transport starts a worker: {}", h.state().state.status);
++    h.run_steps(2);
++    // The calculation may finish before the first frame: then it is a
++    // whole store, and the row is gone.
++    let running = h.state().state.field_play.as_ref().is_some_and(|w| matches!(w.precalc(), Precalc::Running { .. }));
++    if running && let Some(cancel) = h.query_by_label(CANCEL) {
++        cancel.click();
++        h.run_steps(2);
++    }
++    let t0 = std::time::Instant::now();
++    let p = loop {
++        let p = h.state().state.field_play.as_ref().map_or(Precalc::Off, |w| w.precalc());
++        if !matches!(p, Precalc::Running { .. }) || t0.elapsed() > std::time::Duration::from_secs(120) {
++            break p;
++        }
++        std::thread::sleep(std::time::Duration::from_millis(10));
++    };
++    h.run_steps(2);
++    match &p {
++        Precalc::Ready { .. } => {
++            assert!(h.query_by_label_contains("Calculating").is_none(), "a finished calculation has no row");
++            assert!(h.query_by_label_contains("Stock removal").is_none(), "a finished calculation has no row");
++        }
++        Precalc::Incomplete { why, .. } => {
++            assert_eq!(why, "cancelled", "only the Cancel click stops this calculation");
++            assert!(h.query_by_label_contains("Stock removal incomplete (cancelled").is_some(), "the shell says so");
++        }
++        p => panic!("the calculation ends: {p:?}"),
++    }
++    assert!(h.query_by_label(CANCEL).is_none(), "{p:?}: no Cancel once the calculation ended");
++}
+diff --git a/crates/ui/src/play_precalc.rs b/crates/ui/src/play_precalc.rs
+index c443bd74f..80c1bc8a5 100644
+--- a/crates/ui/src/play_precalc.rs
++++ b/crates/ui/src/play_precalc.rs
+@@ -27,21 +27,30 @@ pub fn precalc_readout(p: &Precalc) -> Option<String> {
+     }
+ }
+ 
++/// The Cancel button's label.
++pub const CANCEL: &str = "Cancel";
++
+ /// Draw the line under the transport bar, when there is one.
+ pub(crate) fn transport_row(ui: &mut egui::Ui, state: &State) {
+     let Some(play) = state.field_play.as_ref() else {
+         return;
+     };
+-    let p = play.precalc();
+-    let Some(text) = precalc_readout(&p) else {
+-        return;
++    if precalc_row(ui, &play.precalc()) {
++        play.cancel_precalc();
++    }
++}
++
++/// The line for a calculation state: the readout, and Cancel while it
++/// runs. `true` when Cancel was clicked this frame. Draws nothing when
++/// the readout has nothing to say.
++pub(crate) fn precalc_row(ui: &mut egui::Ui, p: &Precalc) -> bool {
++    let Some(text) = precalc_readout(p) else {
++        return false;
+     };
+     ui.horizontal(|ui| {
+         ui.label(text);
+-        if matches!(p, Precalc::Running { .. })
+-            && ui.button("Cancel").on_hover_text("Stop the calculation and calculate the stock during playback").clicked()
+-        {
+-            play.cancel_precalc();
+-        }
+-    });
++        matches!(p, Precalc::Running { .. })
++            && ui.button(CANCEL).on_hover_text("Stop the calculation and calculate the stock during playback").clicked()
++    })
++    .inner
+ }
+diff --git a/docs/decisions/2181-sim-precalc.md b/docs/decisions/2181-sim-precalc.md
+index 442e210a3..92110166b 100644
+--- a/docs/decisions/2181-sim-precalc.md
++++ b/docs/decisions/2181-sim-precalc.md
+@@ -51,6 +51,22 @@ a long jump without a second simulation path.
+ - Pausing the transport until the calculation ends: the transport keeps
+   its own clock; the picture follows when the calculation is done.
+ 
++**Review fix (#2192).** The keyframe store and the calculation loop
++moved to the simulation crate:
++
++- `camcraft_sim::play_keys`: `Keyframes`, `Precalc`, `PRECALC_BUDGET`,
++  `MAX_KEYFRAMES`. Each keyframe goes in through `Keyframes::offer`. The
++  calculation and the live seek use the same path, so the byte budget
++  also holds when live playback seeks after a cancel.
++- `camcraft_sim::play_precalc`: the loop `drive`, with the
++  `PrecalcCut` and `PrecalcOwner` seams.
++- `app` keeps only the methods of its own types (`FieldPlay`,
++  `PlayWorker`) and re-exports the sim items from `stock_play`.
++- No new crate edge: `camcraft-app` already depends on `camcraft-sim`.
++- Dropped: a move of `FieldPlay` and `PlayWorker` to the simulation
++  crate in this PR. They existed before #2181 and their move touches
++  the playback suites of other issues. Issue #2268 tracks it.
++
+ **Cost to change later.** The budget and the keyframe count are
+-constants in `crates/app/src/stock_play_precalc.rs`. Moving the start to
++constants in `crates/sim/src/play_keys.rs`. Moving the start to
+ Generate needs only a different call site of `PlayWorker::spawn_precalc`.
+
+From ad92e89fa464f282e23d8ca00f0123da9d6390b6 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 23:01:26 +0100
+Subject: [PATCH 3/4] fix(sim): play the stock up to the first operation with
+ no toolpath
+
+The traced stock playback refused the whole setup when one operation
+had no toolpath. It now plays the program in posting order up to the
+first operation with no toolpath and stops there; it never skips that
+operation to cut the ones after it. A separate line under the transport
+bar names the operation in plain English, so the status line keeps the
+generation notes without the error mark. The post and the Deviate
+verdict keep program_ops / plan_program and still refuse by name.
+
+Fixes #2280
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/posting.rs                   |  28 ++++-
+ crates/app/src/stock_play.rs                |  21 +++-
+ crates/app/src/stock_play_head.rs           |  13 ++
+ crates/app/src/stock_sim.rs                 |  19 ++-
+ crates/app/src/stock_view.rs                |  18 ++-
+ crates/app/tests/stock_play_stop.rs         | 124 ++++++++++++++++++++
+ crates/ui/src/actions.rs                    |   2 +-
+ crates/ui/src/egui_app/status_alert.rs      |  11 ++
+ crates/ui/src/field_view_tests.rs           |   2 +-
+ crates/ui/src/play_precalc.rs               |  20 +++-
+ crates/ui/src/play_precalc_tests.rs         |  32 ++++-
+ docs/decisions/2280-sim-partial-playback.md |  37 ++++++
+ 12 files changed, 309 insertions(+), 18 deletions(-)
+ create mode 100644 crates/app/tests/stock_play_stop.rs
+ create mode 100644 docs/decisions/2280-sim-partial-playback.md
+
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index ceb4a3416..a7092eb6d 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -849,6 +849,24 @@ fn viewer_map(records: &[cnc::Record], out: &engine::PostOutput) -> Vec<Option<[
+ /// what would post* holds by construction, not by two copies of the
+ /// law agreeing (stage D makes the agreement load-bearing).
+ pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
++    gated_ops(world, false).map(|(ops, _)| ops)
++}
++
++/// [`program_ops`] for the stock playback only (#2280): the same order
++/// and the same gates, but the walk ends before the first operation
++/// with no toolpath, which comes back with every op from it on. The
++/// playback shows the program up to there; it never skips that op and
++/// cuts the next ones on a stock the skipped op did not cut. The post
++/// and the Deviate verdict keep [`program_ops`]: it refuses.
++pub(crate) fn program_ops_until_ungenerated(
++    world: &World,
++) -> Result<(Vec<(String, Entity)>, Vec<(String, Entity)>), String> {
++    gated_ops(world, true)
++}
++
++/// The walk under [`program_ops`]; `stop_at_ungenerated` turns the
++/// "no toolpath yet" refusal into the end of the list.
++fn gated_ops(world: &World, stop_at_ungenerated: bool) -> Result<(Vec<(String, Entity)>, Vec<(String, Entity)>), String> {
+     // THE order law by call (M3.2 A): setup rank, then operation position - the same
+     // walk re-machining, the sim and the machine-limit check make.
+     // A suppressed op (#110) is not in the program: skipped before the
+@@ -859,7 +877,7 @@ pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
+     if all.is_empty() {
+         return Err("no operations to post".into());
+     }
+-    let ops: Vec<(String, Entity)> = all
++    let mut ops: Vec<(String, Entity)> = all
+         .into_iter()
+         .filter(|(_, e)| !model::operation_of(world, e).is_some_and(|op| op.suppressed))
+         .collect();
+@@ -870,6 +888,12 @@ pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
+     // Validate early: every operation must be generated and fresh
+     // before a single record is built (a half-posted program is the
+     // silent wrong answer this file exists to prevent).
++    // #2280: the playback ends before the first op with no toolpath -
++    // nothing at or after it is cut, so their gates are not read.
++    let rest = match ops.iter().position(|(_, e)| operation::status_of(world, e) == OpStatus::Never) {
++        Some(i) if stop_at_ungenerated => ops.split_off(i),
++        _ => Vec::new(),
++    };
+     for (name, e) in &ops {
+         // M10.1 C first: an op whose tool is gone or cannot cut its kind
+         // is blocked by name - "regenerate" would be the wrong advice,
+@@ -899,7 +923,7 @@ pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
+             OpStatus::Ok => {}
+         }
+     }
+-    Ok(ops)
++    Ok((ops, rest))
+ }
+ 
+ /// The program-level verification, made binding (M2.3 D): the two
+diff --git a/crates/app/src/stock_play.rs b/crates/app/src/stock_play.rs
+index 9f730a238..eeeaa9bb4 100644
+--- a/crates/app/src/stock_play.rs
++++ b/crates/app/src/stock_play.rs
+@@ -36,7 +36,7 @@ use std::sync::Arc;
+ 
+ use crate::geometry::Triangle;
+ use crate::stock_sim::{Planned, SimOp, Stock};
+-use crate::stock_view::{build_stock, build_target, display_inputs, FieldView, DEFAULT_TEXELS};
++use crate::stock_view::{build_stock, build_target, display_inputs_of, FieldView, DEFAULT_TEXELS};
+ 
+ /// Snapshots kept at most - the backward seek's memory bound.
+ pub const MAX_CHECKPOINTS: usize = 32;
+@@ -51,6 +51,9 @@ pub struct PlayIndex {
+     /// (op name, global index of its first move, its move count).
+     ops: Vec<(String, usize, usize)>,
+     total: usize,
++    /// The op the playback stops before and every op after it (#2280,
++    /// `PlaySeed::gather`); empty when the whole program plays.
++    rest: Vec<String>,
+ }
+ 
+ impl PlayIndex {
+@@ -94,22 +97,28 @@ pub struct PlaySeed {
+     /// The verdict tolerance the colours are gated at, or why the
+     /// program is not judged (#1056, `model_fidelity::program_tol`).
+     tol: Result<f64, String>,
++    /// See [`PlayIndex::stop`].
++    rest: Vec<String>,
+ }
+ 
+ impl PlaySeed {
+     /// Read the document's program and stock at a display budget of
+     /// `texels` cells (see `FieldPlay::new` for `judged`).
+     pub fn gather(world: &flecs_ecs::prelude::World, judged: bool, texels: f64) -> Result<Self, String> {
+-        let (stock_facets, planned, cell) = display_inputs(world, texels)?;
++        // #2280: the program plays up to the first op with no toolpath.
++        let (planned, rest) = crate::stock_sim::plan_program_until_ungenerated(world)?;
++        let setup = rest.first().and_then(|(_, e)| crate::model::operation_of(world, e)).and_then(|op| op.setup);
++        let (stock_facets, planned, cell) = display_inputs_of(world, texels, planned, setup)?;
+         let part = if judged { Some(crate::stock_sim::part_facets(world)?) } else { None };
+         let tol = crate::model_fidelity::program_tol(world);
+-        Ok(PlaySeed { stock_facets, planned, cell, part, tol })
++        let rest = rest.into_iter().map(|(name, _)| name).collect();
++        Ok(PlaySeed { stock_facets, planned, cell, part, tol, rest })
+     }
+ 
+     /// The move table the transport maps onto (cheap; no field built).
+     #[must_use]
+     pub fn index(&self) -> PlayIndex {
+-        PlayIndex::of(&self.planned)
++        PlayIndex { rest: self.rest.clone(), ..PlayIndex::of(&self.planned) }
+     }
+ }
+ 
+@@ -181,8 +190,8 @@ impl FieldPlay {
+     /// Build the fields from a gathered seed - no world needed, so a
+     /// worker thread can pay for it.
+     pub fn from_seed(seed: PlaySeed) -> Result<Self, String> {
+-        let PlaySeed { stock_facets, planned, cell, part, tol } = seed;
+-        let index = PlayIndex::of(&planned);
++        let PlaySeed { stock_facets, planned, cell, part, tol, rest } = seed;
++        let index = PlayIndex { rest, ..PlayIndex::of(&planned) };
+         let stock = build_stock(&stock_facets, cell)?;
+         let mut ops = Vec::with_capacity(planned.len());
+         let mut total = 0usize;
+diff --git a/crates/app/src/stock_play_head.rs b/crates/app/src/stock_play_head.rs
+index be715df84..29e47af5a 100644
+--- a/crates/app/src/stock_play_head.rs
++++ b/crates/app/src/stock_play_head.rs
+@@ -63,12 +63,25 @@ impl PlayIndex {
+     /// past an op's last move and at the end (the module law).
+     #[must_use]
+     pub fn position_at(&self, p: &Progress, frac: f64) -> Option<(usize, f64)> {
++        // #2280: an op at or past the stop is not in the plan; the
++        // picture holds the stock as the plan left it.
++        if self.rest.iter().any(|n| *n == p.op) {
++            return Some((self.total, 0.0));
++        }
+         let k = self.index_at(p)?;
+         let (_, _, len) = self.ops.iter().find(|o| o.0 == p.op)?;
+         let in_connector = p.span == len + 1 && p.segs_done == 0;
+         let in_flight = !in_connector && p.segs_done < p.span && k < self.total;
+         Some((k, if in_flight { clamp_frac(frac) } else { 0.0 }))
+     }
++
++    /// The op the playback stops before (#2280): the first op in
++    /// program order with no toolpath. `None` when the whole program
++    /// plays. The playback never skips it to cut the ops after it.
++    #[must_use]
++    pub fn stop(&self) -> Option<&str> {
++        self.rest.first().map(String::as_str)
++    }
+ }
+ 
+ impl FieldPlay {
+diff --git a/crates/app/src/stock_sim.rs b/crates/app/src/stock_sim.rs
+index 0e8b6c456..e49f45cce 100644
+--- a/crates/app/src/stock_sim.rs
++++ b/crates/app/src/stock_sim.rs
+@@ -283,9 +283,22 @@ pub(crate) fn bull_corner(tool: &crate::tools::Tool) -> Result<Option<f64>, Stri
+ /// The program in posting order, each op resolved to its tool's atom
+ /// - the one plan both the column verdict and the field eye walk.
+ pub(crate) fn plan_program(world: &flecs_ecs::prelude::World) -> Result<Vec<Planned>, String> {
+-    use crate::{model, posting};
++    plan_ops(world, &crate::posting::program_ops(world)?)
++}
+ 
+-    let ops = posting::program_ops(world)?;
++/// The playback's plan (#2280): [`plan_program`] up to the first op
++/// with no toolpath, and that op and every op after it, in program
++/// order (empty when every op has a toolpath). The verdict and the
++/// post never read this: they keep `plan_program`, which refuses.
++pub(crate) fn plan_program_until_ungenerated(
++    world: &flecs_ecs::prelude::World,
++) -> Result<(Vec<Planned>, Vec<(String, flecs_ecs::prelude::Entity)>), String> {
++    let (ops, rest) = crate::posting::program_ops_until_ungenerated(world)?;
++    Ok((plan_ops(world, &ops)?, rest))
++}
++
++fn plan_ops(world: &flecs_ecs::prelude::World, ops: &[(String, flecs_ecs::prelude::Entity)]) -> Result<Vec<Planned>, String> {
++    use crate::model;
+ 
+     // Tools and cached paths, resolved once, in program order. The
+     // atom follows the tool kind (stage A's law): a ball nose sweeps
+@@ -298,7 +311,7 @@ pub(crate) fn plan_program(world: &flecs_ecs::prelude::World) -> Result<Vec<Plan
+     // and a tap sweeps the disc of its thread's core (#266,
+     // `tool_law::cutting_radius`).
+     let mut planned: Vec<Planned> = Vec::with_capacity(ops.len());
+-    for (name, e) in &ops {
++    for (name, e) in ops {
+         let op = model::operation_of(world, e)
+             .ok_or_else(|| format!("{name}: lost its operation"))?;
+         if wire::skips(&op) {
+diff --git a/crates/app/src/stock_view.rs b/crates/app/src/stock_view.rs
+index b99803fb9..250233493 100644
+--- a/crates/app/src/stock_view.rs
++++ b/crates/app/src/stock_view.rs
+@@ -183,12 +183,26 @@ pub(crate) fn display_inputs(
+     if !(texels.is_finite() && texels >= 1.0) {
+         return Err(format!("the field view needs a positive texel budget, not {texels}"));
+     }
+-    let planned = plan_program(world)?;
++    display_inputs_of(world, texels, plan_program(world)?, None)
++}
++
++/// `display_inputs` over a given plan (#2280: the playback's plan ends
++/// before an op with no toolpath). `fallback_setup` names the setup
++/// whose stock is drawn when the plan is empty.
++pub(crate) fn display_inputs_of(
++    world: &flecs_ecs::prelude::World,
++    texels: f64,
++    planned: Vec<crate::stock_sim::Planned>,
++    fallback_setup: Option<String>,
++) -> Result<(Vec<Triangle>, Vec<crate::stock_sim::Planned>, f64), String> {
++    if !(texels.is_finite() && texels >= 1.0) {
++        return Err(format!("the field view needs a positive texel budget, not {texels}"));
++    }
+     // #541: the field eye has no box atom - said, never cut as a disc.
+     if let Some(p) = planned.iter().find(|p| p.electrode.is_some()) {
+         return Err(format!("{}: {}", p.name, crate::stock_sim::ELECTRODE_FIELD_REFUSAL));
+     }
+-    let first = planned.first().and_then(|p| p.setup.clone());
++    let first = planned.first().map_or(fallback_setup, |p| p.setup.clone());
+     let eff = crate::setup::effective(world, first.as_deref());
+     if planned.iter().any(|p| crate::setup::effective(world, p.setup.as_deref()) != eff) {
+         return Err("the field view draws one setup's stock; a multi-setup program keeps the sheet (the flip transform is M7.3's)".into());
+diff --git a/crates/app/tests/stock_play_stop.rs b/crates/app/tests/stock_play_stop.rs
+new file mode 100644
+index 000000000..4e8627694
+--- /dev/null
++++ b/crates/app/tests/stock_play_stop.rs
+@@ -0,0 +1,124 @@
++//! #2280: the stock playback plays the program up to the first
++//! operation with no toolpath, and never skips that operation to cut
++//! the ones after it. The post and the Deviate verdict still refuse the
++//! same document by name. Provenance: our own fixtures (a faced box)
++//! over the M7.1 field engine; nothing from vendor binaries.
++//!
++//! Gate map (M4.4): covers app::stock_play (PlaySeed::gather, PlayIndex::stop, PlayIndex::position_at), app::stock_sim (plan_program_until_ungenerated), app::posting (program_ops_until_ungenerated), app::stock_view (display_inputs_of).
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
++use camcraft_app::geometry::{cube, Point3, IDENTITY_Q};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_play::{FieldPlay, PlaySeed, Progress};
++use camcraft_app::stock_sim::{simulate_document, Preview, PreviewCamera, Stock, DEV_TOL};
++use camcraft_app::stock_view::field_view_with;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++const HALF: f64 = 6.0;
++/// ~1.5 mm cells, the `stock_play` suite's own cell law.
++const COARSE: f64 = (2.0 * HALF) * (2.0 * HALF) * 20.0 / 3.6;
++
++fn face(cut_z: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(cut_z),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        blend_turns: false,
++    }
++}
++
++/// A faced box with the ops `ops` in program order: (name, cut Z,
++/// generated).
++fn doc(ops: &[(&str, f64, bool)]) -> World {
++    let world = new_world();
++    let mut history = History::default();
++    let loc = Location { pos: Point3::ZERO, rot: IDENTITY_Q };
++    let cmd = SetStock::new(&world, StockShape::Box { dx: 2.0 * HALF, dy: 2.0 * HALF, dz: 20.0 }, loc);
++    history.execute(&world, cmd.expect("box stock"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "EM-0400-2FL").map(|(_, t)| t).expect("catalog entry");
++    history.execute(&world, AddTool::new(&world, "EM-0400-2FL", tool).expect("catalog tool"));
++    history.execute(&world, ImportModel::from_mesh("part", cube(Point3::new(-HALF, -HALF, 0.0), Point3::new(HALF, HALF, 16.0))));
++    for (name, cut_z, generated) in ops {
++        let cmd = CreateOperation::new(&world, name, "EM-0400-2FL", SrcRef::Stock, face(*cut_z));
++        history.execute(&world, cmd.expect("create face"));
++        if *generated {
++            history.execute(&world, GenerateOperation::new(&world, name).expect("generate face"));
++        }
++    }
++    world
++}
++
++fn frame(s: &Stock) -> Preview {
++    let cam = PreviewCamera::look_at(Point3::new(-25.0, -30.0, 45.0), Point3::new(0.0, 0.0, 10.0), Point3::new(0.0, 0.0, 1.0), 0.5)
++        .expect("camera");
++    s.preview(None, &cam, 24, 24, DEV_TOL).expect("frame")
++}
++
++fn same(a: &Preview, b: &Preview) -> bool {
++    a.depth.iter().zip(&b.depth).all(|(x, y)| (x.is_nan() && y.is_nan()) || (x - y).abs() <= 1e-6)
++}
++
++#[test]
++fn playback_plays_the_ops_before_the_first_one_without_a_toolpath() {
++    let world = doc(&[("Face1", 18.0, true), ("Face2", 17.0, false)]);
++    // Safety: the verdict and the post still refuse the document by name.
++    let err = simulate_document(&world).err().expect("the verdict refuses");
++    assert!(err.contains("Face2: no toolpath yet"), "{err}");
++    assert!(camcraft_app::posting::program_ops(&world).is_err(), "the post refuses as before");
++
++    let seed = PlaySeed::gather(&world, false, COARSE).expect("the playback starts");
++    let index = seed.index();
++    assert_eq!(index.stop(), Some("Face2"), "the playback names where it stops");
++    let mut play = FieldPlay::from_seed(seed).expect("playback builds");
++    assert!(play.total() > 4, "Face1's moves play: {}", play.total());
++    assert_eq!(play.total(), index.total());
++
++    // The end of playback is the stock that Face1 alone leaves.
++    assert!(play.seek(usize::MAX).expect("to the end"));
++    let only_face1 = doc(&[("Face1", 18.0, true)]);
++    let full = field_view_with(&only_face1, COARSE).expect("Face1's stock");
++    assert!(same(&frame(&play.view().stock), &frame(&full.stock)), "the playback shows Face1's removal");
++
++    // On the timeline, an op at or past the stop holds the stock at the
++    // plan's end; an op that is not in the document is still refused.
++    let at_stop = Progress { op: "Face2".into(), segs_done: 3, span: 9 };
++    assert_eq!(index.position_at(&at_stop, 0.5), Some((index.total(), 0.0)));
++    let ghost = Progress { op: "NoSuchOp".into(), segs_done: 3, span: 9 };
++    assert_eq!(index.position_at(&ghost, 0.5), None);
++}
++
++#[test]
++fn playback_never_skips_an_op_without_a_toolpath_to_cut_the_next() {
++    // Face1 has no toolpath; Face2 has one. Face2 must not be cut: the
++    // stock it would cut is not the stock that Face1 leaves.
++    let world = doc(&[("Face1", 18.0, false), ("Face2", 17.0, true)]);
++    let seed = PlaySeed::gather(&world, false, COARSE).expect("the playback starts");
++    let index = seed.index();
++    assert_eq!(index.stop(), Some("Face1"));
++    assert_eq!(index.total(), 0, "nothing plays before the stop");
++    let face2 = Progress { op: "Face2".into(), segs_done: 2, span: 5 };
++    assert_eq!(index.position_at(&face2, 0.5), Some((0, 0.0)), "Face2 is past the stop");
++    let mut play = FieldPlay::from_seed(seed).expect("playback builds");
++    let uncut = frame(&play.view().stock);
++    play.seek(usize::MAX).expect("to the end");
++    assert!(same(&frame(&play.view().stock), &uncut), "the stock stays uncut");
++}
++
++#[test]
++fn a_whole_program_has_no_stop() {
++    let world = doc(&[("Face1", 18.0, true)]);
++    let index = PlaySeed::gather(&world, false, COARSE).expect("seed").index();
++    assert_eq!(index.stop(), None);
++}
+diff --git a/crates/ui/src/actions.rs b/crates/ui/src/actions.rs
+index a077c9712..792b13f6f 100644
+--- a/crates/ui/src/actions.rs
++++ b/crates/ui/src/actions.rs
+@@ -154,7 +154,7 @@ pub(crate) fn ensure_field_view(state: &mut State) {
+         return;
+     }
+     if let Err(err) = follow_playhead(state, judged) {
+-        state.status += &format!(" | traced playback refused: {err} - the sheet stands");
++        state.status += &format!(" | stock simulation refused: {err} - the stock shows uncut");
+         state.field_play = None;
+         state.field_view = Some(Err(err));
+     }
+diff --git a/crates/ui/src/egui_app/status_alert.rs b/crates/ui/src/egui_app/status_alert.rs
+index 51f66b226..ab2fc10d6 100644
+--- a/crates/ui/src/egui_app/status_alert.rs
++++ b/crates/ui/src/egui_app/status_alert.rs
+@@ -47,6 +47,17 @@ mod tests {
+         }
+     }
+ 
++    /// #2280: the notes of an operation with 0 warnings are not an
++    /// error. The text is the status line the maintainer saw, without
++    /// the playback refusal that #2280 removed from its end.
++    #[test]
++    fn the_notes_of_a_clean_operation_are_not_an_alert() {
++        let mut state = State::new();
++        state.status = "generated 2D Adaptive1: 4269 moves (0 plunge(s), 3 level(s), 1617 arc(s)), 0 warning(s) -             arc output: of 789 fitted arcs, 169 could not be proved inside the cutter-centre area, 85 would add a kink             and 2 would cross another feed - those stay chords - Carried stock: the operation's top Z20.000 is below             the material over its region (Z22.000) - the first descent starts over that material and feeds down;             the first level engages 2.000 mm"
++            .to_owned();
++        assert!(!is_alert(&state), "{}", state.status);
++    }
++
+     #[test]
+     fn refusals_are_alerts() {
+         let mut state = State::new();
+diff --git a/crates/ui/src/field_view_tests.rs b/crates/ui/src/field_view_tests.rs
+index c9dd36375..9147dc8d5 100644
+--- a/crates/ui/src/field_view_tests.rs
++++ b/crates/ui/src/field_view_tests.rs
+@@ -22,7 +22,7 @@ fn a_refused_playback_is_said_once_and_retired_with_the_transport() {
+     state.sim = Some(Sim::new()); // an empty document: no stock to cut
+     ensure_field_view(&mut state);
+     assert!(matches!(state.field_view, Some(Err(_))), "no stock is a named refusal");
+-    assert!(state.status.contains("traced playback refused"), "{}", state.status);
++    assert!(state.status.contains("stock simulation refused"), "{}", state.status);
+     let said = state.status.clone();
+     ensure_field_view(&mut state);
+     assert_eq!(state.status, said, "the same state is not re-walked or re-said");
+diff --git a/crates/ui/src/play_precalc.rs b/crates/ui/src/play_precalc.rs
+index 80c1bc8a5..aaecb9cda 100644
+--- a/crates/ui/src/play_precalc.rs
++++ b/crates/ui/src/play_precalc.rs
+@@ -1,6 +1,7 @@
+ //! The transport's line for the stock removal calculated before
+ //! playback (#2181): progress while it runs, a Cancel button, and the
+-//! word "incomplete" when it stopped early. Provenance: our own
++//! word "incomplete" when it stopped early; and the line that names the
++//! operation the stock simulation stops before (#2280). Provenance: our own
+ //! transport bar (`egui_app::shell`); nothing from vendor binaries.
+ //!
+ //! The line is display state only: no command, nothing undoable, and
+@@ -30,11 +31,28 @@ pub fn precalc_readout(p: &Precalc) -> Option<String> {
+ /// The Cancel button's label.
+ pub const CANCEL: &str = "Cancel";
+ 
++/// The sentence when the stock simulation stops before `op` (#2280):
++/// it has no toolpath, so nothing after it is shown cut.
++#[must_use]
++pub fn stop_readout(op: &str) -> String {
++    format!("Stock simulation stops before {op}: it has no toolpath. Generate it to see the rest.")
++}
++
++/// The stop sentence for the running playback, when it stops early.
++#[must_use]
++pub fn playback_stop(state: &State) -> Option<String> {
++    state.field_play.as_ref()?.index().stop().map(stop_readout)
++}
++
+ /// Draw the line under the transport bar, when there is one.
+ pub(crate) fn transport_row(ui: &mut egui::Ui, state: &State) {
+     let Some(play) = state.field_play.as_ref() else {
+         return;
+     };
++    // #2280: its own line, never a clause on the status line.
++    if let Some(text) = playback_stop(state) {
++        ui.label(text);
++    }
+     if precalc_row(ui, &play.precalc()) {
+         play.cancel_precalc();
+     }
+diff --git a/crates/ui/src/play_precalc_tests.rs b/crates/ui/src/play_precalc_tests.rs
+index bedc745cf..034963900 100644
+--- a/crates/ui/src/play_precalc_tests.rs
++++ b/crates/ui/src/play_precalc_tests.rs
+@@ -3,7 +3,7 @@
+ //! stored calculation and starts a new one. Provenance: our own
+ //! fixtures (a staged face) over the M7.1 field engine.
+ //!
+-//! Gate map (M4.4): covers ui::play_precalc, ui::actions::ensure_field_view (precalc stamp).
++//! Gate map (M4.4): covers ui::play_precalc, ui::actions::ensure_field_view (precalc stamp, #2280 stop line).
+ 
+ use camcraft_app::commands::{AddTool, CreateOperation, EditOperationParams, GenerateOperation, SetStock};
+ use camcraft_app::geometry::{Point3, IDENTITY_Q};
+@@ -14,7 +14,7 @@ use camcraft_app::stock_play::Precalc;
+ use camcraft_app::tools::catalog;
+ 
+ use crate::actions::ensure_field_view;
+-use crate::play_precalc::precalc_readout;
++use crate::play_precalc::{playback_stop, precalc_readout, stop_readout};
+ use crate::state::{Sim, State};
+ 
+ fn face(stepover: f64) -> OpParams {
+@@ -84,3 +84,31 @@ fn an_edit_of_the_operation_retires_the_stored_calculation() {
+     assert!(after > before, "the stored calculation was for {before} moves; the edited program has {after}");
+     assert_ne!(play.precalc(), Precalc::Off, "and it calculates again");
+ }
++
++/// #2280: an operation with no toolpath after a generated one. The
++/// playback starts and plays the generated one; the stop is its own
++/// plain-English line, not a refusal on the status line.
++#[test]
++fn an_op_without_a_toolpath_stops_the_playback_and_says_so() {
++    let mut state = faced_state();
++    state.sim = Some(Sim::new());
++    ensure_field_view(&mut state);
++    let whole = state.field_play.as_ref().map(|p| p.index().total()).expect("Face1 alone plays");
++    assert_eq!(playback_stop(&state), None, "a whole program has no stop line");
++
++    let w = &state.world;
++    let cmd = CreateOperation::new(w, "2D Contour1", "EM-0400-2FL", SrcRef::Stock, face(1.5)).expect("create");
++    state.history.execute(w, cmd);
++    state.doc_version += 1;
++    state.status = "generated Face1: 40 moves, 0 warning(s)".into();
++    ensure_field_view(&mut state);
++    assert!(!matches!(state.field_view, Some(Err(_))), "the playback is not refused");
++    let play = state.field_play.as_ref().expect("the playback runs");
++    assert_eq!(play.index().total(), whole, "Face1's moves play");
++    assert_eq!(
++        playback_stop(&state).as_deref(),
++        Some("Stock simulation stops before 2D Contour1: it has no toolpath. Generate it to see the rest.")
++    );
++    assert_eq!(stop_readout("X"), "Stock simulation stops before X: it has no toolpath. Generate it to see the rest.");
++    assert_eq!(state.status, "generated Face1: 40 moves, 0 warning(s)", "the status line is not changed");
++}
+diff --git a/docs/decisions/2280-sim-partial-playback.md b/docs/decisions/2280-sim-partial-playback.md
+new file mode 100644
+index 000000000..d19130ab1
+--- /dev/null
++++ b/docs/decisions/2280-sim-partial-playback.md
+@@ -0,0 +1,37 @@
++## #2280 - The stock playback stops before the first operation with no toolpath
++
++**Decided.** The stock playback (the transport's traced stock) plays the
++program in posting order up to the first operation that has no toolpath.
++It stops there. It does not skip that operation to cut the ones after it.
++A separate line under the transport bar names the operation: "Stock
++simulation stops before 2D Contour1: it has no toolpath. Generate it to
++see the rest." The stop is not added to the status line, so the notes of
++a clean operation do not get the error mark. The remaining playback
++refusal reads "stock simulation refused: ... - the stock shows uncut" in
++place of "traced playback refused: ... - the sheet stands".
++
++**Why.** The issue's expected behaviour. A stock after a skipped
++operation is wrong, so a skip is a silent wrong answer; a stop is not.
++The post and the Deviate verdict keep `posting::program_ops` and
++`stock_sim::plan_program` unchanged: they still refuse the program by
++name. Only the playback uses the new `program_ops_until_ungenerated` /
++`plan_program_until_ungenerated` walk.
++
++**Details.**
++- Only an operation with no toolpath (`OpStatus::Never`) stops the
++  playback. A stale operation, a tool problem or a spindle problem before
++  the stop still refuses the playback, as before: those operations have a
++  toolpath that the playback would cut wrong.
++- When the first operation has no toolpath, the playback shows the uncut
++  stock of that operation's setup and the stop line.
++- On the timeline, an operation at or after the stop holds the stock as
++  the plan left it (`PlayIndex::position_at`). An operation that is not
++  in the plan and is not after the stop is still a refusal.
++
++**Dropped.** Skip the operation and continue (the issue forbids it: the
++stock after the skip is wrong). Keep the stop as a clause on the status
++line (fault 2 of the issue: it reads as an error at the end of other
++notes).
++
++**Cost to change.** Small: the stop list lives in `PlayIndex::rest`; the
++line is drawn by `play_precalc::transport_row`.
+
+From ba987e7b49a753db54ad47e4bc1da97b498984a1 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 16 Nov 2026 23:08:08 +0100
+Subject: [PATCH 4/4] fix(sim): clippy - an op list alias, contains, let-else
+ in the test
+
+Refs #2280
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/posting.rs           | 9 +++++----
+ crates/app/src/stock_play_head.rs   | 2 +-
+ crates/app/src/stock_sim.rs         | 2 +-
+ crates/app/tests/stock_play_stop.rs | 2 +-
+ 4 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/crates/app/src/posting.rs b/crates/app/src/posting.rs
+index a7092eb6d..7d016ab23 100644
+--- a/crates/app/src/posting.rs
++++ b/crates/app/src/posting.rs
+@@ -852,21 +852,22 @@ pub fn program_ops(world: &World) -> Result<Vec<(String, Entity)>, String> {
+     gated_ops(world, false).map(|(ops, _)| ops)
+ }
+ 
++/// Operations by name, in program order.
++pub(crate) type OpList = Vec<(String, Entity)>;
++
+ /// [`program_ops`] for the stock playback only (#2280): the same order
+ /// and the same gates, but the walk ends before the first operation
+ /// with no toolpath, which comes back with every op from it on. The
+ /// playback shows the program up to there; it never skips that op and
+ /// cuts the next ones on a stock the skipped op did not cut. The post
+ /// and the Deviate verdict keep [`program_ops`]: it refuses.
+-pub(crate) fn program_ops_until_ungenerated(
+-    world: &World,
+-) -> Result<(Vec<(String, Entity)>, Vec<(String, Entity)>), String> {
++pub(crate) fn program_ops_until_ungenerated(world: &World) -> Result<(OpList, OpList), String> {
+     gated_ops(world, true)
+ }
+ 
+ /// The walk under [`program_ops`]; `stop_at_ungenerated` turns the
+ /// "no toolpath yet" refusal into the end of the list.
+-fn gated_ops(world: &World, stop_at_ungenerated: bool) -> Result<(Vec<(String, Entity)>, Vec<(String, Entity)>), String> {
++fn gated_ops(world: &World, stop_at_ungenerated: bool) -> Result<(OpList, OpList), String> {
+     // THE order law by call (M3.2 A): setup rank, then operation position - the same
+     // walk re-machining, the sim and the machine-limit check make.
+     // A suppressed op (#110) is not in the program: skipped before the
+diff --git a/crates/app/src/stock_play_head.rs b/crates/app/src/stock_play_head.rs
+index 29e47af5a..a6d085ea2 100644
+--- a/crates/app/src/stock_play_head.rs
++++ b/crates/app/src/stock_play_head.rs
+@@ -65,7 +65,7 @@ impl PlayIndex {
+     pub fn position_at(&self, p: &Progress, frac: f64) -> Option<(usize, f64)> {
+         // #2280: an op at or past the stop is not in the plan; the
+         // picture holds the stock as the plan left it.
+-        if self.rest.iter().any(|n| *n == p.op) {
++        if self.rest.contains(&p.op) {
+             return Some((self.total, 0.0));
+         }
+         let k = self.index_at(p)?;
+diff --git a/crates/app/src/stock_sim.rs b/crates/app/src/stock_sim.rs
+index e49f45cce..1e11c76d8 100644
+--- a/crates/app/src/stock_sim.rs
++++ b/crates/app/src/stock_sim.rs
+@@ -292,7 +292,7 @@ pub(crate) fn plan_program(world: &flecs_ecs::prelude::World) -> Result<Vec<Plan
+ /// post never read this: they keep `plan_program`, which refuses.
+ pub(crate) fn plan_program_until_ungenerated(
+     world: &flecs_ecs::prelude::World,
+-) -> Result<(Vec<Planned>, Vec<(String, flecs_ecs::prelude::Entity)>), String> {
++) -> Result<(Vec<Planned>, crate::posting::OpList), String> {
+     let (ops, rest) = crate::posting::program_ops_until_ungenerated(world)?;
+     Ok((plan_ops(world, &ops)?, rest))
+ }
+diff --git a/crates/app/tests/stock_play_stop.rs b/crates/app/tests/stock_play_stop.rs
+index 4e8627694..d39619e1e 100644
+--- a/crates/app/tests/stock_play_stop.rs
++++ b/crates/app/tests/stock_play_stop.rs
+@@ -74,7 +74,7 @@ fn same(a: &Preview, b: &Preview) -> bool {
+ fn playback_plays_the_ops_before_the_first_one_without_a_toolpath() {
+     let world = doc(&[("Face1", 18.0, true), ("Face2", 17.0, false)]);
+     // Safety: the verdict and the post still refuse the document by name.
+-    let err = simulate_document(&world).err().expect("the verdict refuses");
++    let Err(err) = simulate_document(&world) else { panic!("the verdict refuses") };
+     assert!(err.contains("Face2: no toolpath yet"), "{err}");
+     assert!(camcraft_app::posting::program_ops(&world).is_err(), "the post refuses as before");
+ 

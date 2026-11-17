@@ -1,0 +1,855 @@
+From afa6d9d2859a907a1060de0ebee4da437f201903 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Tue, 17 Nov 2026 09:19:29 +0100
+Subject: [PATCH] perf(ui): cache the shown operation status on a world write
+ revision
+
+The tree, the status bar, the operation page and the debug panel computed
+operation::status_of (the full generation stamp) for each operation on
+each frame. They now read operation::status_shown / stale_reason_shown.
+These keep the answer for each operation until the world write revision
+moves.
+
+- schema::WorldRevision and app::world_rev: one flecs observer on the
+  wildcard id and one on the wildcard pair. Each OnAdd, OnSet and
+  OnRemove of each component (except the read-time memos GeoSig and
+  GeomPrintMemo) takes a fresh number from one process counter.
+- SetSetupPostScriptOptions wrote SetupDef in place (no OnSet event).
+  It now clones and sets.
+- Generation, verify, collision checks, the post, the post dialog, MCP
+  and the script API keep calling status_of, the uncached truth.
+- Row 7: op_page, state and shell read the toolpath through
+  model::with_toolpath and do not clone it.
+
+Pinned by crates/app/tests/status_cache.rs (a build count, one test for
+each writer, undo and redo, project load, and a source scan that refuses
+an in-place component write) and by frame_cost_ops_probe (no status is
+computed on a still frame with 1 and 8 operations).
+
+Refs #2201
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../app/src/commands/post_script_options.rs   |  10 +-
+ crates/app/src/lib.rs                         |   2 +
+ crates/app/src/operation/mod.rs               |   3 +
+ crates/app/src/operation/status_memo.rs       | 108 +++++++
+ crates/app/src/schema.rs                      |   9 +
+ crates/app/src/world_rev.rs                   |  81 ++++++
+ crates/app/tests/status_cache.rs              | 274 ++++++++++++++++++
+ crates/ui/src/egui_app/browser_tree.rs        |   2 +-
+ crates/ui/src/egui_app/debug_info.rs          |   2 +-
+ crates/ui/src/egui_app/op_page.rs             |  12 +-
+ crates/ui/src/egui_app/panes.rs               |   2 +-
+ crates/ui/src/egui_app/shell.rs               |   4 +-
+ .../egui_app/tests/frame_cost_ops_probe.rs    |   7 +-
+ .../ui/src/egui_app/tests/frame_cost_probe.rs |   4 +
+ crates/ui/src/state.rs                        |  10 +-
+ docs/decisions/2201-status-cache.md           |  58 ++++
+ 16 files changed, 566 insertions(+), 22 deletions(-)
+ create mode 100644 crates/app/src/operation/status_memo.rs
+ create mode 100644 crates/app/src/world_rev.rs
+ create mode 100644 crates/app/tests/status_cache.rs
+ create mode 100644 docs/decisions/2201-status-cache.md
+
+diff --git a/crates/app/src/commands/post_script_options.rs b/crates/app/src/commands/post_script_options.rs
+index 2d55176ea..16b7b0751 100644
+--- a/crates/app/src/commands/post_script_options.rs
++++ b/crates/app/src/commands/post_script_options.rs
+@@ -191,9 +191,13 @@ fn write_setup_script_options(world: &World, setup: &str, value: Option<PostScri
+         return;
+     };
+     let view = entity.entity_view(world);
+-    view.get::<&mut SetupDef>(|def| {
+-        def.post_properties = value;
+-    });
++    // Clone and `set`, never a write in place: `set` sends the OnSet
++    // event that moves the world revision (#2201, `world_rev`).
++    let Some(mut def) = view.try_get::<&SetupDef>(Clone::clone) else {
++        return;
++    };
++    def.post_properties = value;
++    view.set(def);
+ }
+ 
+ impl Command for SetSetupPostScriptOptions {
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index c66b8b846..37a93d452 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -180,3 +180,5 @@ pub mod view;
+ // #261: the moves a cached path's warnings name.
+ pub mod warned_moves;
+ pub mod world;
++// #2201: the world's write revision that display caches key on.
++pub mod world_rev;
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index 63a580af7..f3d67dde2 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -83,6 +83,9 @@ mod trochoid_op;
+ mod stamp;
+ mod stamp_tool;
+ pub use stamp::*;
++// #2201: the status the display shows, memoized on the world revision.
++mod status_memo;
++pub use status_memo::{stale_reason_shown, status_builds, status_shown};
+ mod stamp_stock;
+ pub use stamp_stock::reads_setup_stock;
+ pub(crate) use stamp_stock::write_setup_stock;
+diff --git a/crates/app/src/operation/status_memo.rs b/crates/app/src/operation/status_memo.rs
+new file mode 100644
+index 000000000..b3799dedb
+--- /dev/null
++++ b/crates/app/src/operation/status_memo.rs
+@@ -0,0 +1,108 @@
++//! The status the tree, the status bar and the operation page SHOW
++//! (#2201): [`status_of`] memoized on the world's write revision
++//! (`world_rev`), so a still frame computes no stamp. Our own frame-cost
++//! law (docs/decisions/2201-status-cache.md); no vendor material
++//! consulted.
++//!
++//! ## The laws here
++//!
++//! - **Display only.** Generation, verify, the collision checks and the
++//!   post call [`status_of`] - the uncached truth - and never this.
++//! - **The key is the whole world.** Each status is computed from world
++//!   components only, and each add, set or remove of a component moves
++//!   the revision, so a hit answers what a fresh [`status_of`] answers.
++//! - **A moving world is not cached.** When the revision moves during
++//!   the compute, the answer is returned but not kept.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++
++use flecs_ecs::prelude::{Entity, World};
++
++use super::{OpStatus, stale_reason, status_of};
++
++/// One revision and the answers given at it, per entity.
++#[derive(Default)]
++struct Memo {
++    rev: u64,
++    status: HashMap<Entity, OpStatus>,
++    reason: HashMap<Entity, Option<String>>,
++}
++
++thread_local! {
++    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
++    /// Real [`status_of`] computes made for the display on this thread -
++    /// the counter the #2201 pins read.
++    static BUILDS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// Look up `key` at revision `rev`; a new revision forgets all answers.
++fn hit<T: Clone>(rev: u64, pick: impl Fn(&Memo) -> Option<T>) -> Option<T> {
++    MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        if m.rev != rev {
++            *m = Memo { rev, ..Memo::default() };
++        }
++        pick(&m)
++    })
++}
++
++fn keep(rev: u64, put: impl FnOnce(&mut Memo)) {
++    MEMO.with(|m| {
++        let mut m = m.borrow_mut();
++        if m.rev == rev {
++            put(&mut m);
++        }
++    });
++}
++
++/// [`status_of`] for the DISPLAY: the answer of the last compute while
++/// the world's revision has not moved. Never call it from a verdict.
++#[must_use]
++pub fn status_shown(world: &World, entity: &Entity) -> OpStatus {
++    let id = *entity;
++    let Some(rev) = crate::world_rev::of(world) else {
++        BUILDS.with(|n| n.set(n.get().saturating_add(1)));
++        return status_of(world, entity);
++    };
++    if let Some(s) = hit(rev, |m| m.status.get(&id).copied()) {
++        return s;
++    }
++    BUILDS.with(|n| n.set(n.get().saturating_add(1)));
++    let s = status_of(world, entity);
++    if crate::world_rev::of(world) == Some(rev) {
++        keep(rev, |m| {
++            m.status.insert(id, s);
++        });
++    }
++    s
++}
++
++/// [`stale_reason`] for the DISPLAY, on the same key as
++/// [`status_shown`]. Never call it from a verdict.
++#[must_use]
++pub fn stale_reason_shown(world: &World, entity: &Entity) -> Option<String> {
++    let id = *entity;
++    let Some(rev) = crate::world_rev::of(world) else {
++        return stale_reason(world, entity);
++    };
++    if status_shown(world, entity) != OpStatus::Stale {
++        return None;
++    }
++    if let Some(r) = hit(rev, |m| m.reason.get(&id).cloned()) {
++        return r;
++    }
++    let r = stale_reason(world, entity);
++    if crate::world_rev::of(world) == Some(rev) {
++        keep(rev, |m| {
++            m.reason.insert(id, r.clone());
++        });
++    }
++    r
++}
++
++/// How many real status computes [`status_shown`] made on this thread.
++#[must_use]
++pub fn status_builds() -> u64 {
++    BUILDS.with(Cell::get)
++}
+diff --git a/crates/app/src/schema.rs b/crates/app/src/schema.rs
+index 5f1f27edf..b45e1abf8 100644
+--- a/crates/app/src/schema.rs
++++ b/crates/app/src/schema.rs
+@@ -175,6 +175,13 @@ pub struct GeomPrintMemo {
+     pub hash: [u64; 2],
+ }
+ 
++/// The world's write revision (#2201), a singleton that `world_rev`
++/// installs with each world: an observer moves it on each component
++/// add, set or remove. Display caches key on it; no verdict reads it.
++/// Not serialized; each new world gets its own.
++#[derive(Component, Debug, Clone)]
++pub struct WorldRevision(pub std::sync::Arc<std::sync::atomic::AtomicU64>);
++
+ /// Unit tag marking an entity as a work coordinate system origin: a
+ /// setup's one WCS (#342), named by `SetupDef::wcs` (`G54` for a document
+ /// without setups), its `Location` the transform; there is no payload to
+@@ -811,4 +818,6 @@ pub fn register_schema(world: &World) {
+     world.component::<SetupDef>();
+     world.component::<ActiveSetup>();
+     world.component::<FixtureDef>();
++    world.component::<WorldRevision>();
++    crate::world_rev::install(world);
+ }
+diff --git a/crates/app/src/world_rev.rs b/crates/app/src/world_rev.rs
+new file mode 100644
+index 000000000..e3f75d257
+--- /dev/null
++++ b/crates/app/src/world_rev.rs
+@@ -0,0 +1,81 @@
++//! The world's write revision (#2201): one number that moves on each
++//! component add, set or remove in a world, so a display cache can key
++//! on "nothing in the document changed" without a list of writers that
++//! can go out of date. Provenance: our own frame-cost law
++//! (docs/decisions/2201-status-cache.md) over the flecs observer API
++//! (flecs_ecs 0.2.2, MIT); no vendor material consulted.
++//!
++//! ## The laws here
++//!
++//! - **Every write moves it.** A flecs observer on the wildcard id sees
++//!   each `OnAdd`, `OnSet` and `OnRemove` of each component of each
++//!   entity: a command, its undo and redo, a generation result, a project
++//!   load and an entity delete all land through these events. A write
++//!   in place (`get::<&mut T>`) sends no event, so no code may write a
++//!   component that way (`world_rev_tests::no_write_in_place`).
++//! - **Unique across worlds.** Each move takes a fresh number from one
++//!   process counter, so two worlds never show the same revision, and a
++//!   replaced document never matches a key of the old one.
++//! - **Memo writes do not count.** `GeoSig` and `GeomPrintMemo` are
++//!   derived memos that a read writes; they are not inputs of anything.
++//! - **Display only.** No verdict, verify, collision check or post reads
++//!   it.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use flecs_ecs::prelude::*;
++
++use crate::schema::{GeoSig, GeomPrintMemo, WorldRevision};
++
++/// The process counter: each revision move takes the next number.
++static NEXT: AtomicU64 = AtomicU64::new(1);
++
++fn fresh() -> u64 {
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
++/// Give a new world its revision and the observer that moves it. Called
++/// once from `schema::register_schema`.
++pub(crate) fn install(world: &World) {
++    let rev = Arc::new(AtomicU64::new(fresh()));
++    world.set(WorldRevision(Arc::clone(&rev)));
++    // Ids of the memo components and of the revision itself: their
++    // writes say nothing about the document.
++    let skip: [u64; 3] = [
++        *world.component::<GeoSig>().id(),
++        *world.component::<GeomPrintMemo>().id(),
++        *world.component::<WorldRevision>().id(),
++    ];
++    // Plain components, then pairs: no document state rides a pair
++    // today, but a relation added later moves the revision too.
++    let plain = Arc::clone(&rev);
++    world
++        .observer::<flecs::OnSet, ()>()
++        .with(flecs::Wildcard::ID)
++        .set_inout_none()
++        .add_event(flecs::OnAdd::ID)
++        .add_event(flecs::OnRemove::ID)
++        .each_iter(move |it, _, ()| {
++            let id = *it.event_id().id();
++            if !skip.contains(&id) {
++                plain.store(fresh(), Ordering::Relaxed);
++            }
++        });
++    world
++        .observer::<flecs::OnSet, ()>()
++        .with((flecs::Wildcard::ID, flecs::Wildcard::ID))
++        .set_inout_none()
++        .add_event(flecs::OnAdd::ID)
++        .add_event(flecs::OnRemove::ID)
++        .each_iter(move |_, _, ()| {
++            rev.store(fresh(), Ordering::Relaxed);
++        });
++}
++
++/// The world's write revision now. `None` for a world that was not made
++/// by `world::new_world` - a caller then computes fresh each time.
++#[must_use]
++pub fn of(world: &World) -> Option<u64> {
++    world.try_get::<&WorldRevision>(|r| r.0.load(Ordering::Relaxed))
++}
+diff --git a/crates/app/tests/status_cache.rs b/crates/app/tests/status_cache.rs
+new file mode 100644
+index 000000000..ddad61af7
+--- /dev/null
++++ b/crates/app/tests/status_cache.rs
+@@ -0,0 +1,274 @@
++//! #2201: the displayed operation status (`operation::status_shown`) is
++//! computed once per world revision, and every writer of a status input
++//! moves that revision - so the cache always equals a fresh
++//! `operation::status_of`.
++//!
++//! Gate map: covers app::operation, app::world_rev, app::commands, app::project, app::schema.
++
++use camcraft_app::commands::{
++    AddTool, ChangeTool, ClearToolpath, CreateOperation, CreateSetup, DeleteEntity, DeleteTool,
++    EditOperationParams, GenerateOperation, History, ImportModel, LoadMachine, MoveModel, SetSetupPostScriptOptions,
++    SetStock, UpdateModel,
++};
++use camcraft_app::geometry::{cube, Point3};
++use camcraft_app::model;
++use camcraft_app::operation::{self, Height, OpParams, OpStatus, SrcRef};
++use camcraft_app::schema::{Location, PostScriptOptions};
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++use camcraft_app::{project, world_rev};
++use flecs_ecs::prelude::World;
++
++const TOOL: &str = "EM-0600-4FL";
++
++fn face(cut_z: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        blend_turns: false,
++        stepover: 3.0,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(cut_z),
++        top_z: None,
++        stepdown: None,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++    }
++}
++
++/// A part, a stock, a tool and two generated Face operations G1, G2 on
++/// the part.
++fn fixture() -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("tool");
++    h.execute(&world, AddTool::new(&world, TOOL, tool).expect("tool"));
++    h.execute(&world, ImportModel::from_mesh("part", cube(Point3::ZERO, Point3::new(10.0, 10.0, 5.0))));
++    h.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 40.0, dz: 20.0 }, Location::default()).expect("stock"),
++    );
++    for op in ["G1", "G2"] {
++        let src = SrcRef::Entity("part".into());
++        h.execute(&world, CreateOperation::new(&world, op, TOOL, src, face(4.5)).expect("create"));
++        h.execute(&world, GenerateOperation::new(&world, op).expect("generate"));
++    }
++    (world, h)
++}
++
++fn ent(world: &World, name: &str) -> flecs_ecs::prelude::Entity {
++    model::find_by_name(world, name).expect("entity exists")
++}
++
++/// The shown status of `op`, asserted equal to the uncached truth.
++fn shown(world: &World, op: &str) -> OpStatus {
++    let e = ent(world, op);
++    let cached = operation::status_shown(world, &e);
++    assert_eq!(cached, operation::status_of(world, &e), "the cache of '{op}' disagrees with a fresh status");
++    assert_eq!(
++        operation::stale_reason_shown(world, &e),
++        operation::stale_reason(world, &e),
++        "the cached reason of '{op}' disagrees with a fresh one"
++    );
++    cached
++}
++
++/// Read both statuses so the cache holds them, then return the build
++/// count, so a later read can prove it computed again.
++fn warm(world: &World) -> u64 {
++    let _ = (shown(world, "G1"), shown(world, "G2"));
++    operation::status_builds()
++}
++
++#[test]
++fn still_frames_compute_each_status_once() {
++    let (world, _h) = fixture();
++    let before = operation::status_builds();
++    for _ in 0..10 {
++        assert_eq!(operation::status_shown(&world, &ent(&world, "G1")), OpStatus::Ok);
++        assert_eq!(operation::status_shown(&world, &ent(&world, "G2")), OpStatus::Ok);
++        let _ = operation::stale_reason_shown(&world, &ent(&world, "G1"));
++    }
++    assert_eq!(operation::status_builds() - before, 2, "ten still frames, one compute per operation");
++}
++
++#[test]
++fn reads_never_move_the_revision() {
++    let (world, _h) = fixture();
++    let rev = world_rev::of(&world).expect("a new_world has a revision");
++    for op in ["G1", "G2"] {
++        let e = ent(&world, op);
++        let _ = operation::status_of(&world, &e);
++        let _ = operation::stale_reason(&world, &e);
++        let _ = model::toolpath_nonempty(&world, &e);
++    }
++    let _ = model::named_entities(&world);
++    let _ = project::save_text(&world).expect("save");
++    assert_eq!(world_rev::of(&world), Some(rev), "a read wrote a component");
++}
++
++#[test]
++fn an_operation_param_edit_rebuilds_and_undo_redo_follow() {
++    let (world, mut h) = fixture();
++    let n = warm(&world);
++    h.execute(&world, EditOperationParams::new(&world, "G1", face(4.0)).expect("edit"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale);
++    assert!(operation::status_builds() > n, "the edit rebuilt the status");
++    let n = warm(&world);
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok, "undo shows the fresh status again");
++    assert!(operation::status_builds() > n);
++    let n = warm(&world);
++    assert!(h.redo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale, "redo shows the stale status again");
++    assert!(operation::status_builds() > n);
++}
++
++#[test]
++fn a_tool_edit_and_a_tool_delete_rebuild() {
++    let (world, mut h) = fixture();
++    warm(&world);
++    let mut tool = model::tool_of(&world, &ent(&world, TOOL)).expect("tool");
++    tool.diameter *= 0.5;
++    h.execute(&world, ChangeTool::new(&world, TOOL, tool).expect("change tool"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale, "a new diameter is a new stamp");
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++    if let Ok(cmd) = DeleteTool::new(&world, TOOL) {
++        h.execute(&world, cmd);
++        let _ = shown(&world, "G1");
++        assert!(h.undo(&world));
++        assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++    }
++}
++
++#[test]
++fn generate_and_clear_rebuild() {
++    let (world, mut h) = fixture();
++    warm(&world);
++    h.execute(&world, ClearToolpath::new(&world, "G1").expect("clear"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Never);
++    h.execute(&world, EditOperationParams::new(&world, "G1", face(4.0)).expect("edit"));
++    h.execute(&world, GenerateOperation::new(&world, "G1").expect("generate"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok, "a new generation shows Ok");
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Never, "undo of the generation");
++}
++
++#[test]
++fn stock_model_and_placement_edits_rebuild() {
++    let (world, mut h) = fixture();
++    warm(&world);
++    h.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 50.0, dy: 50.0, dz: 30.0 }, Location::default()).expect("stock"),
++    );
++    let _ = shown(&world, "G1");
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++    warm(&world);
++    let slide = Location { pos: Point3::new(4.0, 0.0, 0.0), ..Location::default() };
++    h.execute(&world, MoveModel::new(&world, "part", slide).expect("move"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale, "a moved part is a new stamp");
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++    warm(&world);
++    let taller = cube(Point3::ZERO, Point3::new(10.0, 10.0, 6.0));
++    h.execute(&world, UpdateModel::new(&world, "part", taller).expect("update"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale, "new geometry is a new stamp");
++    assert!(h.undo(&world));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++}
++
++#[test]
++fn a_prior_operation_edit_rebuilds_the_next_one() {
++    let (world, mut h) = fixture();
++    warm(&world);
++    h.execute(&world, EditOperationParams::new(&world, "G1", face(3.0)).expect("edit"));
++    h.execute(&world, GenerateOperation::new(&world, "G1").expect("regenerate"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok);
++    // G2's stamp reads the program ahead (#109): equal to the truth
++    // whatever that truth is.
++    let _ = shown(&world, "G2");
++    assert!(h.undo(&world));
++    let _ = shown(&world, "G2");
++}
++
++#[test]
++fn setup_machine_and_delete_rebuild() {
++    let (world, mut h) = fixture();
++    let rev = world_rev::of(&world);
++    h.execute(&world, CreateSetup::new(&world, None, None).expect("setup"));
++    assert_ne!(world_rev::of(&world), rev);
++    let _ = shown(&world, "G1");
++    let rev = world_rev::of(&world);
++    // The one write that was in place (#2201): it must move the revision.
++    let cmd = SetSetupPostScriptOptions::for_setup(&world, "Setup1", Some(PostScriptOptions::default()));
++    h.execute(&world, cmd.expect("setup script options"));
++    assert_ne!(world_rev::of(&world), rev, "a setup's script options moved the revision");
++    let rev = world_rev::of(&world);
++    h.execute(&world, LoadMachine::builtin(&world, "Sienci AltMill 4x4").expect("machine"));
++    assert_ne!(world_rev::of(&world), rev, "a machine load moved the revision");
++    let _ = shown(&world, "G1");
++    warm(&world);
++    h.execute(&world, DeleteEntity::new(&world, "part").expect("delete"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale, "a deleted source is a new stamp");
++    assert!(h.undo(&world));
++    let _ = shown(&world, "G1");
++}
++
++#[test]
++fn a_project_load_rebuilds() {
++    let (world, mut h) = fixture();
++    let ok_text = project::save_text(&world).expect("save");
++    h.execute(&world, EditOperationParams::new(&world, "G1", face(4.0)).expect("edit"));
++    assert_eq!(shown(&world, "G1"), OpStatus::Stale);
++    // Open the saved document into the same world: the cache must not
++    // keep the status of the document it replaced.
++    project::open(&world, &ok_text).expect("open");
++    assert_eq!(shown(&world, "G1"), OpStatus::Ok, "the loaded document's status");
++    // And into a new world: its revision never matches the old one.
++    let other = new_world();
++    assert_ne!(world_rev::of(&other), world_rev::of(&world));
++    project::open(&other, &ok_text).expect("open");
++    assert_eq!(shown(&other, "G1"), OpStatus::Ok);
++    let _ = shown(&world, "G1");
++}
++
++#[test]
++fn no_component_is_written_in_place() {
++    // A write through `get::<&mut T>` sends no event, so the revision
++    // would not move and a cached status could show a stale "Ok".
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
++    let mut bad = Vec::new();
++    let mut stack = vec![root.join("app/src"), root.join("ui/src")];
++    while let Some(dir) = stack.pop() {
++        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
++        for entry in rd.flatten() {
++            let p = entry.path();
++            if p.is_dir() {
++                stack.push(p);
++            } else if p.extension().is_some_and(|x| x == "rs") {
++                let text = std::fs::read_to_string(&p).unwrap_or_default();
++                for (i, line) in text.lines().enumerate() {
++                    let code = line.split("//").next().unwrap_or("");
++                    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
++                    let typed_mut = ["get::<", "each::<", "each_entity::<", "each_iter::<", "query::<", "system::<"]
++                        .iter()
++                        .any(|door| {
++                            compact.match_indices(door).any(|(at, _)| {
++                                let rest = &compact[at + door.len()..];
++                                rest.split('>').next().is_some_and(|args| args.contains("&mut"))
++                            })
++                        });
++                    if typed_mut || compact.contains("ensure_mut") || compact.contains("get_mut::<") {
++                        bad.push(format!("{}:{}", p.display(), i + 1));
++                    }
++                }
++            }
++        }
++    }
++    assert!(bad.is_empty(), "components written in place (use clone + set): {bad:?}");
++}
+diff --git a/crates/ui/src/egui_app/browser_tree.rs b/crates/ui/src/egui_app/browser_tree.rs
+index d1a5efd62..882414304 100644
+--- a/crates/ui/src/egui_app/browser_tree.rs
++++ b/crates/ui/src/egui_app/browser_tree.rs
+@@ -307,7 +307,7 @@ fn op_row(
+             (k.to_string(), op_icon(k))
+         })
+         .unwrap_or_else(|| (String::new(), Icon::Generate));
+-    let status = operation::status_of(w, entity);
++    let status = operation::status_shown(w, entity);
+     let tag = match status {
+         operation::OpStatus::Never => "never",
+         operation::OpStatus::Ok => "ok",
+diff --git a/crates/ui/src/egui_app/debug_info.rs b/crates/ui/src/egui_app/debug_info.rs
+index aa3b783bb..fc640bad3 100644
+--- a/crates/ui/src/egui_app/debug_info.rs
++++ b/crates/ui/src/egui_app/debug_info.rs
+@@ -58,7 +58,7 @@ pub(crate) fn report(state: &State) -> String {
+     let models = entities.iter().filter(|(_, e)| model::is_model(world, e)).count();
+     let tools = entities.iter().filter(|(_, e)| model::is_tool(world, e)).count();
+     let ops: Vec<_> = entities.iter().filter(|(_, e)| model::is_operation(world, e)).collect();
+-    let status = |s: operation::OpStatus| ops.iter().filter(|(_, e)| operation::status_of(world, e) == s).count();
++    let status = |s: operation::OpStatus| ops.iter().filter(|(_, e)| operation::status_shown(world, e) == s).count();
+     lines.push(format!(
+         "Document: {} setup(s), {} model(s), {} tool(s), {} operation(s) ({} ok, {} stale, {} never generated)",
+         setup::names(world).len(),
+diff --git a/crates/ui/src/egui_app/op_page.rs b/crates/ui/src/egui_app/op_page.rs
+index 141db8712..57a390698 100644
+--- a/crates/ui/src/egui_app/op_page.rs
++++ b/crates/ui/src/egui_app/op_page.rs
+@@ -320,11 +320,12 @@ pub(super) fn status_text(state: &State, target: &str) -> (String, super::layout
+     let ent = model::find_by_name(&state.world, target);
+     let (moves, warnings, notes): (usize, Vec<Warning>, Vec<String>) = ent
+         .as_ref()
+-        .and_then(|e| model::toolpath_of(&state.world, e))
+-        .map(|tp| (tp.path.len(), tp.warnings, tp.path.notes))
++        .and_then(|e| {
++            model::with_toolpath(&state.world, e, |tp| (tp.path.len(), tp.warnings.clone(), tp.path.notes.clone()))
++        })
+         .unwrap_or((0, Vec::new(), Vec::new()));
+     let blocked = ent.as_ref().and_then(|e| operation::tool_gate::tool_problem_of(&state.world, e));
+-    let st = ent.as_ref().map(|e| operation::status_of(&state.world, e));
++    let st = ent.as_ref().map(|e| operation::status_shown(&state.world, e));
+     let mut details: Vec<String> = fold_warnings(&warnings);
+     details.extend(super::approach_page::entry_status_lines(&notes));
+     // #339 slice 4: who the fixture warnings strike, or that no single
+@@ -344,7 +345,7 @@ pub(super) fn status_text(state: &State, target: &str) -> (String, super::layout
+             // M3.1 C: say which input moved, not just that one did.
+             let reason = ent
+                 .as_ref()
+-                .and_then(|e| operation::stale_reason(&state.world, e))
++                .and_then(|e| operation::stale_reason_shown(&state.world, e))
+                 .unwrap_or_else(|| "inputs moved since generation".to_owned());
+             (format!("Stale · {reason} · {moves} moves cached{tail}"), Tone::Warn)
+         }
+@@ -358,8 +359,7 @@ fn status(ui: &mut Ui, state: &mut State, target: &str, pal: &Tokens) {
+     // #261: a warning line that names a move frames it on click (the
+     // fold lines lead `details`, aligned with `warning_focus`).
+     let focus: Vec<Option<[f64; 3]>> = model::find_by_name(&state.world, target)
+-        .and_then(|e| model::toolpath_of(&state.world, &e))
+-        .map(|tp| crate::path_lines::warning_focus(&tp))
++        .and_then(|e| model::with_toolpath(&state.world, &e, crate::path_lines::warning_focus))
+         .unwrap_or_default();
+     let links: Vec<bool> = focus.iter().map(Option::is_some).collect();
+     let inks = text_inks(ui, &state.world);
+diff --git a/crates/ui/src/egui_app/panes.rs b/crates/ui/src/egui_app/panes.rs
+index 8536f9c24..10c555f2e 100644
+--- a/crates/ui/src/egui_app/panes.rs
++++ b/crates/ui/src/egui_app/panes.rs
+@@ -1570,7 +1570,7 @@ pub fn status(ui: &mut Ui, state: &mut State, pal: &Tokens, icons: Option<&IconS
+         .into_iter()
+         .filter(|(_, e)| {
+             model::is_operation(&state.world, e)
+-                && operation::status_of(&state.world, e) == operation::OpStatus::Stale
++                && operation::status_shown(&state.world, e) == operation::OpStatus::Stale
+         })
+         .count();
+     let ops_n = model::named_entities(&state.world)
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index d509f27d9..043e244e1 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -977,8 +977,8 @@ pub(crate) mod headless {
+         state.pending.push_back(CommandKind::FrameAll);
+         state.drain_actions();
+         let op_ok = model::find_by_name(&state.world, "Contour1")
+-            .and_then(|e| model::toolpath_of(&state.world, &e))
+-            .map_or(0, |tp| tp.path.moves.len());
++            .and_then(|e| model::with_toolpath(&state.world, &e, |tp| tp.path.moves.len()))
++            .unwrap_or(0);
+         if op_ok == 0 {
+             return Err(format!(
+                 "seed produced no cached toolpath for Contour1 (status: {})",
+diff --git a/crates/ui/src/egui_app/tests/frame_cost_ops_probe.rs b/crates/ui/src/egui_app/tests/frame_cost_ops_probe.rs
+index fb807b194..6b0f5ca77 100644
+--- a/crates/ui/src/egui_app/tests/frame_cost_ops_probe.rs
++++ b/crates/ui/src/egui_app/tests/frame_cost_ops_probe.rs
+@@ -7,7 +7,7 @@
+ //! Provenance: our own frame-cost law over our own shell; no vendor
+ //! material consulted.
+ 
+-use camcraft_app::operation::OpType;
++use camcraft_app::operation::{self, OpType};
+ 
+ use super::frame_cost_probe::{N, calls, create, fig8, report, run, still};
+ use super::*;
+@@ -36,16 +36,18 @@ fn select(h: &mut Harness<'static, ShellUi>, name: &str) {
+ }
+ 
+ /// #2201 pins: still frames (the UI pass and the scene) build no toolpath
+-/// lines and no solid box after the first.
++/// lines, no solid box and no operation status after the first.
+ fn builds_nothing(h: &mut Harness<'static, ShellUi>, name: &str) {
+     let lines = crate::path_line_memo::path_line_builds();
+     let boxes = crate::solid_aabb_memo::solid_aabb_builds();
++    let statuses = operation::status_builds();
+     for _ in 0..3 {
+         std::hint::black_box(world::collect(&h.state().state));
+         h.step();
+     }
+     assert_eq!(crate::path_line_memo::path_line_builds() - lines, 0, "{name}: no toolpath line build on a still frame");
+     assert_eq!(crate::solid_aabb_memo::solid_aabb_builds() - boxes, 0, "{name}: no solid box build on a still frame");
++    assert_eq!(operation::status_builds() - statuses, 0, "{name}: no operation status computed on a still frame");
+ }
+ 
+ #[test]
+@@ -85,5 +87,6 @@ fn still_frames_with_many_toolpaths_name_their_costs() {
+     for (name, p) in [("f1", &f1), ("f8", &f8), ("g8", &g8), ("n8", &n8)] {
+         assert_eq!(calls(p, "scene/collect"), N, "{name}");
+         assert_eq!((p.delta.walks, p.delta.digests), (0, 0), "{name}: no chain walk, no digest on a still frame");
++        assert_eq!(p.delta.statuses, 0, "{name}: no operation status computed on a still frame");
+     }
+ }
+diff --git a/crates/ui/src/egui_app/tests/frame_cost_probe.rs b/crates/ui/src/egui_app/tests/frame_cost_probe.rs
+index c1cc9eedb..1e198ab2b 100644
+--- a/crates/ui/src/egui_app/tests/frame_cost_probe.rs
++++ b/crates/ui/src/egui_app/tests/frame_cost_probe.rs
+@@ -35,6 +35,8 @@ pub(super) struct Counts {
+     pub(super) patches: u64,
+     pub(super) selections: u64,
+     pub(super) pick_lines: u64,
++    /// #2201: shown operation statuses computed (`status_shown` misses).
++    pub(super) statuses: u64,
+ }
+ 
+ fn counts() -> Counts {
+@@ -46,6 +48,7 @@ fn counts() -> Counts {
+         patches: model::patch_builds(),
+         selections: operation::selection_walks(),
+         pick_lines: crate::pick_line_memo::pick_line_builds(),
++        statuses: operation::status_builds(),
+     }
+ }
+ 
+@@ -156,6 +159,7 @@ pub(super) fn still(h: &mut Harness<'static, ShellUi>) -> Probe {
+         patches: after.patches - before.patches,
+         selections: after.selections - before.selections,
+         pick_lines: after.pick_lines - before.pick_lines,
++        statuses: after.statuses - before.statuses,
+     };
+     let egui_delay =
+         h.output().viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |v| v.repaint_delay);
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 4aeae37dd..d50a0a09b 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -3697,15 +3697,13 @@ impl State {
+                     Ok(command) => {
+                         self.history.execute(&self.world, command);
+                         self.doc_version += 1;
+-                        let cache = model::find_by_name(&self.world, &name)
+-                            .and_then(|e| model::toolpath_of(&self.world, &e));
+                         // The feed in the summary reads in the document's
+                         // unit (M1.1); the path itself is mm law, always.
+                         let unit = self.units();
+-                        self.status = match cache {
+-                            Some(tp) => tp.path.status_summary(&name, tp.warnings.len(), unit),
+-                            None => format!("generated {name}"),
+-                        };
++                        let summary = model::find_by_name(&self.world, &name).and_then(|e| {
++                            model::with_toolpath(&self.world, &e, |tp| tp.path.status_summary(&name, tp.warnings.len(), unit))
++                        });
++                        self.status = summary.unwrap_or_else(|| format!("generated {name}"));
+                     }
+                     Err(err) => {
+                         self.refuse(ErrorScope::Operation, format!("generate failed: {err}"));
+diff --git a/docs/decisions/2201-status-cache.md b/docs/decisions/2201-status-cache.md
+new file mode 100644
+index 000000000..1955ce8f9
+--- /dev/null
++++ b/docs/decisions/2201-status-cache.md
+@@ -0,0 +1,58 @@
++## #2201 - the shown operation status is cached on a world write revision
++
++**Decided.** The tree, the status bar, the operation page and the debug
++panel read `operation::status_shown` and `operation::stale_reason_shown`.
++These keep the answer of `status_of` / `stale_reason` for each operation
++until the world's write revision (`world_rev::of`) moves. The revision is
++a new singleton component, `schema::WorldRevision`. One flecs observer on
++the wildcard id (and one on the wildcard pair) moves it on each `OnAdd`,
++`OnSet` and `OnRemove` of each component, except the two read-time memos
++`GeoSig` and `GeomPrintMemo` and the revision itself. Each move takes a
++fresh number from one process counter, so two worlds never share a value.
++
++Generation, verify, the collision checks, the post, the post dialog,
++`RegenerateAll`, MCP and the script API keep calling `status_of`, the
++uncached truth.
++
++**Why this key is complete.** `status_of` reads only world components:
++the `Operation` (tool name, source, params, area controls, setup and the
++stored stamp), its `Toolpath`, the tool entity, the source and picked
++entities' geometry and `Location`, the setup's `SetupDef` and stock
++source, the stock entity, the part alignment, the work offset, the
++`MachineDef` (wire and sinker conditions), the unit setting, and the
++toolpaths and order of the operations ahead (`rest::prior_digest`). The
++content-keyed memos on the way (`chain_memo`, `carried_cache`, the feature
++cache, `setup_offsets`) are pure functions of those values. No file is
++read on the stamp path.
++
++Each writer of those components and how the key covers it:
++
++| Writer | How it writes | Covered by |
++|---|---|---|
++| Every command `apply` (create, edit params / links / geometry, rename, reorder, tool add / change / delete, stock, setup, machine, post options, model import / update / move / repair, fixtures) | `set`, `add`, `remove`, `destruct` | OnSet / OnAdd / OnRemove |
++| Undo and redo | the command's `invert` / `apply`, same calls | same |
++| Generation result and `ClearToolpath` | `set` / `remove` of `Toolpath` and `Operation` | same |
++| Verify results | carried inside `Toolpath.warnings`, written with the toolpath | same |
++| Project load (`project::open` into a live world, or a new world) | `set` into the world; a new world starts with a fresh revision | same, and the per-process counter |
++| Entity delete | `destruct` | OnRemove of each component |
++| `SetSetupPostScriptOptions` | was the one in-place write (`get::<&mut SetupDef>`), which sends no event | changed to clone + `set` in this PR |
++
++A source scan test (`status_cache::no_component_is_written_in_place`)
++fails when a new `get::<&mut ..>`, `each::<&mut ..>`, query or system
++with a `&mut` term, `ensure_mut` or `get_mut::<` appears in `app` or
++`ui`. No schema component holds interior mutability (`Cell`, `Mutex`,
++atomics) except `WorldRevision` itself. Selection changes move the
++revision too: that is a harmless extra rebuild, never a stale answer.
++
++**Dropped.**
++- `doc_version` as the key: the UI bumps it by hand, and
++  `crates/ui/AGENTS.md` forbids it as the only key.
++- A digest of the inputs as the key: to compute it is the cost we remove.
++- A revision per input (tool, stock, setup, prior chain): eleven writers
++  in many commands, and a missed bump is a stale "OK". The ECS observer
++  covers all writers by construction.
++
++**Cost to change later.** The observer runs on each component write
++(one atomic store). A heavy writer loop can cost a little. If the
++revision must become narrower, filter the observed ids; the tests in
++`crates/app/tests/status_cache.rs` pin each writer.
