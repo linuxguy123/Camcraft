@@ -1,0 +1,875 @@
+From 79ea4410d22bda122207e9624123c31bfedd95fb Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Tue, 17 Nov 2026 03:46:33 +0100
+Subject: [PATCH] fix(motion): hold the crossing law on corner arcs one corner
+ at a time
+
+PR #2273 sent the rounded walks of Waterline and Offset rings through
+post_crossing_free. That law maps a crossing arc onto the vertices of
+the pass, and a rounded walk has new vertices, so one hit gave the whole
+pass back to plain chords: every corner arc was lost (corner_arc_radius
+red on main).
+
+- blend_cross.rs: the law keeps the walks as fitted and rounds them
+  again each round. A corner arc that crosses another feed bans its own
+  corner (kept sharp, counted in the fillet note). A fitted arc that
+  crosses goes back to the chords of the plan. After CROSS_ROUNDS no
+  corner is rounded and the classic law holds.
+- arc_touch.rs: a chord that stays within 1e-5 mm of the tangent at an
+  end of a corner arc, the radius mismatch counted in, is a touch and
+  not a crossing. Only corner arcs get this; Adaptive and the 3D ladder
+  pass no corner arcs and read as before.
+- fillet.rs: fillet_corners_except takes the banned corners and gives
+  the trace of each added or trimmed arc.
+
+Decision: docs/decisions/2317-blend-crossing-law.md
+
+Fixes #2317
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/motion/src/machining2d/arc_cross.rs    |  47 ++++--
+ crates/motion/src/machining2d/arc_touch.rs    | 137 ++++++++++++++++
+ crates/motion/src/machining2d/blend_cross.rs  | 147 ++++++++++++++++++
+ crates/motion/src/machining2d/fillet.rs       |  47 +++++-
+ crates/motion/src/machining2d/fillet_tally.rs |   7 +
+ crates/motion/src/machining2d/mod.rs          |   2 +
+ crates/motion/src/machining2d/pocket_emit.rs  |  55 +++----
+ crates/motion/tests/corner_arc_radius.rs      |  63 +++++++-
+ docs/decisions/2317-blend-crossing-law.md     |  85 ++++++++++
+ 9 files changed, 538 insertions(+), 52 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/arc_touch.rs
+ create mode 100644 crates/motion/src/machining2d/blend_cross.rs
+ create mode 100644 docs/decisions/2317-blend-crossing-law.md
+
+diff --git a/crates/motion/src/machining2d/arc_cross.rs b/crates/motion/src/machining2d/arc_cross.rs
+index b1e4d8df5..01531b64f 100644
+--- a/crates/motion/src/machining2d/arc_cross.rs
++++ b/crates/motion/src/machining2d/arc_cross.rs
+@@ -22,20 +22,21 @@ use crate::geo2d::Point2;
+ use crate::geometry::Point3;
+ 
+ use super::arc_proof::{ProofTally, bracket, judge, plain};
++use super::arc_touch::Touch;
+ use super::arcs::{ARC_FIT_TOL, Seg};
+ 
+ /// Rounds the crossing law may refuse arcs in before the walk gives its
+ /// arcs up wholesale (every round re-posts the walk).
+-const CROSS_ROUNDS: usize = 3;
++pub(super) const CROSS_ROUNDS: usize = 3;
+ 
+ /// Cells per axis at most in the broad-phase grid.
+ const MAX_SIDE: f64 = 1024.0;
+ 
+ /// A fitted arc's identity on the posted path: its end, its centre as
+ /// the move carries it (the 1 um lattice) and its sense, as bits.
+-type Key = (u64, u64, u64, u64, bool);
++pub(super) type Key = (u64, u64, u64, u64, bool);
+ 
+-fn key(to: Point2, center: Point2, ccw: bool) -> Key {
++pub(super) fn key(to: Point2, center: Point2, ccw: bool) -> Key {
+     (to.x.to_bits(), to.y.to_bits(), lattice(center.x).to_bits(), lattice(center.y).to_bits(), ccw)
+ }
+ 
+@@ -46,7 +47,7 @@ fn move_key(m: &Move) -> Option<Key> {
+ }
+ 
+ /// Every fitted arc's key over the walks.
+-fn own_keys(runs: &[Vec<Seg>]) -> HashSet<Key> {
++pub(super) fn own_keys(runs: &[Vec<Seg>]) -> HashSet<Key> {
+     runs.iter()
+         .flatten()
+         .filter_map(|s| match s {
+@@ -65,6 +66,8 @@ struct Chord {
+     z0: f64,
+     z1: f64,
+     own: Option<Key>,
++    /// A corner arc's end tangents (`arc_touch`), by index.
++    touch: Option<usize>,
+ }
+ 
+ /// Twice the signed area of `a b c`.
+@@ -95,9 +98,11 @@ fn crosses(p: &Chord, q: &Chord) -> bool {
+ }
+ 
+ /// The feed chords of `path`: a fitted arc (by key) as its bracket's
+-/// chords, every other feed as its own chords at [`ARC_FIT_TOL`].
+-fn chords(path: &Toolpath, keys: &HashSet<Key>) -> Vec<Chord> {
++/// chords, every other feed as its own chords at [`ARC_FIT_TOL`]; and
++/// the end tangents of the corner arcs (`blends`, by key).
++fn chords(path: &Toolpath, keys: &HashSet<Key>, blends: &HashSet<Key>) -> (Vec<Chord>, Vec<Touch>) {
+     let mut out = Vec::new();
++    let mut touches = Vec::new();
+     for (i, m) in path.moves.iter().enumerate() {
+         if m.kind != MoveKind::Feed {
+             continue;
+@@ -110,21 +115,33 @@ fn chords(path: &Toolpath, keys: &HashSet<Key>) -> Vec<Chord> {
+         });
+         match bracketed {
+             Some((fan, hull)) => {
++                let touch = own
++                    .filter(|k| blends.contains(k))
++                    .zip(m.arc)
++                    .and_then(|(_, a)| Touch::of(a.center, &fan, &hull))
++                    .map(|t| {
++                        touches.push(t);
++                        touches.len() - 1
++                    });
+                 for poly in [fan, hull] {
+-                    out.extend(poly.windows(2).map(|w| Chord { mv: i, a: w[0], b: w[1], z0, z1, own }));
++                    out.extend(poly.windows(2).map(|w| Chord { mv: i, a: w[0], b: w[1], z0, z1, own, touch }));
+                 }
+             }
+-            None => out.extend(m.chords(ARC_FIT_TOL).into_iter().map(|(a, b)| Chord { mv: i, a, b, z0, z1, own })),
++            None => out.extend(m.chords(ARC_FIT_TOL).into_iter().map(|(a, b)| Chord { mv: i, a, b, z0, z1, own, touch: None })),
+         }
+     }
+-    out
++    (out, touches)
+ }
+ 
+ /// The fitted arcs of `path` (by key) whose true arc crosses another
+ /// feed: the uniform-grid broad phase over every feed chord's box, the
+-/// predicate above on the pairs that share a cell.
+-fn crossing_arcs(path: &Toolpath, keys: &HashSet<Key>) -> HashSet<Key> {
+-    let cs = chords(path, keys);
++/// predicate above on the pairs that share a cell. A corner arc
++/// (`blends`, by key) does not cross a chord that only touches the
++/// tangent at one of its ends (`arc_touch`, #2317); no other arc has
++/// that allowance.
++pub(super) fn crossing_arcs(path: &Toolpath, keys: &HashSet<Key>, blends: &HashSet<Key>) -> HashSet<Key> {
++    let (cs, touches) = chords(path, keys, blends);
++    let grazes = |c: &Chord, q: &Chord| c.touch.and_then(|t| touches.get(t)).is_some_and(|t| t.grazes(q.a, q.b));
+     let finite = |c: &Chord| c.a.x.is_finite() && c.a.y.is_finite() && c.b.x.is_finite() && c.b.y.is_finite();
+     let (mut lo, mut hi) = (Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
+     for c in cs.iter().filter(|c| finite(c)) {
+@@ -164,7 +181,7 @@ fn crossing_arcs(path: &Toolpath, keys: &HashSet<Key>) -> HashSet<Key> {
+         'cells: for y in y0..=y1 {
+             for x in x0..=x1 {
+                 for &o in cells.get(y * nx + x).map(Vec::as_slice).unwrap_or(&[]) {
+-                    if o != k && cs.get(o).is_some_and(|q| crosses(c, q)) {
++                    if o != k && cs.get(o).is_some_and(|q| crosses(c, q) && !grazes(c, q) && !grazes(q, c)) {
+                         hit.insert(own);
+                         break 'cells;
+                     }
+@@ -176,7 +193,7 @@ fn crossing_arcs(path: &Toolpath, keys: &HashSet<Key>) -> HashSet<Key> {
+ }
+ 
+ /// Hand every arc of `runs` keyed in `keys` back to its chords.
+-fn refuse(passes: &[Vec<Point2>], runs: &mut [Vec<Seg>], keys: &HashSet<Key>, tally: &mut ProofTally) {
++pub(super) fn refuse(passes: &[Vec<Point2>], runs: &mut [Vec<Seg>], keys: &HashSet<Key>, tally: &mut ProofTally) {
+     for (pass, segs) in passes.iter().zip(runs.iter_mut()) {
+         let judged = judge(pass, std::mem::take(segs), |_, group| {
+             let cross = group.iter().any(|s| matches!(s, Seg::Arc { center, ccw, to } if keys.contains(&key(*to, *center, *ccw))));
+@@ -244,7 +261,7 @@ fn crossing_free_from(
+         if keys.is_empty() {
+             break;
+         }
+-        let mut crossing = crossing_arcs(&path, &keys);
++        let mut crossing = crossing_arcs(&path, &keys, &HashSet::new());
+         if crossing.is_empty() {
+             break;
+         }
+diff --git a/crates/motion/src/machining2d/arc_touch.rs b/crates/motion/src/machining2d/arc_touch.rs
+new file mode 100644
+index 000000000..af6392a21
+--- /dev/null
++++ b/crates/motion/src/machining2d/arc_touch.rs
+@@ -0,0 +1,137 @@
++//! The tangent touch of a corner arc (#2317): what the crossing law
++//! (`arc_cross`) does not count as a crossing. A corner arc ends tangent
++//! on its legs, and another feed often runs on a leg's own line (the
++//! next ring's side, a link). The arc's center rides the 1e-6 mm
++//! lattice, so its bracket dips some 1e-7 mm past that line and the
++//! strict predicate reads a proper crossing where the arc only touches.
++//!
++//! The law here: a circle lies on one side of each of its tangents. Let
++//! `E` be an end of the arc, `n` the unit radius there and `L` the
++//! tangent line through `E`. Every point `X` of the arc's bracket (the
++//! inscribed fan on the start radius, the end point itself, the
++//! circumscribed hull) holds `(X - E) . n <= dr`, where `dr` is the
++//! difference of the two end radii (the lattice step of the center).
++//! So when a chord `q`, over the reach of the bracket along `L`, stays
++//! within `d` of `L`, the arc passes `q` by `d + dr` at most. A pair is
++//! a touch, not a crossing, only while `d + dr <=` [`TOUCH`]: the law
++//! can hide no crossing deeper than [`TOUCH`] (1e-5 mm, a hundredth of
++//! a micrometer). Anything it cannot measure is a crossing.
++//!
++//! Provenance: the tangent of a circle (Euclid, Elements III.16) and
++//! the parametric clip of a segment to a slab (Liang-Barsky 1984);
++//! clean-room, no vendor material consulted.
++
++use crate::geo2d::Point2;
++
++/// The deepest pass of a chord the law calls a touch, mm.
++pub(super) const TOUCH: f64 = 1e-5;
++
++/// One end of the arc: the point, the unit radius there and how far
++/// the bracket reaches along the tangent from it.
++#[derive(Clone, Copy)]
++struct End {
++    e: Point2,
++    n: Point2,
++    reach: f64,
++}
++
++/// A corner arc's two end tangents and its radius mismatch.
++pub(super) struct Touch {
++    ends: [End; 2],
++    dr: f64,
++}
++
++impl Touch {
++    /// The tangents of the arc about `center` whose bracket is `fan`
++    /// and `hull` (both run from the arc's start to its end). `None`
++    /// where a radius is not finite and positive.
++    pub(super) fn of(center: Point2, fan: &[Point2], hull: &[Point2]) -> Option<Touch> {
++        let (from, to) = (*fan.first()?, *fan.last()?);
++        let end = |e: Point2| -> Option<(End, f64)> {
++            let (dx, dy) = (e.x - center.x, e.y - center.y);
++            let r = dx.hypot(dy);
++            if !(r.is_finite() && r > 0.0) {
++                return None;
++            }
++            let n = Point2::new(dx / r, dy / r);
++            let along = |p: &Point2| ((p.x - e.x) * -n.y + (p.y - e.y) * n.x).abs();
++            let reach = fan.iter().chain(hull).map(along).fold(0.0, f64::max);
++            reach.is_finite().then_some((End { e, n, reach }, r))
++        };
++        let ((a, r0), (b, r1)) = (end(from)?, end(to)?);
++        Some(Touch { ends: [a, b], dr: (r0 - r1).abs() })
++    }
++
++    /// The chord `a b` only touches the tangent at an end of the arc:
++    /// over the bracket's reach it stays within [`TOUCH`] of that line,
++    /// the radius mismatch counted in.
++    pub(super) fn grazes(&self, a: Point2, b: Point2) -> bool {
++        self.ends.iter().any(|end| {
++            let at = |p: Point2| {
++                let (dx, dy) = (p.x - end.e.x, p.y - end.e.y);
++                (dx * -end.n.y + dy * end.n.x, dx * end.n.x + dy * end.n.y)
++            };
++            let ((sa, da), (sb, db)) = (at(a), at(b));
++            // The part of the chord inside the slab |s| <= reach.
++            let (lo, hi) = if sa == sb {
++                if sa.abs() > end.reach {
++                    return false;
++                }
++                (0.0, 1.0)
++            } else {
++                let (u, v) = ((-end.reach - sa) / (sb - sa), (end.reach - sa) / (sb - sa));
++                (u.min(v).max(0.0), u.max(v).min(1.0))
++            };
++            // An empty clip or a NaN: not measured, so not a touch.
++            if lo.is_nan() || hi.is_nan() || lo > hi {
++                return false;
++            }
++            let d = |u: f64| (da + (db - da) * u).abs();
++            d(lo).max(d(hi)) + self.dr <= TOUCH
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::arc_proof::bracket;
++    use super::*;
++
++    fn touch(center: Point2) -> Touch {
++        // The bracket of a 0.5 mm corner arc from (0, 0.5) to (0.5, 0)
++        // about (0.5, 0.5): tangent to the line y = 0 at its end.
++        let c = Point2::new(0.5, 0.5);
++        let Some((fan, hull)) = bracket(Point2::new(0.0, 0.5), c, true, Point2::new(0.5, 0.0)) else {
++            panic!("bracket")
++        };
++        let Some(t) = Touch::of(center, &fan, &hull) else { panic!("touch") };
++        t
++    }
++
++    /// A chord on the tangent line, or within the bound of it, is a
++    /// touch; a chord past the bound, or one that cuts through the arc,
++    /// is not.
++    #[test]
++    fn only_a_chord_on_the_end_tangent_is_a_touch() {
++        let t = touch(Point2::new(0.5, 0.5));
++        let on = |y0: f64, y1: f64| t.grazes(Point2::new(-20.0, y0), Point2::new(20.0, y1));
++        assert!(on(0.0, 0.0), "on the tangent");
++        assert!(on(7e-8, 7e-8) && on(-7e-8, -7e-8), "the lattice dip");
++        assert!(!on(2e-5, 2e-5) && !on(-2e-5, -2e-5), "past the bound");
++        // Tilted 1e-6 rad: still a touch over the reach of the arc...
++        assert!(on(-2e-5, 2e-5));
++        // ...and a real slope through the arc is not.
++        assert!(!on(-0.2, 0.2));
++        assert!(!t.grazes(Point2::new(0.2, -1.0), Point2::new(0.2, 1.0)), "a chord across the arc");
++        assert!(!t.grazes(Point2::new(5.0, 0.0), Point2::new(9.0, 0.0)), "beyond the reach: not measured");
++        assert!(!t.grazes(Point2::new(f64::NAN, 0.0), Point2::new(1.0, 0.0)));
++    }
++
++    /// The bound counts the radius mismatch in: an arc whose ends stand
++    /// on radii more than the bound apart has no touch at all.
++    #[test]
++    fn a_radius_mismatch_past_the_bound_leaves_no_touch() {
++        let t = touch(Point2::new(0.5, 0.5 + 3e-5));
++        assert!(!t.grazes(Point2::new(-2.0, 0.0), Point2::new(2.0, 0.0)));
++    }
++}
+diff --git a/crates/motion/src/machining2d/blend_cross.rs b/crates/motion/src/machining2d/blend_cross.rs
+new file mode 100644
+index 000000000..4e0453063
+--- /dev/null
++++ b/crates/motion/src/machining2d/blend_cross.rs
+@@ -0,0 +1,147 @@
++//! The crossing law on walks with corner arcs (#1733 arc turns, #2317).
++//! `arc_cross` gives a crossing arc back to its pass's own chords, and
++//! can only map a walk whose vertices are the pass's. A rounded walk is
++//! not such a walk, so the law here keeps the walks as fitted (`base`)
++//! and rounds them again each round:
++//!
++//! - a corner arc that crosses another feed is refused alone: its corner
++//!   stays sharp (counted `crossed` in the fillet tally), every other
++//!   corner of the pass keeps its arc;
++//! - a fitted arc that crosses (trimmed by a corner arc or not) is given
++//!   back to the plan's chords in `base`, by `arc_cross::refuse`;
++//! - the walks are rounded and posted again, [`CROSS_ROUNDS`] times at
++//!   most; past that no corner is rounded and the plain law
++//!   (`arc_cross::post_crossing_free`) holds on the fitted walks.
++//!
++//! The path returned is one the law read with no crossing, or the plain
++//! law's own answer. A corner arc that only touches the tangent at its
++//! end is no crossing (`arc_touch`, with its bound).
++//!
++//! Provenance: ours, the refusal loop of `arc_cross` (orientation
++//! predicate, O'Rourke; uniform grid, Franklin 1989) over the tangent
++//! circle of `fillet.rs`; clean-room, no vendor material consulted.
++
++use std::collections::HashSet;
++
++use crate::cl::{PathBuilder, Toolpath};
++use crate::geo2d::Point2;
++
++use super::arc_cross::{CROSS_ROUNDS, Key, crossing_arcs, key, own_keys, post_crossing_free, refuse};
++use super::arc_proof::ProofTally;
++use super::arcs::{ARC_FIT_TOL, Seg};
++use super::fillet::{Legal, Source, Traced, fillet_corners_except};
++use super::fillet_tally::{FilletTally, fillet_floor};
++
++/// The corner arcs asked for: the radius and where an arc may stand.
++pub(super) struct Blend<'a> {
++    pub(super) rho: f64,
++    pub(super) legal: Legal<'a>,
++}
++
++/// A corner of a pass: the pass and the corner point, as bits.
++type Corner = (usize, u64, u64);
++
++/// The corners the law keeps sharp.
++#[derive(Default)]
++pub(super) struct Bans {
++    corners: HashSet<Corner>,
++    all: bool,
++}
++
++/// The walks rounded: the walks, the fillet books, and each added or
++/// trimmed arc with its pass.
++pub(super) struct Rounded {
++    pub(super) runs: Vec<Vec<Seg>>,
++    pub(super) tally: FilletTally,
++    trace: Vec<(usize, Traced)>,
++}
++
++impl Rounded {
++    /// The fillet notes, as the pocket family words them.
++    pub(super) fn notes(&self) -> Vec<String> {
++        self.tally.notes("pass", fillet_floor(ARC_FIT_TOL))
++    }
++}
++
++/// Round every pass's walk (`base[i]` walks `passes[i]` past its first
++/// point), the banned corners kept sharp.
++pub(super) fn round_walks(passes: &[Vec<Point2>], base: &[Vec<Seg>], blend: &Blend, bans: &Bans) -> Rounded {
++    let mut out = Rounded { runs: Vec::with_capacity(base.len()), tally: FilletTally::default(), trace: Vec::new() };
++    for (i, (pass, walk)) in passes.iter().zip(base).enumerate() {
++        let Some(first) = pass.first() else {
++            out.runs.push(Vec::new());
++            continue;
++        };
++        let banned = |v: Point2| bans.all || bans.corners.contains(&(i, v.x.to_bits(), v.y.to_bits()));
++        let (walk, t, trace) = fillet_corners_except(walk, *first, blend.rho, ARC_FIT_TOL, &blend.legal, &banned);
++        out.tally.add(t);
++        out.trace.extend(trace.into_iter().map(|t| (i, t)));
++        out.runs.push(walk);
++    }
++    out
++}
++
++/// Round `base`, post it (`post` lays the walks onto a builder standing
++/// where `b` does, the fillet notes on it) and hold the crossing law on
++/// the result, one corner arc at a time (module doc).
++pub(super) fn post_blended_crossing_free(
++    b: PathBuilder,
++    passes: &[Vec<Point2>],
++    mut base: Vec<Vec<Seg>>,
++    blend: &Blend,
++    tally: &mut ProofTally,
++    post: impl Fn(&mut PathBuilder, Option<&[Vec<Seg>]>),
++) -> Toolpath {
++    let noted = |r: &Rounded| {
++        let mut bb = b.clone();
++        for n in r.notes() {
++            bb.note(n);
++        }
++        bb
++    };
++    let mut bans = Bans::default();
++    for round in 0..=CROSS_ROUNDS {
++        let rounded = round_walks(passes, &base, blend, &bans);
++        let mut bb = noted(&rounded);
++        post(&mut bb, Some(rounded.runs.as_slice()));
++        let path = bb.finish();
++        let keys = own_keys(&rounded.runs);
++        let traced: Vec<(Key, usize, &Source)> =
++            rounded.trace.iter().map(|(i, t)| (key(t.to, t.center, t.ccw), *i, &t.source)).collect();
++        let blends: HashSet<Key> =
++            traced.iter().filter(|(.., s)| matches!(s, Source::Corner(_))).map(|(k, ..)| *k).collect();
++        let crossing = if keys.is_empty() { HashSet::new() } else { crossing_arcs(&path, &keys, &blends) };
++        if crossing.is_empty() {
++            return path;
++        }
++        if round == CROSS_ROUNDS {
++            break;
++        }
++        // A corner arc: its corner stays sharp. A fitted arc - by its
++        // own key, or by the key it had before a corner arc trimmed it -
++        // goes back to the plan's chords.
++        let mut fitted: HashSet<Key> = crossing.clone();
++        for (k, i, source) in &traced {
++            if !crossing.contains(k) {
++                continue;
++            }
++            fitted.remove(k);
++            match source {
++                Source::Corner(v) => {
++                    bans.corners.insert((*i, v.x.to_bits(), v.y.to_bits()));
++                }
++                Source::Trimmed(to) => {
++                    fitted.insert((to.x.to_bits(), to.y.to_bits(), k.2, k.3, k.4));
++                }
++            }
++        }
++        if !fitted.is_empty() {
++            refuse(passes, &mut base, &fitted, tally);
++        }
++    }
++    // The rounds are spent: no corner arc, and the plain law on the
++    // fitted walks. Every corner that would round is counted `crossed`.
++    bans.all = true;
++    let rounded = round_walks(passes, &base, blend, &bans);
++    post_crossing_free(noted(&rounded), passes, rounded.runs, tally, post)
++}
+diff --git a/crates/motion/src/machining2d/fillet.rs b/crates/motion/src/machining2d/fillet.rs
+index 742ac9d40..4d825ca39 100644
+--- a/crates/motion/src/machining2d/fillet.rs
++++ b/crates/motion/src/machining2d/fillet.rs
+@@ -271,13 +271,50 @@ pub fn fillet_corners(
+     tol: f64,
+     legal: &Legal,
+ ) -> (Vec<Seg>, FilletTally) {
++    let (out, tally, _) = fillet_corners_except(walk, start, r_max, tol, legal, &|_| false);
++    (out, tally)
++}
++
++/// Where an arc of a rounded walk came from, when it is not an arc of
++/// the walk handed in: the corner it rounds, or the end its arc had
++/// before a corner arc trimmed it.
++pub(super) enum Source {
++    Corner(Point2),
++    Trimmed(Point2),
++}
++
++/// An arc of the rounded walk (its end, center and sense) and its source.
++pub(super) struct Traced {
++    pub(super) to: Point2,
++    pub(super) center: Point2,
++    pub(super) ccw: bool,
++    pub(super) source: Source,
++}
++
++/// [`fillet_corners`] with the corners `banned` names kept sharp (the
++/// crossing law's refusal, #2317: counted as `crossed`), and the trace
++/// of every arc the rounding added or trimmed. A ban changes no other
++/// corner: each joint is judged on its own legs.
++pub(super) fn fillet_corners_except(
++    walk: &[Seg],
++    start: Point2,
++    r_max: f64,
++    tol: f64,
++    legal: &Legal,
++    banned: &dyn Fn(Point2) -> bool,
++) -> (Vec<Seg>, FilletTally, Vec<Traced>) {
++    let mut trace = Vec::new();
+     let els = elements(walk, start);
+     let floor = fillet_floor(tol);
+     let mut tally = FilletTally::default();
+     // joints[j]: the fillet replacing the joint between els[j] and els[j+1].
+     let mut joints: Vec<Option<(Point2, Point2, Point2, bool)>> = Vec::with_capacity(els.len());
+     for pair in els.windows(2) {
+-        joints.push(tally.count(judge(&pair[0], &pair[1], r_max, floor, legal)));
++        let verdict = match judge(&pair[0], &pair[1], r_max, floor, legal) {
++            Verdict::Round(..) if banned(pair[0].to()) => Verdict::Crossed,
++            v => v,
++        };
++        joints.push(tally.count(verdict));
+     }
+     // A closed walk's seam is a corner too - one the walk cannot round
+     // without moving where it starts. Counted, never silent.
+@@ -291,7 +328,7 @@ pub fn fillet_corners(
+     }
+     if tally.rounded == 0 {
+         // Nothing proved: the walk the caller handed in, verbatim.
+-        return (walk.to_vec(), tally);
++        return (walk.to_vec(), tally, trace);
+     }
+     let mut out: Vec<Seg> = Vec::new();
+     let mut line: Vec<Point2> = Vec::new();
+@@ -315,6 +352,9 @@ pub fn fillet_corners(
+                 // Trimmed to the fillet's T1 when its end corner rounds
+                 // (its start already sits at the previous fillet's T2).
+                 let end = fillet.map_or(to, |(t1, ..)| t1);
++                if end != to {
++                    trace.push(Traced { to: end, center, ccw, source: Source::Trimmed(to) });
++                }
+                 out.push(Seg::Arc { center, ccw, to: end });
+                 at = end;
+             }
+@@ -323,6 +363,7 @@ pub fn fillet_corners(
+             if !line.is_empty() {
+                 out.push(Seg::Line(std::mem::take(&mut line)));
+             }
++            trace.push(Traced { to: t2, center: c, ccw, source: Source::Corner(el.to()) });
+             out.push(Seg::Arc { center: c, ccw, to: t2 });
+             at = t2;
+         }
+@@ -330,5 +371,5 @@ pub fn fillet_corners(
+     if !line.is_empty() {
+         out.push(Seg::Line(line));
+     }
+-    (out, tally)
++    (out, tally, trace)
+ }
+diff --git a/crates/motion/src/machining2d/fillet_tally.rs b/crates/motion/src/machining2d/fillet_tally.rs
+index 056eec1e8..18a364fe1 100644
+--- a/crates/motion/src/machining2d/fillet_tally.rs
++++ b/crates/motion/src/machining2d/fillet_tally.rs
+@@ -18,6 +18,8 @@ pub(super) enum Verdict {
+     TowardPart,
+     Tiny,
+     Blocked,
++    /// The crossing law refused the arc this corner would turn on (#2317).
++    Crossed,
+ }
+ 
+ /// What a fillet pass did, counted by reason. Every corner is in
+@@ -40,6 +42,8 @@ pub struct FilletTally {
+     /// A closed walk's seam: the corner where it starts and ends (the
+     /// plunge, the lead join) - rounding it would move the entry.
+     pub seam: usize,
++    /// The arc would cross another feed (`blend_cross`, #2317).
++    pub crossed: usize,
+     /// Worst corner rest left against the sharp path, mm (the fillet's
+     /// bisector offset `e`).
+     pub max_rest: f64,
+@@ -61,6 +65,7 @@ impl FilletTally {
+             Verdict::TowardPart => &mut self.toward_part,
+             Verdict::Tiny => &mut self.tiny,
+             Verdict::Blocked => &mut self.blocked,
++            Verdict::Crossed => &mut self.crossed,
+         };
+         *bucket += 1;
+         self.corners += 1;
+@@ -76,6 +81,7 @@ impl FilletTally {
+         self.blocked += o.blocked;
+         self.curved += o.curved;
+         self.seam += o.seam;
++        self.crossed += o.crossed;
+         self.max_rest = self.max_rest.max(o.max_rest);
+     }
+ 
+@@ -104,6 +110,7 @@ impl FilletTally {
+         say(self.blocked, "live geometry blocks every arc down to the resolution");
+         say(self.curved, "a neighbour is an arc and no tangent fillet fits it (its sweep, its leg or its curve leave no room)");
+         say(self.seam, "the walk starts and ends there; rounding it would move the entry");
++        say(self.crossed, "an arc there would cross another feed");
+         v
+     }
+ }
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index a6d88ea96..15c85c1ae 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -24,9 +24,11 @@ mod arc_biarc;
+ mod arc_cross;
+ mod arc_proof;
+ mod arc_side;
++mod arc_touch;
+ mod arc_leads;
+ mod arcs;
+ mod blend;
++mod blend_cross;
+ mod bore;
+ mod bore_core;
+ mod chamfer;
+diff --git a/crates/motion/src/machining2d/pocket_emit.rs b/crates/motion/src/machining2d/pocket_emit.rs
+index e789dd840..8f85db41f 100644
+--- a/crates/motion/src/machining2d/pocket_emit.rs
++++ b/crates/motion/src/machining2d/pocket_emit.rs
+@@ -12,11 +12,12 @@ use crate::geometry::Point3;
+ 
+ use super::adaptive::Return;
+ use super::arc_cross::post_crossing_free;
++use super::blend_cross::{Bans, Blend, post_blended_crossing_free, round_walks};
+ use super::arc_proof::{ProofTally, fit_proved};
+ use super::arcs::{ARC_FIT_TOL, Seg, fit_arcs};
+ use super::face::GenError;
+-use super::fillet::{Legal, fillet_corners};
+-use super::fillet_tally::{FilletTally, corner_arc_radius, fillet_floor};
++use super::fillet::Legal;
++use super::fillet_tally::corner_arc_radius;
+ use super::levels::{Cert, Motion, cut_levels, run_level_walks};
+ use super::pocket::{PocketParams, PocketStrategy};
+ use super::pocket_hsm::EntryRoom;
+@@ -89,31 +90,15 @@ pub(super) fn emit_pocket_passes(
+         .with_xy_arc(p.links.approach.arc_xy)
+         .with_microlift(joins)
+         .with_holes(holes);
+-    let runs: Option<Vec<Vec<Seg>>> = if p.blend_turns {
++    let fitted: Option<Vec<Vec<Seg>>> = fit.map(|tol| passes.iter().map(|p| fit_pass(p, tol)).collect());
++    // #1733: the corner arcs asked for. They round the walks as fitted
++    // (a pass with no fit: its own chords).
++    let blend = if p.blend_turns {
+         let legal = Legal { region: center, inside: true, air_left: None };
+         let rho = corner_arc_radius(p.blend_radius, p.tool_diameter).map_err(GenError::Invalid)?;
+-        let mut tally = FilletTally::default();
+-        let runs = passes
+-            .iter()
+-            .map(|pass| {
+-                let Some((first, rest)) = pass.split_first() else {
+-                    return Vec::new();
+-                };
+-                let walk = match fit {
+-                    Some(tol) => fit_pass(pass, tol),
+-                    None => vec![Seg::Line(rest.to_vec())],
+-                };
+-                let (walk, t) = fillet_corners(&walk, *first, rho, ARC_FIT_TOL, &legal);
+-                tally.add(t);
+-                walk
+-            })
+-            .collect();
+-        for n in tally.notes("pass", fillet_floor(ARC_FIT_TOL)) {
+-            b.note(n);
+-        }
+-        Some(runs)
++        Some(Blend { rho, legal })
+     } else {
+-        fit.map(|tol| passes.iter().map(|p| fit_pass(p, tol)).collect())
++        None
+     };
+     let cert = match &room {
+         Some(e) => Cert::Stadium { a: e.seed, b: e.seed, h: e.clear, tess: &e.tess },
+@@ -140,9 +125,25 @@ pub(super) fn emit_pocket_passes(
+             strategy,
+             PocketStrategy::Adaptive | PocketStrategy::OffsetRings | PocketStrategy::Waterline
+         );
+-    let mut path = match runs {
+-        Some(runs) if hold_fitted => post_crossing_free(b, &passes, runs, &mut proof, post),
+-        runs => {
++    let mut path = match (blend, fitted) {
++        (Some(blend), fitted) => {
++            let base = fitted
++                .unwrap_or_else(|| passes.iter().map(|pass| vec![Seg::Line(pass.get(1..).unwrap_or(&[]).to_vec())]).collect());
++            if hold_fitted {
++                // #2317: the law on the rounded walks, one corner arc
++                // at a time - a crossing never costs a pass its arcs.
++                post_blended_crossing_free(b, &passes, base, &blend, &mut proof, post)
++            } else {
++                let rounded = round_walks(&passes, &base, &blend, &Bans::default());
++                for n in rounded.notes() {
++                    b.note(n);
++                }
++                post(&mut b, Some(rounded.runs.as_slice()));
++                b.finish()
++            }
++        }
++        (None, Some(runs)) if hold_fitted => post_crossing_free(b, &passes, runs, &mut proof, post),
++        (None, runs) => {
+             post(&mut b, runs.as_deref());
+             b.finish()
+         }
+diff --git a/crates/motion/tests/corner_arc_radius.rs b/crates/motion/tests/corner_arc_radius.rs
+index 920a69893..0c987ea59 100644
+--- a/crates/motion/tests/corner_arc_radius.rs
++++ b/crates/motion/tests/corner_arc_radius.rs
+@@ -185,17 +185,66 @@ fn stated_rest(t: &Toolpath) -> f64 {
+ 
+ #[test]
+ fn corners_turn_on_tangent_arcs_of_the_given_radius() {
++    // Every strategy is read before the test fails: the message names
++    // each one that lost its arcs, not only the first (#2317).
++    let mut failed = Vec::new();
+     for strategy in STRATEGIES {
++        let read = std::panic::catch_unwind(|| {
++            let region = fixture(strategy);
++            let sharp = pocket(&region, &pp(strategy, false, None)).unwrap();
++            let blended = pocket(&region, &pp(strategy, true, Some(1.0))).unwrap();
++            assert!(blended.is_chained() && blended.all_finite(), "{strategy:?}");
++            let radii = added_tangent_radii(&blended, &sharp, &format!("{strategy:?}"));
++            assert!(!radii.is_empty(), "{strategy:?}: no corner turned on an arc");
++            // The law may shrink a corner without room, never grow one.
++            assert!(radii.iter().all(|r| *r <= 1.0 + 1e-6), "{strategy:?}: {radii:?}");
++            assert!(radii.iter().any(|r| (*r - 1.0).abs() < 1e-6), "{strategy:?}: no arc at the radius: {radii:?}");
++        });
++        if let Err(why) = read {
++            let why = why.downcast_ref::<String>().cloned().or_else(|| why.downcast_ref::<&str>().map(|s| s.to_string()));
++            failed.push(why.unwrap_or_else(|| format!("{strategy:?}")));
++        }
++    }
++    assert!(failed.is_empty(), "{} of {} strategies failed: {failed:#?}", failed.len(), STRATEGIES.len());
++}
++
++/// #2317: the crossing law holds on the rounded walks and costs no pass
++/// its arcs. Without a radius (the tool radius) corner arcs of this
++/// fixture would cross other feeds: those corners stay sharp, by name.
++#[test]
++fn the_crossing_law_keeps_the_arc_turns_and_crosses_nowhere() {
++    for strategy in [PocketStrategy::Waterline, PocketStrategy::OffsetRings] {
+         let region = fixture(strategy);
+         let sharp = pocket(&region, &pp(strategy, false, None)).unwrap();
+-        let blended = pocket(&region, &pp(strategy, true, Some(1.0))).unwrap();
+-        assert!(blended.is_chained() && blended.all_finite(), "{strategy:?}");
+-        let radii = added_tangent_radii(&blended, &sharp, &format!("{strategy:?}"));
+-        assert!(!radii.is_empty(), "{strategy:?}: no corner turned on an arc");
+-        // The law may shrink a corner without room, never grow one.
+-        assert!(radii.iter().all(|r| *r <= 1.0 + 1e-6), "{strategy:?}: {radii:?}");
+-        assert!(radii.iter().any(|r| (*r - 1.0).abs() < 1e-6), "{strategy:?}: no arc at the radius: {radii:?}");
++        for radius in [Some(1.0), None] {
++            let blended = pocket(&region, &pp(strategy, true, radius)).unwrap();
++            for tol in [0.01, 0.0005] {
++                let crossed = camcraft_motion::verify::crossed_pairs(&blended, tol);
++                assert!(crossed.is_empty(), "{strategy:?} r={radius:?} tol={tol}: crossed {crossed:?}");
++            }
++            let lost: Vec<&String> = blended
++                .notes
++                .iter()
++                .filter(|n| n.starts_with("arc output") && !n.contains(" 0 could not be proved"))
++                .collect();
++            assert!(lost.is_empty(), "{strategy:?} r={radius:?}: a pass gave its arcs up whole: {lost:?}");
++            let arcs = |t: &Toolpath| t.moves.iter().filter(|m| m.arc.is_some()).count();
++            assert!(arcs(&blended) > arcs(&sharp), "{strategy:?} r={radius:?}: no corner turned on an arc");
++            // At 1 mm no corner arc crosses: an arc that only touches the
++            // line of a feed at its tangent end is not a crossing.
++            let refused = blended.notes.iter().any(|n| n.contains("an arc there would cross another feed"));
++            assert!(radius.is_none() || !refused, "{strategy:?} r={radius:?}: a touch read as a crossing: {:?}", blended.notes);
++        }
+     }
++    // The refusal is stated: at the tool radius the Waterline rings have
++    // corners whose arc would cross another feed.
++    let region = fixture(PocketStrategy::Waterline);
++    let full = pocket(&region, &pp(PocketStrategy::Waterline, true, None)).unwrap();
++    assert!(
++        full.notes.iter().any(|n| n.contains("an arc there would cross another feed")),
++        "the refused corners are not named: {:?}",
++        full.notes
++    );
+ }
+ 
+ #[test]
+diff --git a/docs/decisions/2317-blend-crossing-law.md b/docs/decisions/2317-blend-crossing-law.md
+new file mode 100644
+index 000000000..034678081
+--- /dev/null
++++ b/docs/decisions/2317-blend-crossing-law.md
+@@ -0,0 +1,85 @@
++## #2317 - The crossing law on walks with corner arcs
++
++**Decided.** Two changes, both only for corner arcs (`blend_turns`).
++
++1. *One corner arc is refused, not the pass.* The pocket family keeps the
++   walks as fitted (`base`) and rounds them again each round
++   (`machining2d/blend_cross.rs`). The crossing law reads the posted path.
++   A corner arc that crosses another feed bans its own corner: that corner
++   stays sharp and the fillet note counts it ("an arc there would cross
++   another feed"). A fitted arc that crosses goes back to the chords of the
++   plan through `arc_cross::refuse`, on the fitted walks, which the law can
++   map. The loop runs `CROSS_ROUNDS` (3) rounds. After that no corner is
++   rounded and the classic law (`post_crossing_free`) holds on the fitted
++   walks. The path that returns is a path the law read with no crossing, or
++   the answer of the classic law.
++2. *A tangent touch of a corner arc is not a crossing*
++   (`machining2d/arc_touch.rs`). A pair (corner arc chord, other chord `q`)
++   is not counted when `q`, over the reach of the bracket of the arc along
++   the tangent at one end of the arc, stays within `d` of that tangent line
++   and `d + dr <= TOUCH = 1e-5 mm`. `dr` is the difference of the two end
++   radii of the arc (the lattice step of the center).
++
++**Proof bound of the touch.** A circle lies on one side of each of its
++tangents. The bracket of an arc is the inscribed fan and the circumscribed
++hull; the last hull edge lies on the tangent at the end. Thus each bracket
++point `X` holds `(X - E) . n <= dr` (`E` the end, `n` the unit radius
++there). Outside the reach along the tangent there is no bracket point.
++Inside the reach `q` is within `d` of the tangent line. Thus the true arc
++passes `q` by `d + dr <= 1e-5 mm` at most. The allowance can hide no
++crossing deeper than 0.01 micrometer, which is ten steps of the 1e-6 mm
++lattice of the CL data. A pair that cannot be measured (no finite radius,
++an empty clip, a NaN) is a crossing. A chord that goes through the arc at
++a real angle leaves the 1e-5 mm band inside the reach and is a crossing.
++
++**Why.** PR #2273 sent the rounded walks of Waterline and Offset rings
++through `post_crossing_free`. That law maps a crossing arc onto the
++vertices of the pass. A rounded walk has new vertices (the tangent
++points), so the map failed and the pass went back to plain chords: all
++corner arcs and all fitted arcs of the pass were lost on one hit
++(`corner_arc_radius` red on main). Two causes gave hits:
++
++- real crossings at the full tool radius (fixture: Waterline, no radius,
++  4 corners);
++- false hits: the center of a corner arc is on the 1e-6 mm lattice, so the
++  bracket goes about 7e-8 mm past the line of its own leg, where the next
++  ring or a link runs. The strict predicate reads a proper crossing.
++
++Readings on the fixture of `corner_arc_radius` (20 x 12 pocket with an
++island, 8 mm tool): without the touch allowance 1 Waterline corner and 2
++Offset rings corners at 1 mm lose their arc for a touch; with it, none.
++At the tool radius 4 Waterline corners stay sharp for a real crossing and
++22 of 45 keep their arc. `verify::crossed_pairs` is empty in all cases.
++
++**Dropped.**
++
++- *A tolerance in the general predicate `crosses`.* It would apply to each
++  arc pair, also Adaptive (HSM) and the 3D ladder, and it can hide a
++  through-crossing at a shared vertex. No proof bound is available for the
++  general case. The callers without corner arcs pass an empty blend set and
++  get the same result as before, bit for bit.
++- *The law only on the fitted walks, no check on the rounded walks* (held
++  commit `51c4d8767` on `issue/2317-waterline-corner-arcs`). The corner
++  arcs would be back, but the real crossings at the tool radius would be
++  posted. That is against the Prime Directive.
++- *No allowance, refusal for each corner only.* Safe, but corners lose
++  their arc for a 7e-8 mm lattice effect and the note gives a false cause.
++- *A map of the rounded walk onto its own vertices in `arc_proof::judge`.*
++  The tangent points are not vertices of the plan, so a refused arc has no
++  chords to go back to.
++
++**What changes in output.** Pocket operations with corner arcs on, strategy
++Waterline, Offset rings (also as the fallback of Adaptive) and each
++strategy with `hold_crossings`: the corner arcs are back, less the corners
++that would cross. With corner arcs off nothing changes. Zigzag and Auto
++without `hold_crossings` post as before (rounded one time, no law), which
++is the state before this change.
++
++**Cost to change later.** `TOUCH` is one constant with its tests in
++`arc_touch.rs`. The loop is one function; the classic law is its fallback
++and is not changed. The trace of `fillet_corners_except` (which arc is a
++corner arc, which fitted arc was trimmed) is the only new coupling between
++`fillet.rs` and the law.
++
++**Not exercised.** The word format of each post script was not read. The
++bound is stated against the CL lattice, not against a posted word.
