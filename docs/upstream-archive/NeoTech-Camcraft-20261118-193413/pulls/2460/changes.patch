@@ -1,0 +1,2093 @@
+From 4605573a32b92d74afc528ddba2bcd5a6e655fbd Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Tue, 17 Nov 2026 22:54:51 -0800
+Subject: [PATCH 1/4] fix(2d): continue whole-model 2D Contour across lower
+ outlines
+
+Whole-model 2D Contour previously sectioned the part once at Top Z and let
+contour_depth::ladder stop any ring where the part widened below Top Z
+(such as a chamfered top island, shoulder, or closed slot floor), dropping
+lower depths and tabs without failing.
+
+Extract shared single-band helpers in machining2d::contour and add multi-band
+continuation in machining2d::contour_whole (contour_whole_bodies and
+contour_whole_bodies_with). Whenever a whole-model Side::Outside contour
+stops early on an outer loop or opens an inner counterbore loop below Top Z,
+trim the upper band, slice the overhead silhouette at the next remaining Z,
+re-apply boundary controls, and continue to Bottom Z. Refuse unsliceable or
+collapsed continuation planes by name with ghost moves instead of emitting a
+partial toolpath.
+
+Fixes #2436
+---
+ crates/app/src/operation/generate.rs          |  44 ++-
+ crates/app/tests/contour_whole_step.rs        | 334 ++++++++++++++++++
+ crates/app/tests/real_tip_contour.rs          |  27 +-
+ crates/motion/src/machining2d/contour.rs      | 161 +++++----
+ .../motion/src/machining2d/contour_whole.rs   | 328 +++++++++++++++++
+ crates/motion/src/machining2d/mod.rs          |   2 +
+ crates/motion/tests/contour_whole.rs          | 244 +++++++++++++
+ .../2436-whole-model-contour-steps.md         |  26 ++
+ 8 files changed, 1093 insertions(+), 73 deletions(-)
+ create mode 100644 crates/app/tests/contour_whole_step.rs
+ create mode 100644 crates/motion/src/machining2d/contour_whole.rs
+ create mode 100644 crates/motion/tests/contour_whole.rs
+ create mode 100644 docs/decisions/2436-whole-model-contour-steps.md
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 30f2d753f..dff11dea2 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -265,6 +265,16 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // A Contour under an open boundary rides the chain itself (its arm
+     // below, `contour_open`): no area law runs for it.
+     let contour_open = matches!(params, OpParams::Contour { .. }) && area.as_ref().is_some_and(|c| c.open.is_some());
++    // A whole-model Contour retains its area context so deeper Z bands slice
++    // through the same boundary controls (#2436).
++    let whole_contour_area = if matches!((&params, &src), (OpParams::Contour { .. }, SrcRef::Entity(_)))
++        && !contour_open
++        && part_solid
++    {
++        area.clone()
++    } else {
++        None
++    };
+     let mut face_band: Option<(Vec<(&'static str, Region)>, f64)> = None;
+     if !contour_sel_arm && !contour_open && let Some(ctx) = area.take() {
+         let base = region_for_job(&mut picked_region, &mut section_z, &src, &params, m_gen, frame.as_ref())?;
+@@ -589,22 +599,36 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                         frame.as_ref(),
+                     )?;
+                     let mut cp = cp;
+-                    // A whole part's section is ONE plane's rings: each
+-                    // is walked only where the part's wall it trims
+-                    // still exists (a blind bore's ring ends at its
+-                    // floor) - never the top plane's ring at every level.
+-                    let rings = |cp: &ContourParams| {
++                    let run_whole = |cp: &ContourParams| -> Result<(Toolpath, Region), GenError> {
+                         if part_solid {
+-                            machining2d::contour_on_bodies(&region, &m_gen.facets, &m_gen.bodies, cp)
++                            let (path, bands) = machining2d::contour_whole_bodies_with(
++                                &region,
++                                &m_gen.facets,
++                                &m_gen.bodies,
++                                cp,
++                                &mut |r| apply_area_full(r, whole_contour_area.as_ref()).map(|a| a.region),
++                            )?;
++                            let inside = cp.side == Side::Inside;
++                            let mut reach = Region::empty();
++                            for r in &bands {
++                                let band = super::top_stock::contour_reach(r, inside, d);
++                                reach = if reach.is_empty() { band } else { reach.union(&band)? };
++                            }
++                            if reach.is_empty() {
++                                reach = super::top_stock::contour_reach(&region, inside, d);
++                            }
++                            Ok((path, reach))
+                         } else {
+-                            machining2d::contour(&region, cp)
++                            let path = machining2d::contour(&region, cp)?;
++                            let reach = super::top_stock::contour_reach(&region, cp.side == Side::Inside, d);
++                            Ok((path, reach))
+                         }
+                     };
+-                    let mut path = rings(&cp)?;
+-                    if let Some(m) = carry_need!(&super::top_stock::contour_reach(&region, cp.side == Side::Inside, d), &path) {
++                    let (mut path, reach) = run_whole(&cp)?;
++                    if let Some(m) = carry_need!(&reach, &path) {
+                         cp.links.approach.material_top = Some(m);
+                         lk = cp.links;
+-                        path = rings(&cp)?;
++                        (path, _) = run_whole(&cp)?;
+                     }
+                     (region, path)
+                 }
+diff --git a/crates/app/tests/contour_whole_step.rs b/crates/app/tests/contour_whole_step.rs
+new file mode 100644
+index 000000000..d94711365
+--- /dev/null
++++ b/crates/app/tests/contour_whole_step.rs
+@@ -0,0 +1,334 @@
++//! #2436: whole-model 2D Contour on a part whose outline grows outward
++//! below Top Z (a chamfered island on a plate, an open-ended slot
++//! floor closing into the plate perimeter) must continue down to Bottom Z
++//! using each level's part outline with tabs written, or refuse by name
++//! with the stopped level rather than dropping lower levels silently.
++//!
++//! Provenance: our own grid-matched watertight mesh of a stepped and
++//! slotted flange; no vendor material consulted.
++
++use camcraft_app::cl::{MoveKind, Toolpath};
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
++use camcraft_app::geometry::{Mesh, Point3, Triangle, slice};
++use camcraft_app::machining2d::{Lead, Side};
++use camcraft_app::machining3d::Entry3D;
++use camcraft_app::model;
++use camcraft_app::operation::{Height, HeightReference, OpParams, SrcRef};
++use camcraft_app::posting;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::verify::Warning;
++use camcraft_app::world::new_world;
++use flecs_ecs::prelude::World;
++
++const TOOL: &str = "EM-1000-4FL";
++const EPS: f64 = 1e-3;
++
++/// Grid-matched watertight shell of a 100 x 60 x 10 plate (z 0..10)
++/// centred at XY (0, 0), with an open-ended slot (x 35..45, y 15..30,
++/// floor z 7) and a 60 x 30 x 5 island on top (z 10..15) with a 1 x 45
++/// deg chamfer on its top edges (z 14..15 to 58 x 28).
++fn stepped_slotted_flange() -> Mesh {
++    let xs = [-50.0, -30.0, 30.0, 35.0, 45.0, 50.0];
++    let ys = [-30.0, -15.0, 15.0, 30.0];
++    let mut f = Vec::new();
++    let p = |x: f64, y: f64, z: f64| Point3::new(x, y, z);
++    let quad = |f: &mut Vec<Triangle>, a: Point3, b: Point3, c: Point3, d: Point3| {
++        f.push(Triangle::new(a, b, c));
++        f.push(Triangle::new(a, c, d));
++    };
++
++    // Full bottom face at z = 0 (-z normal) and full cell tops/floors.
++    for i in 0..5 {
++        for j in 0..3 {
++            let (x0, x1, y0, y1) = (xs[i], xs[i + 1], ys[j], ys[j + 1]);
++            // Bottom cap (-z): CW seen from +z.
++            quad(&mut f, p(x0, y0, 0.0), p(x0, y1, 0.0), p(x1, y1, 0.0), p(x1, y0, 0.0));
++            let top_z = if i == 3 && j == 2 {
++                7.0
++            } else if i == 1 && j == 1 {
++                continue; // closed later at the chamfered island top
++            } else {
++                10.0
++            };
++            // Top face (+z): CCW seen from +z.
++            quad(&mut f, p(x0, y0, top_z), p(x1, y0, top_z), p(x1, y1, top_z), p(x0, y1, top_z));
++        }
++    }
++
++    // Perimeter walls at outer box [-50..50] x [-30..30].
++    let edge_wall = |f: &mut Vec<Triangle>, ax: f64, ay: f64, bx: f64, by: f64, z0: f64, z1: f64| {
++        quad(f, p(ax, ay, z0), p(bx, by, z0), p(bx, by, z1), p(ax, ay, z1));
++    };
++    for i in 0..5 {
++        edge_wall(&mut f, xs[i], ys[0], xs[i + 1], ys[0], 0.0, 10.0);
++        let z_north = if i == 3 { 7.0 } else { 10.0 };
++        edge_wall(&mut f, xs[i + 1], ys[3], xs[i], ys[3], 0.0, z_north);
++    }
++    for j in 0..3 {
++        edge_wall(&mut f, xs[5], ys[j], xs[5], ys[j + 1], 0.0, 10.0);
++        edge_wall(&mut f, xs[0], ys[j + 1], xs[0], ys[j], 0.0, 10.0);
++    }
++
++    // Slot side and back walls (x 35..45, y 15..30, z 7..10).
++    edge_wall(&mut f, 35.0, 30.0, 35.0, 15.0, 7.0, 10.0);
++    edge_wall(&mut f, 35.0, 15.0, 45.0, 15.0, 7.0, 10.0);
++    edge_wall(&mut f, 45.0, 15.0, 45.0, 30.0, 7.0, 10.0);
++
++    // Island walls (z 10..14), 1 x 45 deg chamfer (z 14..15), top cap (z 15).
++    let base = [(-30.0, -15.0), (30.0, -15.0), (30.0, 15.0), (-30.0, 15.0)];
++    let top = [(-29.0, -14.0), (29.0, -14.0), (29.0, 14.0), (-29.0, 14.0)];
++    for k in 0..4 {
++        let n = (k + 1) % 4;
++        edge_wall(&mut f, base[k].0, base[k].1, base[n].0, base[n].1, 10.0, 14.0);
++        quad(
++            &mut f,
++            p(base[k].0, base[k].1, 14.0),
++            p(base[n].0, base[n].1, 14.0),
++            p(top[n].0, top[n].1, 15.0),
++            p(top[k].0, top[k].1, 15.0),
++        );
++    }
++    quad(
++        &mut f,
++        p(top[0].0, top[0].1, 15.0),
++        p(top[1].0, top[1].1, 15.0),
++        p(top[2].0, top[2].1, 15.0),
++        p(top[3].0, top[3].1, 15.0),
++    );
++
++    let mesh = Mesh::from_facets(f);
++    for z in [0.5, 5.0, 7.5, 9.5, 11.5, 14.5] {
++        assert!(slice::slice(&mesh.facets, z).is_ok(), "manifold fixture at z {z}");
++    }
++    mesh
++}
++
++fn world_with(mesh: Mesh, oversized_stock: bool) -> (World, History) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("flange", mesh));
++    let (dx, dy, x0, y0) = if oversized_stock { (120.0, 80.0, -60.0, -40.0) } else { (100.0, 60.0, -50.0, -30.0) };
++    let loc = Location { pos: Point3::new(x0, y0, 0.0), ..Default::default() };
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx, dy, dz: 17.0 }, loc).expect("stock"));
++    let t = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    h.execute(&world, AddTool::new(&world, TOOL, t).expect("tool"));
++    (world, h)
++}
++
++fn contour_params(top_z: Height, stepdown: f64, tab_width: f64, tab_height: f64) -> OpParams {
++    OpParams::Contour {
++        side: Side::Auto,
++        stock_to_leave: 0.0,
++        clearance_z: Height::of(HeightReference::TopOfStock, 25.0),
++        retract_z: Height::of(HeightReference::TopOfStock, 10.0),
++        top_z,
++        bottom_z: Height::of(HeightReference::BottomOfModel, -0.5),
++        stepdown,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        lead: Lead::Linear { length: 8.0 },
++        tolerance: 0.01,
++        tab_count: 4,
++        tab_width,
++        tab_height,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        blend_turns: false,
++        links: camcraft_app::links::Links::PLANAR,
++        tilt: None,
++    }
++}
++
++fn run(world: &World, h: &mut History, params: OpParams) -> (Toolpath, Vec<Warning>) {
++    let create = CreateOperation::new(world, "C1", TOOL, SrcRef::Entity("flange".into()), params);
++    h.execute(world, create.expect("create"));
++    h.execute(world, GenerateOperation::new(world, "C1").expect("generate"));
++    let e = model::find_by_name(world, "C1").expect("op");
++    let tp = model::toolpath_of(world, &e).expect("toolpath");
++    (tp.path.clone(), tp.warnings.clone())
++}
++
++fn deepest_feed_z(t: &Toolpath) -> f64 {
++    t.moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && (m.from.z - m.to.z).abs() < 1e-9)
++        .map(|m| m.to.z)
++        .fold(f64::INFINITY, f64::min)
++}
++
++fn feeds_at_z(t: &Toolpath, z: f64) -> Vec<(f64, f64)> {
++    t.moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && (m.from.z - z).abs() < EPS && (m.to.z - z).abs() < EPS)
++        .flat_map(|m| [(m.from.x, m.from.y), (m.to.x, m.to.y)])
++        .collect()
++}
++
++/// Interpolated `y` where planar feed moves at `z` cross `x = x_probe` on the +Y side.
++fn north_crossings_at_x(t: &Toolpath, z: f64, x_probe: f64) -> Vec<f64> {
++    let mut ys = Vec::new();
++    for m in &t.moves {
++        if m.kind != MoveKind::Feed || (m.from.z - z).abs() >= EPS || (m.to.z - z).abs() >= EPS {
++            continue;
++        }
++        let (ax, bx) = (m.from.x, m.to.x);
++        if (ax <= x_probe && bx >= x_probe) || (bx <= x_probe && ax >= x_probe) {
++            let y = if (bx - ax).abs() < 1e-12 {
++                0.5 * (m.from.y + m.to.y)
++            } else {
++                let u = (x_probe - ax) / (bx - ax);
++                m.from.y + u * (m.to.y - m.from.y)
++            };
++            if y > 0.0 {
++                ys.push(y);
++            }
++        }
++    }
++    ys
++}
++
++/// Number of separate planar cutting windows at level `z` (for 4 tabs on
++/// one closed loop there are 4 feed runs separated by tab hops).
++fn cut_windows_at_z(t: &Toolpath, z: f64) -> usize {
++    let mut windows = 0;
++    let mut in_window = false;
++    for m in &t.moves {
++        let on_z = m.kind == MoveKind::Feed && (m.from.z - z).abs() < EPS && (m.to.z - z).abs() < EPS;
++        if on_z {
++            if !in_window {
++                windows += 1;
++                in_window = true;
++            }
++        } else if m.kind == MoveKind::Rapid || m.to.z > z + EPS {
++            in_window = false;
++        }
++    }
++    windows
++}
++
++fn assert_full_plate_outline(t: &Toolpath, z: f64, tag: &str) {
++    let pts = feeds_at_z(t, z);
++    assert!(!pts.is_empty(), "{tag}: no moves at level {z}");
++    let min_x = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
++    let max_x = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
++    let min_y = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
++    let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
++    assert!(
++        min_x <= -55.0 + 0.05 && max_x >= 55.0 - 0.05 && min_y <= -35.0 + 0.05 && max_y >= 35.0 - 0.05,
++        "{tag}: must trace 100x60 plate offset by r=5 ([-55..55] x [-35..35]), got x [{min_x:.3}..{max_x:.3}] y [{min_y:.3}..{max_y:.3}]"
++    );
++    // Across the closed slot mouth (x = 40, y > 0), the path stays out on the plate line y = 35, never dipping into the slot.
++    let mouth_ys = north_crossings_at_x(t, z, 40.0);
++    assert!(!mouth_ys.is_empty() && mouth_ys.iter().all(|&y| (y - 35.0).abs() < 0.05), "{tag}: closed slot mouth {mouth_ys:?}");
++}
++
++#[test]
++fn case1_chamfered_island_top_contours_plate_to_bottom_with_tabs() {
++    for oversized in [false, true] {
++        let (world, mut h) = world_with(stepped_slotted_flange(), oversized);
++        let params = contour_params(Height::of(HeightReference::TopOfModel, 0.0), 3.5, 5.0, 1.0);
++        let (t, warns) = run(&world, &mut h, params);
++        assert!(
++            !warns.iter().any(|w| w.blocks_post()),
++            "oversized={oversized}: blocking warnings {warns:?} / {:?}",
++            t.notes
++        );
++        assert!(
++            (deepest_feed_z(&t) - (-0.5)).abs() < EPS,
++            "oversized={oversized}: deepest z {} != -0.5; notes: {:?}",
++            deepest_feed_z(&t),
++            t.notes
++        );
++        assert_full_plate_outline(&t, -0.5, "Case 1 bottom (-0.5)");
++        assert_eq!(
++            cut_windows_at_z(&t, -0.5),
++            4,
++            "Case 1 must write 4 tab windows at z -0.5; notes: {:?}",
++            t.notes
++        );
++        let nc = std::env::temp_dir().join(format!("camcraft-2436-c1-{oversized}-{}.nc", std::process::id()));
++        let _ = std::fs::remove_file(&nc);
++        let posted = posting::post_setup(&world, &nc);
++        let _ = std::fs::remove_file(&nc);
++        assert!(posted.is_ok(), "oversized={oversized}: post blocked: {:?}", posted.err());
++    }
++}
++
++#[test]
++fn case2_plate_top_with_open_slot_contours_below_slot_floor_to_bottom_with_tabs() {
++    for oversized in [false, true] {
++        let (world, mut h) = world_with(stepped_slotted_flange(), oversized);
++        let params = contour_params(Height::of(HeightReference::BottomOfModel, 10.0), 2.0, 6.0, 1.5);
++        let (t, warns) = run(&world, &mut h, params);
++        assert!(
++            !warns.iter().any(|w| w.blocks_post()),
++            "oversized={oversized}: blocking warnings {warns:?} / {:?}",
++            t.notes
++        );
++        // Upper levels cut into the open slot mouth (y < 30 near x 40).
++        let notch_pts = feeds_at_z(&t, 8.0);
++        assert!(
++            notch_pts.iter().any(|&(x, y)| x > 34.0 && x < 46.0 && y < 29.0),
++            "Case 2 z 8 should follow the open slot notch: {notch_pts:?}"
++        );
++        // Levels below the z 7 slot floor close across the plate perimeter down to Bottom Z (-0.5) with 4 tabs on z 0 and z -0.5.
++        assert!(
++            (deepest_feed_z(&t) - (-0.5)).abs() < EPS,
++            "oversized={oversized}: deepest z {} != -0.5; notes: {:?}",
++            deepest_feed_z(&t),
++            t.notes
++        );
++        assert_full_plate_outline(&t, 6.0, "Case 2 z 6.0");
++        assert_full_plate_outline(&t, 0.0, "Case 2 z 0.0");
++        assert_full_plate_outline(&t, -0.5, "Case 2 bottom (-0.5)");
++        assert_eq!(cut_windows_at_z(&t, 0.0), 4, "4 tabs at z 0.0");
++        assert_eq!(cut_windows_at_z(&t, -0.5), 4, "4 tabs at z -0.5");
++        let nc = std::env::temp_dir().join(format!("camcraft-2436-c2-{oversized}-{}.nc", std::process::id()));
++        let _ = std::fs::remove_file(&nc);
++        let posted = posting::post_setup(&world, &nc);
++        let _ = std::fs::remove_file(&nc);
++        assert!(posted.is_ok(), "oversized={oversized}: post blocked: {:?}", posted.err());
++    }
++}
++
++#[test]
++fn whole_model_contour_that_cannot_reach_bottom_is_refused_with_the_stopped_level() {
++    // A non-manifold open sliver below the slot floor prevents slicing
++    // at z = 4.0 while upper levels [10, 8, 7] still slice cleanly: the op
++    // must refuse by name with the failed lower level rather than silently
++    // posting a partial path stopped at z 7.
++    let mut facets = stepped_slotted_flange().facets.to_vec();
++    // Open dangling triangle spanning z [2.0, 5.0] breaks slices in (2, 5).
++    facets.push(Triangle::new(
++        Point3::new(-5.0, -5.0, 2.0),
++        Point3::new(5.0, -5.0, 2.0),
++        Point3::new(0.0, 5.0, 5.0),
++    ));
++    let (world, mut h) = world_with(Mesh::from_facets(facets), true);
++    let params = contour_params(Height::of(HeightReference::BottomOfModel, 10.0), 2.0, 6.0, 1.5);
++    h.execute(
++        &world,
++        CreateOperation::new(&world, "C1", TOOL, SrcRef::Entity("flange".into()), params).expect("create"),
++    );
++    let res = GenerateOperation::new(&world, "C1");
++    let err = match res {
++        Ok(cmd) => {
++            h.execute(&world, cmd);
++            let e = model::find_by_name(&world, "C1").expect("op");
++            let tp = model::toolpath_of(&world, &e);
++            panic!(
++                "partial whole-model contour must not succeed cleanly; deepest={}, notes={:?}",
++                tp.as_ref().map_or(f64::NAN, |c| deepest_feed_z(&c.path)),
++                tp.as_ref().map(|c| &c.path.notes)
++            );
++        }
++        Err(e) => e.to_string(),
++    };
++    assert!(
++        err.contains("4.000") || err.contains("7.000"),
++        "refusal should name the stopped or failed level: {err}"
++    );
++}
+diff --git a/crates/app/tests/real_tip_contour.rs b/crates/app/tests/real_tip_contour.rs
+index d3602584e..1ceca7bfa 100644
+--- a/crates/app/tests/real_tip_contour.rs
++++ b/crates/app/tests/real_tip_contour.rs
+@@ -53,7 +53,7 @@ use camcraft_app::geometry::{Mesh, Point3, Triangle, slice};
+ use camcraft_app::machining2d::{Lead, Side};
+ use camcraft_app::machining3d::Entry3D;
+ use camcraft_app::model;
+-use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::operation::{FeatureSel, GeoSel, Height, OpParams, SrcRef};
+ use camcraft_app::schema::Location;
+ use camcraft_app::stock::StockShape;
+ use camcraft_app::tools::{Tool, catalog};
+@@ -180,10 +180,31 @@ fn generate(leave: f64) -> (Toolpath, Vec<Warning>) {
+     generate_with(BULL, leave)
+ }
+ 
++/// Pick the boss's top face so the Contour stays scoped to the boss's
++/// filleted wall (#2436: a whole-model Contour now follows lower wider
++/// plate sections past the boss foot).
++fn boss_top(world: &World) -> SrcRef {
++    let e = model::find_by_name(world, "part").expect("part");
++    let f = model::features_of(world, &e).expect("features");
++    let id = f
++        .faces
++        .iter()
++        .find(|fa| {
++            fa.normal[2] > 0.99
++                && fa.loops
++                    .iter()
++                    .flat_map(|l| l.verts.iter())
++                    .all(|&v| f.verts.get(v as usize).is_some_and(|p| (p[2] - TOP).abs() < 1e-9))
++        })
++        .map(|fa| fa.id)
++        .expect("boss top face");
++    SrcRef::Selection(vec![GeoSel { entity: "part".into(), feature: FeatureSel::Face(id) }])
++}
++
+ /// The same, with `tool_name` from the catalog.
+ fn generate_with(tool_name: &str, leave: f64) -> (Toolpath, Vec<Warning>) {
+     let (world, mut h) = world_with(tool_name);
+-    let op = CreateOperation::new(&world, "C1", tool_name, SrcRef::Entity("part".into()), contour_op(leave));
++    let op = CreateOperation::new(&world, "C1", tool_name, boss_top(&world), contour_op(leave));
+     h.execute(&world, op.expect("create"));
+     h.execute(&world, GenerateOperation::new(&world, "C1").expect("generate"));
+     let e = model::find_by_name(&world, "C1").expect("op");
+@@ -350,7 +371,7 @@ fn the_same_contour_pushed_into_the_floor_still_convicts() {
+     if let OpParams::Contour { bottom_z, .. } = &mut deep {
+         *bottom_z = Height::fixed(FLOOR - 2.0);
+     }
+-    h.execute(&world, CreateOperation::new(&world, "C2", BULL, SrcRef::Entity("part".into()), deep).expect("create"));
++    h.execute(&world, CreateOperation::new(&world, "C2", BULL, boss_top(&world), deep).expect("create"));
+     h.execute(&world, GenerateOperation::new(&world, "C2").expect("generate"));
+     let e = model::find_by_name(&world, "C2").expect("op");
+     let tp = model::toolpath_of(&world, &e).expect("cached path");
+diff --git a/crates/motion/src/machining2d/contour.rs b/crates/motion/src/machining2d/contour.rs
+index e0012b0f4..74cf8ff92 100644
+--- a/crates/motion/src/machining2d/contour.rs
++++ b/crates/motion/src/machining2d/contour.rs
+@@ -103,10 +103,16 @@ pub fn contour_on_picked(
+ /// rings were picked (the #1927 law applies).
+ type PartRef<'a> = (&'a [Triangle], &'a [std::ops::Range<usize>], bool);
+ 
+-fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -> Result<Toolpath, GenError> {
+-    p.validate()?;
+-    // Control-side compensation (M13.11): its parameter door first.
+-    contour_comp::door(p)?;
++/// Offset loops, programmed region and walking polylines prepared for one
++/// contour band; shared with `contour_whole`.
++pub(super) struct PreparedBand {
++    pub center: Region,
++    pub prog: Option<Region>,
++    pub loops: Vec<Loop>,
++    pub plan: Vec<Vec<Point2>>,
++}
++
++pub(super) fn prepare_band(region: &Region, p: &ContourParams) -> Result<PreparedBand, GenError> {
+     if region.is_empty() {
+         return Err(GenError::Empty("empty footprint".into()));
+     }
+@@ -125,18 +131,13 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+     // The contour the post programs under G41/G42 (M13.11): the part
+     // at the stock to leave; `None` for every path cut in computer.
+     let prog = contour_comp::programmed_region(region, p)?;
+-    let flat = p.levels()?;
+-    let mut loops: Vec<&Loop> = center.loops().iter().collect();
++    let mut loops: Vec<Loop> = center.loops().to_vec();
+     loops.sort_by(|a, b| b.area().abs().total_cmp(&a.area().abs()));
+-    // #1448: the ring the user's start point re-sequences, or its refusal.
+-    let pick = contour_start::pick_ring(&loops, p)?;
+-    let exit = contour_start::pick_exit(&loops, p)?; // #1473
+-
+     // The rings every level plans to walk, as closed polylines - the
+     // link chords of M8.1's plan law get proven against these. Tabbed
+     // levels walk a subset, which errs conservative: an unproven chord
+     // hops rather than dragging across a ring line.
+-    let plan: Vec<Vec<Point2>> = loops
++    let plan = loops
+         .iter()
+         .map(|l| {
+             let mut v: Vec<Point2> = super::ring::walked(l.points(), p.climb == inside, inside);
+@@ -149,34 +150,34 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             v
+         })
+         .collect();
+-    // The shared motion envelope: dive_link and substituted_dive read
+-    // their lifts and feeds through it, so the contour's arms speak
+-    // the pocket ladders' word verbatim (hop = retract clamped at
+-    // clearance, exactly what `hop` below computes).
+-    let m = Motion::new(p.clearance_z, Some(p.retract_z), p.feed, p.plunge_feed)
+-        .with_entry(p.entry, p.helix_radius)
+-        .with_arc_radius(p.tool_diameter)
+-        .with_links(p.links, p.helix_radius);
+-    let mut said = Said::default();
+-    let cert = Cert::Region(&center);
+-    // Climb travel keeps the part on the RIGHT on both sides (#1555, see
+-    // the per-loop flip below), so the air - the only side a fillet may
+-    // stand on - is left for climb, right for conventional.
+-    let legal = Legal { region: &center, inside, air_left: Some(p.climb) };
+-    let mut tally = FilletTally::default();
++    Ok(PreparedBand { center, prog, loops, plan })
++}
++
++fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -> Result<Toolpath, GenError> {
++    p.validate()?;
++    // Control-side compensation (M13.11): its parameter door first.
++    contour_comp::door(p)?;
++    let band = prepare_band(region, p)?;
++    let refs: Vec<&Loop> = band.loops.iter().collect();
++    // #1448: the user's start point re-sequences its ring instead.
++    let pick = contour_start::pick_ring(&refs, p)?;
++    let exit = contour_start::pick_exit(&refs, p)?; // #1473
++    let flat = p.levels()?;
++    let r = p.tool_diameter * 0.5;
++    let d = r + p.stock_to_leave;
+     // Lead shrinks, refusals and reseated starts, each said once.
+     let mut lead_notes: Vec<String> = Vec::new();
+     // Which ring is cut at which level: all of them at every level for
+     // a flat region; against a part, each ring down to its own floor.
+     let lad = match part {
+-        None => Ladder::uniform(&flat, loops.len()),
+-        Some((f, bodies, _)) => ladder(&plan, f, bodies, &flat, p.top_z, r, p.stock_to_leave, &mut lead_notes),
++        None => Ladder::uniform(&flat, band.loops.len()),
++        Some((f, bodies, _)) => ladder(&band.plan, f, bodies, &flat, p.top_z, r, p.stock_to_leave, &mut lead_notes),
+     };
+     // A picked ring on the wrong side is refused by its own name first
+     // (#1927), also when it was the only ring (#2004: with no air level
+     // at Top Z, such a ring walks no level at all).
+     if let Some((f, _, true)) = part {
+-        picked_law(&plan, f, &flat, &lad, d, p.side)?;
++        picked_law(&band.plan, f, &flat, &lad, d, p.side)?;
+     }
+     if lad.zs.is_empty() {
+         // Every ring stands in the part at its first level: nothing is
+@@ -187,11 +188,42 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             lead_notes.join("; ")
+         )));
+     }
+-    let lad = &lad;
+-
+-    let eng = Engage { p, center: &center, cert: &cert, plan: &plan, m: &m, legal: &legal };
+-
+     let mut b = PathBuilder::approached(Point3::new(0.0, 0.0, p.clearance_z));
++    let mut said = Said::default();
++    let mut tally = FilletTally::default();
++    emit_band(&mut b, &band, p, &lad, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
++    finish_contour(b, lead_notes, &tally, p)
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn emit_band(
++    b: &mut PathBuilder,
++    band: &PreparedBand,
++    p: &ContourParams,
++    lad: &Ladder,
++    pick: Option<(usize, Point2)>,
++    exit: Option<(usize, Point2)>,
++    said: &mut Said,
++    lead_notes: &mut Vec<String>,
++    tally: &mut FilletTally,
++) -> Result<(), GenError> {
++    let r = p.tool_diameter * 0.5;
++    let inside = p.side == Side::Inside;
++    // The shared motion envelope: dive_link and substituted_dive read
++    // their lifts and feeds through it, so the contour's arms speak
++    // the pocket ladders' word verbatim (hop = retract clamped at
++    // clearance, exactly what `hop` below computes).
++    let m = Motion::new(p.clearance_z, Some(p.retract_z), p.feed, p.plunge_feed)
++        .with_entry(p.entry, p.helix_radius)
++        .with_arc_radius(p.tool_diameter)
++        .with_links(p.links, p.helix_radius);
++    let cert = Cert::Region(&band.center);
++    // Climb travel keeps the part on the RIGHT on both sides (#1555, see
++    // the per-loop flip below), so the air - the only side a fillet may
++    // stand on - is left for climb, right for conventional.
++    let legal = Legal { region: &band.center, inside, air_left: Some(p.climb) };
++    let eng = Engage { p, center: &band.center, cert: &cert, plan: &band.plan, m: &m, legal: &legal };
++    let prog = &band.prog;
+     let hop = p.retract_z.min(p.clearance_z);
+     let mut first_entry = true;
+     let mut lifted = LinkTally::default();
+@@ -203,9 +235,9 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+     let mut last_leads: Vec<Vec<Point2>> = Vec::new();
+     let is_tabbed = |z: f64| p.tab_count > 0 && z < p.bottom_z + p.tab_height;
+     // The cut order, and where the stay-down link joins it (contour_link).
+-    let (sched, stay) = plan_links(p, lad, &plan, &mut lead_notes);
++    let (sched, stay) = plan_links(p, lad, &band.plan, lead_notes);
+     for (si, &(z, li)) in sched.iter().enumerate() {
+-        let l = loops[li];
++        let l = &band.loops[li];
+         let tabbed = is_tabbed(z);
+         // A tab-hop template traverses at `hop` between windows, and a
+         // standing tab is material AT the window down to the level -
+@@ -242,14 +274,14 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+         // the user's start point re-sequences its ring instead.
+         let ap = &p.links.approach;
+         let picked = pick.filter(|&(pi, _)| pi == li).map(|(_, q)| q);
+-        let ring = Ring::new(contour_start::seat(pts, picked, tabbed, prog.is_some(), p, &legal, &mut lead_notes));
++        let ring = Ring::new(contour_start::seat(pts, picked, tabbed, prog.is_some(), p, &legal, lead_notes));
+         // The overlap past the start on closed rings (M11.3 C): not on
+         // tabbed levels (their windows are the tab law's) and not under a
+         // keep-down level link (the next level descends from the seam).
+         let ov = if tabbed || ap.overlap <= 0.0 {
+             0.0
+         } else if p.links.level == Link::KeepDown {
+-            say(&mut lead_notes, "lead: the overlap stands down under the keep-down level link - the next level descends from the seam".into());
++            say(lead_notes, "lead: the overlap stands down under the keep-down level link - the next level descends from the seam".into());
+             0.0
+         } else {
+             ap.overlap.min(ring.len)
+@@ -278,8 +310,8 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             // (lead_fit.rs), meet the wall on its own tangent, and stay
+             // off each other at the seam (contour_entry::seam_leads); the
+             // extensions ride the same room (lead_ext).
+-            let (entry, lead, lead_off) = seam_leads(&walk, &poly, p, &legal, &mut lead_notes);
+-            let (entry, lead, lead_off) = extend_leads(entry, lead, lead_off, &walk, &poly, p, &legal, &mut lead_notes);
++            let (entry, lead, lead_off) = seam_leads(&walk, &poly, p, &legal, lead_notes);
++            let (entry, lead, lead_off) = extend_leads(entry, lead, lead_off, &walk, &poly, p, &legal, lead_notes);
+             if picked.is_some() && k == 0 {
+                 // The first window begins at the pick (tabbed levels too);
+                 // a later one begins after a tab, the tab law's start.
+@@ -291,14 +323,14 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             let mut window = (poly, walk, entry, lead, lead_off);
+             if let Some((_, q)) = exit.filter(|&(ei, _)| ei == li) {
+                 // #1473: on past the seam to the user's exit point.
+-                window = contour_start::exit_at(window, q, p, &legal, &mut lead_notes)?;
++                window = contour_start::exit_at(window, q, p, &legal, lead_notes)?;
+             } else if ov > 0.0 {
+                 let (rpoly, rwalk) = retrace(&window.0, &window.1, ov);
+-                let (en, li, lo) = seam_leads(&rwalk, &rpoly, p, &legal, &mut lead_notes);
+-                let (en, li, lo) = extend_leads(en, li, lo, &rwalk, &rpoly, p, &legal, &mut lead_notes);
++                let (en, li, lo) = seam_leads(&rwalk, &rpoly, p, &legal, lead_notes);
++                let (en, li, lo) = extend_leads(en, li, lo, &rwalk, &rpoly, p, &legal, lead_notes);
+                 let last = rpoly[rpoly.len() - 1];
+                 if crosses(en, &li, last, &lo) {
+-                    say(&mut lead_notes, format!("lead: the {ov:.3} mm overlap's lead-out crosses the lead-in at ({:.3}, {:.3}) - overlap dropped", last.x, last.y));
++                    say(lead_notes, format!("lead: the {ov:.3} mm overlap's lead-out crosses the lead-in at ({:.3}, {:.3}) - overlap dropped", last.x, last.y));
+                 } else {
+                     window = (rpoly, rwalk, en, li, lo);
+                 }
+@@ -314,11 +346,11 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             if let (Some(s), Some(&zp)) = (stay_in, rzi.checked_sub(1).and_then(|i| rz.get(i))) {
+                 // Stayed down: the tool stands on the seam at the level
+                 // above (its lead-out skipped); descend on the ring.
+-                push_stay(&mut b, s, &poly, &walk, zp, z, p, &legal, &mut lead_notes);
++                push_stay(b, s, &poly, &walk, zp, z, p, &legal, lead_notes);
+                 first_entry = false;
+-                push_segs(&mut b, &walk, z, p.feed);
++                push_segs(b, &walk, z, p.feed);
+                 if !stay_out {
+-                    push_segs(&mut b, &lead_off, z, p.feed);
++                    push_segs(b, &lead_off, z, p.feed);
+                 }
+                 continue;
+             }
+@@ -346,10 +378,10 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+             if wall_arc_on && !tabbed {
+                 let z_top = wall_arc_top(p, rz, rzi, hop_z);
+                 let first = lead.first().or(walk.first());
+-                match wall_arc(&mut b, &eng, e2, z, z_top, hop_z, first) {
++                match wall_arc(b, &eng, e2, z, z_top, hop_z, first) {
+                     Ok(()) => arced = true,
+                     Err(why) => say(
+-                        &mut lead_notes,
++                        lead_notes,
+                         format!(
+                             "entry: no arc fits beside the wall at the lead-in ({:.3}, {:.3}) - {why}; \
+                              grazing dive there instead",
+@@ -359,7 +391,7 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+                 }
+             } else if wall_arc_on {
+                 say(
+-                    &mut lead_notes,
++                    lead_notes,
+                     "entry: the arc stands down on tabbed levels - a standing tab is material \
+                      beside the wall the room law cannot see; grazing dive at the lead-in there"
+                         .into(),
+@@ -371,7 +403,7 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+                 // Ring to ring within one level: the pass link, proved
+                 // against the rings and this level's dive links.
+                 let cut = if dives.0.to_bits() == z.to_bits() { dives.1.as_slice() } else { &[] };
+-                ring_link(&mut b, p, &legal, &[&plan, cut, &link_leads], e2, z, hop_z, tabbed, &mut lifted);
++                ring_link(b, p, &legal, &[&band.plan, cut, &link_leads], e2, z, hop_z, tabbed, &mut lifted);
+             } else if k == 0 {
+                 // The level's first engagement: a crossing, or the path's
+                 // first entry (prev_z falls back to clearance there).
+@@ -380,7 +412,7 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+                 // when the descent one level up was the same arm.
+                 let opened = rzi >= 2 || (rzi == 1 && arm == p.entry);
+                 let step = Step { arm, e2, z, prev_z, first: first_entry, opened, inside, tabbed, lead_top };
+-                if let Some(d) = engage_level(&mut b, &eng, &step, &lead, &walk, &mut said) {
++                if let Some(d) = engage_level(b, &eng, &step, &lead, &walk, said) {
+                     if dives.0.to_bits() != z.to_bits() {
+                         dives = (z, Vec::new());
+                     }
+@@ -391,31 +423,31 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+                 let cur = b.at();
+                 b.push(MoveKind::Feed, Point3::new(cur.x, cur.y, hop_z), Some(p.feed));
+                 b.push(MoveKind::Rapid, Point3::new(e2.x, e2.y, hop_z), None);
+-                super::contour_link::guard(&mut b, p, e2, lead_top, p.entry_top(), "the dive past a tab");
++                super::contour_link::guard(b, p, e2, lead_top, p.entry_top(), "the dive past a tab");
+                 b.push(MoveKind::Plunge, Point3::new(e2.x, e2.y, lead_top), Some(p.plunge_feed));
+             }
+             first_entry = false;
+             let at = b.at();
+             let lead_at = b.moves_len();
+             if at.x == e2.x && at.y == e2.y && at.z > z {
+-                push_lead_down(&mut b, &lead, at.z, z, lf);
++                push_lead_down(b, &lead, at.z, z, lf);
+             } else {
+                 if lead_top > z {
+-                    say(&mut lead_notes, "lead: the vertical lead-in rides only a dive at the lead-in's start - this entry lands on the cut plane".into());
++                    say(lead_notes, "lead: the vertical lead-in rides only a dive at the lead-in's start - this entry lands on the cut plane".into());
+                 }
+-                push_segs(&mut b, &lead, z, lf);
++                push_segs(b, &lead, z, lf);
+             }
+             let walk_at = b.moves_len();
+-            push_segs(&mut b, &walk, z, p.feed);
++            push_segs(b, &walk, z, p.feed);
+             let out_at = b.moves_len();
+             if !stay_out {
+-                push_segs(&mut b, &lead_off, z, p.feed);
++                push_segs(b, &lead_off, z, p.feed);
+             }
+             // The control's span (M13.11): the lead-in move that lands
+             // on the wall engages, the lead-out move that leaves it
+             // cancels; a lead the room law refused is a refusal here
+             // too, by name - never a centre path under a Control op.
+-            if let Some(prog) = &prog {
++            if let Some(prog) = prog {
+                 if walk_at == lead_at || b.moves_len() == out_at {
+                     return Err(contour_comp::refused_as(p, format!(
+                         "needs a lead-in and a lead-out at ({:.3}, {:.3}) - the room law refused one ({})",
+@@ -426,14 +458,23 @@ fn contour_impl(region: &Region, p: &ContourParams, part: Option<PartRef<'_>>) -
+                     .with_ghost_moves(b.moves()));
+                 }
+                 // #871: a part-way refusal hands back the rings so far.
+-                contour_comp::push_span(&mut b, &SpanCtx { prog, p }, walk_at - 1, out_at)
++                contour_comp::push_span(b, &SpanCtx { prog, p }, walk_at - 1, out_at)
+                     .map_err(|e| e.with_ghost_moves(b.moves()))?;
+             }
+         }
+     }
+-    lifted.say(&mut b, "ring-to-ring");
++    lifted.say(b, "ring-to-ring");
+     let cur = b.at();
+     b.push(MoveKind::Rapid, Point3::new(cur.x, cur.y, p.clearance_z), None);
++    Ok(())
++}
++
++pub(super) fn finish_contour(
++    mut b: PathBuilder,
++    lead_notes: Vec<String>,
++    tally: &FilletTally,
++    p: &ContourParams,
++) -> Result<Toolpath, GenError> {
+     for n in lead_notes {
+         b.note(n);
+     }
+diff --git a/crates/motion/src/machining2d/contour_whole.rs b/crates/motion/src/machining2d/contour_whole.rs
+new file mode 100644
+index 000000000..5bf99f321
+--- /dev/null
++++ b/crates/motion/src/machining2d/contour_whole.rs
+@@ -0,0 +1,328 @@
++//! Multi-level whole-model 2D contouring (#2436): when no specific faces or
++//! edges are picked, a part whose cross-section grows outward below Top Z (a
++//! chamfer, shoulder or open-ended slot floor) cannot stay on the top plane's
++//! rings down to Bottom Z. Each depth band walks the active outline as far as
++//! the solid allows (`contour_depth::ladder`), then re-slices the part's
++//! overhead silhouette (`slice::material_overhead_of`) at the next level down
++//! until Bottom Z is reached; unsliceable planes or collapsed lower bands fail
++//! closed naming the stopped level. Provenance: 2.5D Z-level outer-profile
++//! continuation over textbook polygonal cross-section + downward shadow union;
++//! no vendor material consulted.
++
++use std::ops::Range;
++
++use crate::cl::{PathBuilder, Toolpath};
++use crate::geo2d::{Point2, Region};
++use crate::geometry::slice::{SliceError, material_overhead_of};
++use crate::geometry::{Point3, Triangle};
++
++use super::contour::{PreparedBand, emit_band, finish_contour, prepare_band};
++use super::contour_comp;
++use super::contour_depth::{Ladder, ladder};
++use super::contour_entry::say;
++use super::contour_params::{ContourParams, Side};
++use super::contour_start;
++use super::contour_step::Said;
++use super::face::GenError;
++use super::fillet_tally::FilletTally;
++
++const SAME_LEVEL: f64 = 1e-6;
++const SLICE_NUDGE: f64 = 1e-3;
++
++fn from_slice(e: SliceError) -> GenError {
++    match e {
++        SliceError::Geo(g) => GenError::Geo(g),
++        e @ (SliceError::Open { .. } | SliceError::NonManifold { .. }) => GenError::Model(e.to_string()),
++        other => GenError::Invalid(other.to_string()),
++    }
++}
++
++/// All part material at or above `probe_z` (section strictly above plus shadow
++/// of overhanging down-facing walls), nudged inside `cut_z` when `probe_z` sits
++/// at the top of the model.
++fn whole_region_at(
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    probe_z: f64,
++    cut_z: f64,
++) -> Result<Region, GenError> {
++    let r = material_overhead_of(part, bodies, probe_z).map_err(from_slice)?;
++    if !r.is_empty() {
++        return Ok(r);
++    }
++    material_overhead_of(part, bodies, cut_z - SLICE_NUDGE).map_err(from_slice)
++}
++
++fn check_unread(
++    lad: &Ladder,
++    remaining: &[f64],
++    p: &ContourParams,
++    b: &PathBuilder,
++) -> Result<(), GenError> {
++    for (li, why) in lad.unread.iter().enumerate() {
++        let Some(why) = why else { continue };
++        let k = remaining.iter().position(|z| !lad.walks(li, *z)).unwrap_or(0);
++        let z_bad = remaining.get(k).copied().unwrap_or(p.bottom_z);
++        let skipped: Vec<String> = remaining[k..].iter().map(|z| format!("{z:.3}")).collect();
++        let last = lad.ring(li).last().copied();
++        let stopped = last.map_or_else(
++            || format!("before first level Z {z_bad:.3}"),
++            |z| format!("at Z {z:.3} above Z {z_bad:.3}"),
++        );
++        let msg = format!(
++            "whole-model contour stopped {stopped} (Bottom Z {:.3}) - cannot section deeper ({}): {why}",
++            p.bottom_z,
++            skipped.join(", ")
++        );
++        let partial = b.clone().finish();
++        if why.contains("open") || why.contains("non-manifold") || why.contains("hole") {
++            return Err(GenError::Model(msg));
++        }
++        return Err(if partial.moves.is_empty() {
++            GenError::Invalid(msg)
++        } else {
++            GenError::Invalid(msg).with_ghost(&partial)
++        });
++    }
++    Ok(())
++}
++
++/// First index in `remaining` that needs a fresh region slice below it: either
++/// an outer boundary ring ended before that level, or an interior hole ring
++/// ended and a narrower hole opened inside it at that level (counterbore).
++fn first_split(
++    band: &PreparedBand,
++    lad: &Ladder,
++    remaining: &[f64],
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    p: &ContourParams,
++) -> Result<Option<usize>, GenError> {
++    let has_outer = band.loops.iter().any(|l| l.is_ccw());
++    let outer_stop = band
++        .loops
++        .iter()
++        .enumerate()
++        .filter(|(_, l)| !has_outer || l.is_ccw())
++        .filter_map(|(li, _)| remaining.iter().position(|z| !lad.walks(li, *z)))
++        .min();
++    let limit = outer_stop.unwrap_or(remaining.len());
++    let hole_first_stop = band
++        .loops
++        .iter()
++        .enumerate()
++        .filter(|(_, l)| has_outer && !l.is_ccw())
++        .filter_map(|(li, _)| remaining[..limit].iter().position(|z| !lad.walks(li, *z)))
++        .min();
++    let hole_stop = if let Some(k) = hole_first_stop
++        && k > 0
++    {
++        let z_k = remaining[k];
++        let active_holes = band
++            .loops
++            .iter()
++            .enumerate()
++            .filter(|(li, l)| !l.is_ccw() && lad.walks(*li, z_k))
++            .count();
++        let next = whole_region_at(part, bodies, z_k - p.stock_to_leave, z_k)?;
++        let d = p.tool_diameter * 0.5 + p.stock_to_leave;
++        let next_holes = next.offset(d)?.loops().iter().filter(|l| !l.is_ccw()).count();
++        (next_holes > active_holes).then_some(k)
++    } else {
++        None
++    };
++    Ok(match (outer_stop, hole_stop) {
++        (Some(a), Some(b)) => Some(a.min(b)),
++        (a, b) => a.or(b),
++    })
++}
++
++fn trim_ladder(lad: &Ladder, z_cut: f64) -> Ladder {
++    let per_ring: Vec<Vec<f64>> = lad
++        .per_ring
++        .iter()
++        .map(|zs| zs.iter().copied().filter(|&z| z > z_cut + SAME_LEVEL).collect())
++        .collect();
++    let mut zs: Vec<f64> = per_ring.iter().flatten().copied().collect();
++    zs.sort_by(|a, b| b.total_cmp(a));
++    zs.dedup_by(|a, b| a.to_bits() == b.to_bits());
++    Ladder { zs, per_ring, unread: lad.unread.clone() }
++}
++
++fn forward_band_notes(
++    band: &PreparedBand,
++    lad: &Ladder,
++    remaining_last: f64,
++    continues: bool,
++    ring_notes: Vec<String>,
++    lead_notes: &mut Vec<String>,
++) {
++    let mut it = ring_notes.into_iter();
++    for (li, l) in band.loops.iter().enumerate() {
++        if !lad.walks(li, remaining_last)
++            && let Some(n) = it.next()
++            && (!continues || !l.is_ccw())
++        {
++            say(lead_notes, n);
++        }
++    }
++}
++
++fn match_pick(
++    res: Result<Option<(usize, Point2)>, GenError>,
++    matched: &mut bool,
++    deferred: &mut Option<GenError>,
++) -> Result<Option<(usize, Point2)>, GenError> {
++    match res {
++        Ok(Some(v)) => {
++            *matched = true;
++            Ok(Some(v))
++        }
++        Ok(None) => Ok(None),
++        Err(e) => {
++            let msg = e.to_string();
++            if msg.contains("farther than") || msg.contains("no contour ring") {
++                *deferred = Some(e);
++                Ok(None)
++            } else {
++                Err(e)
++            }
++        }
++    }
++}
++
++/// Whole-model `2D Contour` over `part` / `bodies`: starts with `top_region`
++/// and continues deeper bands from the part's overhead outline whenever the
++/// outer boundary changes below `Top Z`.
++pub fn contour_whole_bodies(
++    top_region: &Region,
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    p: &ContourParams,
++) -> Result<Toolpath, GenError> {
++    contour_whole_bodies_with(top_region, part, bodies, p, &mut Ok).map(|(path, _)| path)
++}
++
++/// [`contour_whole_bodies`] with a caller-supplied per-band region transform
++/// (such as boundary controls) and the sequence of regions cut.
++pub fn contour_whole_bodies_with(
++    top_region: &Region,
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    p: &ContourParams,
++    area_at: &mut dyn FnMut(Region) -> Result<Region, GenError>,
++) -> Result<(Toolpath, Vec<Region>), GenError> {
++    if p.side == Side::Inside {
++        let path = super::contour::contour_on_bodies(top_region, part, bodies, p)?;
++        return Ok((path, vec![top_region.clone()]));
++    }
++    p.validate()?;
++    contour_comp::door(p)?;
++    if top_region.is_empty() {
++        return Err(GenError::Empty("empty footprint".into()));
++    }
++    let flat = p.levels()?;
++    let r = p.tool_diameter * 0.5;
++    let mut b = PathBuilder::approached(Point3::new(0.0, 0.0, p.clearance_z));
++    let mut said = Said::default();
++    let mut tally = FilletTally::default();
++    let mut lead_notes = Vec::new();
++    let mut walked = Vec::new();
++    let mut remaining: &[f64] = &flat;
++    let mut current_region = top_region.clone();
++    let mut ceiling = p.top_z;
++    let mut used_fallback = false;
++    let mut pick_matched = p.links.approach.start_point.is_none();
++    let mut exit_matched = p.links.approach.exit_point.is_none();
++    let mut deferred_pick = None;
++    let mut deferred_exit = None;
++
++    for band_idx in 0..=flat.len() {
++        if remaining.is_empty() {
++            break;
++        }
++        let last_z = remaining[remaining.len() - 1];
++        let band = prepare_band(&current_region, p)?;
++        let refs: Vec<&crate::geo2d::Loop> = band.loops.iter().collect();
++        let pick = match_pick(contour_start::pick_ring(&refs, p), &mut pick_matched, &mut deferred_pick)?;
++        let exit = match_pick(contour_start::pick_exit(&refs, p), &mut exit_matched, &mut deferred_exit)?;
++
++        let mut ring_notes = Vec::new();
++        let lad = ladder(&band.plan, part, bodies, remaining, ceiling, r, p.stock_to_leave, &mut ring_notes);
++        check_unread(&lad, remaining, p, &b)?;
++
++        let split = first_split(&band, &lad, remaining, part, bodies, p)?;
++        match split {
++            Some(0) if band_idx == 0 && !used_fallback => {
++                used_fallback = true;
++                let raw = whole_region_at(part, bodies, remaining[0] - p.stock_to_leave, remaining[0])?;
++                current_region = area_at(raw)?;
++            }
++            Some(0) => {
++                let msg = format!(
++                    "whole-model contour cannot cut Z {:.3} (Bottom Z {:.3}) without gouging ({})",
++                    remaining[0],
++                    p.bottom_z,
++                    ring_notes.join("; ")
++                );
++                let partial = b.finish();
++                return Err(if partial.moves.is_empty() {
++                    GenError::Invalid(msg)
++                } else {
++                    GenError::Invalid(msg).with_ghost(&partial)
++                });
++            }
++            Some(j) => {
++                let z_next = remaining[j];
++                let trimmed = trim_ladder(&lad, z_next);
++                if trimmed.zs.is_empty() {
++                    return Err(GenError::Invalid(format!(
++                        "whole-model contour produced no cut levels above Z {z_next:.3}"
++                    )));
++                }
++                forward_band_notes(&band, &lad, last_z, true, ring_notes, &mut lead_notes);
++                emit_band(&mut b, &band, p, &trimmed, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
++                walked.push(current_region.clone());
++                ceiling = trimmed.zs.last().copied().unwrap_or(remaining[j - 1]);
++                remaining = &remaining[j..];
++                used_fallback = true;
++                let raw = whole_region_at(part, bodies, remaining[0] - p.stock_to_leave, remaining[0])?;
++                current_region = match area_at(raw) {
++                    Ok(r) => r,
++                    Err(e) => {
++                        let msg = format!(
++                            "whole-model contour stopped at Z {ceiling:.3} (Bottom Z {:.3}): \
++                             no machinable region at Z {:.3} ({e})",
++                            p.bottom_z, remaining[0]
++                        );
++                        let partial = b.finish();
++                        return Err(if partial.moves.is_empty() {
++                            GenError::Invalid(msg)
++                        } else {
++                            GenError::Invalid(msg).with_ghost(&partial)
++                        });
++                    }
++                };
++            }
++            None => {
++                forward_band_notes(&band, &lad, last_z, false, ring_notes, &mut lead_notes);
++                emit_band(&mut b, &band, p, &lad, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
++                walked.push(current_region);
++                break;
++            }
++        }
++    }
++
++    if !pick_matched
++        && let Some(e) = deferred_pick
++    {
++        return Err(e);
++    }
++    if !exit_matched
++        && let Some(e) = deferred_exit
++    {
++        return Err(e);
++    }
++    let path = finish_contour(b, lead_notes, &tally, p)?;
++    Ok((path, walked))
++}
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 29860f4b6..6a75ff5db 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -55,6 +55,7 @@ mod contour_run_side;
+ mod contour_run_stock;
+ mod contour_start;
+ mod contour_step;
++mod contour_whole;
+ mod descent;
+ mod descent_dive;
+ mod descent_xy;
+@@ -117,6 +118,7 @@ pub use bore_core::{bore_core_gap, bore_floor_reach, bore_leaves_core, cutting_r
+ pub use chamfer::{chamfer, ChamferParams};
+ pub use circular::{circular, CircularParams};
+ pub use contour::{contour, contour_on_bodies, contour_on_part, contour_on_picked, ContourParams, Lead, Side};
++pub use contour_whole::{contour_whole_bodies, contour_whole_bodies_with};
+ pub use contour_auto::{auto_side, AutoSide, AUTO_BAND, AUTO_PROBE_DZ};
+ pub use contour_chain::contour_along_chain;
+ pub use contour_run_side::{contour_open_run, SectionAt};
+diff --git a/crates/motion/tests/contour_whole.rs b/crates/motion/tests/contour_whole.rs
+new file mode 100644
+index 000000000..36d4e49d3
+--- /dev/null
++++ b/crates/motion/tests/contour_whole.rs
+@@ -0,0 +1,244 @@
++//! Direct kernel pins for whole-model multi-band 2D Contour (#2436):
++//! two islands above a common base plate (no double cutting on the deeper
++//! island), a counterbore that narrows below Top Z, and fail-closed refusal
++//! when a deeper slice cannot be read.
++//!
++//! Provenance: our own extruded manifold test meshes; no vendor material.
++
++use camcraft_motion::cl::MoveKind;
++use camcraft_motion::geo2d::Region;
++use camcraft_motion::geometry::{Point3, Triangle, slice};
++use camcraft_motion::machining2d::{ContourParams, Lead, Side, contour_whole_bodies};
++use camcraft_motion::machining3d::Entry3D;
++use camcraft_motion::verify::{Mode, ToolGeom, VerifyContext, Warning, verify};
++
++fn quad(f: &mut Vec<Triangle>, a: Point3, b: Point3, c: Point3, d: Point3) {
++    f.push(Triangle::new(a, b, c));
++    f.push(Triangle::new(a, c, d));
++}
++
++fn cap_poly(f: &mut Vec<Triangle>, outer: &[(f64, f64)], inner: Option<&[(f64, f64)]>, z: f64, up: bool) {
++    let p = |q: (f64, f64)| Point3::new(q.0, q.1, z);
++    let mut push = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
++        if up {
++            f.push(Triangle::new(p(a), p(b), p(c)));
++        } else {
++            f.push(Triangle::new(p(a), p(c), p(b)));
++        }
++    };
++    match inner {
++        None => {
++            for k in 1..outer.len() - 1 {
++                push(outer[0], outer[k], outer[k + 1]);
++            }
++        }
++        Some(inn) => {
++            assert_eq!(outer.len(), inn.len());
++            for k in 0..outer.len() {
++                let n = (k + 1) % outer.len();
++                push(outer[k], outer[n], inn[n]);
++                push(outer[k], inn[n], inn[k]);
++            }
++        }
++    }
++}
++
++fn walls(f: &mut Vec<Triangle>, loop_xy: &[(f64, f64)], z0: f64, z1: f64, out: bool) {
++    for k in 0..loop_xy.len() {
++        let (a, b) = (loop_xy[k], loop_xy[(k + 1) % loop_xy.len()]);
++        let (p0, p1) = if out { (a, b) } else { (b, a) };
++        quad(
++            f,
++            Point3::new(p0.0, p0.1, z0),
++            Point3::new(p1.0, p1.1, z0),
++            Point3::new(p1.0, p1.1, z1),
++            Point3::new(p0.0, p0.1, z1),
++        );
++    }
++}
++
++fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> [(f64, f64); 4] {
++    [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
++}
++
++/// Plate `[-40..0] x [-20..20]` z `[0..10]` topped by Island A `[-30..-10] x [-10..10]`
++/// z `[10..15]`, beside standalone Island B `[20..40] x [-10..10]` z `[0..15]`.
++fn two_islands_part() -> Vec<Triangle> {
++    let mut f = Vec::new();
++    let plate = rect(-40.0, -20.0, 0.0, 20.0);
++    let boss_a = rect(-30.0, -10.0, -10.0, 10.0);
++    let boss_b = rect(20.0, -10.0, 40.0, 10.0);
++    cap_poly(&mut f, &plate, None, 0.0, false);
++    walls(&mut f, &plate, 0.0, 10.0, true);
++    cap_poly(&mut f, &plate, Some(&boss_a), 10.0, true);
++    walls(&mut f, &boss_a, 10.0, 15.0, true);
++    cap_poly(&mut f, &boss_a, None, 15.0, true);
++    cap_poly(&mut f, &boss_b, None, 0.0, false);
++    walls(&mut f, &boss_b, 0.0, 15.0, true);
++    cap_poly(&mut f, &boss_b, None, 15.0, true);
++    f
++}
++
++/// Outer `[-40..40]^2` block z `[0..20]` with counterbore: `[-15..15]^2` z `[10..20]`
++/// narrowing to `[-10..10]^2` z `[0..10]`.
++fn counterbore_part() -> Vec<Triangle> {
++    let mut f = Vec::new();
++    let outer = rect(-40.0, -40.0, 40.0, 40.0);
++    let upper = rect(-15.0, -15.0, 15.0, 15.0);
++    let lower = rect(-10.0, -10.0, 10.0, 10.0);
++    walls(&mut f, &outer, 0.0, 20.0, true);
++    cap_poly(&mut f, &outer, Some(&upper), 20.0, true);
++    walls(&mut f, &upper, 10.0, 20.0, false);
++    cap_poly(&mut f, &upper, Some(&lower), 10.0, true);
++    walls(&mut f, &lower, 0.0, 10.0, false);
++    cap_poly(&mut f, &outer, Some(&lower), 0.0, false);
++    f
++}
++
++fn params(top: f64, bottom: f64, stepdown: f64) -> ContourParams {
++    ContourParams {
++        tool_diameter: 6.0,
++        stock_to_leave: 0.0,
++        clearance_z: top + 10.0,
++        retract_z: top + 5.0,
++        top_z: top,
++        bottom_z: bottom,
++        stepdown,
++        feed: 1000.0,
++        plunge_feed: 300.0,
++        climb: true,
++        side: Side::Auto,
++        lead: Lead::None,
++        tolerance: 0.01,
++        tab_count: 0,
++        tab_width: 5.0,
++        tab_height: 1.0,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        blend_turns: false,
++        links: camcraft_motion::links::Links::PLANAR,
++    }
++}
++
++fn depth_verify(path: &camcraft_motion::cl::Toolpath, region: &Region, f: &[Triangle], top: f64) -> Vec<Warning> {
++    let tool = ToolGeom {
++        radius: 3.0,
++        nose_radius: 0.0,
++        flute_len: 30.0,
++        shank_radius: 3.0,
++        shank_len: 40.0,
++        holder_radius: 20.0,
++        holder_len: 60.0,
++    };
++    verify(
++        path,
++        &VerifyContext {
++            region,
++            stock: None,
++            model: Some(f),
++            tool: &tool,
++            cutter: None,
++            mode: Mode::Boundary,
++            stock_top_z: top,
++            clearance_z: top + 10.0,
++            stock_to_leave: 0.0,
++            gouge_tol: 0.01,
++            z_tol: 1e-6,
++            finish_tol: None,
++            fixtures: &[],
++            spindle: None,
++            ..Default::default()
++        },
++    )
++}
++
++#[test]
++fn two_islands_above_a_plate_continue_without_double_cutting_the_deeper_island() {
++    let f = two_islands_part();
++    let top_reg = slice::slice(&f, 15.0 - 1e-3).expect("top slice");
++    let path = contour_whole_bodies(&top_reg, &f, &[], &params(15.0, 0.0, 2.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    assert_eq!(depth_verify(&path, &top_reg, &f, 15.0), Vec::new(), "{:?}", path.notes);
++
++    // Every level 13, 11, 9, 7, 5, 3, 1, 0 must walk Island B (x > 10) exactly once.
++    for z in [13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0, 0.0] {
++        let len_b: f64 = path
++            .moves
++            .iter()
++            .filter(|m| {
++                m.kind == MoveKind::Feed
++                    && (m.from.z - z).abs() < 1e-6
++                    && (m.to.z - z).abs() < 1e-6
++                    && m.from.x > 10.0
++                    && m.to.x > 10.0
++            })
++            .map(|m| (m.to.x - m.from.x).hypot(m.to.y - m.from.y))
++            .sum();
++        // Offset 20x20 square with r=3 round corners is 4*20 + 4*3*sqrt(2) ~= 97 mm (never 2x).
++        assert!(
++            (94.0..=102.0).contains(&len_b),
++            "z {z}: expected one lap around B (~97 mm), got {len_b:.3}"
++        );
++    }
++    // Lower levels must trace the [-40..0] x [-20..20] plate (x around -43).
++    assert!(
++        path.moves.iter().any(|m| m.kind == MoveKind::Feed && m.to.z < 1e-6 && m.to.x < -42.5),
++        "must finish plate down to Z 0"
++    );
++}
++
++#[test]
++fn counterbore_narrowing_below_top_z_walks_both_upper_and_lower_bores() {
++    let f = counterbore_part();
++    let top_reg = slice::slice(&f, 20.0 - 1e-3).expect("top slice");
++    let path = contour_whole_bodies(&top_reg, &f, &[], &params(20.0, 0.0, 4.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    assert_eq!(depth_verify(&path, &top_reg, &f, 20.0), Vec::new(), "{:?}", path.notes);
++
++    let bore_at = |z: f64| -> Option<f64> {
++        path.moves
++            .iter()
++            .filter(|m| {
++                m.kind == MoveKind::Feed
++                    && (m.from.z - z).abs() < 1e-6
++                    && (m.to.z - z).abs() < 1e-6
++                    && m.to.x.abs() < 20.0
++                    && m.to.y.abs() < 20.0
++            })
++            .map(|m| m.to.x.abs().max(m.to.y.abs()))
++            .reduce(f64::max)
++    };
++    assert!((bore_at(12.0).expect("upper bore") - 12.0).abs() < 0.05);
++    assert!((bore_at(8.0).expect("lower bore") - 7.0).abs() < 0.05);
++    assert!((bore_at(0.0).expect("lower bore bottom") - 7.0).abs() < 0.05);
++}
++
++#[test]
++fn broken_lower_plane_refuses_rather_than_stopping_silently() {
++    let mut f = two_islands_part();
++    // Dangling sliver at z [2, 6] breaks slicing inside band 1 without touching band 0.
++    f.push(Triangle::new(Point3::new(0.0, 0.0, 2.0), Point3::new(10.0, 0.0, 2.0), Point3::new(5.0, 5.0, 6.0)));
++    let top_reg = slice::slice(&f, 15.0 - 1e-3).expect("top slice");
++    let err = contour_whole_bodies(&top_reg, &f, &[], &params(15.0, 0.0, 4.0))
++        .expect_err("must refuse broken lower plane")
++        .to_string();
++    assert!(err.contains("3.000") || err.contains("7.000"), "{err}");
++}
++
++#[test]
++fn broken_vertical_sliver_between_levels_refuses_via_check_unread() {
++    // A vertical open triangle strictly between cut levels 13 and 11 (z 11.8..12.2):
++    // material_overhead_of(11) ignores vertical walls and clean planes, so only
++    // ladder's intermediate vertex flank check + check_unread catches it.
++    let mut f = two_islands_part();
++    f.push(Triangle::new(
++        Point3::new(0.0, 0.0, 11.8),
++        Point3::new(2.0, 0.0, 11.8),
++        Point3::new(1.0, 0.0, 12.2),
++    ));
++    let top_reg = slice::slice(&f, 15.0 - 1e-3).expect("top slice");
++    let err = contour_whole_bodies(&top_reg, &f, &[], &params(15.0, 0.0, 2.0))
++        .expect_err("must refuse unread intermediate vertex flank")
++        .to_string();
++    assert!(err.contains("11.000") && err.contains("cannot section deeper"), "{err}");
++}
+diff --git a/docs/decisions/2436-whole-model-contour-steps.md b/docs/decisions/2436-whole-model-contour-steps.md
+new file mode 100644
+index 000000000..be092f2ab
+--- /dev/null
++++ b/docs/decisions/2436-whole-model-contour-steps.md
+@@ -0,0 +1,26 @@
++## #2436 - Whole-model 2D Contour continues across Z-varying outlines
++
++**What was decided**
++
++- Split the single-band body of `crates/motion/src/machining2d/contour.rs` into shared helpers (`PreparedBand`, `prepare_band`, `emit_band`, `finish_contour`) and added multi-band continuation in `crates/motion/src/machining2d/contour_whole.rs` (`contour_whole_bodies`, `contour_whole_bodies_with`).
++- When a solid-body whole-model `OpParams::Contour` (`SrcRef::Entity`, `!contour_open`, `Side::Outside`) runs, `crates/app/src/operation/generate.rs` retains the boundary-control context in `whole_contour_area`, walks each band with `contour_whole_bodies_with`, and unions `contour_reach` across all walked bands for `carry_need!`.
++- Whenever `contour_depth::ladder` stops an outer loop before `Bottom Z` — or stops an inner loop above a level whose section opens an additional hole (such as a counterbore narrowing below `Top Z`) — `contour_whole` trims the upper band with `trim_ladder`, slices the part's overhead silhouette at the next remaining Z (`material_overhead_of` via `whole_region_at`), re-applies `area_at`, and continues downward.
++- Any unsliceable Z band (`check_unread` on `Ladder::unread`) or unmachinable continuation band refuses with `GenError::Model` / `GenError::Invalid` (carrying the partial toolpath as a ghost when moves were emitted), naming the stopped Z level and `Bottom Z`, instead of emitting a partial toolpath silently.
++- Updated `crates/app/tests/real_tip_contour.rs` via `boss_top` so those boss-fillet tests select the boss top face (`SrcRef::Selection`) instead of the whole `part` entity.
++
++**Why**
++
++- Whole-model `2D Contour` previously sectioned the part once at `Top Z`, then let `ladder` drop any loop whose downward path hit a chamfered skirt, shoulder, or closed slot floor, finishing as `OpStatus::Ok` with missing deeper passes and missing tabs.
++- Slicing the overhead silhouette at each new band boundary preserves the part's cumulative overhang shadow from `z` upward, so deeper bands clear wider upper bosses without gouging while following the newly exposed outer (or narrower bore) profile down to `Bottom Z` with tabs intact.
++- Keeping explicit face/edge selections on single-band `contour_on_part` / `contour_on_bodies` preserves the rule that a user-selected contour walks only its picked rings.
++- Scoping `real_tip_contour.rs` to `boss_top` matches the test fixture's intent (testing the boss fillet tip contact) now that whole-model `SrcRef::Entity` intentionally continues around the lower plate past the boss foot.
++
++**What was considered and dropped**
++
++- **Refusing stopped whole-model contours without continuing lower bands**: simple, but fails whenever a user selects the whole part (`SrcRef::Entity`) on chamfered bosses, stepped islands, or open-ended slots whose floors appear at an intermediate Z.
++- **Unifying band `Region`s before calling `contour_reach`**: produces the wrong `carry_need!` region when stock is fitted around both an upper island and a lower plate, because the plate's reach sits outside stock while the upper island's reach sits inside stock; unioning per-band `contour_reach` results avoids this.
++- **Replacing the whole `VerifyContext.region` with the bottom plate**: would fail upper-band reach and tangency checks against the upper island footprint, whereas `top_region <= R(z)` keeps `top_region` valid across downward-growing footprints.
++
++**What it would cost to change later**
++
++- Moderate and localized to `contour_whole.rs` and the single call site in `crates/app/src/operation/generate.rs`; explicit selection paths, `Side::Inside`, and flat/uniform contours share `PreparedBand`/`emit_band` and are unaffected.
+
+From c6b66a532386a9c6e7d29391d44e39f0e1621977 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Wed, 18 Nov 2026 01:32:51 -0800
+Subject: [PATCH 2/4] fix(2d): inspect every stopped-hole contour level
+
+---
+ .../motion/src/machining2d/contour_whole.rs   | 20 +++----
+ crates/motion/tests/contour_whole.rs          | 52 +++++++++++++++++++
+ .../2436-whole-model-contour-steps.md         |  2 +
+ 3 files changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/crates/motion/src/machining2d/contour_whole.rs b/crates/motion/src/machining2d/contour_whole.rs
+index 5bf99f321..94e6ecb81 100644
+--- a/crates/motion/src/machining2d/contour_whole.rs
++++ b/crates/motion/src/machining2d/contour_whole.rs
+@@ -107,16 +107,17 @@ fn first_split(
+         .filter_map(|(li, _)| remaining.iter().position(|z| !lad.walks(li, *z)))
+         .min();
+     let limit = outer_stop.unwrap_or(remaining.len());
+-    let hole_first_stop = band
++    let mut hole_stops: Vec<usize> = band
+         .loops
+         .iter()
+         .enumerate()
+         .filter(|(_, l)| has_outer && !l.is_ccw())
+         .filter_map(|(li, _)| remaining[..limit].iter().position(|z| !lad.walks(li, *z)))
+-        .min();
+-    let hole_stop = if let Some(k) = hole_first_stop
+-        && k > 0
+-    {
++        .collect();
++    hole_stops.sort_unstable();
++    hole_stops.dedup();
++    let mut hole_stop = None;
++    for k in hole_stops {
+         let z_k = remaining[k];
+         let active_holes = band
+             .loops
+@@ -127,10 +128,11 @@ fn first_split(
+         let next = whole_region_at(part, bodies, z_k - p.stock_to_leave, z_k)?;
+         let d = p.tool_diameter * 0.5 + p.stock_to_leave;
+         let next_holes = next.offset(d)?.loops().iter().filter(|l| !l.is_ccw()).count();
+-        (next_holes > active_holes).then_some(k)
+-    } else {
+-        None
+-    };
++        if next_holes > active_holes {
++            hole_stop = Some(k);
++            break;
++        }
++    }
+     Ok(match (outer_stop, hole_stop) {
+         (Some(a), Some(b)) => Some(a.min(b)),
+         (a, b) => a.or(b),
+diff --git a/crates/motion/tests/contour_whole.rs b/crates/motion/tests/contour_whole.rs
+index 36d4e49d3..8af4ccc82 100644
+--- a/crates/motion/tests/contour_whole.rs
++++ b/crates/motion/tests/contour_whole.rs
+@@ -213,6 +213,58 @@ fn counterbore_narrowing_below_top_z_walks_both_upper_and_lower_bores() {
+     assert!((bore_at(0.0).expect("lower bore bottom") - 7.0).abs() < 0.05);
+ }
+ 
++fn assert_counterbore_at(path: &camcraft_motion::cl::Toolpath, z: f64, extent: f64) {
++    let mut length = 0.0;
++    for m in &path.moves {
++        if m.kind != MoveKind::Feed
++            || (m.from.z - z).abs() > 1e-6
++            || (m.to.z - z).abs() > 1e-6
++            || m.from.x.abs().max(m.from.y.abs()) >= 20.0
++            || m.to.x.abs().max(m.to.y.abs()) >= 20.0
++        {
++            continue;
++        }
++        assert!((m.to.x.abs().max(m.to.y.abs()) - extent).abs() < 0.05, "bore envelope at Z {z}: {m:?}");
++        length += (m.to.x - m.from.x).hypot(m.to.y - m.from.y);
++    }
++    assert!((length - 8.0 * extent).abs() < 0.1, "Z {z}: expected one complete bore lap, got {length}");
++}
++
++#[test]
++fn counterbore_changing_before_first_cut_level_keeps_lower_bore() {
++    let f = counterbore_part();
++    let top_reg = slice::slice(&f, 20.0 - 1e-3).expect("top slice");
++    let path = contour_whole_bodies(&top_reg, &f, &[], &params(20.0, 0.0, 12.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    for z in [8.0, 0.0] {
++        assert_counterbore_at(&path, z, 7.0);
++    }
++    assert_eq!(depth_verify(&path, &top_reg, &f, 20.0), Vec::new(), "{:?}", path.notes);
++}
++
++#[test]
++fn earlier_blind_hole_stop_does_not_hide_later_counterbore_change() {
++    let mut f = counterbore_part();
++    let first_end = f.len();
++    // A separate block with a blind bore that ends at Z 14, before the
++    // counterbore shoulder at Z 10. Its first missing cut level is Z 12.
++    let outer = rect(60.0, -30.0, 120.0, 30.0);
++    let hole = rect(80.0, -10.0, 100.0, 10.0);
++    cap_poly(&mut f, &outer, None, 0.0, false);
++    walls(&mut f, &outer, 0.0, 20.0, true);
++    cap_poly(&mut f, &outer, Some(&hole), 20.0, true);
++    walls(&mut f, &hole, 14.0, 20.0, false);
++    cap_poly(&mut f, &hole, None, 14.0, true);
++    let bodies = [0..first_end, first_end..f.len()];
++    let top_reg = slice::slice(&f, 20.0 - 1e-3).expect("top slice");
++    let path = contour_whole_bodies(&top_reg, &f, &bodies, &params(20.0, 0.0, 4.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    for (z, extent) in [(16.0, 12.0), (12.0, 12.0), (8.0, 7.0), (4.0, 7.0), (0.0, 7.0)] {
++        assert_counterbore_at(&path, z, extent);
++    }
++    assert_eq!(depth_verify(&path, &top_reg, &f, 20.0), Vec::new(), "{:?}", path.notes);
++}
++
+ #[test]
+ fn broken_lower_plane_refuses_rather_than_stopping_silently() {
+     let mut f = two_islands_part();
+diff --git a/docs/decisions/2436-whole-model-contour-steps.md b/docs/decisions/2436-whole-model-contour-steps.md
+index be092f2ab..bcb73e2a9 100644
+--- a/docs/decisions/2436-whole-model-contour-steps.md
++++ b/docs/decisions/2436-whole-model-contour-steps.md
+@@ -8,6 +8,8 @@
+ - Any unsliceable Z band (`check_unread` on `Ladder::unread`) or unmachinable continuation band refuses with `GenError::Model` / `GenError::Invalid` (carrying the partial toolpath as a ghost when moves were emitted), naming the stopped Z level and `Bottom Z`, instead of emitting a partial toolpath silently.
+ - Updated `crates/app/tests/real_tip_contour.rs` via `boss_top` so those boss-fillet tests select the boss top face (`SrcRef::Selection`) instead of the whole `part` entity.
+ 
++- Review correction: inspect the sorted, deduplicated hole-stop levels before the outer stop, including index zero. An earlier blind-hole floor must not hide a later counterbore change; checking only the first stop was dropped because it silently omitted valid lower bore passes. This remains localized to the split search.
++
+ **Why**
+ 
+ - Whole-model `2D Contour` previously sectioned the part once at `Top Z`, then let `ladder` drop any loop whose downward path hit a chamfered skirt, shoulder, or closed slot floor, finishing as `OpStatus::Ok` with missing deeper passes and missing tabs.
+
+From ceac40dd977f9b5fccae5ed31080b2629a501cca Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 18 Nov 2026 13:39:46 +0100
+Subject: [PATCH 3/4] fix(2d): keep the floor passes of the first band when the
+ split is at its first level
+
+When the first band of a whole-model 2D Contour splits at index 0, a ring
+can still have a floor pass above the first flat level (#2004 floor
+search). The fallback re-sliced the region and dropped that pass and its
+ring notes, so the wall above was left uncut with no note.
+
+The band-0 split now trims the ladder at the first level, like the
+Some(j) arm: it emits the trimmed band, forwards the notes, records the
+region and sets the ceiling before the re-slice.
+
+Pins: large_stepdown_keeps_the_upper_island_floor_pass_before_the_plate,
+counterbore_changing_before_first_cut_level_keeps_lower_bore (Z 10 lap).
+
+Refs #2436
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../motion/src/machining2d/contour_whole.rs   | 10 ++++++
+ crates/motion/tests/contour_whole.rs          | 34 +++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/crates/motion/src/machining2d/contour_whole.rs b/crates/motion/src/machining2d/contour_whole.rs
+index 94e6ecb81..08c74fe42 100644
+--- a/crates/motion/src/machining2d/contour_whole.rs
++++ b/crates/motion/src/machining2d/contour_whole.rs
+@@ -256,6 +256,16 @@ pub fn contour_whole_bodies_with(
+         let split = first_split(&band, &lad, remaining, part, bodies, p)?;
+         match split {
+             Some(0) if band_idx == 0 && !used_fallback => {
++                // A ring of the top band can still have floor passes above the
++                // first flat level (#2004 floor search): cut them before the
++                // re-slice, or that wall is silently left uncut.
++                let trimmed = trim_ladder(&lad, remaining[0]);
++                if !trimmed.zs.is_empty() {
++                    forward_band_notes(&band, &lad, last_z, true, ring_notes, &mut lead_notes);
++                    emit_band(&mut b, &band, p, &trimmed, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
++                    walked.push(current_region.clone());
++                    ceiling = trimmed.zs.last().copied().unwrap_or(ceiling);
++                }
+                 used_fallback = true;
+                 let raw = whole_region_at(part, bodies, remaining[0] - p.stock_to_leave, remaining[0])?;
+                 current_region = area_at(raw)?;
+diff --git a/crates/motion/tests/contour_whole.rs b/crates/motion/tests/contour_whole.rs
+index 8af4ccc82..40faa456f 100644
+--- a/crates/motion/tests/contour_whole.rs
++++ b/crates/motion/tests/contour_whole.rs
+@@ -3,6 +3,8 @@
+ //! island), a counterbore that narrows below Top Z, and fail-closed refusal
+ //! when a deeper slice cannot be read.
+ //!
++//! Gate map: covers camcraft_motion::machining2d (contour_whole, contour_depth).
++//!
+ //! Provenance: our own extruded manifold test meshes; no vendor material.
+ 
+ use camcraft_motion::cl::MoveKind;
+@@ -236,12 +238,44 @@ fn counterbore_changing_before_first_cut_level_keeps_lower_bore() {
+     let top_reg = slice::slice(&f, 20.0 - 1e-3).expect("top slice");
+     let path = contour_whole_bodies(&top_reg, &f, &[], &params(20.0, 0.0, 12.0)).expect("whole contour");
+     assert!(path.all_finite() && path.is_chained());
++    // The upper bore wall (Z 10..20) gets its floor pass at Z 10 before the
++    // band splits at the first flat level; it must not be dropped.
++    assert_counterbore_at(&path, 10.0, 12.0);
+     for z in [8.0, 0.0] {
+         assert_counterbore_at(&path, z, 7.0);
+     }
+     assert_eq!(depth_verify(&path, &top_reg, &f, 20.0), Vec::new(), "{:?}", path.notes);
+ }
+ 
++#[test]
++fn large_stepdown_keeps_the_upper_island_floor_pass_before_the_plate() {
++    let f = two_islands_part();
++    let top_reg = slice::slice(&f, 15.0 - 1e-3).expect("top slice");
++    // Flat levels are Z 3 and Z 0: Island A (Z 10..15) is not legal at Z 3, so
++    // its only pass is the floor pass at Z 10, before the plate band.
++    let path = contour_whole_bodies(&top_reg, &f, &[], &params(15.0, 0.0, 12.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    assert_eq!(depth_verify(&path, &top_reg, &f, 15.0), Vec::new(), "{:?}", path.notes);
++    let len_a: f64 = path
++        .moves
++        .iter()
++        .filter(|m| {
++            m.kind == MoveKind::Feed
++                && (m.from.z - 10.0).abs() < 1e-6
++                && (m.to.z - 10.0).abs() < 1e-6
++                && m.from.x < -5.0
++                && m.to.x < -5.0
++        })
++        .map(|m| (m.to.x - m.from.x).hypot(m.to.y - m.from.y))
++        .sum();
++    // Offset 20x20 square with r=3 round corners is 4*20 + 2*pi*3 ~= 98.8 mm.
++    assert!((94.0..=102.0).contains(&len_a), "expected one lap around Island A at Z 10, got {len_a:.3}");
++    assert!(
++        path.moves.iter().any(|m| m.kind == MoveKind::Feed && m.to.z < 1e-6 && m.to.x < -42.5),
++        "must finish plate down to Z 0"
++    );
++}
++
+ #[test]
+ fn earlier_blind_hole_stop_does_not_hide_later_counterbore_change() {
+     let mut f = counterbore_part();
+
+From 3dd8e343820c1ead96d84f1d259ef1426b321748 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 18 Nov 2026 14:05:17 +0100
+Subject: [PATCH 4/4] fix(motion): cut the floor of a middle outline that has
+ no flat level
+
+A whole-model contour band skipped an outline whose Z range held no
+flat level (a middle step between two cut levels). That wall was never
+cut and the result was Ok with no note.
+
+When the outline just under the band ceiling differs from the outline at
+the next flat level, the band loop now runs an intermediate band with its
+own floor pass at that outline. If the intermediate band has no floor
+level, the result carries a visible note that names the uncut Z range.
+A loop that stops with levels left now returns an error, not a silent Ok.
+
+The slice helpers move to contour_whole_slice.rs to keep the file short.
+The app test gets its Gate map line and the lap-length comments agree.
+
+Pinned by middle_step_without_a_flat_level_gets_its_floor_pass.
+
+Refs #2436
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/contour_whole_step.rs        |  3 +
+ .../motion/src/machining2d/contour_whole.rs   | 99 +++++++++----------
+ .../src/machining2d/contour_whole_slice.rs    | 74 ++++++++++++++
+ crates/motion/src/machining2d/mod.rs          |  1 +
+ crates/motion/tests/contour_whole.rs          | 51 +++++++++-
+ 5 files changed, 173 insertions(+), 55 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/contour_whole_slice.rs
+
+diff --git a/crates/app/tests/contour_whole_step.rs b/crates/app/tests/contour_whole_step.rs
+index d94711365..284e4eb31 100644
+--- a/crates/app/tests/contour_whole_step.rs
++++ b/crates/app/tests/contour_whole_step.rs
+@@ -4,6 +4,9 @@
+ //! using each level's part outline with tabs written, or refuse by name
+ //! with the stopped level rather than dropping lower levels silently.
+ //!
++//! Gate map (#2436): covers app::operation (generate, 2D Contour whole model),
++//! app::commands (GenerateOperation), app::posting.
++//!
+ //! Provenance: our own grid-matched watertight mesh of a stepped and
+ //! slotted flange; no vendor material consulted.
+ 
+diff --git a/crates/motion/src/machining2d/contour_whole.rs b/crates/motion/src/machining2d/contour_whole.rs
+index 08c74fe42..ea938a8fd 100644
+--- a/crates/motion/src/machining2d/contour_whole.rs
++++ b/crates/motion/src/machining2d/contour_whole.rs
+@@ -13,7 +13,6 @@ use std::ops::Range;
+ 
+ use crate::cl::{PathBuilder, Toolpath};
+ use crate::geo2d::{Point2, Region};
+-use crate::geometry::slice::{SliceError, material_overhead_of};
+ use crate::geometry::{Point3, Triangle};
+ 
+ use super::contour::{PreparedBand, emit_band, finish_contour, prepare_band};
+@@ -23,35 +22,11 @@ use super::contour_entry::say;
+ use super::contour_params::{ContourParams, Side};
+ use super::contour_start;
+ use super::contour_step::Said;
++use super::contour_whole_slice::{next_region, whole_region_at};
+ use super::face::GenError;
+ use super::fillet_tally::FilletTally;
+ 
+ const SAME_LEVEL: f64 = 1e-6;
+-const SLICE_NUDGE: f64 = 1e-3;
+-
+-fn from_slice(e: SliceError) -> GenError {
+-    match e {
+-        SliceError::Geo(g) => GenError::Geo(g),
+-        e @ (SliceError::Open { .. } | SliceError::NonManifold { .. }) => GenError::Model(e.to_string()),
+-        other => GenError::Invalid(other.to_string()),
+-    }
+-}
+-
+-/// All part material at or above `probe_z` (section strictly above plus shadow
+-/// of overhanging down-facing walls), nudged inside `cut_z` when `probe_z` sits
+-/// at the top of the model.
+-fn whole_region_at(
+-    part: &[Triangle],
+-    bodies: &[Range<usize>],
+-    probe_z: f64,
+-    cut_z: f64,
+-) -> Result<Region, GenError> {
+-    let r = material_overhead_of(part, bodies, probe_z).map_err(from_slice)?;
+-    if !r.is_empty() {
+-        return Ok(r);
+-    }
+-    material_overhead_of(part, bodies, cut_z - SLICE_NUDGE).map_err(from_slice)
+-}
+ 
+ fn check_unread(
+     lad: &Ladder,
+@@ -170,6 +145,15 @@ fn forward_band_notes(
+     }
+ }
+ 
++fn stopped(msg: String, b: PathBuilder) -> GenError {
++    let partial = b.finish();
++    if partial.moves.is_empty() {
++        GenError::Invalid(msg)
++    } else {
++        GenError::Invalid(msg).with_ghost(&partial)
++    }
++}
++
+ fn match_pick(
+     res: Result<Option<(usize, Point2)>, GenError>,
+     matched: &mut bool,
+@@ -239,10 +223,10 @@ pub fn contour_whole_bodies_with(
+     let mut deferred_pick = None;
+     let mut deferred_exit = None;
+ 
+-    for band_idx in 0..=flat.len() {
+-        if remaining.is_empty() {
+-            break;
+-        }
++    let mut mid = false;
++    let max_bands = flat.len().saturating_mul(2).saturating_add(part.len().saturating_mul(3)).saturating_add(2);
++    let mut band_idx = 0usize;
++    while !remaining.is_empty() && band_idx <= max_bands {
+         let last_z = remaining[remaining.len() - 1];
+         let band = prepare_band(&current_region, p)?;
+         let refs: Vec<&crate::geo2d::Loop> = band.loops.iter().collect();
+@@ -253,21 +237,33 @@ pub fn contour_whole_bodies_with(
+         let lad = ladder(&band.plan, part, bodies, remaining, ceiling, r, p.stock_to_leave, &mut ring_notes);
+         check_unread(&lad, remaining, p, &b)?;
+ 
+-        let split = first_split(&band, &lad, remaining, part, bodies, p)?;
++        // An intermediate band (the outline changed between the last cut level
++        // and the next flat level) cuts only its floor passes above that level.
++        let split = if mid { Some(0) } else { first_split(&band, &lad, remaining, part, bodies, p)? };
+         match split {
+-            Some(0) if band_idx == 0 && !used_fallback => {
+-                // A ring of the top band can still have floor passes above the
+-                // first flat level (#2004 floor search): cut them before the
+-                // re-slice, or that wall is silently left uncut.
++            Some(0) if mid || (band_idx == 0 && !used_fallback) => {
++                // A ring can still have floor passes above the next flat level
++                // (#2004 floor search): cut them before the re-slice, or that
++                // wall is silently left uncut.
+                 let trimmed = trim_ladder(&lad, remaining[0]);
+-                if !trimmed.zs.is_empty() {
++                let emitted = trimmed.zs.last().is_some_and(|&z| z < ceiling - SAME_LEVEL);
++                if emitted {
+                     forward_band_notes(&band, &lad, last_z, true, ring_notes, &mut lead_notes);
+                     emit_band(&mut b, &band, p, &trimmed, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
+                     walked.push(current_region.clone());
+                     ceiling = trimmed.zs.last().copied().unwrap_or(ceiling);
++                } else if mid {
++                    say(
++                        &mut lead_notes,
++                        format!(
++                            "whole-model contour: the outline changes between Z {:.3} and Z {:.3} but has                              no floor level there - that wall is not cut; reduce the stepdown",
++                            remaining[0], ceiling
++                        ),
++                    );
+                 }
+                 used_fallback = true;
+-                let raw = whole_region_at(part, bodies, remaining[0] - p.stock_to_leave, remaining[0])?;
++                let (raw, next_mid) = next_region(part, bodies, p, ceiling, remaining[0], emitted)?;
++                mid = next_mid;
+                 current_region = area_at(raw)?;
+             }
+             Some(0) => {
+@@ -277,12 +273,7 @@ pub fn contour_whole_bodies_with(
+                     p.bottom_z,
+                     ring_notes.join("; ")
+                 );
+-                let partial = b.finish();
+-                return Err(if partial.moves.is_empty() {
+-                    GenError::Invalid(msg)
+-                } else {
+-                    GenError::Invalid(msg).with_ghost(&partial)
+-                });
++                return Err(stopped(msg, b));
+             }
+             Some(j) => {
+                 let z_next = remaining[j];
+@@ -298,21 +289,16 @@ pub fn contour_whole_bodies_with(
+                 ceiling = trimmed.zs.last().copied().unwrap_or(remaining[j - 1]);
+                 remaining = &remaining[j..];
+                 used_fallback = true;
+-                let raw = whole_region_at(part, bodies, remaining[0] - p.stock_to_leave, remaining[0])?;
++                let (raw, next_mid) = next_region(part, bodies, p, ceiling, remaining[0], true)?;
++                mid = next_mid;
+                 current_region = match area_at(raw) {
+                     Ok(r) => r,
+                     Err(e) => {
+                         let msg = format!(
+-                            "whole-model contour stopped at Z {ceiling:.3} (Bottom Z {:.3}): \
+-                             no machinable region at Z {:.3} ({e})",
++                            "whole-model contour stopped at Z {ceiling:.3} (Bottom Z {:.3}):                              no machinable region at Z {:.3} ({e})",
+                             p.bottom_z, remaining[0]
+                         );
+-                        let partial = b.finish();
+-                        return Err(if partial.moves.is_empty() {
+-                            GenError::Invalid(msg)
+-                        } else {
+-                            GenError::Invalid(msg).with_ghost(&partial)
+-                        });
++                        return Err(stopped(msg, b));
+                     }
+                 };
+             }
+@@ -320,9 +306,18 @@ pub fn contour_whole_bodies_with(
+                 forward_band_notes(&band, &lad, last_z, false, ring_notes, &mut lead_notes);
+                 emit_band(&mut b, &band, p, &lad, pick, exit, &mut said, &mut lead_notes, &mut tally)?;
+                 walked.push(current_region);
++                remaining = &[];
+                 break;
+             }
+         }
++        band_idx += 1;
++    }
++    if let Some(z) = remaining.first() {
++        let msg = format!(
++            "whole-model contour stopped at Z {ceiling:.3} (Bottom Z {:.3}): too many outline changes above Z {z:.3}",
++            p.bottom_z
++        );
++        return Err(stopped(msg, b));
+     }
+ 
+     if !pick_matched
+diff --git a/crates/motion/src/machining2d/contour_whole_slice.rs b/crates/motion/src/machining2d/contour_whole_slice.rs
+new file mode 100644
+index 000000000..1e7c1ef09
+--- /dev/null
++++ b/crates/motion/src/machining2d/contour_whole_slice.rs
+@@ -0,0 +1,74 @@
++//! Overhead-outline slicing for the whole-model 2D contour (#2436): the
++//! region of all part material above a level, and the check for an outline
++//! that changes between the last cut level and the next flat level (a step
++//! shorter than the stepdown). Provenance: 2.5D Z-level cross-section +
++//! downward shadow union and polygon symmetric difference from textbook
++//! computational geometry; no vendor material consulted.
++
++use std::ops::Range;
++
++use crate::geo2d::Region;
++use crate::geometry::Triangle;
++use crate::geometry::slice::{SliceError, material_overhead_of};
++
++use super::contour_params::ContourParams;
++use super::face::GenError;
++
++const SAME_LEVEL: f64 = 1e-6;
++const SLICE_NUDGE: f64 = 1e-3;
++/// Symmetric-difference area (mm^2) under which two outlines are the same.
++const SAME_OUTLINE_AREA: f64 = 1e-2;
++
++fn from_slice(e: SliceError) -> GenError {
++    match e {
++        SliceError::Geo(g) => GenError::Geo(g),
++        e @ (SliceError::Open { .. } | SliceError::NonManifold { .. }) => GenError::Model(e.to_string()),
++        other => GenError::Invalid(other.to_string()),
++    }
++}
++
++/// All part material at or above `probe_z` (section strictly above plus shadow
++/// of overhanging down-facing walls), nudged inside `cut_z` when `probe_z` sits
++/// at the top of the model.
++pub(super) fn whole_region_at(
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    probe_z: f64,
++    cut_z: f64,
++) -> Result<Region, GenError> {
++    let r = material_overhead_of(part, bodies, probe_z).map_err(from_slice)?;
++    if !r.is_empty() {
++        return Ok(r);
++    }
++    material_overhead_of(part, bodies, cut_z - SLICE_NUDGE).map_err(from_slice)
++}
++
++fn outline_changes(a: &Region, b: &Region) -> Result<bool, GenError> {
++    let d = a.difference(b)?.area().abs() + b.difference(a)?.area().abs();
++    Ok(d > SAME_OUTLINE_AREA)
++}
++
++/// The next region to cut after a band, and whether it is an intermediate
++/// band. When the band emitted passes down to `ceiling` and the outline just
++/// under `ceiling` differs from the outline at the next flat level `z_next`,
++/// a step lies between them with no flat level in it: the outline just under
++/// `ceiling` is returned so that its floor pass is cut first (`true`).
++/// Otherwise the outline at `z_next` (`false`).
++pub(super) fn next_region(
++    part: &[Triangle],
++    bodies: &[Range<usize>],
++    p: &ContourParams,
++    ceiling: f64,
++    z_next: f64,
++    emitted: bool,
++) -> Result<(Region, bool), GenError> {
++    let lower = whole_region_at(part, bodies, z_next - p.stock_to_leave, z_next)?;
++    if !emitted || ceiling <= z_next + SAME_LEVEL {
++        return Ok((lower, false));
++    }
++    let upper = whole_region_at(part, bodies, ceiling - p.stock_to_leave - SLICE_NUDGE, ceiling)?;
++    if upper.is_empty() || !outline_changes(&upper, &lower)? {
++        return Ok((lower, false));
++    }
++    Ok((upper, true))
++}
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 6a75ff5db..4a39e9a2f 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -56,6 +56,7 @@ mod contour_run_stock;
+ mod contour_start;
+ mod contour_step;
+ mod contour_whole;
++mod contour_whole_slice;
+ mod descent;
+ mod descent_dive;
+ mod descent_xy;
+diff --git a/crates/motion/tests/contour_whole.rs b/crates/motion/tests/contour_whole.rs
+index 40faa456f..788358b13 100644
+--- a/crates/motion/tests/contour_whole.rs
++++ b/crates/motion/tests/contour_whole.rs
+@@ -1,6 +1,7 @@
+ //! Direct kernel pins for whole-model multi-band 2D Contour (#2436):
+ //! two islands above a common base plate (no double cutting on the deeper
+-//! island), a counterbore that narrows below Top Z, and fail-closed refusal
++//! island), a counterbore that narrows below Top Z, a middle step with no
++//! flat level in its Z range, and fail-closed refusal
+ //! when a deeper slice cannot be read.
+ //!
+ //! Gate map: covers camcraft_motion::machining2d (contour_whole, contour_depth).
+@@ -176,10 +177,10 @@ fn two_islands_above_a_plate_continue_without_double_cutting_the_deeper_island()
+             })
+             .map(|m| (m.to.x - m.from.x).hypot(m.to.y - m.from.y))
+             .sum();
+-        // Offset 20x20 square with r=3 round corners is 4*20 + 4*3*sqrt(2) ~= 97 mm (never 2x).
++        // Offset 20x20 square with r=3 round corners is 4*20 + 2*pi*3 ~= 98.8 mm (never 2x).
+         assert!(
+             (94.0..=102.0).contains(&len_b),
+-            "z {z}: expected one lap around B (~97 mm), got {len_b:.3}"
++            "z {z}: expected one lap around B (~98.8 mm), got {len_b:.3}"
+         );
+     }
+     // Lower levels must trace the [-40..0] x [-20..20] plate (x around -43).
+@@ -276,6 +277,50 @@ fn large_stepdown_keeps_the_upper_island_floor_pass_before_the_plate() {
+     );
+ }
+ 
++/// Base `[-40..40]^2` z `[0..10]`, middle step `[-25..25]^2` z `[10..20]`,
++/// boss `[-10..10]^2` z `[20..30]`.
++fn three_level_part() -> Vec<Triangle> {
++    let mut f = Vec::new();
++    let base = rect(-40.0, -40.0, 40.0, 40.0);
++    let mid = rect(-25.0, -25.0, 25.0, 25.0);
++    let boss = rect(-10.0, -10.0, 10.0, 10.0);
++    cap_poly(&mut f, &base, None, 0.0, false);
++    walls(&mut f, &base, 0.0, 10.0, true);
++    cap_poly(&mut f, &base, Some(&mid), 10.0, true);
++    walls(&mut f, &mid, 10.0, 20.0, true);
++    cap_poly(&mut f, &mid, Some(&boss), 20.0, true);
++    walls(&mut f, &boss, 20.0, 30.0, true);
++    cap_poly(&mut f, &boss, None, 30.0, true);
++    f
++}
++
++#[test]
++fn middle_step_without_a_flat_level_gets_its_floor_pass() {
++    let f = three_level_part();
++    let top_reg = slice::slice(&f, 30.0 - 1e-3).expect("top slice");
++    // Flat levels are Z 5 and Z 0. The middle step (Z 10..20) holds no flat
++    // level: it must still get one full lap at its floor, Z 10.
++    let path = contour_whole_bodies(&top_reg, &f, &[], &params(30.0, 0.0, 25.0)).expect("whole contour");
++    assert!(path.all_finite() && path.is_chained());
++    let ext = |x: f64, y: f64| x.abs().max(y.abs());
++    let mut len_mid = 0.0;
++    for m in &path.moves {
++        let at_10 = (m.from.z - 10.0).abs() < 1e-6 && (m.to.z - 10.0).abs() < 1e-6;
++        if m.kind != MoveKind::Feed || !at_10 || ext(m.from.x, m.from.y) < 20.0 || ext(m.to.x, m.to.y) > 35.0 {
++            continue;
++        }
++        assert!((ext(m.to.x, m.to.y) - 28.0).abs() < 0.05, "middle step envelope at Z 10: {m:?}");
++        len_mid += (m.to.x - m.from.x).hypot(m.to.y - m.from.y);
++    }
++    // Offset 50x50 square with r=3 round corners is 4*50 + 2*pi*3 ~= 218.8 mm.
++    assert!((len_mid - 218.85).abs() < 2.0, "expected one lap around the middle step at Z 10, got {len_mid:.3}");
++    assert!(
++        path.moves.iter().any(|m| m.kind == MoveKind::Feed && m.to.z < 1e-6 && m.to.x < -42.5),
++        "must finish the base down to Z 0"
++    );
++    assert_eq!(depth_verify(&path, &top_reg, &f, 30.0), Vec::new(), "{:?}", path.notes);
++}
++
+ #[test]
+ fn earlier_blind_hole_stop_does_not_hide_later_counterbore_change() {
+     let mut f = counterbore_part();

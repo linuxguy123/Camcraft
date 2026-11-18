@@ -1,0 +1,861 @@
+From ea064685321d80f43918603c2d43728640938d96 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 17 Nov 2026 23:04:32 -0800
+Subject: [PATCH 1/2] perf(xtask): run release-gate suites in a longest-first
+ queue; narrow the alone list
+
+The release gate kept a 16-core server busy only during its builds: after
+them ~80% of the run used one or two cores, because every app and kernel
+step ran alone, one after another, and the remaining steps ran in barrier
+waves that each waited for their slowest lane.
+
+A. lanes::alone() is narrowed. Builds (--no-run), clippy and every UI step
+   (windows) still run alone, as does an app or kernel step that is not one
+   named target. Of the app/kernel targets only lanes::ISOLATED runs alone:
+   the lib suites and the integration binaries with a wall-clock assertion
+   (import watchdogs on recv_timeout, deadline loops, elapsed() < limit),
+   found by grepping the suites. Every other app/kernel target joins the
+   shared lanes. A test pins that each listed binary exists.
+
+B. The barrier waves are replaced by a work queue (queue.rs): the builds
+   first, each alone; then budget::lane_limit lanes of budget::per_lane jobs,
+   each lane pulling the next step as it finishes; then the alone steps, one
+   at a time with the whole budget. The queue is ordered longest first
+   (Graham's LPT rule) by the step seconds the previous release run wrote to
+   gate-logs/release-*/timings.tsv (new: every release run writes one); a
+   step with no history ranks with the longest, and with no history at all
+   the queue keeps plan order. The checkout guard runs before every step, a
+   failed build still stops the run, a failed suite still stops nothing.
+
+C. Alone steps already get --test-threads=<budget> through budget::scale
+   (the plan's 6 is the default budget); the gate now prints a note when
+   the machine has more cores than the budget, since CAMCRAFT_GATE_JOBS is
+   what lets a 16-core runner use them.
+
+--dry-run still prints the whole plan, the queue in pull order.
+
+Measurement plan: run `cargo xtask gate release --no-snapshots` on the same
+Hetzner ccx43 (16 cores, CAMCRAFT_GATE_JOBS=16) at the base commit and at
+this head, twice each at this head (the first run records timings.tsv, the
+second uses it), and compare wall time from the gate summary plus mean core
+use (sar/mpstat) after the builds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CUsqDAAAJyAPrC37zBzbbX
+---
+ xtask/src/budget.rs       |   8 +-
+ xtask/src/budget_tests.rs |  48 +++++-----
+ xtask/src/exec.rs         |  74 +++++++--------
+ xtask/src/lanes.rs        | 184 ++++++++++++++++++++++++++++----------
+ xtask/src/lanes_tests.rs  | 108 +++++++++++++++-------
+ xtask/src/main.rs         |   1 +
+ xtask/src/plan.rs         |   2 +-
+ xtask/src/queue.rs        | 141 +++++++++++++++++++++++++++++
+ 8 files changed, 415 insertions(+), 151 deletions(-)
+ create mode 100644 xtask/src/queue.rs
+
+diff --git a/xtask/src/budget.rs b/xtask/src/budget.rs
+index 546238fe7..14a3e3f92 100644
+--- a/xtask/src/budget.rs
++++ b/xtask/src/budget.rs
+@@ -1,5 +1,5 @@
+-//! One job budget for a whole gate run (#2057): the lanes of a wave share it, so `-j` summed over a
+-//! wave never exceeds it. Provenance: our own build law (AGENTS.md "Three gate tiers"), cargo's `-j`
++//! One job budget for a whole gate run (#2057): the lanes of the release queue share it, so `-j` summed
++//! over the running lanes never exceeds it. Provenance: our own build law (AGENTS.md "Three gate tiers"), cargo's `-j`
+ //! and libtest's `--test-threads` flags as documented in the Cargo Book and the rustc test docs.
+ 
+ /// The budget when `CAMCRAFT_GATE_JOBS` is not set. The plan writes this value as `plan::J`.
+@@ -23,7 +23,7 @@ pub fn from_env() -> (usize, Option<String>) {
+     from_value(std::env::var(ENV).ok().as_deref())
+ }
+ 
+-/// The most lanes in one wave: half the budget, so each lane has two jobs or more; at least one.
++/// The most lanes of the release queue: half the budget, so each lane has two jobs or more; at least one.
+ pub fn lane_limit(budget: usize) -> usize {
+     (budget / 2).max(1)
+ }
+@@ -67,5 +67,5 @@ pub fn header(budget: usize, lanes: bool) -> String {
+     }
+     let limit = lane_limit(budget);
+     let split: Vec<String> = (1..=limit).map(|n| format!("{n} lane(s) x -j {}", per_lane(budget, n))).collect();
+-    format!("gate budget: {budget} job(s) ({ENV} overrides); at most {limit} lane(s) per wave; {}", split.join(", "))
++    format!("gate budget: {budget} job(s) ({ENV} overrides); at most {limit} queue lane(s); alone steps take all {budget}; {}", split.join(", "))
+ }
+diff --git a/xtask/src/budget_tests.rs b/xtask/src/budget_tests.rs
+index a13c6467f..54dbc4b2c 100644
+--- a/xtask/src/budget_tests.rs
++++ b/xtask/src/budget_tests.rs
+@@ -1,4 +1,4 @@
+-//! Provenance: the job budget law of issue #2057 (one budget shared by the lanes of a wave).
++//! Provenance: the job budget law of issue #2057 (one budget shared by the lanes of the release queue).
+ 
+ use crate::budget::{DEFAULT, from_value, lane_limit, per_lane, scale};
+ use crate::plan::Step;
+@@ -25,21 +25,27 @@ fn suites(n: usize) -> Vec<Step> {
+     steps
+ }
+ 
++/// The lanes and per-lane jobs `queue::run_schedule` uses for a queue of `n` steps.
++fn queue_split(budget: usize, n: usize) -> (usize, usize) {
++    let lanes = lane_limit(budget).min(n).max(1);
++    (lanes, per_lane(budget, lanes))
++}
++
+ #[test]
+-fn wave_jobs_sum_to_at_most_the_budget_and_lanes_to_at_most_half() {
++fn queue_jobs_sum_to_at_most_the_budget_and_lanes_to_at_most_half() {
+     for budget in 1..=16 {
+         let steps = suites(11);
+-        let waves = crate::lanes::waves(&steps, lane_limit(budget));
+-        let mut seen: Vec<_> = waves.iter().flatten().copied().collect();
++        let s = crate::lanes::schedule(&steps, &std::collections::HashMap::new());
++        let mut seen: Vec<_> = s.builds.iter().chain(&s.queue).chain(&s.alone).copied().collect();
+         seen.sort_unstable();
+         assert_eq!(seen, (0..steps.len()).collect::<Vec<_>>(), "budget {budget}: a step was lost");
+-        for wave in &waves {
+-            assert!(wave.len() <= (budget / 2).max(1), "budget {budget}: wave {wave:?} has too many lanes");
+-            let jobs = per_lane(budget, wave.len());
+-            let sum: usize = wave.iter().filter_map(|&i| job_value(&scale(&steps[i].args, jobs))).sum();
+-            let thr: usize = wave.iter().filter_map(|&i| threads(&scale(&steps[i].args, jobs))).sum();
+-            assert!(sum <= budget.max(1), "budget {budget}: wave {wave:?} has -j sum {sum}");
+-            assert!(thr <= budget.max(1), "budget {budget}: wave {wave:?} has {thr} test threads");
++        let (lanes, jobs) = queue_split(budget, s.queue.len());
++        assert!(lanes <= (budget / 2).max(1), "budget {budget}: {lanes} lanes");
++        for &i in &s.queue {
++            let args = scale(&steps[i].args, jobs);
++            let (j, t) = (job_value(&args).unwrap_or(0), threads(&args).unwrap_or(0));
++            assert!(j * lanes <= budget.max(1), "budget {budget}: -j sum {}", j * lanes);
++            assert!(t * lanes <= budget.max(1), "budget {budget}: {} test threads", t * lanes);
+         }
+     }
+ }
+@@ -50,23 +56,23 @@ fn budget_six_gives_three_lanes_of_two_jobs() {
+     assert_eq!(crate::plan::J, DEFAULT.to_string(), "the plan writes the default budget");
+     assert_eq!(lane_limit(6), 3);
+     assert_eq!(per_lane(6, 3), 2);
+-    let waves = crate::lanes::waves(&suites(6), lane_limit(6));
+-    assert!(waves.iter().any(|w| w.len() == 3), "{waves:?}");
++    assert_eq!(queue_split(6, 6), (3, 2));
++    assert_eq!(queue_split(16, 100), (8, 2));
++    assert_eq!(queue_split(16, 2), (2, 8), "a short queue gives each lane more jobs");
+ }
+ 
+ #[test]
+ fn a_step_alone_keeps_the_full_budget() {
+-    for budget in [1, 4, 6, 12] {
++    for budget in [1, 4, 6, 12, 16] {
+         let steps = suites(0);
+-        let waves = crate::lanes::waves(&steps, lane_limit(budget));
+-        assert!(waves.iter().all(|w| w.len() == 1));
+-        let jobs = per_lane(budget, 1);
+-        assert_eq!(jobs, budget);
+-        for &i in waves.iter().flatten() {
+-            let args = scale(&steps[i].args, jobs);
++        let s = crate::lanes::schedule(&steps, &std::collections::HashMap::new());
++        assert!(s.queue.is_empty(), "{s:?}");
++        for &i in s.builds.iter().chain(&s.alone) {
++            let args = scale(&steps[i].args, budget);
+             assert_eq!(job_value(&args), Some(budget), "{}", steps[i].name);
+         }
+-        assert_eq!(threads(&scale(&steps[1].args, jobs)), Some(budget));
++        // The whole-crate app step runs with --test-threads equal to the budget, not the plan's 6.
++        assert_eq!(threads(&scale(&steps[1].args, budget)), Some(budget));
+     }
+ }
+ 
+diff --git a/xtask/src/exec.rs b/xtask/src/exec.rs
+index fef9d475e..36492194e 100644
+--- a/xtask/src/exec.rs
++++ b/xtask/src/exec.rs
+@@ -15,23 +15,23 @@ pub struct Run {
+     pub root: PathBuf,
+     pub label: String,
+     pub dry: bool,
+-    /// The job budget of the whole run (#2057): a wave's lanes share it, a step alone gets all of it.
++    /// The job budget of the whole run (#2057): the release queue's lanes share it, a step alone gets all of it.
+     pub budget: usize,
+     budget_note: Option<String>,
+-    log_dir: PathBuf,
++    pub(crate) log_dir: PathBuf,
+     clock: Instant,
+-    done: Vec<Done>,
++    pub(crate) done: Vec<Done>,
+     /// HEAD and the working tree when the gate started (#1201); every later reading is compared with it.
+-    guard: Reading,
++    pub(crate) guard: Reading,
+     /// The VOID line, once the checkout was seen to move; a void run has no verdict.
+-    void: Option<String>,
++    pub(crate) void: Option<String>,
+ }
+ 
+-struct Done {
+-    name: String,
+-    ok: bool,
+-    secs: u64,
+-    note: String,
++pub(crate) struct Done {
++    pub(crate) name: String,
++    pub(crate) ok: bool,
++    pub(crate) secs: u64,
++    pub(crate) note: String,
+ }
+ 
+ /// The cargo that launched us (`cargo xtask` sets CARGO), else the one on PATH.
+@@ -163,32 +163,13 @@ impl Run {
+         }
+         println!("{}", crate::budget::header(self.budget, lanes));
+         if lanes {
+-            let waves = crate::lanes::waves(&plan.steps, crate::budget::lane_limit(self.budget));
+-            for (k, wave) in waves.iter().enumerate() {
+-                if self.check("before release wave") {
+-                    break;
+-                }
+-                let jobs = crate::budget::per_lane(self.budget, wave.len());
+-                println!("-- wave {}: {} lane(s) x -j {jobs}", k + 1, wave.len());
+-                let results = std::thread::scope(|scope| {
+-                    let handles: Vec<_> = wave.iter().map(|&i| {
+-                        let (root, logs, dry) = (&self.root, &self.log_dir, self.dry);
+-                        let step = &plan.steps[i];
+-                        scope.spawn(move || Self::execute(root, logs, dry, i + 1, step, jobs))
+-                    }).collect();
+-                    // Join every lane even when one returns an error or panics.
+-                    let joined: Vec<_> = handles.into_iter().map(|h| {
+-                        h.join().map_err(|_| "gate lane thread failed".to_string()).and_then(|r| r)
+-                    }).collect();
+-                    joined.into_iter().collect::<Result<Vec<_>, String>>()
+-                })?;
+-                let build_failed = wave.iter().any(|&i| plan.steps[i].args.iter().any(|a| a == "--no-run"))
+-                    && results.iter().any(|d| !d.ok);
+-                self.done.extend(results);
+-                if build_failed {
+-                    break;
+-                }
++            if self.budget_note.is_none() && std::env::var_os(crate::budget::ENV).is_none()
++                && let Ok(n) = std::thread::available_parallelism()
++                && n.get() > self.budget
++            {
++                println!("note: this machine has {n} cores; {}={n} lets the gate use them", crate::budget::ENV);
+             }
++            self.run_release(plan)?;
+         } else {
+             for s in &plan.steps {
+                 if self.check(&format!("before {}", s.name)) {
+@@ -209,20 +190,14 @@ impl Run {
+     }
+ 
+     /// Compares the checkout with the start reading. Returns true (and prints VOID) once it has moved.
+-    fn check(&mut self, at: &str) -> bool {
++    pub(crate) fn check(&mut self, at: &str) -> bool {
+         if self.void.is_some() {
+             return true;
+         }
+         if self.dry {
+             return false; // a dry run runs nothing, so the checkout cannot void it (one git call per step)
+         }
+-        let msg = match checkout::read(&self.root) {
+-            Ok(now) => checkout::void_message(&self.guard, &now, at),
+-            Err(e) => Some(format!(
+-                "VOID: could not read the checkout ({e}) during the gate ({at}) - this run is void, not a verdict on any commit"
+-            )),
+-        };
+-        match msg {
++        match moved(&self.root, &self.guard, at) {
+             Some(m) => {
+                 println!("{m}");
+                 self.void = Some(m);
+@@ -239,7 +214,7 @@ impl Run {
+     }
+ 
+     /// Runs one step with its `-j` and `--test-threads` set to `jobs` (`budget::scale`).
+-    fn execute(root: &Path, log_dir: &Path, dry: bool, n: usize, s: &Step, jobs: usize) -> Result<Done, String> {
++    pub(crate) fn execute(root: &Path, log_dir: &Path, dry: bool, n: usize, s: &Step, jobs: usize) -> Result<Done, String> {
+         let args = crate::budget::scale(&s.args, jobs);
+         let log = log_dir.join(log_name(n, &s.name));
+         let dir = if s.in_ui { root.join("crates").join("ui") } else { root.to_path_buf() };
+@@ -297,6 +272,17 @@ impl Run {
+     }
+ }
+ 
++/// The VOID line when the checkout under `root` no longer reads as `guard` (or cannot be read); `None` while
++/// it is unchanged. Shared by the one-at-a-time loop and the release queue's lanes.
++pub(crate) fn moved(root: &Path, guard: &Reading, at: &str) -> Option<String> {
++    match checkout::read(root) {
++        Ok(now) => checkout::void_message(guard, &now, at),
++        Err(e) => Some(format!(
++            "VOID: could not read the checkout ({e}) during the gate ({at}) - this run is void, not a verdict on any commit"
++        )),
++    }
++}
++
+ /// The step's note from its log: a compile error, the suites that failed (with the failed tests by name,
+ /// #1714), or a bare exit code. A test that libtest reports as "has been running for over N seconds" is
+ /// added as `slow: <name>` so a long heavy test shows up by name.
+diff --git a/xtask/src/lanes.rs b/xtask/src/lanes.rs
+index e4343e6ac..a31fe3d0b 100644
+--- a/xtask/src/lanes.rs
++++ b/xtask/src/lanes.rs
+@@ -1,59 +1,147 @@
+-//! Provenance: bounded release-gate lanes requested in issue #1703, sized by the job budget (#2057);
+-//! standard Rust scoped threads.
++//! Provenance: bounded release-gate lanes requested in issue #1703, sized by the job budget (#2057); the
++//! longest-processing-time-first queue is Graham's LPT list-scheduling rule (R. L. Graham, "Bounds on
++//! multiprocessing timing anomalies", SIAM J. Appl. Math. 17, 1969). Standard Rust scoped threads.
++
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
+ 
+ use crate::plan::Step;
+ 
+-/// Whole app/kernel suites include import watchdogs, and UI suites can open windows. Keep these,
+-/// builds and clippy alone. A selected release subset uses the same conservative rule.
++/// The app and kernel test targets that must not share the machine with another suite, as
++/// `crate-dir:target` (`lib` for `--lib`, else the integration binary's name). Each holds a wall-clock
++/// assertion that a busy neighbour could trip: a thread watchdog that panics when an import does not
++/// answer within N seconds (`recv_timeout`), a polling loop with a deadline, or an `elapsed() < limit`
++/// assert. Found by grepping the suites for `recv_timeout`, `deadline`, `Instant`/`elapsed` and
++/// `Duration::from_secs` (2026-11-17); suites that only print a timing are not listed. A new suite with a
++/// wall-clock assertion is added here; one listed by mistake only costs speed.
++pub const ISOLATED: &[&str] = &[
++    // app: watchdogs and wall-clock asserts in the lib's own tests (step_guard_tests, step_division_tests).
++    "app:lib",
++    // app: STEP import watchdogs (`within(limit, ..)` panics on a timeout).
++    "app:import_step_closed_shell",
++    "app:import_step_corner_blend",
++    "app:import_step_curve_guard",
++    "app:import_step_guard",
++    "app:import_step_guard_default_cap",
++    "app:import_step_open_shell",
++    // app: `elapsed() < limit` asserts and deadline loops.
++    "app:large_models",           // streaming import < 60 s (heavy)
++    "app:mcp_live",               // TCP client/listener deadlines of 0.3-20 s
++    "app:shoulder_adaptive",      // band plans in < 60 s
++    "app:step_nesting",           // refusal in < 1 s
++    "app:stock_field_cost",       // per-program cost budget (heavy)
++    "app:stock_play",             // worker publishes within 60 s
++    "app:stock_play_partial",     // worker publishes within 60 s
++    "app:stock_play_precalc",     // precalc finishes within 120 s
++    // kernel: lib (solidcore_step's guarded import) and the suites on step_util / smb_util watchdogs.
++    "kernel:lib",
++    "kernel:heal_import",
++    "kernel:import_corpus",
++    "kernel:mesh_deviation_bench",
++    "kernel:solidcraft_hostile",
++    "kernel:solidcraft_import",
++    "kernel:step_agreement",
++    "kernel:step_import",
++];
++
++/// The `crate-dir:target` key of a step that runs one target of one camcraft crate (`-p camcraft-x` with
++/// `--lib`, `--bins`, `--doc` or `--test <name>`); `None` for anything else (a whole crate, several crates).
++pub fn target_key(s: &Step) -> Option<String> {
++    let a = &s.args;
++    let end = a.iter().position(|x| x == "--").unwrap_or(a.len());
++    let a = &a[..end];
++    let mut pkgs = a.windows(2).filter(|w| w[0] == "-p").map(|w| w[1].as_str());
++    let dir = pkgs.next()?.strip_prefix("camcraft-")?;
++    if pkgs.next().is_some() {
++        return None;
++    }
++    let target = if a.iter().any(|x| x == "--lib") {
++        "lib".to_string()
++    } else if a.iter().any(|x| x == "--bins") {
++        "bins".to_string()
++    } else if a.iter().any(|x| x == "--doc") {
++        "doc".to_string()
++    } else {
++        a.windows(2).find(|w| w[0] == "--test").map(|w| w[1].clone())?
++    };
++    Some(format!("{dir}:{target}"))
++}
++
++pub fn is_build(s: &Step) -> bool {
++    s.args.iter().any(|a| a == "--no-run")
++}
++
++/// Runs with the whole budget and no neighbour: builds, clippy, every UI step (windows), an app or kernel
++/// step that is not one named target (a whole-crate run), and the `ISOLATED` targets.
+ pub fn alone(s: &Step) -> bool {
+-    s.in_ui
+-        || s.args.iter().any(|a| matches!(a.as_str(),
+-            "--no-run" | "clippy" | "camcraft-ui" | "camcraft-kernel" | "camcraft-app"
+-        ))
+-}
+-
+-/// Group independent suites into waves of at most `limit` (`budget::lane_limit`, at least 1). Mix profiles within a wave so heavy release
+-/// tests can run beside debug suites. Barrier steps never share a wave, including in selected runs.
+-pub fn waves(steps: &[Step], limit: usize) -> Vec<Vec<usize>> {
+-    let limit = limit.max(1);
+-    let mut out = Vec::new();
+-    let mut debug = Vec::new();
+-    let mut release = Vec::new();
+-    for (i, s) in steps.iter().enumerate() {
+-        if s.args.iter().any(|a| a == "--no-run") {
+-            out.push(vec![i]);
+-        } else if !alone(s) {
+-            if s.args.iter().any(|a| a == "--release") {
+-                release.push(i);
+-            } else {
+-                debug.push(i);
+-            }
+-        }
++    if s.in_ui || s.args.iter().any(|a| matches!(a.as_str(), "--no-run" | "clippy" | "camcraft-ui")) {
++        return true;
+     }
+-    let (mut debug, mut release) = (debug.into_iter(), release.into_iter());
+-    loop {
+-        let mut wave = Vec::new();
+-        for _ in 0..limit / 2 {
+-            if let Some(i) = debug.next() {
+-                wave.push(i);
+-            }
+-            if let Some(i) = release.next() {
+-                wave.push(i);
+-            }
+-        }
+-        while wave.len() < limit {
+-            let Some(i) = debug.next().or_else(|| release.next()) else { break };
+-            wave.push(i);
+-        }
+-        if wave.is_empty() {
+-            break;
+-        }
+-        out.push(wave);
++    let guarded = s.args.iter().any(|a| a == "camcraft-app" || a == "camcraft-kernel");
++    match target_key(s) {
++        Some(k) => ISOLATED.contains(&k.as_str()),
++        None => guarded,
+     }
++}
++
++/// A release plan split for the executor: the builds (in order, each alone, first), the queued steps
++/// (shared lanes, in the order they are pulled) and the alone steps (after the queue, one at a time).
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct Schedule {
++    pub builds: Vec<usize>,
++    pub queue: Vec<usize>,
++    pub alone: Vec<usize>,
++}
++
++/// Splits `steps` and orders the queue longest-first by `history` (seconds by step name, from an
++/// earlier run). A step with no history counts as the longest known one, so a new suite is never left
++/// for the tail; ties keep plan order. With no history at all the queue keeps plan order.
++pub fn schedule(steps: &[Step], history: &HashMap<String, u64>) -> Schedule {
++    let mut out = Schedule::default();
+     for (i, s) in steps.iter().enumerate() {
+-        if alone(s) && !s.args.iter().any(|a| a == "--no-run") {
+-            out.push(vec![i]);
++        if is_build(s) {
++            out.builds.push(i);
++        } else if alone(s) {
++            out.alone.push(i);
++        } else {
++            out.queue.push(i);
+         }
+     }
++    let top = out.queue.iter().filter_map(|&i| history.get(&steps[i].name)).copied().max().unwrap_or(0);
++    let cost = |i: usize| history.get(&steps[i].name).copied().unwrap_or(top);
++    out.queue.sort_by_key(|&i| std::cmp::Reverse(cost(i))); // stable: ties keep plan order
+     out
+ }
++
++/// The timings file a release run writes into its log dir: one `seconds<TAB>step name` line per step.
++pub const TIMINGS: &str = "timings.tsv";
++
++/// The step seconds of the newest `gate-logs/release-*/timings.tsv` under `root` (the stamp sorts by
++/// time), with the file it came from; empty when no release run has recorded one. Unreadable lines are
++/// skipped: history only orders the queue, it never selects or drops a step.
++pub fn history(root: &Path) -> (HashMap<String, u64>, Option<PathBuf>) {
++    let Ok(rd) = std::fs::read_dir(root.join("gate-logs")) else { return (HashMap::new(), None) };
++    let mut dirs: Vec<PathBuf> = rd
++        .filter_map(|e| e.ok().map(|e| e.path()))
++        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("release-")))
++        .filter(|p| p.join(TIMINGS).is_file())
++        .collect();
++    dirs.sort();
++    let Some(dir) = dirs.pop() else { return (HashMap::new(), None) };
++    let file = dir.join(TIMINGS);
++    let text = std::fs::read_to_string(&file).unwrap_or_default();
++    (parse_timings(&text), Some(file))
++}
++
++pub fn parse_timings(text: &str) -> HashMap<String, u64> {
++    text.lines()
++        .filter_map(|l| {
++            let (secs, name) = l.split_once('\t')?;
++            Some((name.to_string(), secs.trim().parse().ok()?))
++        })
++        .collect()
++}
++
++pub fn format_timings<'a>(rows: impl IntoIterator<Item = (&'a str, u64)>) -> String {
++    rows.into_iter().map(|(name, secs)| format!("{secs}\t{name}\n")).collect()
++}
+diff --git a/xtask/src/lanes_tests.rs b/xtask/src/lanes_tests.rs
+index b8de75db2..7fbcb0718 100644
+--- a/xtask/src/lanes_tests.rs
++++ b/xtask/src/lanes_tests.rs
+@@ -14,56 +14,98 @@ fn release_prebuilds_both_profiles_before_running_suites() {
+     assert!(second.args.iter().any(|a| a == "--release"));
+ }
+ 
++fn none() -> std::collections::HashMap<String, u64> {
++    std::collections::HashMap::new()
++}
++
+ #[test]
+-fn release_waves_mix_profiles_with_a_four_lane_bound_and_no_omissions() {
++fn release_queue_holds_every_ordinary_suite_of_both_profiles_and_loses_none() {
+     let mut steps = Vec::new();
+     for i in 0..7 {
+-        steps.push(Step::new(format!("debug {i}"), &["test", "-p", "camcraft-motion"], ""));
+-        steps.push(Step::new(format!("release {i}"), &["test", "--release", "-p", "camcraft-motion"], ""));
++        steps.push(Step::new(format!("debug {i}"), &["test", "-p", "camcraft-motion", "--test", "a"], ""));
++        steps.push(Step::new(format!("release {i}"), &["test", "--release", "-p", "camcraft-motion", "--test", "a"], ""));
+     }
+-    let waves = lanes::waves(&steps, 4);
+-    assert_eq!(waves[0].len(), 4, "independent suites must run concurrently");
+-    assert!(waves.iter().all(|wave| !wave.is_empty() && wave.len() <= 4));
+-    assert!(waves.iter().any(|wave| {
+-        wave.iter().any(|&i| steps[i].args.iter().any(|a| a == "--release"))
+-            && wave.iter().any(|&i| !steps[i].args.iter().any(|a| a == "--release"))
+-    }), "debug and release suites must share a wave");
+-    let mut seen: Vec<_> = waves.into_iter().flatten().collect();
+-    seen.sort_unstable();
+-    assert_eq!(seen, (0..steps.len()).collect::<Vec<_>>());
++    let s = lanes::schedule(&steps, &none());
++    assert!(s.builds.is_empty() && s.alone.is_empty(), "{s:?}");
++    assert_eq!(s.queue, (0..steps.len()).collect::<Vec<_>>(), "no history keeps plan order");
+ }
+ 
+ #[test]
+-fn release_builds_and_watchdog_or_window_suites_run_alone() {
++fn release_builds_ui_clippy_and_isolated_targets_run_alone() {
+     let steps = vec![
+-        Step::new("ordinary", &["test", "-p", "camcraft-motion"], ""),
++        Step::new("ordinary", &["test", "-p", "camcraft-motion", "--lib"], ""),
+         Step::new("debug build", &["test", "--no-run"], ""),
+-        Step::new("ui", &["test", "-p", "camcraft-ui"], ""),
+-        Step::new("app", &["test", "-p", "camcraft-app"], ""),
+-        Step::new("kernel", &["test", "-p", "camcraft-kernel"], ""),
++        Step::new("ui", &["test", "-p", "camcraft-ui", "--lib"], ""),
++        Step::new("app whole crate", &["test", "-p", "camcraft-app"], ""),
++        Step::new("kernel whole crate", &["test", "-p", "camcraft-kernel"], ""),
+         Step::new("clippy", &["clippy"], ""),
+         Step::new("release build", &["test", "--release", "--no-run"], ""),
+         Step::new("ui cwd", &["test"], "ui"),
++        Step::new("app watchdog", &["test", "-p", "camcraft-app", "--test", "import_step_guard", "--", "--test-threads=6"], ""),
++        Step::new("app lib", &["test", "--release", "-p", "camcraft-app", "--lib", "--", "--ignored"], ""),
++        Step::new("kernel watchdog", &["test", "-p", "camcraft-kernel", "--test", "step_import"], ""),
++        Step::new("app ordinary", &["test", "-p", "camcraft-app", "--test", "cmds", "--", "--test-threads=6"], ""),
++        Step::new("app doc", &["test", "-p", "camcraft-app", "--doc"], ""),
++        Step::new("kernel ordinary", &["test", "--release", "-p", "camcraft-kernel", "--test", "smb_roundtrip"], ""),
+     ];
+-    let waves = lanes::waves(&steps, 4);
+-    assert_eq!(&waves[..2], &[vec![1], vec![6]], "both builds precede every run");
+-    for &i in &[1, 2, 3, 4, 5, 6, 7] {
+-        assert!(waves.contains(&vec![i]), "{} must run alone", steps[i].name);
++    let s = lanes::schedule(&steps, &none());
++    assert_eq!(s.builds, vec![1, 6], "both builds come first, in plan order");
++    assert_eq!(s.alone, vec![2, 3, 4, 5, 7, 8, 9, 10]);
++    assert_eq!(s.queue, vec![0, 11, 12, 13], "ordinary app and kernel targets join the lanes");
++}
++
++#[test]
++fn every_isolated_entry_names_a_real_target() {
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace");
++    for key in lanes::ISOLATED {
++        let (dir, target) = key.split_once(':').expect("crate-dir:target");
++        assert!(matches!(dir, "app" | "kernel"), "{key}: only app and kernel suites are listed");
++        if target != "lib" {
++            let file = root.join("crates").join(dir).join("tests").join(format!("{target}.rs"));
++            assert!(file.is_file(), "{key}: no {}", file.display());
++        }
+     }
+-    let mut seen: Vec<_> = waves.into_iter().flatten().collect();
+-    seen.sort_unstable();
+-    assert_eq!(seen, (0..steps.len()).collect::<Vec<_>>());
+ }
+ 
+ #[test]
+-fn selected_release_without_builds_still_keeps_watchdogs_alone() {
+-    let steps = vec![
+-        Step::new("ordinary", &["test", "-p", "camcraft-motion"], ""),
+-        Step::new("selected app", &["test", "--release", "-p", "camcraft-app"], ""),
+-        Step::new("selected ui", &["test"], "ui"),
+-    ];
+-    assert_eq!(lanes::waves(&steps, 4), vec![vec![0], vec![1], vec![2]]);
+-    assert!(lanes::waves(&[], 4).is_empty());
++fn target_keys_name_one_target_of_one_crate() {
++    let k = |args: &[&str]| lanes::target_key(&Step::new("s", args, ""));
++    assert_eq!(k(&["test", "-p", "camcraft-app", "--test", "x", "--", "--ignored"]).as_deref(), Some("app:x"));
++    assert_eq!(k(&["test", "-p", "camcraft-kernel", "--lib"]).as_deref(), Some("kernel:lib"));
++    assert_eq!(k(&["test", "-p", "camcraft-app"]), None, "a whole crate is not one target");
++    assert_eq!(k(&["test", "-p", "camcraft-app", "-p", "camcraft-cl", "--lib"]), None);
++    assert_eq!(k(&["run", "--", "--test", "x", "-p", "camcraft-app"]), None, "child args are not cargo's");
++}
++
++#[test]
++fn queue_runs_longest_first_and_unknown_steps_early() {
++    let steps: Vec<Step> = ["short", "long", "new", "mid"]
++        .iter()
++        .map(|n| Step::new(*n, &["test", "-p", "camcraft-motion", "--test", n], ""))
++        .collect();
++    let hist = lanes::parse_timings("3\tshort\n900\tlong\n40\tmid\nnot a row\nx\tbad secs\n");
++    assert_eq!(hist.len(), 3, "unreadable rows are skipped: {hist:?}");
++    assert_eq!(lanes::schedule(&steps, &hist).queue, vec![1, 2, 3, 0], "a step with no history ranks with the longest");
++    let text = lanes::format_timings([("a b", 5), ("c", 0)]);
++    assert_eq!(lanes::parse_timings(&text).get("a b"), Some(&5));
++}
++
++#[test]
++fn history_reads_the_newest_release_timings_only() {
++    use std::fs;
++    let root = std::env::temp_dir().join(format!("xtask-history-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&root);
++    assert!(lanes::history(&root).0.is_empty(), "no gate-logs: plan order");
++    for (dir, body) in [("release-20261101-000000", "1\told\n"), ("release-20261102-000000", "2\tnew\n"), ("batch-20261103-000000", "3\tbatch\n")] {
++        fs::create_dir_all(root.join("gate-logs").join(dir)).expect("log dir");
++        fs::write(root.join("gate-logs").join(dir).join(lanes::TIMINGS), body).expect("timings");
++    }
++    fs::create_dir_all(root.join("gate-logs/release-20261104-000000")).expect("a run with no timings yet");
++    let (h, from) = lanes::history(&root);
++    assert_eq!(h.get("new"), Some(&2));
++    assert!(!h.contains_key("old") && !h.contains_key("batch"), "{h:?}");
++    assert!(from.is_some_and(|f| f.to_string_lossy().contains("release-20261102")));
++    fs::remove_dir_all(root).expect("remove fixture");
+ }
+ 
+ #[test]
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 19490754a..c474b5491 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -50,6 +50,7 @@ mod package;
+ mod path_mods;
+ mod plan;
+ mod process_bump;
++mod queue;
+ #[cfg(test)]
+ mod process_bump_tests;
+ mod quick;
+diff --git a/xtask/src/plan.rs b/xtask/src/plan.rs
+index 157cd2523..5465884bb 100644
+--- a/xtask/src/plan.rs
++++ b/xtask/src/plan.rs
+@@ -237,7 +237,7 @@ pub fn release(root: &Path) -> Plan {
+ pub fn release_with(root: &Path, snapshots: bool) -> Plan {
+     let mut plan = Plan::default();
+     plan.notes.push(
+-        "release: prebuild both profiles, then debug/release lanes that share the job budget; app, kernel, ui and clippy run alone"
++        "release: prebuild both profiles, then a longest-first queue of lanes that share the job budget; ui, clippy and the lanes::ISOLATED app/kernel targets run alone after it"
+             .into(),
+     );
+     if !snapshots {
+diff --git a/xtask/src/queue.rs b/xtask/src/queue.rs
+new file mode 100644
+index 000000000..4057c1691
+--- /dev/null
++++ b/xtask/src/queue.rs
+@@ -0,0 +1,141 @@
++//! The release tier's executor: builds first and alone, then a work queue of shared lanes (each lane pulls
++//! the next step as it finishes, longest first), then the alone steps one at a time with the whole budget.
++//! Provenance: our own build law (AGENTS.md "Three gate tiers", #1703, #2057); Graham's LPT list
++//! scheduling (see `lanes`); standard Rust scoped threads and atomics.
++
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Mutex, MutexGuard};
++
++use crate::budget;
++use crate::exec::{Done, Run, moved};
++use crate::lanes::{self, Schedule};
++use crate::plan::Plan;
++
++fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
++    match m.lock() {
++        Ok(g) => g,
++        Err(poisoned) => poisoned.into_inner(),
++    }
++}
++
++impl Run {
++    /// Runs a release plan (`lanes::schedule`). A failed build stops the run; a VOID checkout stops it
++    /// before the next step; a failed suite never stops the others. Writes `lanes::TIMINGS` for the next run.
++    pub(crate) fn run_release(&mut self, plan: &Plan) -> Result<(), String> {
++        let (history, from) = lanes::history(&self.root);
++        let sched: Schedule = lanes::schedule(&plan.steps, &history);
++        match &from {
++            Some(f) => println!("queue order: longest first, by {}", f.display()),
++            None => println!("queue order: plan order (no gate-logs/release-*/{} yet)", lanes::TIMINGS),
++        }
++        let result = self.run_schedule(plan, &sched);
++        if !self.dry && !self.done.is_empty() {
++            let text = lanes::format_timings(self.done.iter().map(|d| (d.name.as_str(), d.secs)));
++            let file = self.log_dir.join(lanes::TIMINGS);
++            if let Err(e) = std::fs::write(&file, text) {
++                println!("note: could not write {}: {e} (the next run keeps plan order)", file.display());
++            }
++        }
++        result
++    }
++
++    fn run_schedule(&mut self, plan: &Plan, sched: &Schedule) -> Result<(), String> {
++        for &i in &sched.builds {
++            if self.check("before a release build") {
++                return Ok(());
++            }
++            println!("-- build alone x -j {}", self.budget);
++            let d = Self::execute(&self.root, &self.log_dir, self.dry, i + 1, &plan.steps[i], self.budget)?;
++            let ok = d.ok;
++            self.done.push(d);
++            if !ok {
++                return Ok(());
++            }
++        }
++        if !sched.queue.is_empty() {
++            if self.check("before the release queue") {
++                return Ok(());
++            }
++            let lanes = budget::lane_limit(self.budget).min(sched.queue.len()).max(1);
++            let jobs = budget::per_lane(self.budget, lanes);
++            println!("-- queue: {} step(s) in {lanes} lane(s) x -j {jobs}, each lane takes the next step when it finishes", sched.queue.len());
++            let done = self.drain(plan, &sched.queue, lanes, jobs)?;
++            self.done.extend(done);
++            if self.void.is_some() {
++                return Ok(());
++            }
++        }
++        for &i in &sched.alone {
++            let s = &plan.steps[i];
++            if self.check(&format!("before {}", s.name)) {
++                break;
++            }
++            println!("-- alone x -j {}", self.budget);
++            let d = Self::execute(&self.root, &self.log_dir, self.dry, i + 1, s, self.budget)?;
++            self.done.push(d);
++        }
++        Ok(())
++    }
++
++    /// Runs `queue` (plan indices, in pull order) on `lanes` threads of `jobs` each. A dry run prints the
++    /// queue in pull order without threads. Results come back in plan order.
++    fn drain(&mut self, plan: &Plan, queue: &[usize], lanes: usize, jobs: usize) -> Result<Vec<Done>, String> {
++        let (root, logs, dry, guard) = (&self.root, &self.log_dir, self.dry, &self.guard);
++        if dry {
++            return queue.iter().map(|&i| Self::execute(root, logs, true, i + 1, &plan.steps[i], jobs)).collect();
++        }
++        let next = AtomicUsize::new(0);
++        let stop = AtomicBool::new(false);
++        let void: Mutex<Option<String>> = Mutex::new(None);
++        let error: Mutex<Option<String>> = Mutex::new(None);
++        let done: Mutex<Vec<(usize, Done)>> = Mutex::new(Vec::new());
++        std::thread::scope(|scope| {
++            let handles: Vec<_> = (0..lanes)
++                .map(|_| {
++                    scope.spawn(|| {
++                        while !stop.load(Ordering::SeqCst) {
++                            let k = next.fetch_add(1, Ordering::SeqCst);
++                            let Some(&i) = queue.get(k) else { break };
++                            let step = &plan.steps[i];
++                            if let Some(m) = moved(root, guard, &format!("before {}", step.name)) {
++                                stop.store(true, Ordering::SeqCst);
++                                let mut v = lock(&void);
++                                if v.is_none() {
++                                    println!("{m}");
++                                    *v = Some(m);
++                                }
++                                break;
++                            }
++                            match Self::execute(root, logs, false, i + 1, step, jobs) {
++                                Ok(d) => lock(&done).push((i, d)),
++                                Err(e) => {
++                                    stop.store(true, Ordering::SeqCst);
++                                    lock(&error).get_or_insert(e);
++                                    break;
++                                }
++                            }
++                        }
++                    })
++                })
++                .collect();
++            // Join every lane even when one panics; a panicked lane is an error, never a silent pass.
++            for h in handles {
++                if h.join().is_err() {
++                    stop.store(true, Ordering::SeqCst);
++                    lock(&error).get_or_insert_with(|| "gate lane thread failed".to_string());
++                }
++            }
++        });
++        if let Some(m) = lock(&void).take() {
++            self.void = Some(m);
++        }
++        let mut done = std::mem::take(&mut *lock(&done));
++        done.sort_by_key(|(i, _)| *i);
++        let done: Vec<Done> = done.into_iter().map(|(_, d)| d).collect();
++        if let Some(e) = lock(&error).take() {
++            self.done.extend(done);
++            return Err(e);
++        }
++        Ok(done)
++    }
++}
+
+From 9dcd85c58fbdbe14d68fba7bdf6213f030001f07 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 17 Nov 2026 23:35:36 -0800
+Subject: [PATCH 2/2] docs(xtask): record release scheduler decisions for
+ review
+
+Fixes #2466
+---
+ docs/decisions/2466-gate-release-lanes.md | 41 +++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+ create mode 100644 docs/decisions/2466-gate-release-lanes.md
+
+diff --git a/docs/decisions/2466-gate-release-lanes.md b/docs/decisions/2466-gate-release-lanes.md
+new file mode 100644
+index 000000000..6f4d81145
+--- /dev/null
++++ b/docs/decisions/2466-gate-release-lanes.md
+@@ -0,0 +1,41 @@
++## #2466 - Release-gate queue and suite isolation
++
++**Decided:** In PR #2461, keep builds first and exclusive, replace barrier
++waves with a shared work queue, then run exclusive suites one at a time.
++Use the existing lane limit and per-lane job budget for shared steps; give
++exclusive steps the whole budget. Order the queue longest first using the
++newest prior release run's `timings.tsv`. Unknown steps rank with the
++longest known step, ties retain plan order, and an empty history retains
++plan order. History orders work; it never selects or drops a planned step.
++
++**Why:** A barrier wave waits for its slowest suite while other lanes sit
++idle. A queue lets a freed lane take another suite immediately, and starting
++long suites early is intended to reduce the final idle tail. No full release
++performance measurement is claimed by this decision.
++
++**Isolation policy:** Builds, clippy and every UI step remain exclusive.
++App/kernel steps that do not identify one target remain exclusive too.
++For single app/kernel targets, retain exclusivity for `lanes::ISOLATED`:
++the library targets and named integration suites with watchdogs, polling
++deadlines or elapsed-time assertions. Other single targets may share lanes.
++The named list was identified from those assertions; new suites with such
++assertions must be added. This preserves protection against load-sensitive
++failures without serializing every app/kernel target. Failed builds still
++stop execution, failed suites still allow the remaining suites to run, and
++the checkout guard runs before each queued step.
++
++**Considered and dropped:** Keeping barrier waves leaves capacity unused
++when suites have uneven durations. Keeping every app/kernel step exclusive
++retains the long serial portion of the release gate. Running every suite
++concurrently exposes watchdog and UI tests to interference. Removing the
++job budget risks oversubscribing the machine. Requiring timing history
++would make a first run depend on a previous run, so absent or unreadable
++history falls back to plan order rather than refusing the gate.
++
++**Cost of changing later:** Restoring barrier waves requires changing the
++release executor and its overlap/failure/checkout tests. Restoring blanket
++app/kernel isolation only requires changing `lanes::alone` and its policy
++pins, at the cost of more serial execution. Adding a newly discovered
++timing-sensitive suite requires an `ISOLATED` entry and checking its target
++exists. A different queue ordering requires updating the ordering tests;
++the plan steps and their names remain independent of timing history.

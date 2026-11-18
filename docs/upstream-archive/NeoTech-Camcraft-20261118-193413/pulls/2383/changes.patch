@@ -1,0 +1,642 @@
+From 21a6ea58bfe86dd77cf3c6db3bdf37003184e0ce Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 17 Nov 2026 13:27:07 -0800
+Subject: [PATCH] fix(2d): clear outside containment to stock on clearing ops
+
+Implement #2232 Option 1 so clearing operations (2D Adaptive, 2D Pocket,
+2D Offset, 3D Pocket) with Containment::Outside and a closed selection
+clear from setup stock (+2r air band) inward to the selected face or
+edge while keeping enclosed pockets inside their walls. Filter
+sub-tolerance Clipper arc-chord slivers in non_sliver_center and name
+Extension (Boundary) and setup stock in narrow-band Outside refusals.
+
+Fixes #2232
+---
+ crates/app/src/operation/boundary.rs          |  48 ++-
+ crates/app/src/operation/generate/run_job.rs  |  33 ++
+ crates/app/tests/shoulder_adaptive.rs         | 322 +++++++++++++++++-
+ .../motion/src/machining2d/adaptive_troch.rs  |   2 +-
+ crates/motion/src/machining2d/pocket.rs       |  24 +-
+ docs/decisions/2232-adaptive-outside-stock.md |  68 ++++
+ 6 files changed, 463 insertions(+), 34 deletions(-)
+ create mode 100644 docs/decisions/2232-adaptive-outside-stock.md
+
+diff --git a/crates/app/src/operation/boundary.rs b/crates/app/src/operation/boundary.rs
+index 4e2dc4100..a7b50571e 100644
+--- a/crates/app/src/operation/boundary.rs
++++ b/crates/app/src/operation/boundary.rs
+@@ -107,6 +107,12 @@ impl AreaCtx {
+             self.native = if inside { Native::ToolInside } else { Native::ToolOutside };
+         }
+     }
++
++    /// Whether this runs `Containment::Outside` clearing (no open boundary), and whether stock exists.
++    pub(crate) fn outside_clearing_stock(&self) -> Option<bool> {
++        let out = self.family == Family::Clearing && self.controls.containment == Some(Containment::Outside);
++        (out && self.open.is_none()).then_some(self.stock.is_some())
++    }
+ }
+ 
+ /// The law's answer: the area, plus what Face needs to stay honest - the
+@@ -158,29 +164,35 @@ pub(super) fn containment_delta(native: Native, want: Containment, r: f64) -> f6
+     t - n
+ }
+ 
+-/// Containment past the edge (user hand test 2026-11-06): a positive `d`
+-/// lets a clearing tool pass the selection's OUTER edge only. A hole of
+-/// the selection is material the tool stays out of whatever the
+-/// containment - growing every contour shrank holes and, past their
+-/// size, deleted them. The holes stay as they were (the generator's own
+-/// offset keeps the tool >= r from them). Then the island law, and what
+-/// the tool reaches FROM that edge: a void of the part the band past the
+-/// outline never touches (the recess in the part's top over a picked
+-/// underside) is not "past the boundary" and stays uncut. An enclosed
+-/// pocket, whose walls take the whole band, is its own answer: nothing
+-/// touches the band, so the area stands as the island law left it.
++/// Containment past the edge (user hand test 2026-11-06; #2232): let a
++/// clearing tool pass the outer edge only (keeping selection holes out
++/// and dropping unreached voids). With setup stock (`stock_reach`),
++/// `Outside` clears out to `stock + 2r` unless walls enclose `pre`.
+ fn reach_past_edge(
+     pre: &Region,
+     d: f64,
++    stock_reach: Option<&Region>,
+     islands: &dyn Fn(Region) -> Result<Region, GenError>,
+ ) -> Result<Region, GenError> {
+     let shells: Vec<Loop> = pre.loops().iter().filter(|l| l.is_ccw()).cloned().collect();
+     let filled = Region::union_all(shells)?;
+     let holes = filled.difference(pre)?;
+-    let grown = grow(&filled, d, CornerStyle::Round)?.difference(&holes)?;
+-    let band = grown.difference(pre)?;
+-    let area = islands(grown)?;
+-    let reached = connected_to(&area, &band)?;
++    let local_grown = grow(&filled, d, CornerStyle::Round)?.difference(&holes)?;
++    let band = local_grown.difference(pre)?;
++    let pick = |cand: Region| -> Result<(Region, Region), GenError> {
++        let area = islands(cand)?;
++        Ok((connected_to(&area, &band)?, area))
++    };
++    if let Some(sr) = stock_reach {
++        let pre_free = islands(pre.clone())?;
++        let rim = islands(grow(&filled, 1e-2, CornerStyle::Round)?.difference(&filled)?)?;
++        if pre_free.area().abs() > AREA_EPS && rim.area().abs() <= AREA_EPS {
++            return Ok(pre_free);
++        }
++        let (reached, _) = pick(local_grown.union(sr)?.difference(&holes)?)?;
++        if reached.area().abs() > AREA_EPS { return Ok(reached); }
++    }
++    let (reached, area) = pick(local_grown)?;
+     Ok(if reached.area().abs() > AREA_EPS { reached } else { area })
+ }
+ 
+@@ -321,7 +333,11 @@ pub(super) fn resolve(base: Region, ctx: &AreaCtx) -> Result<AreaApplied, GenErr
+         // The rides shape the ring they ride, holes included; the
+         // clearing kinds keep a hole's protection (`contain`).
+         if grow_d.is_some() {
+-            area = check(reach_past_edge(&pre_islands, d, &islands)?, "tool containment (the part fills the area)")?;
++            let sr = (ctx.outside_clearing_stock() == Some(true))
++                .then(|| ctx.stock.as_ref().map(|s| s.offset(2.0 * r)))
++                .flatten()
++                .transpose()?;
++            area = check(reach_past_edge(&pre_islands, d, sr.as_ref(), &islands)?, "tool containment (the part fills the area)")?;
+         } else {
+             area = check(grow(&area, d, CornerStyle::Round)?, "tool containment")?;
+             if !rides(ctx.family) {
+diff --git a/crates/app/src/operation/generate/run_job.rs b/crates/app/src/operation/generate/run_job.rs
+index 05c7a39fc..1d73ccedc 100644
+--- a/crates/app/src/operation/generate/run_job.rs
++++ b/crates/app/src/operation/generate/run_job.rs
+@@ -25,10 +25,16 @@ pub fn run_job(mut job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // a body whose band stack does not fit the record.
+     let judged_tool = job.tool.clone();
+     let body = job.body.clone().filter(|p| crate::operation::body_judged::falls_back(&judged_tool, p));
++    let outside_clearing = job
++        .area
++        .as_ref()
++        .and_then(|r| r.as_ref().ok())
++        .and_then(AreaCtx::outside_clearing_stock);
+     let _span = tracing::info_span!("generate", op = %job.op_name).entered();
+     let started = crate::clock::Instant::now();
+     tracing::debug!(kind = %kind, "generation started");
+     let (mut path, warns) = pocket_reach(&job).and_then(|()| run_job_arms(job))
++        .map_err(|e| name_outside_entry_refusal(e, outside_clearing))
+         .map_err(|e| crate::operation::body_judged::name_enclosure(e, &judged_tool, body.as_ref()))
+         .map_err(|e| e.map_location(|p| frame.map_or(p, |f| f.to_world(p))))
+         // #261 part 3: a refusal's ghost rides the same frame map as a path.
+@@ -85,3 +91,30 @@ fn pocket_reach(job: &GenJob) -> Result<(), GenError> {
+     }
+     Ok(())
+ }
++
++/// Annotate a narrow-area or missing-entry refusal when a clearing kind
++/// ran with `Containment::Outside`, naming the `Extension` control and
++/// setup stock (#2232).
++fn name_outside_entry_refusal(e: GenError, outside_stock: Option<bool>) -> GenError {
++    let Some(has_stock) = outside_stock else {
++        return e;
++    };
++    e.map_msg(|m| {
++        if m.contains("no room for an entry")
++            || m.contains("narrower than the tool")
++            || m.contains("too narrow")
++        {
++            if has_stock {
++                format!(
++                    "{m} - the setup stock leaves no room past the selection; enlarge the stock or set an Extension (Boundary)"
++                )
++            } else {
++                format!(
++                    "{m} - this setup has no stock, so Outside containment leaves a band one tool wide; set an Extension (Boundary) or add setup stock"
++                )
++            }
++        } else {
++            m
++        }
++    })
++}
+diff --git a/crates/app/tests/shoulder_adaptive.rs b/crates/app/tests/shoulder_adaptive.rs
+index c90e5cfdf..814ff1b0c 100644
+--- a/crates/app/tests/shoulder_adaptive.rs
++++ b/crates/app/tests/shoulder_adaptive.rs
+@@ -13,6 +13,7 @@
+ 
+ mod area_support;
+ mod common;
++mod pocket_support;
+ 
+ use area_support::*;
+ use camcraft_app::geo2d::Point2;
+@@ -75,28 +76,29 @@ fn containment_outside_clears_past_the_edge_never_the_recess() {
+     let (world, name) = milling_test();
+     let (c, recess_r) = recess(&world, &name);
+     let src = sel(&name, top_face(&world, &name, -5.0));
+-    // Outside alone leaves a band one tool wide around the part - the
+-    // adaptive names that ("no room for an entry"), never the recess.
++    // #2232 Option 1: with a setup stock, Containment Outside clears
++    // from the selected face out to the stock outline (+2r air band),
++    // entering in the free area and ending at the selected face, never
++    // entering the recess.
+     let a = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
+-    let err = run(&world, &op(src.clone(), adaptive(FLOOR), a.clone())).expect_err("a one-tool band has no entry room");
+-    assert!(!err.contains("fills the whole selection"), "Outside is not a height error: {err}");
+-    let preview = operation::region_of(&world, &op(src.clone(), adaptive(FLOOR), a)).expect("the band previews");
++    let preview = operation::region_of(&world, &op(src.clone(), adaptive(FLOOR), a.clone())).expect("the band previews");
+     assert!(!preview.contains(Point2::new(c.0, c.1)), "the recess is not in the machined area");
+-    // With room past the edge the band clears. 2D Adaptive itself: the
+-    // band is a channel ~270 mm long no single spiral should grow
+-    // through, so the planner refuses it by name at once (issue #13: it
+-    // used to grind for minutes) and its Offset rings cut it.
+-    let a = AreaControls { containment: Some(Containment::Outside), extension: 4.0, ..Default::default() };
+-    let band = operation::region_of(&world, &op(src.clone(), adaptive(FLOOR), a.clone())).expect("the band previews");
+-    assert!(!band.contains(Point2::new(c.0, c.1)), "the recess stays out with an extension too");
+     let t0 = std::time::Instant::now();
+-    let (t, warns) = run(&world, &op(src, adaptive(FLOOR), a)).expect("generates");
++    let (t, warns) = run(&world, &op(src, adaptive(FLOOR), a)).expect("generates with stock");
+     assert!(t0.elapsed().as_secs_f64() < 60.0, "the band plans in seconds, not minutes");
+     assert_eq!(warns, 0, "the plan verifies clean: {:?}", t.notes);
++    let part_outline = entity_outline(&world, &name);
++    let first_feed = t.moves.iter().find(|m| m.kind == MoveKind::Feed).expect("first cut");
+     assert!(
+-        t.notes.iter().any(|n| n.contains("channel") && n.contains("Offset rings cut")),
+-        "the refusal is named: {:?}",
+-        t.notes
++        min_dist_to_region(&part_outline, first_feed.from) > R + 0.5,
++        "first cut enters in the free area away from the face: {:?}",
++        first_feed.from
++    );
++    let last_feed = t.moves.iter().rfind(|m| m.kind == MoveKind::Feed).expect("last cut");
++    assert!(
++        min_dist_to_region(&part_outline, last_feed.to) <= R + 0.05,
++        "last pass finishes at the selected face: {:?}",
++        last_feed.to
+     );
+     let f: Vec<&camcraft_app::cl::Move> = t.moves.iter().filter(|m| m.kind == MoveKind::Feed).collect();
+     assert!(!f.is_empty());
+@@ -123,6 +125,42 @@ fn containment_outside_clears_past_the_edge_never_the_recess() {
+     );
+ }
+ 
++#[test]
++fn containment_outside_without_stock_clears_with_extension_never_the_recess() {
++    let world = new_world();
++    let mut h = History::default();
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/Milling-test.step");
++    let imp = ImportModel::new(&path).expect("the user's STEP imports");
++    let name = imp.name.clone();
++    h.execute(&world, imp);
++    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    h.execute(&world, AddTool::new(&world, TOOL, tool).expect("tool"));
++    let (c, recess_r) = recess(&world, &name);
++    let src = sel(&name, top_face(&world, &name, -5.0));
++    let a = AreaControls { containment: Some(Containment::Outside), extension: 4.0, ..Default::default() };
++    let band = operation::region_of(&world, &op(src.clone(), adaptive(FLOOR), a.clone())).expect("the band previews");
++    assert!(!band.contains(Point2::new(c.0, c.1)), "the recess stays out with an extension too");
++    let t0 = std::time::Instant::now();
++    let (t, warns) = run(&world, &op(src, adaptive(FLOOR), a)).expect("generates");
++    assert!(t0.elapsed().as_secs_f64() < 60.0, "the band plans in seconds, not minutes");
++    assert_eq!(warns, 0, "the plan verifies clean: {:?}", t.notes);
++    assert!(
++        t.notes.iter().any(|n| n.contains("channel") && n.contains("Offset rings cut")),
++        "the refusal is named: {:?}",
++        t.notes
++    );
++    let mut worst = f64::INFINITY;
++    for m in t.moves.iter().filter(|m| m.kind == MoveKind::Feed) {
++        for (a, b) in m.chords(0.01) {
++            for i in 0..=8 {
++                let s = f64::from(i) / 8.0;
++                worst = worst.min((a.x + (b.x - a.x) * s - c.0).hypot(a.y + (b.y - a.y) * s - c.1));
++            }
++        }
++    }
++    assert!(worst >= recess_r + R - 0.05, "a feed enters the recess ({worst:.3})");
++}
++
+ #[test]
+ fn the_open_run_refusal_says_how_to_close_it() {
+     let world = block_world();
+@@ -135,3 +173,255 @@ fn the_open_run_refusal_says_how_to_close_it() {
+         "{err}"
+     );
+ }
++
++fn horizontal_face(world: &World, name: &str, z: f64) -> FeatureSel {
++    let e = model::find_by_name(world, name).expect("model");
++    let f = model::features_of(world, &e).expect("features");
++    let mut best: Option<(f64, FeatureSel)> = None;
++    for face in f.faces.iter().filter(|face| face.normal[2].abs() > 0.99) {
++        let Some(l) = face.loops.iter().find(|l| l.kind == feature::LoopKind::Outer) else { continue };
++        let pts: Vec<[f64; 3]> = l.verts.iter().filter_map(|&v| f.verts.get(v as usize).copied()).collect();
++        if pts.is_empty() || pts.iter().any(|p| (p[2] - z).abs() > 1e-6) {
++            continue;
++        }
++        let ext = pts.iter().map(|p| p[0].abs().max(p[1].abs())).fold(0.0, f64::max);
++        if best.is_none_or(|(b, _)| ext > b) {
++            best = Some((ext, FeatureSel::Face(face.id)));
++        }
++    }
++    best.expect("a horizontal face").1
++}
++
++fn fig8_world(stock_margin: Option<f64>, tool_name: &str) -> (World, History, String, (Point3, Point3)) {
++    let world = new_world();
++    let mut h = History::default();
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/models/fig8.step");
++    let imp = ImportModel::new(&path).expect("fig8.step imports");
++    let name = imp.name.clone();
++    h.execute(&world, imp);
++    let e = model::find_by_name(&world, &name).expect("part");
++    let b = model::entity_world_aabb(&world, &e).expect("part aabb");
++    let tool = catalog().into_iter().find(|(n, _)| *n == tool_name).map(|(_, t)| t).expect("catalog tool");
++    h.execute(&world, AddTool::new(&world, tool_name, tool).expect("tool"));
++    h.execute(&world, camcraft_app::commands::CreateSetup::new(&world, None, None).expect("setup"));
++    if let Some(m) = stock_margin {
++        let dx = (b.max.x - b.min.x) + 2.0 * m;
++        let dy = (b.max.y - b.min.y) + 2.0 * m;
++        let dz = b.max.z - b.min.z;
++        let loc = Location {
++            pos: Point3::new(0.5 * (b.min.x + b.max.x), 0.5 * (b.min.y + b.max.y), b.min.z),
++            ..Default::default()
++        };
++        h.execute(&world, SetStock::new(&world, StockShape::Box { dx, dy, dz }, loc).expect("stock"));
++    }
++    (world, h, name, (b.min, b.max))
++}
++
++fn entity_outline(world: &World, name: &str) -> camcraft_app::geo2d::Region {
++    let e = model::find_by_name(world, name).expect("part");
++    let facets = model::world_facets(world, &e).expect("facets");
++    camcraft_app::geometry::slice::project(&facets, 64).expect("part outline")
++}
++
++fn min_dist_to_region(reg: &camcraft_app::geo2d::Region, pt: Point3) -> f64 {
++    let mut best = f64::INFINITY;
++    for l in reg.loops() {
++        let pts = l.points();
++        for i in 0..pts.len() {
++            let a = pts[i];
++            let b = pts[(i + 1) % pts.len()];
++            let (dx, dy) = (b.x - a.x, b.y - a.y);
++            let dd = dx * dx + dy * dy;
++            let t = if dd > 0.0 { (((pt.x - a.x) * dx + (pt.y - a.y) * dy) / dd).clamp(0.0, 1.0) } else { 0.0 };
++            best = best.min((pt.x - a.x - dx * t).hypot(pt.y - a.y - dy * t));
++        }
++    }
++    best
++}
++
++#[test]
++fn fig8_bottom_face_outside_containment_generates_and_stops_at_face() {
++    let (world, mut h, name, (bmin, bmax)) = fig8_world(Some(5.0), TOOL);
++    let face = horizontal_face(&world, &name, bmin.z);
++    let src = sel(&name, face);
++    let mut p = operation::retype_params(&pocket(bmax.z, bmin.z), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut p {
++        *top_z = Height::fixed(bmax.z);
++        *bottom_z = FLOOR;
++        *stepdown = (bmax.z - bmin.z) + 1.0;
++    }
++    let area = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
++    h.execute(&world, CreateOperation::new(&world, "Adp1", TOOL, src, p.clone()).expect("create"));
++    h.execute(&world, EditOperationParams::with_area(&world, "Adp1", p, area).expect("area"));
++    h.execute(&world, camcraft_app::commands::GenerateOperation::new(&world, "Adp1").expect("generate"));
++    let e = model::find_by_name(&world, "Adp1").expect("op");
++    let cached = model::toolpath_of(&world, &e).expect("cached");
++    assert!(cached.warnings.is_empty(), "verifies clean: {:?}", cached.warnings);
++    assert!(!cached.path.moves.is_empty());
++    let posted = camcraft_app::posting::post_setup_unwritten(&world).expect("posts clean");
++    assert!(!posted.program.is_empty());
++
++    let part_outline = entity_outline(&world, &name);
++    let op_val = model::operation_of(&world, &e).expect("op");
++    let region = operation::region_of(&world, &op_val).expect("region previews");
++    let (lo, hi) = region.bounds().expect("bounds");
++    assert!(lo.x < bmin.x - 5.0 - R && hi.x > bmax.x + 5.0 + R, "region reaches air past stock: {lo:?} {hi:?}");
++    let first_feed = cached.path.moves.iter().find(|m| m.kind == MoveKind::Feed).expect("first cut");
++    assert!(
++        min_dist_to_region(&part_outline, first_feed.from) > R + 1.0,
++        "first cut enters inside free stock area away from face: {:?}",
++        first_feed.from
++    );
++    let last_feed = cached.path.moves.iter().rfind(|m| m.kind == MoveKind::Feed).expect("last cut");
++    let d_last = min_dist_to_region(&part_outline, last_feed.to);
++    assert!(
++        (d_last - R).abs() < 0.05,
++        "last pass ends at the selected face (dist {d_last:.3}, R {R})"
++    );
++}
++
++#[test]
++fn fig8_outside_containment_with_em0800_and_clearing_kinds_works() {
++    // EM-0800-4FL (D 8, flute 20, shank 10) within flute length clears cleanly and posts.
++    let (world, mut h, name, (bmin, bmax)) = fig8_world(Some(5.0), "EM-0800-4FL");
++    let r8 = 4.0;
++    let face = horizontal_face(&world, &name, bmin.z);
++    let src = sel(&name, face);
++    let mut p = operation::retype_params(&pocket(bmax.z, bmin.z + 5.0), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, entry, helix_radius, .. } = &mut p {
++        *top_z = Height::fixed(bmax.z);
++        *bottom_z = Height::fixed(bmin.z + 5.0);
++        *stepdown = 20.0;
++        *entry = Entry3D::Helix;
++        *helix_radius = 1.0;
++    }
++    let area = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
++    h.execute(&world, CreateOperation::new(&world, "Adp8", "EM-0800-4FL", src, p.clone()).expect("create"));
++    h.execute(&world, EditOperationParams::with_area(&world, "Adp8", p, area).expect("area"));
++    h.execute(&world, camcraft_app::commands::GenerateOperation::new(&world, "Adp8").expect("generate"));
++    let e = model::find_by_name(&world, "Adp8").expect("op");
++    let cached = model::toolpath_of(&world, &e).expect("cached");
++    assert!(cached.warnings.is_empty(), "verifies clean: {:?}", cached.warnings);
++    assert!(!camcraft_app::posting::post_setup_unwritten(&world).expect("posts clean").program.is_empty());
++    let part_outline = entity_outline(&world, &name);
++    let first_feed = cached.path.moves.iter().find(|m| m.kind == MoveKind::Feed).expect("first cut");
++    assert!(min_dist_to_region(&part_outline, first_feed.from) > r8 + 1.0, "EM-0800-4FL enters away from face");
++    let last_feed = cached.path.moves.iter().rfind(|m| m.kind == MoveKind::Feed).expect("last cut");
++    let d_last = min_dist_to_region(&part_outline, last_feed.to);
++    assert!((d_last - r8).abs() < 0.05, "EM-0800-4FL ends at selected face (dist {d_last:.3}, r {r8})");
++}
++
++#[test]
++fn outside_containment_clearing_kinds_and_enclosed_pockets() {
++    let bw = block_world();
++    let bsrc = sel("part", horizontal_face(&bw, "part", 0.0));
++    let out_area = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
++    for kind in [OpType::Adaptive2D, OpType::Offset2D, OpType::Pocket] {
++        let mut kp = operation::retype_params(&pocket(10.0, 0.0), kind.ordinal());
++        match &mut kp {
++            OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. }
++            | OpParams::Offset2D { top_z, bottom_z, stepdown, .. }
++            | OpParams::Pocket { top_z, bottom_z, stepdown, .. } => {
++                *top_z = Height::fixed(10.0);
++                *bottom_z = Height::fixed(0.0);
++                *stepdown = 12.0;
++            }
++            _ => {}
++        }
++        let (t, warns) = run(&bw, &op(bsrc.clone(), kp, out_area.clone())).unwrap_or_else(|e| panic!("{kind}: {e}"));
++        assert_eq!(warns, 0, "{kind} verifies clean");
++        let reach = max_by(&feeds(&t), |q| q.x.abs().max(q.y.abs()));
++        assert!((reach - (35.0 + R)).abs() < 0.1, "{kind} reaches stock + R: {reach}");
++    }
++
++    // Enclosed pocket inside a block inside larger stock must stay inside the pocket walls.
++    let pocket_mesh = pocket_support::block_with_pocket(25.0, 25.0, &pocket_support::rounded_rect(12.0, 12.0, 1.0, 1), 10.0, 20.0);
++    let ew = world_with(Some(ImportModel::from_mesh("part", pocket_mesh)), 0.0, 20.0);
++    let floor = horizontal_face(&ew, "part", 10.0);
++    let mut ep = operation::retype_params(&pocket(20.0, 10.0), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut ep {
++        (*top_z, *bottom_z, *stepdown) = (Height::fixed(20.0), Height::fixed(10.0), 12.0);
++    }
++    let (et, ewarns) = run(&ew, &op(sel("part", floor), ep, out_area.clone())).expect("enclosed pocket cuts");
++    assert_eq!(ewarns, 0);
++    assert!(max_by(&feeds(&et), |q| q.x.abs().max(q.y.abs())) <= 12.0 - R + 0.05, "enclosed pocket stays inside walls");
++
++    // Enclosed circular recess on STEP model (Milling-test.step at Z 0) also stays inside its walls.
++    let (mw, mname) = milling_test();
++    let (rc, rr) = recess(&mw, &mname);
++    let rfloor = top_face(&mw, &mname, 0.0);
++    let (rt, rwarns) = run(&mw, &op(sel(&mname, rfloor), adaptive(Height::fixed(0.0)), out_area)).expect("STEP recess cuts");
++    assert_eq!(rwarns, 0, "STEP recess verifies clean");
++    assert!(
++        feeds(&rt).into_iter().all(|q| (q.x - rc.0).hypot(q.y - rc.1) <= rr - R + 0.05),
++        "STEP circular recess stays inside walls"
++    );
++}
++
++#[test]
++fn outside_containment_without_stock_refuses_naming_extension() {
++    let (world, _h, name, (bmin, bmax)) = fig8_world(None, "EM-0800-4FL");
++    let src = sel(&name, horizontal_face(&world, &name, bmin.z));
++    let mut p = operation::retype_params(&pocket(bmax.z, bmin.z), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut p {
++        (*top_z, *bottom_z, *stepdown) = (Height::fixed(bmax.z), FLOOR, (bmax.z - bmin.z) + 1.0);
++    }
++    let area = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
++    let mut o = op(src, p, area.clone());
++    o.tool = "EM-0800-4FL".into();
++    let err = run(&world, &o).expect_err("without stock a one-tool band has no entry room");
++    assert!(err.contains("Extension"), "refusal must name the Extension control: {err}");
++
++    let fw = new_world();
++    let mut fh = History::default();
++    fh.execute(&fw, ImportModel::from_mesh("part", cube(Point3::new(-20.0, -20.0, 0.0), Point3::new(20.0, 20.0, 10.0))));
++    let floc = Location { pos: Point3::new(0.0, 0.0, 0.0), ..Default::default() };
++    fh.execute(&fw, SetStock::new(&fw, StockShape::Box { dx: 40.0, dy: 40.0, dz: 10.0 }, floc).expect("flush stock"));
++    let t = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    fh.execute(&fw, AddTool::new(&fw, TOOL, t).expect("tool"));
++    let fface = horizontal_face(&fw, "part", 0.0);
++    let mut fp = operation::retype_params(&pocket(10.0, 0.0), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut fp {
++        (*top_z, *bottom_z, *stepdown) = (Height::fixed(10.0), FLOOR, 12.0);
++    }
++    let ferr = run(&fw, &op(sel("part", fface), fp.clone(), area.clone())).expect_err("flush stock leaves no room past selection");
++    assert!(ferr.contains("Extension") && ferr.contains("stock"), "refusal must name Extension and stock: {ferr}");
++
++    // Without stock on a square block, Clipper round corners must not emit an empty toolpath.
++    let nw = new_world();
++    let mut nh = History::default();
++    nh.execute(&nw, ImportModel::from_mesh("part", cube(Point3::new(-20.0, -20.0, 0.0), Point3::new(20.0, 20.0, 10.0))));
++    let nt = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    nh.execute(&nw, AddTool::new(&nw, TOOL, nt).expect("tool"));
++    let nface = horizontal_face(&nw, "part", 0.0);
++    let nerr = run(&nw, &op(sel("part", nface), fp, area)).expect_err("no stock on square block must refuse");
++    assert!(nerr.contains("Extension") && nerr.contains("stock"), "refusal must name Extension and stock: {nerr}");
++}
++
++#[test]
++fn outside_containment_air_band_fixture_blocks_post() {
++    use camcraft_app::commands::{GenerateOperation, MoveFixture, TagFixture};
++    use camcraft_app::verify::Warning;
++    let (world, mut h, name, (bmin, bmax)) = fig8_world(Some(5.0), TOOL);
++    let src = sel(&name, horizontal_face(&world, &name, bmin.z));
++    let mut p = operation::retype_params(&pocket(bmax.z, bmin.z), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut p {
++        (*top_z, *bottom_z, *stepdown) = (Height::fixed(bmax.z), FLOOR, (bmax.z - bmin.z) + 1.0);
++    }
++    let area = AreaControls { containment: Some(Containment::Outside), ..Default::default() };
++    h.execute(&world, CreateOperation::new(&world, "Adp1", TOOL, src, p.clone()).expect("create"));
++    h.execute(&world, EditOperationParams::with_area(&world, "Adp1", p, area).expect("area"));
++    let clamp = cube(Point3::new(bmax.x + 6.0, bmin.y, bmin.z), Point3::new(bmax.x + 25.0, bmax.y, bmax.z));
++    h.execute(&world, ImportModel::from_mesh("Clamp", clamp));
++    h.execute(&world, TagFixture::new(&world, "Clamp", None).expect("tag fixture"));
++    h.execute(&world, GenerateOperation::new(&world, "Adp1").expect("generate"));
++    let cached = model::toolpath_of(&world, &model::find_by_name(&world, "Adp1").expect("op")).expect("cached");
++    assert!(cached.warnings.iter().any(|w| matches!(w, Warning::FixtureHit { .. })), "fixture hit: {:?}", cached.warnings);
++    assert!(camcraft_app::posting::post_setup_unwritten(&world).is_err(), "post gate must block air-band fixture hit");
++
++    // Move the fixture clear and regenerate: verification and post gate both pass.
++    h.execute(&world, MoveFixture::new(&world, "Clamp", Location { pos: Point3::new(100.0, 0.0, 0.0), ..Default::default() }).expect("move"));
++    assert!(camcraft_app::posting::verification_gate(&world).is_empty(), "moved fixture clears live gate");
++    h.execute(&world, GenerateOperation::new(&world, "Adp1").expect("regenerate"));
++    assert!(!camcraft_app::posting::post_setup_unwritten(&world).expect("clear fixture posts").program.is_empty());
++}
+diff --git a/crates/motion/src/machining2d/adaptive_troch.rs b/crates/motion/src/machining2d/adaptive_troch.rs
+index 25bccdc3e..52016631d 100644
+--- a/crates/motion/src/machining2d/adaptive_troch.rs
++++ b/crates/motion/src/machining2d/adaptive_troch.rs
+@@ -142,7 +142,7 @@ pub fn adaptive_trochoidal_with(region: &Region, p: &PocketParams, t: &AdaptiveT
+         return Err(GenError::Empty("empty pocket region".into()));
+     }
+     let r = 0.5 * p.tool_diameter;
+-    let center = region.offset(-(r + p.stock_to_leave))?;
++    let center = super::pocket::non_sliver_center(region, r + p.stock_to_leave)?;
+     if center.is_empty() {
+         return Err(GenError::Invalid(format!(
+             "{WHO}: the region is narrower than the {:.3} mm tool (with {:.3} mm left on each wall)",
+diff --git a/crates/motion/src/machining2d/pocket.rs b/crates/motion/src/machining2d/pocket.rs
+index c47ca220f..406744d8a 100644
+--- a/crates/motion/src/machining2d/pocket.rs
++++ b/crates/motion/src/machining2d/pocket.rs
+@@ -214,7 +214,7 @@ pub fn pocket_entered(region: &Region, p: &PocketParams, holes: &[PreHole]) -> R
+     if region.is_empty() {
+         return Err(GenError::Empty("empty pocket region".into()));
+     }
+-    let center = region.offset(-(p.tool_diameter * 0.5 + p.stock_to_leave))?;
++    let center = non_sliver_center(region, p.tool_diameter * 0.5 + p.stock_to_leave)?;
+     if center.is_empty() {
+         // Material exists that no legal tool position can reach.
+         return Err(GenError::Invalid("pocket is narrower than the tool".into()));
+@@ -222,6 +222,28 @@ pub fn pocket_entered(region: &Region, p: &PocketParams, holes: &[PreHole]) -> R
+     pocket_over(region, &center, p, Vec::new(), false, holes)
+ }
+ 
++/// Erode `region` by `erode` and drop sub-tolerance Clipper arc-chord
++/// slivers (`<= 0.01 mm^2` area and `<= 0.008 mm` half-width) that hold
++/// no cuttable pass and would spin on empty bores (#2232).
++pub(super) fn non_sliver_center(region: &Region, erode: f64) -> Result<Region, GenError> {
++    let center = region.offset(-erode)?;
++    if center.is_empty() {
++        return Ok(center);
++    }
++    let outers = center.loops().iter().filter(|l| l.is_ccw()).count();
++    if outers <= 1 && center.area().abs() > 1e-2 {
++        return Ok(center);
++    }
++    let clean = Region::from_slices(center.loops().to_vec())?;
++    let mut kept = Vec::new();
++    for c in super::pocket_hsm::components(&clean)? {
++        if c.area().abs() > 1e-2 || crate::entry::dive_room(&c, 0.008).is_some() {
++            kept.extend(c.loops().iter().cloned());
++        }
++    }
++    Ok(Region::from_slices(kept)?)
++}
++
+ /// The pocket passes over a given cutter-center area: [`pocket`]'s body
+ /// once the area is known, shared with rest machining (`rest2d`, #1446),
+ /// whose area is the part of the pocket's own that touches the rest
+diff --git a/docs/decisions/2232-adaptive-outside-stock.md b/docs/decisions/2232-adaptive-outside-stock.md
+new file mode 100644
+index 000000000..33b31f249
+--- /dev/null
++++ b/docs/decisions/2232-adaptive-outside-stock.md
+@@ -0,0 +1,68 @@
++## #2232 - Clearing operations with outside containment clear from stock outline to selected boundary
++
++**What was decided:** Implement Option 1 in `crates/app/src/operation/boundary.rs`
++(`reach_past_edge`), `crates/app/src/operation/generate/run_job.rs`
++(`name_outside_entry_refusal`), and `crates/motion/src/machining2d/pocket.rs`
++(`non_sliver_center`, shared with `adaptive_troch.rs`):
++
++1. When a clearing operation (`Family::Clearing`: `2D Adaptive`, `2D Pocket`,
++   `2D Offset`, `3D Pocket`) runs with `Containment::Outside`, no open
++   boundary, and setup stock present (`AreaCtx::outside_clearing_stock`), the
++   machined area expands to the setup stock outline grown by `2 * r` (rounded
++   corners via `stock.offset(2.0 * r)`) minus holes and standing part islands,
++   unless part walls enclose the entire perimeter of the selection (`rim`
++   check: `pre_free` is non-empty and the `1e-2` mm rim outside `filled` is
++   completely blocked).
++2. **"The inside" for outside containment:** Under `Containment::Outside` with
++   setup stock, the region "the inside" of the machined area is the free
++   annular/outer region between the stock side (extended by one tool radius
++   in cutter-center space so outer passes run in air) and the selected face
++   or edge boundary (stopped at `r` from the part wall). As the maintainer
++   stated on 2026-11-16:
++   > "outside machining like that should be entering from the inside and work up to the selected face or edge.."
++   > "2D Adaptive; Does not understand how to \"clear\" bulk material from outside of a model up to outer selected edge. Planning for bulk removal using an adaptive strategy.. Containment \"outside\" states \"Center area has no room for entry\" which makes no sense if its going to clear from outside in.."
++   > "Decision on 2232; Option1.."
++3. **Where the entry goes:** Inside that free region between the stock side and
++   the selected boundary, `pocket_hsm::choose_entry` places the helix/plunge
++   entry at the kernel or widest point of least geodesic eccentricity in the
++   cutter-center region (`region.offset(-r)`), away from the selected face or
++   edge; `OffsetRings` fallback likewise seeds in the deepest eroded ring
++   inside that region (`k` descending) and works outward so the final pass
++   finishes at the selected face or edge (`r` from the part wall).
++4. **Without stock or with flush stock:** When no setup stock exists or the
++   stock leaves no room past the selection, `non_sliver_center` drops
++   sub-tolerance (`<= 0.01 mm^2` area and `<= 0.008 mm` half-width) Clipper
++   arc-chord slivers (decomposing pinched offset loops with
++   `Region::from_slices`) so narrow `2r` bands do not spin on empty bores or
++   emit zero-move toolpaths, and `name_outside_entry_refusal` annotates narrow
++   or missing-entry refusals to name `Extension (Boundary)` and setup stock.
++5. **Verify and post gate unchanged:** Verification (`ShankHit`,
++   `FixtureHit`) and the post gate are untouched; air-band passes hitting a
++   tagged fixture still block posting.
++
++**Why:** Previously `reach_past_edge` only grew the selection by `2 * r` even
++when setup stock was present, leaving a cutter-center area of width zero (or
++sub-tolerance Clipper chord slivers) and refusing `2D Adaptive` with
++`adaptive: the center area has no room for an entry`. Expanding to
++`stock.offset(2.0 * r)` matches the open-boundary air-band law while using
++round corners at the stock boundary so flush square stock corners do not leave
++4 triangular corner pockets. Placing `non_sliver_center` in `pocket.rs`
++(`pocket_entered`) avoids overlapping open PR #2035 in `pocket_hsm.rs`.
++
++**Considered and dropped:**
++- Option 2 (better refusal text only without clearing to stock) was rejected by
++  the maintainer because it does not clear bulk material from stock to the
++  selected edge.
++- Using `stock.offset_sharp(2.0 * r)` was dropped because on flush square stock
++  its mitered outer corners extend `sqrt(2) * 2r`, leaving `5.36 mm^2`
++  corner wedges after `-r` erosion instead of a clean narrow-area refusal.
++- Filtering slivers inside `pocket_hsm::hsm_passes` was dropped in favor of
++  `pocket::non_sliver_center` to protect all clearing strategies (`Adaptive`,
++  `OffsetRings`, `Trochoidal`) and avoid overlapping PR #2035.
++
++**Cost to change later:** The stock-reach expansion is localized to
++`reach_past_edge` and `AreaCtx::outside_clearing_stock` in `boundary.rs`, the
++sliver filter to `non_sliver_center` in `pocket.rs`, and the refusal message
++to `name_outside_entry_refusal` in `run_job.rs`. The pinned refusal in
++`crates/app/tests/shoulder_adaptive.rs` (`containment_outside_clears_past_the_edge_never_the_recess`)
++was converted into a generated-toolpath pin per the maintainer's condition.
