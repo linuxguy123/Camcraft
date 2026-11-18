@@ -1,0 +1,531 @@
+From 66633a80c93f7e5ac32455346b09f9aade29875b Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 17 Nov 2026 22:51:58 -0800
+Subject: [PATCH] fix(ui): persist desktop GPU startup diagnostics
+
+Append and synchronize console-less desktop logs before GPU work.
+Keep adapter driver metadata, panic and startup backtraces, and recovery hints.
+Preserve terminal filtering, the previous panic hook, and prior-run evidence.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #2421
+---
+ crates/app/src/logging.rs                  |   6 +
+ crates/app/src/logging_desktop.rs          | 114 +++++++++++++++++++
+ crates/ui/src/egui_app/gpu_init.rs         |   5 +-
+ crates/ui/src/egui_app/gpu_select.rs       |  15 ++-
+ crates/ui/src/egui_app/gpu_select_tests.rs |  24 +++-
+ crates/ui/src/egui_app/shell_window.rs     |   7 +-
+ crates/ui/src/main.rs                      |   5 +-
+ crates/ui/src/win_console.rs               |   8 +-
+ crates/ui/tests/startup_log.rs             | 124 +++++++++++++++++++++
+ docs/decisions/2421-startup-log-uma.md     |  37 ++++++
+ 10 files changed, 329 insertions(+), 16 deletions(-)
+ create mode 100644 crates/app/src/logging_desktop.rs
+ create mode 100644 crates/ui/tests/startup_log.rs
+ create mode 100644 docs/decisions/2421-startup-log-uma.md
+
+diff --git a/crates/app/src/logging.rs b/crates/app/src/logging.rs
+index fc8bb84d0..e7c34b70e 100644
+--- a/crates/app/src/logging.rs
++++ b/crates/app/src/logging.rs
+@@ -14,6 +14,12 @@ use crate::clock::Instant;
+ use tracing_subscriber::util::SubscriberInitExt as _;
+ use tracing_subscriber::EnvFilter;
+ 
++#[cfg(not(target_arch = "wasm32"))]
++#[path = "logging_desktop.rs"]
++mod desktop;
++#[cfg(not(target_arch = "wasm32"))]
++pub use desktop::{failure_message, init_desktop, log_path, startup_failure};
++
+ /// Milliseconds since `started`, saturating at `u64::MAX` rather than
+ /// truncating the `u128` `as_millis` returns (safe numeric conversion).
+ #[must_use]
+diff --git a/crates/app/src/logging_desktop.rs b/crates/app/src/logging_desktop.rs
+new file mode 100644
+index 000000000..7d068099d
+--- /dev/null
++++ b/crates/app/src/logging_desktop.rs
+@@ -0,0 +1,114 @@
++//! Durable desktop diagnostics for console-less launches (#2421).
++//! Provenance: our own wiring over std file/panic APIs and tracing-subscriber layers.
++
++use std::fs::{File, OpenOptions};
++use std::io::{self, Write};
++use std::path::PathBuf;
++use std::sync::{Arc, Mutex, OnceLock};
++
++use tracing_subscriber::prelude::*;
++
++type Sink = Arc<Mutex<File>>;
++static DESKTOP: OnceLock<Result<Sink, String>> = OnceLock::new();
++
++/// The existing platform config folder, or a temporary folder when no home resolves.
++pub fn log_path() -> PathBuf {
++    crate::recent::config_dir_for(std::env::consts::OS, |key| std::env::var_os(key))
++        .unwrap_or_else(|| std::env::temp_dir().join("camcraft"))
++        .join("camcraft.log")
++}
++
++fn append(sink: &Sink, bytes: &[u8]) -> io::Result<()> {
++    let mut file = sink.lock().map_err(|_| io::Error::other("desktop log lock poisoned"))?;
++    file.write_all(bytes)?;
++    // No shutdown guard: main uses process::exit and a driver hang may prevent shutdown.
++    file.sync_data()
++}
++
++fn report_write(sink: &Sink, bytes: &[u8]) {
++    if let Err(err) = append(sink, bytes) {
++        let _ = writeln!(io::stderr(), "cannot write desktop log {}: {err}", log_path().display());
++    }
++}
++
++/// Buffer one formatted event, then append and synchronize it before returning.
++struct Record {
++    sink: Sink,
++    bytes: Vec<u8>,
++}
++
++impl Write for Record {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        self.bytes.extend_from_slice(bytes);
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++impl Drop for Record {
++    fn drop(&mut self) {
++        report_write(&self.sink, &self.bytes);
++    }
++}
++
++fn open_log() -> Result<Sink, String> {
++    let path = log_path();
++    let opened = (|| -> io::Result<File> {
++        if let Some(parent) = path.parent() {
++            std::fs::create_dir_all(parent)?;
++        }
++        OpenOptions::new().create(true).append(true).open(&path)
++    })();
++    let sink = Arc::new(Mutex::new(opened.map_err(|err| format!("cannot open desktop log {}: {err}", path.display()))?));
++    let file_sink = Arc::clone(&sink);
++    let file = tracing_subscriber::fmt::layer()
++        .with_ansi(false)
++        .with_writer(move || Record { sink: Arc::clone(&file_sink), bytes: Vec::new() })
++        // Terminal verbosity must never hide the startup evidence in the file.
++        .with_filter(tracing_subscriber::EnvFilter::new(super::DEFAULT_FILTER));
++    let terminal = tracing_subscriber::fmt::layer()
++        .with_writer(io::stderr)
++        .with_filter(super::filter_from_env());
++    if let Err(err) = tracing_subscriber::registry().with(terminal).with(file).try_init() {
++        report_write(&sink, format!("desktop tracing subscriber not installed: {err}\n").as_bytes());
++    }
++    let panic_sink = Arc::clone(&sink);
++    let previous = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        let text = format!("{}\nbacktrace:\n{}\n", failure_message(&format!("panic: {info}")), std::backtrace::Backtrace::force_capture());
++        report_write(&panic_sink, text.as_bytes());
++        previous(info);
++    }));
++    append(&sink, format!("CamCraft desktop startup (pid {}); log file: {}\n", std::process::id(), path.display()).as_bytes())
++        .map_err(|err| format!("cannot synchronize desktop log {}: {err}", path.display()))?;
++    Ok(sink)
++}
++
++/// Install file and terminal layers once. The CLI keeps the stderr-only initializer.
++pub fn init_desktop() {
++    if let Err(err) = DESKTOP.get_or_init(open_log) {
++        super::init();
++        let _ = writeln!(io::stderr(), "{err}");
++    }
++}
++
++/// Crash dialogs and terminal failures share the same location and recovery hints.
++pub fn failure_message(message: &str) -> String {
++    let location = match DESKTOP.get() {
++        Some(Err(err)) => format!("Log unavailable: {err}"),
++        _ => format!("Log file: {}", log_path().display()),
++    };
++    format!("{message}\n\n{location}\nTry --gpu-backend dx12, --gpu-backend vulkan or --gpu-backend gl.\nUse --gpu <adapter name> to choose an adapter.")
++}
++
++/// Persist a returned startup error with a forced backtrace, independent of filters.
++pub fn startup_failure(message: &str) {
++    let text = format!("{}\nbacktrace:\n{}\n", failure_message(message), std::backtrace::Backtrace::force_capture());
++    if let Some(Ok(sink)) = DESKTOP.get() {
++        report_write(sink, text.as_bytes());
++    }
++    let _ = writeln!(io::stderr(), "{}", failure_message(message));
++}
+diff --git a/crates/ui/src/egui_app/gpu_init.rs b/crates/ui/src/egui_app/gpu_init.rs
+index f0d066e1a..3ef776cec 100644
+--- a/crates/ui/src/egui_app/gpu_init.rs
++++ b/crates/ui/src/egui_app/gpu_init.rs
+@@ -108,11 +108,12 @@ where
+                 continue; // already failed under an earlier mask
+             }
+             let who = format!("\"{}\" via {}", desc.name, gpu::backend_name(desc.backend));
++            diag_info!("gpu: trying {}", desc.summary());
+             match try_adapter(&surface, adapter, size.width, size.height, &who, &mut build) {
+                 Ok((device, queue, config, built)) => {
+                     diag_info!(
+-                        "gpu: using {who} ({}; {:?} {:?} {:?})",
+-                        gpu_select::type_name(desc.device_type),
++                        "gpu: using {} ({:?} {:?} {:?})",
++                        desc.summary(),
+                         config.format,
+                         config.present_mode,
+                         config.alpha_mode
+diff --git a/crates/ui/src/egui_app/gpu_select.rs b/crates/ui/src/egui_app/gpu_select.rs
+index 052b676fe..3bd110ddb 100644
+--- a/crates/ui/src/egui_app/gpu_select.rs
++++ b/crates/ui/src/egui_app/gpu_select.rs
+@@ -17,6 +17,8 @@ pub struct AdapterDesc {
+     pub device: u32,
+     pub device_type: wgpu::DeviceType,
+     pub backend: wgpu::Backend,
++    pub driver: String,
++    pub driver_info: String,
+     /// `Adapter::is_surface_supported` for the window's surface.
+     pub surface_ok: bool,
+ }
+@@ -29,20 +31,28 @@ impl AdapterDesc {
+             device: info.device,
+             device_type: info.device_type,
+             backend: info.backend,
++            driver: info.driver.clone(),
++            driver_info: info.driver_info.clone(),
+             surface_ok,
+         }
+     }
+ 
+     /// One startup log line per adapter seen.
+     pub fn log_line(&self) -> String {
++        format!("gpu: seen {}{}", self.summary(), if self.surface_ok { "" } else { " (cannot present to this window)" })
++    }
++
++    /// The same metadata names both enumerated and selected adapters.
++    pub fn summary(&self) -> String {
+         format!(
+-            "gpu: seen \"{}\" vendor 0x{:04x} device 0x{:04x} {} via {}{}",
++            "\"{}\" vendor 0x{:04x} device 0x{:04x} {} via {} driver {:?} ({})",
+             self.name,
+             self.vendor,
+             self.device,
+             type_name(self.device_type),
+             super::gpu::backend_name(self.backend),
+-            if self.surface_ok { "" } else { " (cannot present to this window)" }
++            self.driver,
++            self.driver_info
+         )
+     }
+ 
+@@ -201,6 +211,7 @@ pub fn refusal(failures: &[String], skipped: &[String]) -> String {
+         s.push_str("; skipped: ");
+         s.push_str(&skipped.join("; "));
+     }
++    s.push_str("; try --gpu-backend dx12, --gpu-backend vulkan or --gpu-backend gl");
+     s
+ }
+ 
+diff --git a/crates/ui/src/egui_app/gpu_select_tests.rs b/crates/ui/src/egui_app/gpu_select_tests.rs
+index 80bd06de4..3166695e2 100644
+--- a/crates/ui/src/egui_app/gpu_select_tests.rs
++++ b/crates/ui/src/egui_app/gpu_select_tests.rs
+@@ -6,7 +6,7 @@ use super::*;
+ use wgpu::{Backend, DeviceType};
+ 
+ fn a(name: &str, vendor: u32, ty: DeviceType, backend: Backend, ok: bool) -> AdapterDesc {
+-    AdapterDesc { name: name.into(), vendor, device: 1, device_type: ty, backend, surface_ok: ok }
++    AdapterDesc { name: name.into(), vendor, device: 1, device_type: ty, backend, driver: String::new(), driver_info: String::new(), surface_ok: ok }
+ }
+ 
+ /// Intel UHD + Quadro P3200 as an Optimus laptop enumerates them, Vulkan
+@@ -25,6 +25,28 @@ fn names(list: &[AdapterDesc], idx: &[usize]) -> Vec<String> {
+     idx.iter().map(|&i| format!("{}/{}", list[i].name, crate::egui_app::gpu::backend_name(list[i].backend))).collect()
+ }
+ 
++#[test]
++fn startup_adapter_log_names_the_gpu_backend_and_driver() {
++    let mut info = wgpu::AdapterInfo::new(DeviceType::IntegratedGpu, Backend::Vulkan);
++    info.name = "AMD Radeon test adapter".into();
++    info.vendor = 0x1002;
++    info.device = 0x164e;
++    info.driver = "AMD test driver".into();
++    info.driver_info = "Adrenalin test version".into();
++    let line = AdapterDesc::from_info(&info, true).log_line();
++    for wanted in ["AMD Radeon test adapter", "0x1002", "vulkan", "AMD test driver", "Adrenalin test version"] {
++        assert!(line.contains(wanted), "startup log omits {wanted}: {line}");
++    }
++}
++
++#[test]
++fn startup_gpu_refusal_names_backend_retry_flags() {
++    let text = refusal(&[], &[]);
++    for retry in ["--gpu-backend dx12", "--gpu-backend vulkan", "--gpu-backend gl"] {
++        assert!(text.contains(retry), "GPU startup refusal omits {retry}: {text}");
++    }
++}
++
+ #[test]
+ fn discrete_before_integrated_before_cpu() {
+     let list = hybrid();
+diff --git a/crates/ui/src/egui_app/shell_window.rs b/crates/ui/src/egui_app/shell_window.rs
+index b0a17942d..4ee98b0da 100644
+--- a/crates/ui/src/egui_app/shell_window.rs
++++ b/crates/ui/src/egui_app/shell_window.rs
+@@ -191,6 +191,7 @@ impl Shell {
+ 
+     fn fail(&mut self, el: &ActiveEventLoop, what: &str, err: impl std::fmt::Display) {
+         diag_warn!("egui shell: {what}: {err}");
++        camcraft_app::logging::startup_failure(&format!("egui shell: {what}: {err}"));
+         self.failed = true;
+         self.exit_code = 1;
+         el.exit();
+@@ -306,11 +307,7 @@ fn refuse_dialog(err: &str) {
+     let dialog = rfd::MessageDialog::new()
+         .set_level(rfd::MessageLevel::Error)
+         .set_title("CamCraft cannot start the viewport")
+-        .set_description(format!(
+-            "{err}
+-
+-Try --gpu <adapter name> (or CAMCRAFT_GPU) to choose an adapter, or --gpu-backend dx12|vulkan|gl."
+-        ))
++        .set_description(camcraft_app::logging::failure_message(err))
+         .set_buttons(rfd::MessageButtons::Ok);
+     // #1067: owned by the shell window, so the refusal is in front of the app.
+     let dialog = match crate::file_dialog::parent() {
+diff --git a/crates/ui/src/main.rs b/crates/ui/src/main.rs
+index 363b1984c..93e86b1b1 100644
+--- a/crates/ui/src/main.rs
++++ b/crates/ui/src/main.rs
+@@ -12,7 +12,7 @@ mod win_console;
+ fn main() {
+     #[cfg(windows)]
+     win_console::attach_parent_console();
+-    camcraft_app::logging::init();
++    camcraft_app::logging::init_desktop();
+     let args: Vec<String> = std::env::args().skip(1).collect();
+     #[cfg(windows)]
+     let code = match std::panic::catch_unwind(|| camcraft_ui::run(&args)) {
+@@ -24,6 +24,9 @@ fn main() {
+     };
+     #[cfg(not(windows))]
+     let code = camcraft_ui::run(&args);
++    if code != 0 {
++        camcraft_app::logging::startup_failure(&format!("CamCraft stopped with exit code {code}"));
++    }
+     #[cfg(windows)]
+     if code != 0 {
+         win_console::report_exit_failure(code);
+diff --git a/crates/ui/src/win_console.rs b/crates/ui/src/win_console.rs
+index 5f00bc02d..8251e6f81 100644
+--- a/crates/ui/src/win_console.rs
++++ b/crates/ui/src/win_console.rs
+@@ -110,7 +110,7 @@ fn show_error(text: &str) {
+     if CONSOLE_ATTACHED.load(Ordering::SeqCst) || ERROR_SHOWN.swap(true, Ordering::SeqCst) {
+         return;
+     }
+-    let text = wide(text);
++    let text = wide(&camcraft_app::logging::failure_message(text));
+     let caption = wide("CamCraft");
+     // SAFETY: both buffers are live NUL-terminated UTF-16 for the whole call; a NULL owner
+     // window is allowed. The pressed button is irrelevant.
+@@ -127,8 +127,7 @@ fn show_error(text: &str) {
+ /// `run` returned non-zero: with no console, nothing of the log is visible, so say so.
+ pub fn report_exit_failure(code: i32) {
+     show_error(&format!(
+-        "CamCraft could not start or stopped with an error (exit code {code}).\n\n\
+-         Start camcraft-ui.exe from a terminal (Command Prompt or PowerShell) to see the log."
++        "CamCraft could not start or stopped with an error (exit code {code})."
+     ));
+ }
+ 
+@@ -136,7 +135,6 @@ pub fn report_exit_failure(code: i32) {
+ /// box when no console is attached. Handled panics inside the app never reach here (#1325).
+ pub fn report_panic(text: &str) {
+     show_error(&format!(
+-        "CamCraft stopped unexpectedly.\n\n{text}\n\n\
+-         Start camcraft-ui.exe from a terminal (Command Prompt or PowerShell) to see the log."
++        "CamCraft stopped unexpectedly.\n\n{text}"
+     ));
+ }
+diff --git a/crates/ui/tests/startup_log.rs b/crates/ui/tests/startup_log.rs
+new file mode 100644
+index 000000000..795b39220
+--- /dev/null
++++ b/crates/ui/tests/startup_log.rs
+@@ -0,0 +1,124 @@
++//! #2421: a console-less desktop launch leaves durable startup diagnostics.
++//! Provenance: our own subprocess fixtures over the public desktop entry point.
++//! Gate map: covers camcraft_ui::run, app::logging.
++
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++
++struct ConfigDir(PathBuf);
++
++impl ConfigDir {
++    fn new(tag: &str) -> Self {
++        let path = std::env::temp_dir().join(format!("camcraft-startup-log-{tag}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path).expect("isolated config directory");
++        Self(path)
++    }
++
++    fn log(&self) -> PathBuf {
++        self.0.join("camcraft.log")
++    }
++
++    fn text(&self) -> String {
++        std::fs::read_to_string(self.log()).expect("desktop launch must leave camcraft.log without a terminal")
++    }
++}
++
++impl Drop for ConfigDir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++fn desktop(config: &Path, args: &[&str], filter: &str) -> Output {
++    Command::new(env!("CARGO_BIN_EXE_camcraft-ui"))
++        .args(args)
++        .env("CAMCRAFT_CONFIG_DIR", config)
++        .env("CAMCRAFT_LOG", filter)
++        .env_remove("CAMCRAFT_GPU_BACKEND")
++        .env_remove("CAMCRAFT_GPU")
++        .output()
++        .expect("desktop process starts")
++}
++
++#[test]
++fn desktop_startup_error_survives_without_a_terminal() {
++    let config = ConfigDir::new("startup-error");
++    let result = desktop(&config.0, &["--gpu-backend", "invalid-test-backend"], "info");
++    assert_eq!(result.status.code(), Some(2), "{result:?}");
++    let text = config.text();
++    assert!(text.contains("invalid-test-backend"), "the refusal names the bad backend: {text}");
++    assert!(!text.contains('\u{1b}'), "the file must contain plain text: {text:?}");
++    assert!(text.contains(&config.log().display().to_string()), "the failure names its log location: {text}");
++    for retry in ["--gpu-backend dx12", "--gpu-backend vulkan", "--gpu-backend gl"] {
++        assert!(text.contains(retry), "missing retry hint {retry}: {text}");
++    }
++    assert!(text.contains("backtrace"), "the failure keeps a backtrace: {text}");
++}
++
++#[test]
++fn desktop_startup_error_is_persisted_when_terminal_logging_is_off() {
++    let config = ConfigDir::new("filter-off");
++    let result = desktop(&config.0, &["--gpu-backend", "off-test-backend"], "off");
++    assert_eq!(result.status.code(), Some(2), "{result:?}");
++    let text = config.text();
++    assert!(text.contains("off-test-backend"), "terminal verbosity must not hide crash diagnostics: {text}");
++}
++
++#[test]
++fn desktop_startup_log_preserves_the_previous_run() {
++    let config = ConfigDir::new("append");
++    std::fs::write(config.log(), "previous run diagnostic\n").expect("previous log");
++    let result = desktop(&config.0, &["--gpu-backend", "append-test-backend"], "info");
++    assert_eq!(result.status.code(), Some(2), "{result:?}");
++    let text = config.text();
++    assert!(text.starts_with("previous run diagnostic\n"), "do not truncate evidence from a hard lock: {text}");
++    assert!(text.contains("append-test-backend"), "the current run is appended before exit: {text}");
++}
++
++#[test]
++fn desktop_log_open_failure_keeps_a_named_terminal_diagnostic() {
++    let config = ConfigDir::new("unavailable");
++    let occupied = config.0.join("occupied");
++    std::fs::write(&occupied, "a file cannot contain a log").expect("occupied config path");
++    let result = desktop(&occupied, &["--gpu-backend", "unavailable-test-backend"], "info");
++    assert_eq!(result.status.code(), Some(2), "a log setup failure must not panic: {result:?}");
++    let text = String::from_utf8_lossy(&result.stderr);
++    assert!(text.contains("cannot open desktop log"), "the fallback names the failure: {text}");
++    assert!(text.contains(&occupied.display().to_string()), "the fallback names the path: {text}");
++    assert!(text.contains("unavailable-test-backend"), "the original startup refusal remains visible: {text}");
++}
++
++#[test]
++fn desktop_panic_keeps_its_message_and_backtrace() {
++    let config = ConfigDir::new("panic");
++    let result = Command::new(std::env::current_exe().expect("test executable"))
++        .args(["--exact", "desktop_panic_child", "--nocapture"])
++        .env("CAMCRAFT_TEST_PANIC_CHILD", "1")
++        .env("CAMCRAFT_CONFIG_DIR", &config.0)
++        .env("CAMCRAFT_LOG", "off")
++        .output()
++        .expect("panic child starts");
++    assert!(result.status.success(), "the child catches its thread panic: {result:?}");
++    let text = config.text();
++    assert!(text.contains("2421 forced startup panic"), "panic message persisted: {text}");
++    assert!(text.contains("backtrace"), "panic backtrace persisted: {text}");
++    assert!(text.contains("gpu: seen synthetic adapter via vulkan"), "GPU startup info survives the terminal filter: {text}");
++    assert_eq!(std::fs::read_to_string(config.0.join("previous-hook.txt")).expect("previous panic hook runs"), "called");
++}
++
++#[test]
++fn desktop_panic_child() {
++    if std::env::var_os("CAMCRAFT_TEST_PANIC_CHILD").is_none() {
++        return;
++    }
++    let marker = PathBuf::from(std::env::var_os("CAMCRAFT_CONFIG_DIR").expect("child config"))
++        .join("previous-hook.txt");
++    std::panic::set_hook(Box::new(move |_| {
++        std::fs::write(&marker, "called").expect("previous hook marker");
++    }));
++    camcraft_app::logging::init_desktop();
++    camcraft_app::logging::init_desktop();
++    tracing::info!(target: "camcraft_ui", "gpu: seen synthetic adapter via vulkan");
++    assert!(std::thread::spawn(|| panic!("2421 forced startup panic")).join().is_err());
++}
+diff --git a/docs/decisions/2421-startup-log-uma.md b/docs/decisions/2421-startup-log-uma.md
+new file mode 100644
+index 000000000..98eb77909
+--- /dev/null
++++ b/docs/decisions/2421-startup-log-uma.md
+@@ -0,0 +1,37 @@
++## #2421 - Keep desktop startup diagnostics without a terminal
++
++**Decided.** The desktop initializer appends plain-text diagnostics to
++`camcraft.log` in the existing platform configuration directory. It uses a
++temporary `camcraft` directory when no configuration directory resolves.
++Each completed record calls `write_all` and `sync_data`. The file keeps the
++default INFO-level diagnostics independently of terminal verbosity. The
++CLI keeps its existing stderr-only initializer.
++
++The logger preserves the previous panic hook and records panic messages
++with forced backtraces. Returned startup failures also get forced
++backtraces. Failure dialogs and terminal messages name the log location
++and the backend flags to try. GPU records include the adapter name,
++vendor, device, backend, driver and driver information. Enumeration and
++candidate records reach the log before device creation and the test
++frame; the selected-adapter record follows successful bring-up.
++
++**Why.** A desktop launch may have no terminal, and `process::exit` or a
++driver hang can prevent shutdown cleanup. Synchronous append gives each
++startup record a chance to reach disk immediately and retains evidence
++from the previous run. Terminal filtering must not hide the GPU path or
++failure that a report needs. Reusing the configuration resolver and the
++existing tracing dependencies keeps this change small.
++
++**Considered and dropped.** An asynchronous writer that flushes only at
++shutdown cannot preserve these records during a hard lock. Truncating on
++startup would erase the previous run. File logging for the CLI would add
++filesystem side effects to commands such as help. New logging dependencies
++are unnecessary. Software graphics mode, changes to automatic backend
++fallback and project-file command-line handling need separate work.
++
++**Cost to change later.** Retention limits or rotation can replace the
++append policy inside the desktop logger without changing project files or
++CAM commands. A different log destination requires updating the path
++resolver, failure messages and subprocess fixtures. Headless tests cover
++persistence and failure handling; Windows dialogs, physical GPU failures
++and survival of a full system lock remain unexercised.

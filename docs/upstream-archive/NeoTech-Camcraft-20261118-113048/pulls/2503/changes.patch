@@ -1,0 +1,756 @@
+From aa13a6f3e25ea7aeda6ef6d20c19d14ea0345455 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 18 Nov 2026 03:15:34 -0800
+Subject: [PATCH] fix(2d): keep extension out of whole-model islands and note
+ uncut corners
+
+Default whole-model and stock-source 2D clearing keeps cutters inside
+the sharp box stock outline, leaving uncut corner material around islands
+such as an R5 boss in a 100 x 60 zero-margin plate. Add
+unreached_corners and unreached_corner_note in motion::machining2d,
+excluding extended air outside setup stock and filtering sub-0.03 mm
+polygon arc noise, and expose non-empty path notes through
+script::api::op_view so MCP generate and verify report uncut corners.
+
+Populate AreaCtx::blocked in operation::boundary_ctx for SrcRef::Entity
+and SrcRef::Stock on Pocket, Adaptive2D, and Offset2D using
+slice::material_overhead across ladder planes while leaving islands =
+false. Boundary extension now grows only past the exterior stock outline
+without cutting into standing part geometry, while explicit inward
+offsets still exercise DepthLaw::Keep.
+
+Fixes #2438
+---
+ crates/app/src/operation/boundary_ctx.rs      |  45 +++-
+ crates/app/src/operation/generate.rs          |  23 +-
+ crates/app/src/operation/keep_law.rs          |  22 +-
+ crates/app/src/script/api.rs                  |   7 +-
+ .../app/tests/adaptive_zero_margin_island.rs  | 231 ++++++++++++++++++
+ crates/app/tests/keep_law.rs                  |  21 +-
+ crates/motion/src/machining2d/mod.rs          |   2 +-
+ crates/motion/src/machining2d/unreached.rs    | 173 +++++++++++--
+ .../2438-adaptive-zero-margin-corners.md      |  20 ++
+ 9 files changed, 505 insertions(+), 39 deletions(-)
+ create mode 100644 crates/app/tests/adaptive_zero_margin_island.rs
+ create mode 100644 docs/decisions/2438-adaptive-zero-margin-corners.md
+
+diff --git a/crates/app/src/operation/boundary_ctx.rs b/crates/app/src/operation/boundary_ctx.rs
+index 81485f5ae..a0564842b 100644
+--- a/crates/app/src/operation/boundary_ctx.rs
++++ b/crates/app/src/operation/boundary_ctx.rs
+@@ -121,20 +121,53 @@ fn build(world: &World, op: &Operation, tool_r: f64, material: &Material, part_s
+     // is still steel an extension must not flood and a face must not
+     // sweep.
+     let mut islands = false;
++    let overhead_union = |facets: &[Triangle], planes: &[f64]| -> Result<Region, GenError> {
++        let mut b = Region::empty();
++        for &z in planes {
++            b = b.union(&slice::material_overhead(facets, z).map_err(from_slice)?)?;
++        }
++        Ok(b)
++    };
+     let blocked = match &op.params {
+-        OpParams::Pocket { .. } | OpParams::Adaptive2D { .. } | OpParams::Offset2D { .. } => {
++        OpParams::Pocket { top_z, bottom_z, stepdown, .. }
++        | OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. }
++        | OpParams::Offset2D { top_z, bottom_z, stepdown, .. } => {
++            let planes_for = |parts: &[Triangle], init_top: f64| -> Option<Vec<f64>> {
++                let t = fold_height(world, setup, Some(&op.src), frame.as_ref(), *top_z)?;
++                let b = fold_height(world, setup, Some(&op.src), frame.as_ref(), *bottom_z)?;
++                let mt = super::area::stock_top(world, setup, parts, init_top, frame.as_ref());
++                Some(super::area::ladder_planes(t - oz, mt, b - oz, *stepdown))
++            };
+             match &op.src {
+                 SrcRef::Selection(items) => match pocket_ladder(world, setup, items, &op.params)? {
+                     Some((part, planes)) => {
+                         islands = true;
+-                        let mut b = Region::empty();
+-                        for z in planes {
+-                            b = b.union(&slice::material_overhead(&part, z).map_err(from_slice)?)?;
+-                        }
+-                        Some(b)
++                        Some(overhead_union(&part, &planes)?)
+                     }
+                     None => None,
+                 },
++                // Whole-model / stock-source pockets clear stock AROUND
++                // standing part islands (`islands` stays false so manual
++                // offset into the part still exercises DepthLaw::Keep,
++                // while extension only grows past the stock exterior).
++                SrcRef::Entity(_) if part_solid && stock.is_some() => match planes_for(&material.facets, material.top) {
++                    Some(planes) => Some(overhead_union(facets, &planes)?),
++                    None => None,
++                },
++                SrcRef::Stock if stock.is_some() => {
++                    let parts = crate::setup_align::parts_facets_in(world, setup);
++                    if parts.is_empty() {
++                        None
++                    } else {
++                        match planes_for(&parts, f64::NEG_INFINITY) {
++                            Some(planes) => {
++                                let local_parts = frame.as_ref().map(|fr| fr.local_facets(&parts));
++                                Some(overhead_union(local_parts.as_deref().unwrap_or(&parts), &planes)?)
++                            }
++                            None => None,
++                        }
++                    }
++                }
+                 _ => None,
+             }
+         }
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 5b72a6008..f25ce0d6c 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -2952,10 +2952,27 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     let path = super::turning_holder::noted(path, &params, &tool, lathe_body.is_some());
+     // #1037: ...and a bodied one names the fixtures its law cannot read.
+     let path = super::turning_holder_steel::noted(path, &params, lathe_body.is_some(), &unread_steel);
+-    // #1655: a band of the stock around the part that is narrower than
+-    // the tool gets no pass - the op names it.
++    // #1655, #2438: a band or corner of the stock around the part that the
++    // tool cannot reach gets no pass - the op names it.
+     let cleared_around = around_part || (matches!(src, SrcRef::Stock) && !keep_parts.is_empty());
+-    let path = super::keep_law::narrow_noted(path, &params, &region, d, cleared_around, unit);
++    let around_stock;
++    let narrow_stock = if !cleared_around {
++        None
++    } else if frame.is_none() && stock_region.is_some() {
++        stock_region.as_ref()
++    } else {
++        let src_facets = stock_facets
++            .as_deref()
++            .or_else(|| matches!(src, SrcRef::Stock).then_some(&material.facets[..]));
++        around_stock = src_facets.and_then(|f| {
++            let local = frame.as_ref().map(|fr| fr.local_facets(f));
++            slice::project(local.as_deref().unwrap_or(f), FOOTPRINT_SAMPLES)
++                .ok()
++                .filter(|r| !r.is_empty())
++        });
++        around_stock.as_ref()
++    };
++    let path = super::keep_law::narrow_noted(path, &params, &region, narrow_stock, d, cleared_around, unit);
+ 
+     // M3.2 stage B: what the program clamps to. The op's setup context
+     // decides - user fixtures bound to it (tagged models, implicit-
+diff --git a/crates/app/src/operation/keep_law.rs b/crates/app/src/operation/keep_law.rs
+index 2b6655b23..ecef07ff1 100644
+--- a/crates/app/src/operation/keep_law.rs
++++ b/crates/app/src/operation/keep_law.rs
+@@ -66,17 +66,18 @@ pub fn is_keep_kind(params: &OpParams) -> bool {
+     matches!(params, OpParams::Pocket { .. } | OpParams::Adaptive2D { .. } | OpParams::Offset2D { .. })
+ }
+ 
+-/// #1655: a pocket-family op that clears the stock AROUND the part (a
+-/// whole-model source, #12, or the stock source with parts, #1554) says
+-/// by name each band of that area narrower than the tool: the generator
+-/// gives such a band no pass, and refuses only when nothing is left to
+-/// cut. `cleared_around` is that reading; every other job is unchanged.
+-/// The note never blocks the cut: a region the band check cannot read
+-/// keeps its path and says that the check did not run.
++/// #1655, #2438: a pocket-family op that clears the stock AROUND the part
++/// (a whole-model source, #12, or the stock source with parts, #1554)
++/// says by name each band of that area narrower than the tool (and any
++/// sharp stock corners left uncut inside reached pieces, excluding air
++/// outside `stock`). `cleared_around` is that reading; every other job
++/// is unchanged. The note never blocks the cut: a region the band check
++/// cannot read keeps its path and says that the check did not run.
+ pub(super) fn narrow_noted(
+     mut path: crate::cl::Toolpath,
+     params: &OpParams,
+     region: &crate::geo2d::Region,
++    stock: Option<&crate::geo2d::Region>,
+     tool_diameter: f64,
+     cleared_around: bool,
+     unit: crate::units::Unit,
+@@ -101,6 +102,13 @@ pub(super) fn narrow_noted(
+             ));
+         }
+     }
++    match crate::machining2d::unreached_corner_note(region, stock, tool_diameter, leave, unit) {
++        Ok(Some(n)) => path.notes.push(format!("{label}: {n}")),
++        Ok(None) => {}
++        Err(e) => {
++            tracing::warn!(kind = label, "the corner check around the part did not run: {e}");
++        }
++    }
+     path
+ }
+ 
+diff --git a/crates/app/src/script/api.rs b/crates/app/src/script/api.rs
+index 6acfa6a50..e8739c555 100644
+--- a/crates/app/src/script/api.rs
++++ b/crates/app/src/script/api.rs
+@@ -415,12 +415,17 @@ fn op_view(env: &Env, name: &str, entity: &Entity, warnings: bool) -> Value {
+         "setup": op.as_ref().and_then(|o| o.setup.clone()),
+         "status": st_str(status),
+     });
++    let tp = model::toolpath_of(&env.world, entity);
+     if warnings {
+-        let warns: Vec<String> = model::toolpath_of(&env.world, entity)
++        let warns: Vec<String> = tp
++            .as_ref()
+             .map(|t| t.warnings.iter().map(|w| w.to_string()).collect())
+             .unwrap_or_default();
+         row["warnings"] = json!(warns);
+     }
++    if let Some(notes) = tp.filter(|t| !t.path.notes.is_empty()).map(|t| t.path.notes) {
++        row["notes"] = json!(notes);
++    }
+     row
+ }
+ 
+diff --git a/crates/app/tests/adaptive_zero_margin_island.rs b/crates/app/tests/adaptive_zero_margin_island.rs
+new file mode 100644
+index 000000000..03c8a9e27
+--- /dev/null
++++ b/crates/app/tests/adaptive_zero_margin_island.rs
+@@ -0,0 +1,231 @@
++//! Issue #2438: a whole-model 2D Adaptive in a zero-margin stock around
++//! an island on a plate:
++//! 1. With default area controls (tool kept inside the sharp stock
++//!    outline), the four sharp stock corners are left uncut; the op
++//!    names that unreached material in its notes (and MCP `generate` /
++//!    `verify` expose those notes).
++//! 2. With `Boundary` `extension` (e.g. `extension: 6`), only the
++//!    exterior boundary grows past the stock - the island stays
++//!    untouched, the four stock corners are cleared to Bottom Z, and
++//!    `verify` is clean.
++//!
++//! Gate map (#2438): covers app::operation (area, boundary, boundary_ctx,
++//! generate, keep_law), app::mcp (area, job, render), app::script::api,
++//! motion::machining2d (unreached), app::stock_sim, sim::verify.
++//! Provenance: our own island-on-plate fixture matching #2438; no vendor
++//! material consulted.
++
++mod area_support;
++mod common;
++mod pocket_support;
++
++use area_support::*;
++use common::solid_part::{cap, rect, walls};
++use pocket_support::{rounded_rect, write_stl};
++use serde_json::{json, Value};
++
++use camcraft_app::geometry::{Mesh, Triangle};
++use camcraft_app::mcp::Server;
++use camcraft_app::posting;
++use camcraft_app::stock_sim::simulate_document;
++
++/// 100 x 60 x 10 plate (z 0..10) centred on the origin with a 60 x 30 x 5
++/// R5-cornered island on top (z 10..15). Watertight, outward-wound.
++fn island_on_plate() -> Mesh {
++    let plate = rect(-50.0, -30.0, 50.0, 30.0);
++    let island = rounded_rect(30.0, 15.0, 5.0, 8);
++    let mut f: Vec<Triangle> = Vec::new();
++    cap(&plate, None, 0.0, false, &mut f);
++    walls(&plate, 0.0, 10.0, true, &mut f);
++    cap(&plate, Some(&island), 10.0, true, &mut f);
++    walls(&island, 10.0, 15.0, true, &mut f);
++    cap(&island, None, 15.0, true, &mut f);
++    Mesh::from_facets(f)
++}
++
++fn call(s: &mut Server, id: &mut i64, name: &str, args: Value) -> Value {
++    *id += 1;
++    let msg = json!({ "jsonrpc": "2.0", "id": *id, "method": "tools/call",
++        "params": { "name": name, "arguments": args } });
++    let reply = s.handle(&msg).expect("request gets response");
++    let res = &reply["result"];
++    assert_ne!(res["isError"], json!(true), "{name} refused: {}", res["content"][0]["text"]);
++    res["structuredContent"].clone()
++}
++
++fn setup_mcp(tag: &str) -> (Server, i64, std::path::PathBuf) {
++    let dir = std::env::temp_dir().join(format!("camcraft-2438-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let stl = dir.join("flange.stl");
++    write_stl(&island_on_plate(), &stl);
++    let mut s = Server::new();
++    let mut id = 0;
++    let _ = s.handle(&json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }));
++    call(&mut s, &mut id, "import_model", json!({ "name": "flange", "path": stl.display().to_string() }));
++    call(&mut s, &mut id, "set_stock", json!({ "box": { "dx": 100.0, "dy": 60.0, "dz": 15.0 } }));
++    call(&mut s, &mut id, "add_tool", json!({ "catalog": TOOL }));
++    (s, id, dir)
++}
++
++fn add_adaptive_mcp(s: &mut Server, id: &mut i64, source: &str) {
++    call(
++        s,
++        id,
++        "add_operation",
++        json!({
++            "kind": "2D Adaptive",
++            "tool": TOOL,
++            "source": source,
++            "name": "Rough",
++            "params": {
++                "top_z": { "reference": "top_of_model", "offset": 0.0 },
++                "bottom_z": { "reference": "bottom_of_model", "offset": 10.0 },
++                "stepdown": 5.0
++            }
++        }),
++    );
++}
++
++/// Signed distance from (x, y) outside the 60 x 30 R5 island centered at the origin.
++fn dist_to_island(x: f64, y: f64) -> f64 {
++    let dx = (x.abs() - 25.0).max(0.0);
++    let dy = (y.abs() - 10.0).max(0.0);
++    if dx > 0.0 && dy > 0.0 {
++        dx.hypot(dy) - 5.0
++    } else {
++        (x.abs() - 30.0).max(y.abs() - 15.0)
++    }
++}
++
++#[test]
++fn zero_margin_adaptive_around_island_names_uncut_stock_corners() {
++    let (mut s, mut id, dir) = setup_mcp("default");
++    add_adaptive_mcp(&mut s, &mut id, "flange");
++    let generated = call(&mut s, &mut id, "generate", json!({}));
++    let ver = call(&mut s, &mut id, "verify", json!({}));
++    assert_eq!(ver["ok"], json!(true), "{ver}");
++    assert_eq!(ver["findings"], json!([]), "{ver}");
++
++    let rendered = call(&mut s, &mut id, "render_stock", json!({ "width": 160, "height": 120 }));
++    assert!(
++        rendered["rest"]["max"].as_f64().is_some_and(|v| v > 4.0),
++        "default keeps tool inside stock corners: {rendered}"
++    );
++
++    let gen_notes = generated["generated"][0]["notes"].as_array().expect("generate exposes op notes");
++    assert!(
++        gen_notes.iter().any(|n| n.as_str().is_some_and(|t| t.contains("corner") && t.contains("10.000 mm tool"))),
++        "generate notes missing corner warning: {generated}"
++    );
++    let ver_notes = ver["operations"][0]["notes"].as_array().expect("verify exposes op notes");
++    assert!(
++        ver_notes.iter().any(|n| n.as_str().is_some_and(|t| t.contains("corner"))),
++        "verify notes missing corner warning: {ver}"
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++fn check_extension_clears_corners(tag: &str, source: &str) {
++    let (mut s, mut id, dir) = setup_mcp(tag);
++    add_adaptive_mcp(&mut s, &mut id, source);
++    call(
++        &mut s,
++        &mut id,
++        "set_operation_area",
++        json!({ "operation": "Rough", "area": { "extension": 6.0 } }),
++    );
++    let generated = call(&mut s, &mut id, "generate", json!({}));
++    let ver = call(&mut s, &mut id, "verify", json!({}));
++    assert_eq!(ver["ok"], json!(true), "{tag}: verify must be clean: {ver}");
++    assert_eq!(ver["findings"], json!([]), "{tag}: no findings: {ver}");
++
++    // Extension cleared all stock corners: no corner/narrow-band note emitted.
++    if let Some(notes) = generated["generated"][0]["notes"].as_array() {
++        assert!(
++            notes.iter().all(|n| n.as_str().is_none_or(|t| !t.contains("corner") && !t.contains("narrower"))),
++            "{tag}: unexpected unreached note: {notes:?}"
++        );
++    }
++
++    let rendered = call(&mut s, &mut id, "render_stock", json!({ "width": 160, "height": 120 }));
++    assert_eq!(rendered["gouge"]["cells"], json!(0), "{tag}: zero gouge cells: {rendered}");
++    assert!(
++        rendered["rest"]["max"].as_f64().is_some_and(|v| v < 0.05),
++        "{tag}: corners cleared to floor: {rendered}"
++    );
++
++    let nc = dir.join("out.nc");
++    let posted = call(&mut s, &mut id, "post", json!({ "output": nc.display().to_string(), "post": "Fanuc" }));
++    assert!(posted["lines"].as_u64().is_some_and(|n| n > 0), "{tag}: {posted}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn extension_on_island_on_plate_grows_only_exterior_clears_corners_part_source() {
++    check_extension_clears_corners("ext-part", "flange");
++}
++
++#[test]
++fn extension_on_island_on_plate_grows_only_exterior_clears_corners_stock_source() {
++    check_extension_clears_corners("ext-stock", "stock");
++}
++
++/// With +2 mm stock on top (100 x 60 x 17, matching #2438's repro), the
++/// ladder slices at Z 15 and Z 10; `extension: 6` must keep every feed
++/// move >= R off the island and pass verify + post cleanly.
++#[test]
++fn extension_with_top_allowance_keeps_island_untouched_and_clears_corners() {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("flange", island_on_plate()));
++    h.execute(
++        &world,
++        SetStock::new(&world, StockShape::Box { dx: 100.0, dy: 60.0, dz: 17.0 }, Location::default()).expect("stock"),
++    );
++    let tool = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    h.execute(&world, AddTool::new(&world, TOOL, tool).expect("tool"));
++
++    let mut params = operation::retype_params(&pocket(15.0, 10.0), OpType::Adaptive2D.ordinal());
++    if let OpParams::Adaptive2D { top_z, bottom_z, stepdown, .. } = &mut params {
++        *top_z = Height::fixed(15.0);
++        *bottom_z = Height::fixed(10.0);
++        *stepdown = 5.0;
++    }
++    let area = AreaControls { extension: 6.0, ..Default::default() };
++    h.execute(&world, CreateOperation::new(&world, "Rough", TOOL, SrcRef::Entity("flange".into()), params.clone()).expect("create"));
++    h.execute(&world, EditOperationParams::with_area(&world, "Rough", params, area).expect("area"));
++    h.execute(&world, camcraft_app::commands::GenerateOperation::new(&world, "Rough").expect("generate"));
++
++    let op_e = model::find_by_name(&world, "Rough").expect("op");
++    let tp = model::toolpath_of(&world, &op_e).expect("cached");
++    assert!(tp.warnings.is_empty(), "verify must be clean: {:?}", tp.warnings);
++    assert!(
++        tp.path.notes.iter().all(|n| !n.contains("corner") && !n.contains("narrower")),
++        "extension cleared corners: {:?}",
++        tp.path.notes
++    );
++    // `rounded_rect(..., 8)` places chords `5 * (1 - cos(pi/16)) ~= 0.096 mm`
++    // inside the smooth R5 corner; allow that facet chord sag + planner tol.
++    let chord_sag = 5.0 * (1.0 - (std::f64::consts::PI / 16.0).cos());
++    for m in tp.path.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++        if m.from.z.min(m.to.z) < 15.0 - 1e-4 {
++            for (a, b) in m.chords(0.05) {
++                for k in 0..=4 {
++                    let t = f64::from(k) / 4.0;
++                    let x = a.x + (b.x - a.x) * t;
++                    let y = a.y + (b.y - a.y) * t;
++                    let d = dist_to_island(x, y);
++                    assert!(d >= R - chord_sag - 0.05, "cutter entered island at ({x:.2}, {y:.2}), d={d:.3}");
++                }
++            }
++        }
++    }
++    let sim = simulate_document(&world).expect("sim runs");
++    assert_eq!(sim.dev.gouge_cells, 0, "zero gouge cells");
++    let dir = std::env::temp_dir().join(format!("camcraft-2438-top17-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let nc = dir.join("out.nc");
++    posting::post_setup(&world, &nc).expect("clean program posts");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/crates/app/tests/keep_law.rs b/crates/app/tests/keep_law.rs
+index dc323c0b2..8d60ec396 100644
+--- a/crates/app/tests/keep_law.rs
++++ b/crates/app/tests/keep_law.rs
+@@ -208,31 +208,42 @@ mod a_whole_model_area_offset_into_the_part_gouges_and_never_posts {
+     }
+ }
+ 
+-mod a_whole_model_extension_into_the_part_gouges_and_never_posts {
++// Extension only grows past the exterior stock outline (#2438): the part's
++// standing material stays in `blocked`, so extension clears past the stock
++// edges without gouging the block or boss and posts on both stocks.
++mod a_whole_model_extension_keeps_the_part_and_posts {
+     use super::*;
+ 
+     fn extension_5() -> AreaControls {
+         AreaControls { extension: 5.0, ..Default::default() }
+     }
+ 
++    fn stays_clear((label, params): Kind, rotated: bool) {
++        let (world, mut h) = job(Some(block_with_boss()), rotated);
++        let warns = generated(&world, &mut h, whole(), params, extension_5());
++        let blocking: Vec<_> = warns.iter().filter(|w| w.blocks_post()).collect();
++        assert!(blocking.is_empty(), "{label} extension rotated {rotated}: {blocking:?}");
++        assert_posts(&world, &format!("ext-legal-{label}-{rotated}"));
++    }
++
+     #[test]
+     fn pocket_aligned() {
+-        refused(pocket_k(20.0, 5.0), false, &extension_5(), "extension");
++        stays_clear(pocket_k(20.0, 5.0), false);
+     }
+ 
+     #[test]
+     fn pocket_turned() {
+-        refused(pocket_k(20.0, 5.0), true, &extension_5(), "extension");
++        stays_clear(pocket_k(20.0, 5.0), true);
+     }
+ 
+     #[test]
+     fn adaptive_aligned() {
+-        refused(adaptive_k(20.0, 5.0), false, &extension_5(), "extension");
++        stays_clear(adaptive_k(20.0, 5.0), false);
+     }
+ 
+     #[test]
+     fn adaptive_turned() {
+-        refused(adaptive_k(20.0, 5.0), true, &extension_5(), "extension");
++        stays_clear(adaptive_k(20.0, 5.0), true);
+     }
+ }
+ 
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 2227239a9..a32f4759e 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -139,7 +139,7 @@ pub use ring::{on_boundary, ring_is_circular};
+ pub use slots::{chord_clears, slot, trace, SlotParams, TraceParams};
+ pub use slot_ends::extended_ends as slot_extended_ends;
+ pub use slot_room::{SlotBound, SlotFit, FIT_TOL as SLOT_FIT_TOL};
+-pub use unreached::{unreached_note, unreached_pieces};
++pub use unreached::{unreached_corner_note, unreached_corners, unreached_note, unreached_pieces};
+ pub use adaptive::{rest_adaptive, RestStock, StockFloor, REST_STOCK_FILM};
+ pub use adaptive_method::AdaptiveMethod;
+ pub use adaptive_troch::{AdaptiveTrochParams, adaptive_trochoidal, adaptive_trochoidal_with};
+diff --git a/crates/motion/src/machining2d/unreached.rs b/crates/motion/src/machining2d/unreached.rs
+index 5f093cefd..b9b4abd6d 100644
+--- a/crates/motion/src/machining2d/unreached.rs
++++ b/crates/motion/src/machining2d/unreached.rs
+@@ -23,14 +23,13 @@ const PIECE_AREA_MIN: f64 = 1e-4;
+ /// a shared wall (a stock face that meets the part face), not a band.
+ const SLIVER_HALF_WIDTH: f64 = 5e-3;
+ 
+-/// The connected pieces of `region` (each outer loop less the outer loops
+-/// nested in it) that erode to nothing by `reach` - the tool radius plus
+-/// the stock to leave. Slivers of noise are left out. Empty when every
+-/// piece keeps a cutter-center area, and for an empty region.
+-pub fn unreached_pieces(region: &Region, reach: f64) -> Result<Vec<Region>, GenError> {
+-    if !(reach.is_finite() && reach > 0.0) {
+-        return Ok(Vec::new());
+-    }
++/// A leftover corner cusp that erodes to nothing by this (mm) is
++/// circular-arc approximation noise, not uncut sharp-corner stock.
++const CORNER_HALF_WIDTH: f64 = 0.03;
++
++/// Connected material pieces of `region` (each outer loop less any nested
++/// outer loops), dropping narrow tessellation/offset slivers.
++fn connected_pieces(region: &Region) -> Result<Vec<Region>, GenError> {
+     let outers: Vec<Region> = region
+         .loops()
+         .iter()
+@@ -50,6 +49,21 @@ pub fn unreached_pieces(region: &Region, reach: f64) -> Result<Vec<Region>, GenE
+         if piece.area().abs() < PIECE_AREA_MIN || piece.offset(-SLIVER_HALF_WIDTH)?.is_empty() {
+             continue;
+         }
++        out.push(piece);
++    }
++    Ok(out)
++}
++
++/// The connected pieces of `region` (each outer loop less the outer loops
++/// nested in it) that erode to nothing by `reach` - the tool radius plus
++/// the stock to leave. Slivers of noise are left out. Empty when every
++/// piece keeps a cutter-center area, and for an empty region.
++pub fn unreached_pieces(region: &Region, reach: f64) -> Result<Vec<Region>, GenError> {
++    if !(reach.is_finite() && reach > 0.0) {
++        return Ok(Vec::new());
++    }
++    let mut out = Vec::new();
++    for piece in connected_pieces(region)? {
+         if piece.offset(-reach)?.is_empty() {
+             out.push(piece);
+         }
+@@ -57,6 +71,64 @@ pub fn unreached_pieces(region: &Region, reach: f64) -> Result<Vec<Region>, GenE
+     Ok(out)
+ }
+ 
++/// Connected corner residuals left inside reached pieces of `region`:
++/// where a piece's cutter-center area is non-empty, its round dilation
++/// `center.offset(reach)` stops short of sharp `< 180 deg` corners. When
++/// `stock` is given, cusps outside the stock outline (in extended air)
++/// are excluded. Polygon arc discretization slivers thinner than
++/// [`CORNER_HALF_WIDTH`] are filtered out.
++pub fn unreached_corners(region: &Region, reach: f64, stock: Option<&Region>) -> Result<Vec<Region>, GenError> {
++    if !(reach.is_finite() && reach > 0.0) {
++        return Ok(Vec::new());
++    }
++    let mut out = Vec::new();
++    for piece in connected_pieces(region)? {
++        let center = piece.offset(-reach)?;
++        if center.is_empty() {
++            continue;
++        }
++        let swept = center.offset(reach)?;
++        let mut leftover = piece.difference(&swept)?;
++        if let Some(st) = stock {
++            leftover = leftover.intersect(st)?;
++        }
++        for corner in connected_pieces(&leftover)? {
++            if !corner.offset(-CORNER_HALF_WIDTH)?.is_empty() {
++                out.push(corner);
++            }
++        }
++    }
++    Ok(out)
++}
++
++fn len_label(v: f64, unit: Unit) -> String {
++    format!("{} {}", units::len(v, unit, 3), unit.suffix())
++}
++
++fn leave_note(stock_to_leave: f64, unit: Unit) -> String {
++    if stock_to_leave > 0.0 {
++        format!(" with {} stock to leave", len_label(stock_to_leave, unit))
++    } else {
++        String::new()
++    }
++}
++
++fn format_boxes(pieces: &[Region], unit: Unit) -> Vec<String> {
++    pieces
++        .iter()
++        .filter_map(Region::bounds)
++        .map(|(lo, hi)| {
++            format!(
++                "X {} to {}, Y {} to {}",
++                len_label(lo.x, unit),
++                len_label(hi.x, unit),
++                len_label(lo.y, unit),
++                len_label(hi.y, unit),
++            )
++        })
++        .collect()
++}
++
+ /// The note that names each piece [`unreached_pieces`] finds: where it
+ /// stands (its XY box) and why no pass cuts it. `None` when every piece
+ /// is reached.
+@@ -70,23 +142,44 @@ pub fn unreached_note(
+     if pieces.is_empty() {
+         return Ok(None);
+     }
+-    let len = |v: f64| format!("{} {}", units::len(v, unit, 3), unit.suffix());
+-    let boxes: Vec<String> = pieces
+-        .iter()
+-        .filter_map(Region::bounds)
+-        .map(|(lo, hi)| format!("X {} to {}, Y {} to {}", len(lo.x), len(hi.x), len(lo.y), len(hi.y)))
+-        .collect();
+-    let leave = if stock_to_leave > 0.0 { format!(" with {} stock to leave", len(stock_to_leave)) } else { String::new() };
++    let boxes = format_boxes(&pieces, unit);
++    let leave = leave_note(stock_to_leave, unit);
+     Ok(Some(format!(
+         "{} of the area to clear {} narrower than the {} tool{leave}, so no pass cuts {}: {} - use a smaller tool, or a wider stock margin",
+         if pieces.len() == 1 { "1 band" } else { "some bands" },
+         if pieces.len() == 1 { "is" } else { "are" },
+-        len(tool_diameter),
++        len_label(tool_diameter, unit),
+         if pieces.len() == 1 { "it" } else { "them" },
+         boxes.join("; "),
+     )))
+ }
+ 
++/// The note that names each corner cusp [`unreached_corners`] leaves
++/// uncut inside reached pieces (such as a sharp box stock's corners when
++/// cutting around an island with no boundary extension). `None` when the
++/// swept cutter clears every stock corner.
++pub fn unreached_corner_note(
++    region: &Region,
++    stock: Option<&Region>,
++    tool_diameter: f64,
++    stock_to_leave: f64,
++    unit: Unit,
++) -> Result<Option<String>, GenError> {
++    let corners = unreached_corners(region, tool_diameter * 0.5 + stock_to_leave, stock)?;
++    if corners.is_empty() {
++        return Ok(None);
++    }
++    let boxes = format_boxes(&corners, unit);
++    let leave = leave_note(stock_to_leave, unit);
++    Ok(Some(format!(
++        "{} of the area to clear {} tighter than the {} tool{leave}, leaving uncut corner material at {} - extend the Boundary or use a smaller tool",
++        if corners.len() == 1 { "1 corner" } else { "some corners" },
++        if corners.len() == 1 { "is" } else { "are" },
++        len_label(tool_diameter, unit),
++        boxes.join("; "),
++    )))
++}
++
+ #[cfg(test)]
+ mod law {
+     use super::*;
+@@ -116,11 +209,59 @@ mod law {
+         assert!(left.contains("with 1.000 mm stock to leave"), "{left}");
+     }
+ 
++    fn rounded_rect(hx: f64, hy: f64, rad: f64, segs: usize) -> Loop {
++        let mut pts = Vec::with_capacity(4 * (segs + 1));
++        for k in 0..4 {
++            let (cx, cy, a0) = match k {
++                0 => (hx - rad, hy - rad, 0.0),
++                1 => (-hx + rad, hy - rad, std::f64::consts::FRAC_PI_2),
++                2 => (-hx + rad, -hy + rad, std::f64::consts::PI),
++                _ => (hx - rad, -hy + rad, 3.0 * std::f64::consts::FRAC_PI_2),
++            };
++            for i in 0..=segs {
++                let a = a0 + std::f64::consts::FRAC_PI_2 * (i as f64 / segs as f64);
++                pts.push(Point2::new(cx + rad * a.cos(), cy + rad * a.sin()));
++            }
++        }
++        Loop::new(pts).expect("rounded rect")
++    }
++
++    #[test]
++    fn sharp_stock_corners_around_island_are_named_until_extended() {
++        let stock = Region::new(vec![square(-50.0, -30.0, 50.0, 30.0)]).expect("stock");
++        let island = rounded_rect(30.0, 15.0, 5.0, 8);
++        let region = Region::new(vec![square(-50.0, -30.0, 50.0, 30.0), island.clone()]).expect("region");
++
++        let corners = unreached_corners(&region, 5.0, Some(&stock)).expect("corners");
++        assert_eq!(corners.len(), 4, "four sharp stock corners, zero island slivers: {corners:?}");
++        let note = unreached_corner_note(&region, Some(&stock), 10.0, 0.0, Unit::Millimeters)
++            .expect("note")
++            .expect("some");
++        assert!(note.contains("some corners") && note.contains("10.000 mm tool"), "{note}");
++
++        // Extending outside the stock clears all four stock corners: nothing inside stock remains.
++        let extended = Region::new(vec![square(-56.0, -36.0, 56.0, 36.0), island]).expect("extended");
++        assert!(unreached_corners(&extended, 5.0, Some(&stock)).expect("ext").is_empty());
++        assert!(unreached_corner_note(&extended, Some(&stock), 10.0, 0.0, Unit::Millimeters).expect("note").is_none());
++    }
++
++    #[test]
++    fn filleted_corners_and_unreached_bands_emit_no_corner_note() {
++        let filleted = Region::new(vec![rounded_rect(30.0, 20.0, 5.0, 8)]).expect("filleted");
++        assert!(unreached_corners(&filleted, 5.0, None).expect("filleted").is_empty());
++
++        let band = Region::new(vec![square(0.0, 0.0, 50.0, 50.0), square(5.0, 5.0, 45.0, 45.0)]).expect("band");
++        assert!(unreached_corners(&band, 6.0, None).expect("band").is_empty());
++    }
++
+     #[test]
+     fn a_noise_sliver_and_an_empty_region_say_nothing() {
+         let r = Region::new(vec![square(0.0, 0.0, 50.0, 50.0), square(0.004, 0.004, 49.996, 49.996)]).expect("region");
+         assert!(unreached_pieces(&r, 3.0).expect("pieces").is_empty());
+         assert!(unreached_pieces(&Region::empty(), 3.0).expect("pieces").is_empty());
+         assert!(unreached_pieces(&r, f64::NAN).expect("pieces").is_empty());
++        assert!(unreached_corners(&r, 3.0, None).expect("corners").is_empty());
++        assert!(unreached_corners(&Region::empty(), 3.0, None).expect("corners").is_empty());
++        assert!(unreached_corners(&r, f64::NAN, None).expect("corners").is_empty());
+     }
+ }
+diff --git a/docs/decisions/2438-adaptive-zero-margin-corners.md b/docs/decisions/2438-adaptive-zero-margin-corners.md
+new file mode 100644
+index 000000000..4871fd753
+--- /dev/null
++++ b/docs/decisions/2438-adaptive-zero-margin-corners.md
+@@ -0,0 +1,20 @@
++## #2438 - Zero-margin 2D clearing corners note and exterior-only boundary extension
++
++**Chosen:**
++- Keep default whole-model (`SrcRef::Entity`) and stock-source (`SrcRef::Stock`) 2D clearing (`2D Pocket`, `2D Adaptive`, `2D Offset`) inside the stock outline, preserving `Containment::Inside` and fixture/vise clearance.
++- Add `unreached_corners` and `unreached_corner_note` in `crates/motion/src/machining2d/unreached.rs` (filtering polygon arc noise under `CORNER_HALF_WIDTH = 0.03` mm and clipping residuals to the setup's `stock` outline so extended air corners are ignored). Call it from `keep_law::narrow_noted` via `generate.rs` whenever `cleared_around` holds, and surface non-empty operation `notes` in `script::api::op_view` so MCP `generate` and `verify` expose them.
++- In `crates/app/src/operation/boundary_ctx.rs::build`, populate `AreaCtx::blocked` with the union of `slice::material_overhead` across `area::ladder_planes` for `SrcRef::Entity` (`part_solid`) and `SrcRef::Stock` (setup parts) while leaving `islands = false`. In `boundary::resolve`, step 3 (`extension > 0`) subtracts `ctx.blocked` from `reach`, so `extension` expands only past the exterior stock outline without entering standing part/island walls.
++- Update `crates/app/tests/keep_law.rs::a_whole_model_extension_keeps_the_part_and_posts` (`extension: 5.0` now avoids the boss/block and posts cleanly, while `offset: 3.0` still exercises `DepthLaw::Keep`), and add end-to-end pins in `crates/app/tests/adaptive_zero_margin_island.rs`.
++
++**Why:**
++- In a zero-margin box stock around an island (such as an `R5` boss centered in a `100 x 60` plate with a `10 mm` cutter), keeping the tool inside the sharp box stock inevitably leaves `5 mm` corner cusps (`~0.86 mm` inscribed half-width). Leaving them silent while returning `ok` hid why material remained; naming them in `notes` explains the residual and points to `extension` or a smaller tool without turning a legal contained path into a verify failure.
++- Setting `blocked` with `islands = false` makes `extension` grow only the exterior boundary past the stock (clearing the four corners cleanly) without altering `#1603`'s `DepthLaw::Keep` behavior for explicit inward `offset` values.
++
++**Considered and dropped:**
++- Growing the default whole-model or stock-source clearing region past sharp stock corners by default: violates `Containment::Inside`, risks hitting workholding along stock sides, and breaks `narrow_band.rs` / `adaptive_pinch.rs`.
++- Setting `islands = true` on `SrcRef::Entity` / `SrcRef::Stock`: would mask manual inward `offset` gouges tested by `#1603` (`keep_law.rs`).
++- Emitting corner residuals as `Verify` warnings or using `"narrower than the ... no pass cuts"` phrasing: uncut corners under `Containment::Inside` are not verify faults, and existing `band_notes` checks distinguish unreached bands from corner cusps.
++- Computing unreached corners without intersecting with the `stock` outline: would falsely report sharp corners in extended air even after `extension` cleared every stock corner.
++
++**Cost to change later:**
++Low. `blocked` construction is localized to `boundary_ctx::build`, corner detection lives behind `unreached_corners`/`unreached_corner_note`, `op_view` only appends an optional `"notes"` array when non-empty, and no project file format or crate dependency changed.
