@@ -1,0 +1,394 @@
+From d06e64d36c8741ac37650f6b52943fb0e757b2e0 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 18 Nov 2026 23:37:10 +0100
+Subject: [PATCH] fix(ui): hold the playhead while the stock removal is
+ calculated
+
+The playback worker calculates the whole stock removal before it
+publishes a frame (#2181). During that time the viewport shows the
+uncut stock, but the transport clock played on: the tool moved over
+stock that showed no cut, and on a large block the whole program could
+play with no visible removal.
+
+The transport now holds its playhead and disables the scrub slider
+while the calculation runs, as its line already says. Cancel ends the
+calculation and playback cuts live, as before.
+
+A new app test proves that the worker's frames draw the removal as the
+program plays, at the full and at the display budget.
+
+Fixes #2611
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/stock_play_picture.rs        | 173 ++++++++++++++++++
+ crates/ui/src/egui_app/shell.rs               |  11 +-
+ crates/ui/src/play_precalc.rs                 |  20 ++
+ crates/ui/src/play_precalc_tests.rs           |  67 ++++++-
+ .../2611-playhead-waits-for-precalc.md        |  25 +++
+ 5 files changed, 288 insertions(+), 8 deletions(-)
+ create mode 100644 crates/app/tests/stock_play_picture.rs
+ create mode 100644 docs/decisions/2611-playhead-waits-for-precalc.md
+
+diff --git a/crates/app/tests/stock_play_picture.rs b/crates/app/tests/stock_play_picture.rs
+new file mode 100644
+index 000000000..39af747b0
+--- /dev/null
++++ b/crates/app/tests/stock_play_picture.rs
+@@ -0,0 +1,173 @@
++//! #2611: the stock the eye draws during playback shows the removal.
++//! The UI's playback path is replayed headless: the transport asks the
++//! worker for positions one after the other, each published frame is
++//! composed into one resident cut layer the way the GPU eye does it
++//! (a whole layer replaces, a patch over the resident frame writes its
++//! runs, any other patch repacks the frame whole), and the drawn
++//! material is counted as `max(mesh, cut) < 0` texels. No pixels.
++//! Provenance: our own fixtures over the M7.1 field engine; nothing
++//! from vendor binaries.
++//!
++//! Gate map (M4.4): covers app::stock_play, app::stock_play_worker, app::stock_play_worker_precalc, app::stock_view.
++
++use std::time::{Duration, Instant};
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::commands::{AddTool, CreateOperation, GenerateOperation, History, ImportModel, SetStock};
++use camcraft_app::geometry::{cube, Point3, IDENTITY_Q};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_play::{FieldPlay, PlaySeed, Precalc, PRECALC_BUDGET};
++use camcraft_app::stock_play_worker::{PlayFrame, PlayWorker};
++use camcraft_app::stock_sim::preview::pack_cut;
++use camcraft_app::stock_view::{field_view_with, CutLayer, PackedBase};
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++/// A staged face over a `side` x `side` block (the `stock_play_precalc`
++/// fixture).
++fn faced_doc(side: f64, stepover: f64, stepdown: Option<f64>) -> World {
++    let world = new_world();
++    let mut history = History::default();
++    let half = side / 2.0;
++    let loc = Location { pos: Point3::ZERO, rot: IDENTITY_Q };
++    let cmd = SetStock::new(&world, StockShape::Box { dx: side, dy: side, dz: 20.0 }, loc);
++    history.execute(&world, cmd.expect("box stock"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "EM-0400-2FL").map(|(_, t)| t).expect("catalog entry");
++    history.execute(&world, AddTool::new(&world, "EM-0400-2FL", tool).expect("catalog tool"));
++    let (lo, hi) = (Point3::new(-half, -half, 0.0), Point3::new(half, half, 14.0));
++    history.execute(&world, ImportModel::from_mesh("part", cube(lo, hi)));
++    let params = OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover,
++        clearance_z: Height::fixed(25.0),
++        cut_z: Height::fixed(14.0),
++        top_z: stepdown.map(|_| Height::fixed(19.0)),
++        stepdown,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++        climb: true,
++        blend_turns: false,
++    };
++    let cmd = CreateOperation::new(&world, "Face1", "EM-0400-2FL", SrcRef::Stock, params);
++    history.execute(&world, cmd.expect("create face"));
++    history.execute(&world, GenerateOperation::new(&world, "Face1").expect("generate face"));
++    world
++}
++
++/// Texels drawn as material: `max(mesh, cut) < 0`.
++fn solid(mesh: &[f32], cut: &[f32]) -> usize {
++    mesh.iter().zip(cut).filter(|(m, c)| m.max(**c) < 0.0).count()
++}
++
++/// The eye's resident state: the frame number it holds and its cut layer.
++struct Resident {
++    seq: u64,
++    cut: Vec<f32>,
++}
++
++/// Take `frame` into the resident layer as `eye.rs` `rewrite_cut` /
++/// `upload` do.
++fn compose(res: &mut Option<Resident>, frame: &PlayFrame) {
++    let packed = frame.view.packed.as_ref().expect("the worker packs its frames for the eye");
++    let whole = |p: &camcraft_app::stock_view::Packed| match &p.cut {
++        CutLayer::Full(c) => c.as_ref().clone(),
++        CutLayer::Patch { .. } => pack_cut(frame.view.stock.field().expect("a field stock"), &p.base.meta),
++    };
++    match res {
++        Some(r) if packed.patches(r.seq) => {
++            let CutLayer::Patch { patch, .. } = &packed.cut else { unreachable!("patches() is only true for a patch") };
++            patch.apply(&mut r.cut).expect("the patch fits the layer");
++            r.seq = packed.seq;
++        }
++        _ => *res = Some(Resident { seq: packed.seq, cut: whole(packed) }),
++    }
++}
++
++fn wait_precalc(w: &PlayWorker) -> Precalc {
++    let t0 = Instant::now();
++    loop {
++        let p = w.precalc();
++        if !matches!(p, Precalc::Running { .. }) || t0.elapsed() > Duration::from_secs(120) {
++            return p;
++        }
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++/// Play the program as the transport does - one position after the
++/// other, every frame the worker publishes taken and composed - and
++/// return the drawn material at each landed position with the frame.
++fn play_through(w: &PlayWorker, positions: &[(usize, f64)], res: &mut Option<Resident>) -> Vec<(usize, PlayFrame)> {
++    let mut landed = Vec::new();
++    for &(k, f) in positions {
++        w.request_at(k, f);
++        let (mut seen, t0) = (w.published(), Instant::now());
++        loop {
++            assert!(t0.elapsed() < Duration::from_secs(120), "no frame at move {k}");
++            if let Some(fr) = w.take() {
++                let fr = fr.expect("the worker cuts the face program");
++                compose(res, &fr);
++                if fr.at == k && fr.frac.to_bits() == f.to_bits() {
++                    landed.push((k, fr));
++                    break;
++                }
++            }
++            seen = w.wait_published(seen, Duration::from_millis(100));
++        }
++    }
++    landed
++}
++
++fn check_playback(world: &World, cells: f64) {
++    let seed = || PlaySeed::gather(world, false, cells).expect("seed");
++    let w = PlayWorker::spawn_precalc(seed(), PRECALC_BUDGET).expect("worker");
++    assert!(matches!(wait_precalc(&w), Precalc::Ready { .. }), "the calculation finishes: {:?}", w.precalc());
++    let total = w.index().total();
++    let uncut = FieldPlay::from_seed(seed()).expect("play").view().stock;
++    let (ub, ucut) = PackedBase::of(&uncut, None).expect("packs");
++    let full = field_view_with(world, cells).expect("deviate view");
++    let (fb, fcut) = PackedBase::of(&full.stock, None).expect("packs");
++    let (start, finished) = (solid(&ub.mesh, &ucut), solid(&fb.mesh, &fcut));
++    assert!(start > finished, "the face removes material: uncut {start}, finished {finished} texels");
++    // The transport from the start to the end, a few moves a frame, the
++    // move in flight half drawn on the way.
++    let step = (total / 40).max(1);
++    let mut positions: Vec<(usize, f64)> = (0..total).step_by(step).map(|k| (k, if k % 2 == 0 { 0.0 } else { 0.5 })).collect();
++    positions.push((total, 0.0));
++    let mut res = None;
++    let landed = play_through(&w, &positions, &mut res);
++    let r = res.as_ref().expect("frames were drawn");
++    let (_, last) = landed.last().expect("the end landed");
++    let base = &last.view.packed.as_ref().expect("packed").base;
++    let drawn = solid(&base.mesh, &r.cut);
++    assert!(drawn < start, "the drawn stock at the end shows a removal: {drawn} texels drawn, uncut {start}");
++    assert_eq!(drawn, finished, "the drawn stock at the end is the finished stock");
++    // Played again from the start: at each landed position the drawn
++    // layer is that frame's own stock, and the removal grows.
++    let mut res = None;
++    let mut prev = start;
++    for &(k, f) in &positions {
++        play_through(&w, &[(k, f)], &mut res);
++        let r = res.as_ref().expect("a frame was drawn");
++        let drawn = solid(&base.mesh, &r.cut);
++        assert!(drawn <= prev, "move {k}+{f}: the drawn material only goes down ({drawn} after {prev})");
++        prev = drawn;
++    }
++    assert_eq!(prev, finished, "the replay ends at the finished stock");
++}
++
++/// The small face at about 1 mm cells.
++#[test]
++fn the_drawn_stock_shows_the_removal_as_the_program_plays() {
++    check_playback(&faced_doc(12.0, 1.5, Some(2.5)), 12.0 * 12.0 * 20.0);
++}
++
++/// A longer program at the viewport's own display budget.
++#[test]
++fn the_drawn_stock_shows_the_removal_at_the_display_budget() {
++    check_playback(&faced_doc(24.0, 0.8, Some(2.5)), camcraft_app::stock_view::DEFAULT_TEXELS);
++}
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index e3937486e..aa5f4b109 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -309,11 +309,10 @@ fn viewport_panel(
+         let sc = crate::frame_cost::time("ui/viewport.sim_script", || cached_script(state));
+         let total = sc.total.max(0.0);
+         let unit = camcraft_app::units::of(&state.world);
+-        if let Some(sim) = state.sim.as_mut() {
+-            // Clamp a stalled frame's dt: a hiccup never teleports the
+-            // tool through material.
+-            sim.advance(f64::from(ui.input(|i| i.stable_dt).clamp(0.0, 0.1)), total);
+-        }
++        // Clamp a stalled frame's dt: a hiccup never teleports the tool
++        // through material. Held while the stock removal is calculated.
++        crate::play_precalc::advance_playhead(state, f64::from(ui.input(|i| i.stable_dt).clamp(0.0, 0.1)), total);
++        let held = crate::play_precalc::holds_playhead(state);
+         let mut stop = false;
+         ui.horizontal(|ui| {
+             let Some(sim) = state.sim.as_mut() else {
+@@ -339,7 +338,7 @@ fn viewport_panel(
+                 stop = true;
+             }
+             if total > 0.0 {
+-                ui.add(egui::Slider::new(&mut sim.t, 0.0..=total).show_value(false));
++                ui.add_enabled(!held, egui::Slider::new(&mut sim.t, 0.0..=total).show_value(false));
+                 egui::ComboBox::from_id_salt("sim_speed")
+                     .selected_text(format!("{:.0}x", sim.speed))
+                     .show_ui(ui, |ui| {
+diff --git a/crates/ui/src/play_precalc.rs b/crates/ui/src/play_precalc.rs
+index aaecb9cda..2d25e48c1 100644
+--- a/crates/ui/src/play_precalc.rs
++++ b/crates/ui/src/play_precalc.rs
+@@ -44,6 +44,26 @@ pub fn playback_stop(state: &State) -> Option<String> {
+     state.field_play.as_ref()?.index().stop().map(stop_readout)
+ }
+ 
++/// True while the calculation before playback runs (#2611). The stock
++/// on screen stays uncut until the calculation ends, so the transport
++/// holds its playhead (and its scrub) as the line says: a tool that
++/// moved on would show cuts that the picture does not have.
++#[must_use]
++pub fn holds_playhead(state: &State) -> bool {
++    state.field_play.as_ref().is_some_and(|p| matches!(p.precalc(), Precalc::Running { .. }))
++}
++
++/// One frame of the transport clock: `Sim::advance`, held while the
++/// calculation runs (`holds_playhead`).
++pub(crate) fn advance_playhead(state: &mut State, dt: f64, total: f64) {
++    if holds_playhead(state) {
++        return;
++    }
++    if let Some(sim) = state.sim.as_mut() {
++        sim.advance(dt, total);
++    }
++}
++
+ /// Draw the line under the transport bar, when there is one.
+ pub(crate) fn transport_row(ui: &mut egui::Ui, state: &State) {
+     let Some(play) = state.field_play.as_ref() else {
+diff --git a/crates/ui/src/play_precalc_tests.rs b/crates/ui/src/play_precalc_tests.rs
+index 034963900..1c059628c 100644
+--- a/crates/ui/src/play_precalc_tests.rs
++++ b/crates/ui/src/play_precalc_tests.rs
+@@ -3,7 +3,7 @@
+ //! stored calculation and starts a new one. Provenance: our own
+ //! fixtures (a staged face) over the M7.1 field engine.
+ //!
+-//! Gate map (M4.4): covers ui::play_precalc, ui::actions::ensure_field_view (precalc stamp, #2280 stop line).
++//! Gate map (M4.4): covers ui::play_precalc, ui::actions::ensure_field_view (precalc stamp, #2280 stop line), ui::egui_app::shell (the transport holds its playhead, #2611).
+ 
+ use camcraft_app::commands::{AddTool, CreateOperation, EditOperationParams, GenerateOperation, SetStock};
+ use camcraft_app::geometry::{Point3, IDENTITY_Q};
+@@ -14,7 +14,7 @@ use camcraft_app::stock_play::Precalc;
+ use camcraft_app::tools::catalog;
+ 
+ use crate::actions::ensure_field_view;
+-use crate::play_precalc::{playback_stop, precalc_readout, stop_readout};
++use crate::play_precalc::{advance_playhead, holds_playhead, playback_stop, precalc_readout, stop_readout};
+ use crate::state::{Sim, State};
+ 
+ fn face(stepover: f64) -> OpParams {
+@@ -85,6 +85,69 @@ fn an_edit_of_the_operation_retires_the_stored_calculation() {
+     assert_ne!(play.precalc(), Precalc::Off, "and it calculates again");
+ }
+ 
++/// Texels drawn as material in `fv`'s packed lattice, `max(mesh, cut)
++/// < 0`, with the uncut stock's count (an unclaimed cut texel is
++/// negative, so the uncut stock is the mesh layer alone).
++fn drawn_solid(fv: &camcraft_app::stock_view::FieldView) -> Option<(usize, usize)> {
++    let base = &fv.packed.as_ref()?.base;
++    let cut = camcraft_app::stock_sim::preview::pack_cut(fv.stock.field()?, &base.meta);
++    let uncut = base.mesh.iter().filter(|m| **m < 0.0).count();
++    Some((uncut, base.mesh.iter().zip(&cut).filter(|(m, c)| m.max(**c) < 0.0).count()))
++}
++
++/// #2611: the transport played on while the stock removal was
++/// calculated, and the stock on screen stayed uncut (no frame is
++/// published before the calculation ends): the tool moved over stock
++/// it showed no cut in. The playhead now waits for the calculation, so
++/// the picture is never behind it; once playback runs, the stock that
++/// the frames draw shows the removal.
++#[test]
++fn the_playhead_waits_for_the_calculation_and_then_the_drawn_stock_shows_the_cut() {
++    use std::time::{Duration, Instant};
++    let mut state = faced_state();
++    state.sim = Some(Sim::new());
++    // The eye's first frame starts the playback worker.
++    ensure_field_view(&mut state);
++    let total = crate::egui_app::shell::cached_script(&mut state).total;
++    assert!(total > 1.0, "the face program takes time to play: {total} s");
++    let mut held = 0;
++    for _ in 0..5 {
++        if !holds_playhead(&state) {
++            break;
++        }
++        held += 1;
++        advance_playhead(&mut state, 0.1, total);
++        ensure_field_view(&mut state);
++        let t = state.sim.as_ref().map(|s| s.t);
++        assert_eq!(t, Some(0.0), "the playhead waits while the stock removal is calculated");
++        assert!(state.field_view.is_none(), "no picture before the calculation ends");
++    }
++    assert!(held > 0, "the calculation runs while the first frames play");
++    // Cancel: the calculation stops, the playback goes on and cuts live.
++    state.field_play.as_ref().expect("worker").cancel_precalc();
++    let t0 = Instant::now();
++    while holds_playhead(&state) {
++        assert!(t0.elapsed() < Duration::from_secs(120), "the cancel ends the calculation");
++        std::thread::sleep(Duration::from_millis(10));
++    }
++    let mut cut_seen = None;
++    while cut_seen.is_none() {
++        let t = state.sim.as_ref().map_or(0.0, |s| s.t);
++        assert!(t < total && t0.elapsed() < Duration::from_secs(300), "no drawn removal up to {t} s of {total} s");
++        advance_playhead(&mut state, 0.1, total);
++        ensure_field_view(&mut state);
++        if let Some(Ok(fv)) = &state.field_view
++            && let Some((uncut, n)) = drawn_solid(fv)
++            && n < uncut
++        {
++            cut_seen = Some((uncut, n));
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    let t = state.sim.as_ref().map_or(0.0, |s| s.t);
++    assert!(t > 0.0, "the playhead runs again after the calculation: {t} s; drawn {cut_seen:?}");
++}
++
+ /// #2280: an operation with no toolpath after a generated one. The
+ /// playback starts and plays the generated one; the stop is its own
+ /// plain-English line, not a refusal on the status line.
+diff --git a/docs/decisions/2611-playhead-waits-for-precalc.md b/docs/decisions/2611-playhead-waits-for-precalc.md
+new file mode 100644
+index 000000000..a07197e46
+--- /dev/null
++++ b/docs/decisions/2611-playhead-waits-for-precalc.md
+@@ -0,0 +1,25 @@
++## #2611 - The playhead waits for the stock removal calculation
++
++**What was decided.** While the stock removal before playback is calculated
++(`Precalc::Running`, #2181), the transport holds its playhead: `sim.t` does
++not advance and the scrub slider is disabled. Play/Pause and Stop still work,
++and Cancel stops the calculation (playback then cuts live, as before).
++
++**Why.** The worker publishes no frame until the calculation ends, so the
++viewport shows the uncut stock. The transport played on meanwhile, and the
++tool moved over stock that showed no cut - on a large block the calculation
++takes long enough that the whole program can play with no visible removal.
++The transport line already said "playback starts when it is done"; the clock
++did not obey it. A headless test of the worker's frames
++(`crates/app/tests/stock_play_picture.rs`) showed the published frames do
++draw the removal, so the defect is the clock, not the cut.
++
++**Considered and dropped.**
++- Publish progress frames from the calculation: the calculation cuts in
++  program order, so its stock is at a position other than the playhead's.
++  A picture at the wrong position is a silent wrong answer.
++- Interrupt the calculation to cut live at the playhead: this is the lag
++  that #2181 removed.
++
++**Cost to change later.** Small: `play_precalc::advance_playhead` and the
++`held` flag in `egui_app::shell`.
