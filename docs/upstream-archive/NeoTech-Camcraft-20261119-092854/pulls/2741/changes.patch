@@ -1,0 +1,821 @@
+From 7cb22f632f82ed1ac9f4e95abd3422c6ce52c5c7 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 19 Nov 2026 09:15:48 +0100
+Subject: [PATCH 1/2] feat(sim): f32 twin of the cell cut kernel and the brick
+ work list
+
+GPU stock sim S1. A CPU f32 twin of the per-cell cut kernel, on
+tile-relative coordinates (tile = brick), with a claim margin so that
+the twin never removes more than the f64 field cut. The max law runs
+on order-preserving u32 keys (the GPU atomicMax law). The brick work
+list uses the f64 sweep windows, clipped to the pack_cut lattice and
+sorted brick-major. Only the upright ball and flat end mill on linear
+moves have a twin; other tools, arcs, tilted axes, zero-length and
+non-finite moves refuse by name. No caller changes.
+
+Pinned by crates/sim/tests/stock_cut_twin.rs (7 tests).
+
+Fixes #2626
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/sim/src/stock_sim/cut_twin.rs      | 222 +++++++++++++++++++++
+ crates/sim/src/stock_sim/cut_twin_work.rs | 228 ++++++++++++++++++++++
+ crates/sim/src/stock_sim/mod.rs           |   5 +
+ crates/sim/tests/stock_cut_twin.rs        | 211 ++++++++++++++++++++
+ docs/decisions/2626-f32-cut-twin.md       |  48 +++++
+ 5 files changed, 714 insertions(+)
+ create mode 100644 crates/sim/src/stock_sim/cut_twin.rs
+ create mode 100644 crates/sim/src/stock_sim/cut_twin_work.rs
+ create mode 100644 crates/sim/tests/stock_cut_twin.rs
+ create mode 100644 docs/decisions/2626-f32-cut-twin.md
+
+diff --git a/crates/sim/src/stock_sim/cut_twin.rs b/crates/sim/src/stock_sim/cut_twin.rs
+new file mode 100644
+index 000000000..07f959919
+--- /dev/null
++++ b/crates/sim/src/stock_sim/cut_twin.rs
+@@ -0,0 +1,222 @@
++//! The f32 cell cut (#2626, GPU stock sim S1): the CPU twin of the
++//! per-cell removal kernel that a compute shader runs, in single
++//! precision, on tile-relative coordinates.
++//!
++//! Provenance: the swept-solid distance laws of `field_cut` /
++//! `field_sweep` (capsule closed form, upright flat cylinder in the
++//! (rho, z) half-plane, golden section on a convex 1-D minimum),
++//! re-stated in IEEE-754 single precision; the order-preserving
++//! float-to-unsigned key is the standard radix-sort transform (flip
++//! all bits of a negative, the sign bit of a positive). Nothing from
++//! vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Tile-relative.** Every coordinate the kernel sees is a world
++//!   value minus the origin of its brick (`BRICK` cells a side),
++//!   formed in f64 and rounded once to f32. A cell center is
++//!   `(local + 0.5) * cell` with `local` in `0..BRICK`, so the f32
++//!   values stay near the tile and the rounding scales with the move's
++//!   reach from it, not with the world position.
++//! - **Never more removal than the f64 law.** The kernel adds a
++//!   margin to every distance before it claims: `TWIN_ULPS` f32
++//!   epsilons of the tile's coordinate scale, plus the f64 golden
++//!   section's own bracket on the path that uses it. The f32 cut is
++//!   therefore never above the f64 cut; it sits below it by at most
++//!   about twice that margin (`stock_cut_twin` pins both sides).
++//! - **The max law on ordered keys.** A claim is `min(-phi, cap)`,
++//!   written as `ordered_bits` and folded with an unsigned max - the
++//!   one atomic a GPU has for this. The key keeps the order of every
++//!   non-NaN f32, so the max of keys is the key of the max, and the
++//!   fold commutes: any move order answers bit for bit the same.
++//! - **No NaN is claimed.** A non-finite distance claims nothing.
++
++use super::field::BRICK;
++
++/// Rounding slack of the f32 distance, in f32 epsilons of the tile
++/// scale: the endpoints round once (half an ulp each), and the
++/// longest path (the flat's hypot of positive parts after a golden
++/// section) takes about a dozen roundings. 32 covers both with room.
++pub const TWIN_ULPS: f32 = 32.0;
++
++/// The f64 golden section's final bracket, as a fraction of the path
++/// length (`field_sweep::GS_RESIDUAL`): the f64 distance on that path
++/// may read this much above the truth, so the twin's margin holds it.
++const GS_RESIDUAL: f64 = 1e-6;
++
++/// Golden-section iterations of the f32 search (the f64 count).
++const GS_ITERS: u32 = 32;
++
++/// (sqrt(5) - 1) / 2 in f32.
++const PHI: f32 = 0.618_034;
++
++/// The tool of one twin chord. Only the two the kernel has: other
++/// tools refuse by name in `twin_work`.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum TwinTool {
++    /// Ball nose of radius `r`; the chord is the ball's CENTER path.
++    Ball { r: f64 },
++    /// Upright flat end mill: disc of `r`, flank `flank` up +Z; the
++    /// chord is the TIP path.
++    Flat { r: f64, flank: f64 },
++}
++
++/// One linear chord in world coordinates (f64), as the CPU uploads it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct TwinChord {
++    pub a: [f64; 3],
++    pub b: [f64; 3],
++    pub tool: TwinTool,
++}
++
++/// One chord as the kernel reads it inside one tile: f32, relative to
++/// the tile origin, with its claim margin.
++#[derive(Clone, Copy, Debug)]
++pub struct TileChord {
++    pub a: [f32; 3],
++    pub b: [f32; 3],
++    pub r: f32,
++    /// Flank length; `0` marks the ball.
++    pub flank: f32,
++    pub ball: bool,
++    pub margin: f32,
++}
++
++impl TileChord {
++    /// The chord seen from the tile whose world origin is `origin`.
++    #[must_use]
++    pub fn of(ch: &TwinChord, origin: [f64; 3], cell: f64) -> TileChord {
++        let rel = |p: [f64; 3]| [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
++        let (ra, rb) = (rel(ch.a), rel(ch.b));
++        let (r, flank, ball) = match ch.tool {
++            TwinTool::Ball { r } => (r, 0.0, true),
++            TwinTool::Flat { r, flank } => (r, flank, false),
++        };
++        let reach = ra.iter().chain(rb.iter()).fold(0.0f64, |m, v| m.max(v.abs()));
++        let scale = reach + r + flank + f64::from(BRICK) * cell;
++        let mut margin = f64::from(TWIN_ULPS) * f64::from(f32::EPSILON) * scale;
++        if !ball {
++            let d = [rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2]];
++            margin += (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * GS_RESIDUAL;
++        }
++        let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
++        TileChord {
++            a: f(ra),
++            b: f(rb),
++            r: r as f32,
++            flank: flank as f32,
++            ball,
++            // rounded UP so the margin never shrinks in the cast
++            margin: (margin as f32) * (1.0 + f32::EPSILON),
++        }
++    }
++}
++
++/// The cell cut at tile-relative center `q`: `Some(min(-phi, cap))`
++/// when the biased distance `phi` is under `cap`, `None` otherwise
++/// (the f64 claim's two rejects) and for any non-finite value.
++#[must_use]
++pub fn cell_cut(tc: &TileChord, q: [f32; 3], cap: f32) -> Option<f32> {
++    let d = if tc.ball { ball_dist(tc, q) } else { flat_dist(tc, q) };
++    let phi = d + tc.margin;
++    if !phi.is_finite() || phi >= cap {
++        return None;
++    }
++    Some((-phi).min(cap))
++}
++
++/// The capsule: distance to the center segment, less `r`.
++fn ball_dist(tc: &TileChord, q: [f32; 3]) -> f32 {
++    let d = sub(tc.b, tc.a);
++    let v = sub(q, tc.a);
++    let dd = dot(d, d);
++    let t = if dd > 0.0 { (dot(v, d) / dd).clamp(0.0, 1.0) } else { 0.0 };
++    let w = [v[0] - t * d[0], v[1] - t * d[1], v[2] - t * d[2]];
++    dot(w, w).sqrt() - tc.r
++}
++
++/// The upright flat cylinder swept along the tip chord: closed form on
++/// a level move (foot at the XY projection) and a plunge (foot at
++/// mid-flank), the golden section on every other move - the three
++/// paths of `field_sweep::Sweep::dist`, in f32.
++fn flat_dist(tc: &TileChord, q: [f32; 3]) -> f32 {
++    let d = sub(tc.b, tc.a);
++    let at = |t: f32| pose(tc, [tc.a[0] + t * d[0], tc.a[1] + t * d[1], tc.a[2] + t * d[2]], q);
++    if d[2] == 0.0 {
++        let dd = d[0] * d[0] + d[1] * d[1];
++        let t = ((q[0] - tc.a[0]) * d[0] + (q[1] - tc.a[1]) * d[1]) / dd;
++        return at(if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 });
++    }
++    if d[0] == 0.0 && d[1] == 0.0 {
++        let t = (q[2] - tc.a[2] - 0.5 * tc.flank) / d[2];
++        return at(if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 });
++    }
++    let (mut lo, mut hi) = (0.0f32, 1.0f32);
++    let mut c = hi - PHI * (hi - lo);
++    let mut e = lo + PHI * (hi - lo);
++    let mut fc = at(c);
++    let mut fe = at(e);
++    for _ in 0..GS_ITERS {
++        if fc < fe {
++            hi = e;
++            e = c;
++            fe = fc;
++            c = hi - PHI * (hi - lo);
++            fc = at(c);
++        } else {
++            lo = c;
++            c = e;
++            fc = fe;
++            e = lo + PHI * (hi - lo);
++            fe = at(e);
++        }
++    }
++    fc.min(fe)
++}
++
++/// One upright flat pose with its tip at `t`: the box distance in the
++/// (rho, z) half-plane (`field_solid::pose_dist`'s flat arm).
++fn pose(tc: &TileChord, t: [f32; 3], q: [f32; 3]) -> f32 {
++    let (x, y, zl) = (q[0] - t[0], q[1] - t[1], q[2] - t[2]);
++    let rho = (x * x + y * y).sqrt();
++    let (e1, e2, e3) = (rho - tc.r, -zl, zl - tc.flank);
++    let m = e1.max(e2).max(e3);
++    if m > 0.0 {
++        let (p1, p2, p3) = (e1.max(0.0), e2.max(0.0), e3.max(0.0));
++        (p1 * p1 + p2 * p2 + p3 * p3).sqrt()
++    } else {
++        m
++    }
++}
++
++fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
++    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++/// The order-preserving key of an f32: for any two non-NaN values,
++/// `x < y` gives `ordered_bits(x) < ordered_bits(y)` (`-0.0` sorts
++/// just under `+0.0`). A negative flips every bit; a positive sets
++/// the sign bit.
++#[must_use]
++pub fn ordered_bits(v: f32) -> u32 {
++    let b = v.to_bits();
++    if b & 0x8000_0000 != 0 {
++        !b
++    } else {
++        b | 0x8000_0000
++    }
++}
++
++/// The inverse of [`ordered_bits`].
++#[must_use]
++pub fn from_ordered_bits(u: u32) -> f32 {
++    if u & 0x8000_0000 != 0 {
++        f32::from_bits(u & 0x7fff_ffff)
++    } else {
++        f32::from_bits(!u)
++    }
++}
+diff --git a/crates/sim/src/stock_sim/cut_twin_work.rs b/crates/sim/src/stock_sim/cut_twin_work.rs
+new file mode 100644
+index 000000000..302f17d16
+--- /dev/null
++++ b/crates/sim/src/stock_sim/cut_twin_work.rs
+@@ -0,0 +1,228 @@
++//! The brick work list of the f32 cut twin (#2626, GPU stock sim
++//! S1): from a batch of moves, the bricks and cells that each move's
++//! window touches, and the CPU run of the kernel over that list into
++//! the dense lattice layout of `preview::pack_cut`.
++//!
++//! Provenance: the swept windows of `field_sweep::window_of` and the
++//! brick-major walk of `field_batch::cut_batch`, clipped to the dense
++//! lattice of `preview::pack`; nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Same windows as the f64 walk.** A chord's window is the f64
++//!   sweep's own (`Sweep::window`), clipped to the lattice box (the
++//!   lattice lies inside the f64 cut region, `field_batch::region_of`
++//!   pads further). The work list is integer data, so it is made in
++//!   f64 on the CPU and only the cell kernel runs in f32.
++//! - **Refuse by name, never cut another way.** Only the ball and the
++//!   flat end mill, upright, on linear moves have a twin. Any other
++//!   tool, an arc, a tilted pose, a zero-length move, a non-finite
++//!   value or a non-positive tool size refuses before any output.
++//!   Rapids touch nothing (RS-274 G0, the f64 law).
++//! - **Deterministic order.** Items are sorted brick-major, then by
++//!   chord; the max law makes the result independent of that order.
++
++use super::cut_twin::{cell_cut, from_ordered_bits, ordered_bits, TileChord, TwinChord, TwinTool};
++use super::field::{brick_of, BRICK};
++use super::field_cut::{chord_sweep, SdfTool};
++use super::field_solid::{tool_kind, ToolKind};
++use super::kernel::StockError;
++use super::preview::{pack::MAX_TEXELS, LatticeMeta};
++
++use crate::cl::{Move, MoveKind};
++
++/// Refusal ceiling of one chord's clipped window, in cells: the f64
++/// walk's `MAX_CELLS_PER_MOVE`, the same value.
++pub const TWIN_MAX_CELLS_PER_CHORD: u64 = 1 << 22;
++
++/// One unit of kernel work: chord `chord` against brick `brick`, on
++/// the cells `lo..=hi` (world cell keys, inside the brick and the
++/// lattice).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct WorkItem {
++    pub brick: [i32; 3],
++    pub chord: u32,
++    pub lo: [i32; 3],
++    pub hi: [i32; 3],
++}
++
++/// The chords of a batch and the brick work list over them.
++#[derive(Clone, Debug, PartialEq)]
++pub struct TwinWork {
++    pub chords: Vec<TwinChord>,
++    pub items: Vec<WorkItem>,
++}
++
++fn invalid(msg: String) -> StockError {
++    StockError::Invalid(format!("f32 cut twin: {msg}"))
++}
++
++/// The tool's twin, or its refusal by name.
++fn twin_tool(tool: &SdfTool) -> Result<TwinTool, StockError> {
++    let name = match tool {
++        SdfTool::Ball { .. } | SdfTool::Flat { .. } => None,
++        SdfTool::Shanked { .. } => Some("shanked ball"),
++        SdfTool::Taper { .. } => Some("taper"),
++        SdfTool::Drill { .. } => Some("drill"),
++        SdfTool::BullNose { .. } => Some("bull nose"),
++        SdfTool::Lathe { .. } => Some("lathe"),
++    };
++    if let Some(n) = name {
++        return Err(invalid(format!(
++            "the {n} tool has no f32 twin; only the ball and the flat end mill cut here"
++        )));
++    }
++    // The f64 gate checks the sizes (positive, finite) by name.
++    match tool_kind(tool)? {
++        ToolKind::Ball(r) => Ok(TwinTool::Ball { r }),
++        ToolKind::Flat { r, flank } => Ok(TwinTool::Flat { r, flank }),
++        _ => Err(invalid("the tool has no f32 twin".into())),
++    }
++}
++
++/// The lattice box `[lo, hi]` per axis, or a refusal of a bad meta.
++fn lattice_box(meta: &LatticeMeta) -> Result<[(i32, i32); 3], StockError> {
++    if !(meta.cell.is_finite() && meta.cell > 0.0 && meta.cap.is_finite() && meta.cap > 0.0) {
++        return Err(invalid(format!(
++            "the lattice cell {} and cap {} must be positive finite numbers",
++            meta.cell, meta.cap
++        )));
++    }
++    let n = (meta.dims[0] as usize)
++        .checked_mul(meta.dims[1] as usize)
++        .and_then(|n| n.checked_mul(meta.dims[2] as usize));
++    if !n.is_some_and(|n| n > 0 && n <= MAX_TEXELS) {
++        return Err(invalid(format!("the lattice dims {:?} are empty or over the texel budget", meta.dims)));
++    }
++    let mut out = [(0, 0); 3];
++    for (a, o) in out.iter_mut().enumerate() {
++        let hi = i64::from(meta.origin[a]) + i64::from(meta.dims[a]) - 1;
++        let hi = i32::try_from(hi).map_err(|_| invalid(format!("the lattice axis {a} leaves the i32 range")))?;
++        *o = (meta.origin[a], hi);
++    }
++    Ok(out)
++}
++
++/// The chords of `moves` and the brick work list that their windows
++/// touch inside `meta`'s lattice. Validates the whole batch first.
++pub fn twin_work(moves: &[Move], tool: &SdfTool, meta: &LatticeMeta) -> Result<TwinWork, StockError> {
++    let tt = twin_tool(tool)?;
++    let bx = lattice_box(meta)?;
++    let kind = tool_kind(tool)?;
++    let up = [0.0, 0.0, 1.0];
++    let mut chords = Vec::new();
++    let mut items = Vec::new();
++    for m in moves {
++        if !m.is_finite() {
++            return Err(invalid("the move has a non-finite endpoint".into()));
++        }
++        if m.kind == MoveKind::Rapid {
++            continue;
++        }
++        if m.arc.is_some() {
++            return Err(invalid("an arc move has no twin; only linear moves cut here".into()));
++        }
++        if let Some(a) = m.axis {
++            if !(a[0] == 0.0 && a[1] == 0.0 && a[2].is_finite() && a[2] > 0.0) {
++                return Err(invalid(format!("the tool axis {a:?} is not upright; only +Z cuts here")));
++            }
++        }
++        if m.from == m.to {
++            return Err(invalid("a zero-length move has no swept solid".into()));
++        }
++        let sw = chord_sweep(&kind, up, m.from, m.to)?;
++        let (a, b) = match tt {
++            TwinTool::Ball { r } => ([m.from.x, m.from.y, m.from.z + r], [m.to.x, m.to.y, m.to.z + r]),
++            TwinTool::Flat { .. } => ([m.from.x, m.from.y, m.from.z], [m.to.x, m.to.y, m.to.z]),
++        };
++        let n = u32::try_from(chords.len()).map_err(|_| invalid("too many chords in one batch".into()))?;
++        chords.push(TwinChord { a, b, tool: tt });
++        let w = sw.window(meta.cell, meta.cap, up);
++        let c: [(i32, i32); 3] = std::array::from_fn(|i| (w[i].0.max(bx[i].0), w[i].1.min(bx[i].1)));
++        if c.iter().any(|s| s.0 > s.1) {
++            continue; // the whole reach lies outside the lattice
++        }
++        let cells = c
++            .iter()
++            .fold(1u64, |acc, s| acc.saturating_mul((i64::from(s.1) - i64::from(s.0) + 1) as u64));
++        if cells > TWIN_MAX_CELLS_PER_CHORD {
++            return Err(invalid(format!(
++                "a chord's window spans more than {TWIN_MAX_CELLS_PER_CHORD} cells at cell size {}; segment the move",
++                meta.cell
++            )));
++        }
++        let (blo, bhi) = (brick_of([c[0].0, c[1].0, c[2].0]), brick_of([c[0].1, c[1].1, c[2].1]));
++        for kz in blo[2]..=bhi[2] {
++            for ky in blo[1]..=bhi[1] {
++                for kx in blo[0]..=bhi[0] {
++                    let bk = [kx, ky, kz];
++                    let lo: [i32; 3] = std::array::from_fn(|i| bk[i].saturating_mul(BRICK).max(c[i].0));
++                    let hi: [i32; 3] =
++                        std::array::from_fn(|i| bk[i].saturating_mul(BRICK).saturating_add(BRICK - 1).min(c[i].1));
++                    items.push(WorkItem { brick: bk, chord: n, lo, hi });
++                }
++            }
++        }
++    }
++    items.sort_by_key(|w| (w.brick, w.chord));
++    Ok(TwinWork { chords, items })
++}
++
++/// Run the f32 kernel over a work list: the cut layer in the dense
++/// layout of `pack_cut` over `meta` (z-major, then y, then x), with
++/// the same `-4 cap` floor where no chord claims a cell.
++pub fn run_twin(work: &TwinWork, meta: &LatticeMeta) -> Result<Vec<f32>, StockError> {
++    let bx = lattice_box(meta)?;
++    let dims = [meta.dims[0] as usize, meta.dims[1] as usize, meta.dims[2] as usize];
++    let floor = ordered_bits((-4.0 * meta.cap) as f32);
++    let mut keys = vec![floor; dims[0] * dims[1] * dims[2]];
++    let (cell32, cap32) = (meta.cell as f32, meta.cap as f32);
++    for it in &work.items {
++        let Some(ch) = work.chords.get(it.chord as usize) else {
++            return Err(invalid(format!("work item names chord {} of {}", it.chord, work.chords.len())));
++        };
++        let b0 = [
++            it.brick[0].saturating_mul(BRICK),
++            it.brick[1].saturating_mul(BRICK),
++            it.brick[2].saturating_mul(BRICK),
++        ];
++        let origin = [f64::from(b0[0]) * meta.cell, f64::from(b0[1]) * meta.cell, f64::from(b0[2]) * meta.cell];
++        let tc = TileChord::of(ch, origin, meta.cell);
++        for k in it.lo[2]..=it.hi[2] {
++            for j in it.lo[1]..=it.hi[1] {
++                for i in it.lo[0]..=it.hi[0] {
++                    let key = [i, j, k];
++                    let outside = || invalid(format!("work item cell {key:?} lies outside its brick or the lattice"));
++                    let mut q = [0.0f32; 3];
++                    let mut at = [0usize; 3];
++                    for a in 0..3 {
++                        // the local index must be in 0..BRICK, the
++                        // lattice offset in 0..dims: a hand-made list
++                        // refuses, never writes a wrapped slot
++                        let local = key[a].saturating_sub(b0[a]);
++                        let off = usize::try_from(i64::from(key[a]) - i64::from(bx[a].0)).map_err(|_| outside())?;
++                        if !(0..BRICK).contains(&local) || off >= dims[a] {
++                            return Err(outside());
++                        }
++                        q[a] = (local as f32 + 0.5) * cell32;
++                        at[a] = off;
++                    }
++                    let Some(v) = cell_cut(&tc, q, cap32) else {
++                        continue;
++                    };
++                    let slot = (at[2] * dims[1] + at[1]) * dims[0] + at[0];
++                    let Some(dst) = keys.get_mut(slot) else {
++                        return Err(outside());
++                    };
++                    *dst = (*dst).max(ordered_bits(v));
++                }
++            }
++        }
++    }
++    Ok(keys.into_iter().map(from_ordered_bits).collect())
++}
++
++/// [`twin_work`] then [`run_twin`]: the f32 cut layer of a batch.
++pub fn twin_cut(moves: &[Move], tool: &SdfTool, meta: &LatticeMeta) -> Result<Vec<f32>, StockError> {
++    run_twin(&twin_work(moves, tool, meta)?, meta)
++}
+diff --git a/crates/sim/src/stock_sim/mod.rs b/crates/sim/src/stock_sim/mod.rs
+index 9ff8b5956..51777fb88 100644
+--- a/crates/sim/src/stock_sim/mod.rs
++++ b/crates/sim/src/stock_sim/mod.rs
+@@ -91,6 +91,9 @@ mod wall_anchor;
+ mod mark;
+ mod display;
+ mod dual;
++// #2626: the f32 twin of the GPU cell cut and its brick work list.
++mod cut_twin;
++mod cut_twin_work;
+ mod field;
+ mod field_arc;
+ mod field_batch;
+@@ -149,6 +152,8 @@ pub use wall_anchor::{models_a_bevel, on_walls};
+ pub use mark::{credit_marks, Mark};
+ // The floor a mark must leave on the part's underside (#1595).
+ pub use crate::verify::MARK_FLOOR;
++pub use cut_twin::{cell_cut, from_ordered_bits, ordered_bits, TileChord, TwinChord, TwinTool, TWIN_ULPS};
++pub use cut_twin_work::{run_twin, twin_cut, twin_work, TwinWork, WorkItem, TWIN_MAX_CELLS_PER_CHORD};
+ pub use field::SdfField;
+ pub use field_body::Lattice;
+ pub use field_carry::{box_signed, CarriedField, Clip, ClipRefusal};
+diff --git a/crates/sim/tests/stock_cut_twin.rs b/crates/sim/tests/stock_cut_twin.rs
+new file mode 100644
+index 000000000..22089339f
+--- /dev/null
++++ b/crates/sim/tests/stock_cut_twin.rs
+@@ -0,0 +1,211 @@
++//! The f32 cut twin (#2626, GPU stock sim S1) against the f64 field
++//! cut: one-sided parity on the same moves, the order-preserving key,
++//! the move-order law and the refusals.
++//! Provenance: this codebase's own f64 field cut (`SdfField::
++//! subtract_batch`, `preview::pack_cut`) as the reference; nothing
++//! from vendor binaries.
++//!
++//! Gate map: covers camcraft_sim::stock_sim::cut_twin and
++//! camcraft_sim::stock_sim::cut_twin_work.
++
++use camcraft_sim::cl::{Move, MoveKind};
++use camcraft_sim::geometry::{cube, Point3};
++use camcraft_sim::stock_sim::preview::{pack_cut, pack_field, LatticeMeta};
++use camcraft_sim::stock_sim::{
++    from_ordered_bits, ordered_bits, twin_cut, twin_work, SdfField, SdfTool, StockError,
++};
++
++fn p(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++fn feed(from: Point3, to: Point3) -> Move {
++    Move { rotary: None, kind: MoveKind::Feed, from, to, feed: Some(500.0), arc: None, axis: None }
++}
++
++/// A 16 x 16 x 8 block on a cell that is not a power of two (0.7),
++/// so the tile-relative rounding is real; band 4 -> cap 2.8.
++fn block() -> (SdfField, LatticeMeta) {
++    let f = SdfField::from_mesh(&cube(p(0.0, 0.0, 0.0), p(16.0, 16.0, 8.0)).facets, 0.7, 4).expect("the block builds");
++    let meta = pack_field(&f).expect("the block packs").meta;
++    (f, meta)
++}
++
++/// A level feed, a plunge, two ramps (the flat's golden-section path)
++/// and a rapid that must cut nothing.
++fn program() -> Vec<Move> {
++    let mut rapid = feed(p(-5.0, -5.0, 3.0), p(20.0, 20.0, 3.0));
++    rapid.kind = MoveKind::Rapid;
++    vec![
++        feed(p(2.0, 3.0, 5.0), p(13.0, 4.0, 5.0)),
++        feed(p(13.0, 4.0, 5.0), p(6.0, 12.0, 3.5)),
++        feed(p(6.0, 12.0, 9.0), p(6.0, 12.0, 4.0)),
++        feed(p(1.0, 1.0, 7.0), p(15.0, 14.0, 2.0)),
++        rapid,
++    ]
++}
++
++const BALL: SdfTool = SdfTool::Ball { r: 2.5 };
++const FLAT: SdfTool = SdfTool::Flat { r: 3.0, flank: 10.0 };
++
++/// The f64 reference: the field's own cut, packed (f64 -> f32 rounds
++/// to nearest, which keeps order, so the one-sided bound stays exact).
++fn reference(tool: &SdfTool, moves: &[Move]) -> (Vec<f32>, LatticeMeta) {
++    let (mut f, meta) = block();
++    f.subtract_batch(moves, tool, 0.01).expect("the f64 cut");
++    (pack_cut(&f, &meta), meta)
++}
++
++fn parity(tool: SdfTool) {
++    let moves = program();
++    let (want, meta) = reference(&tool, &moves);
++    let got = twin_cut(&moves, &tool, &meta).expect("the twin cuts");
++    assert_eq!(got.len(), want.len());
++    // A cut below -cap never shows: the mesh layer is at least -cap,
++    // and the march reads max(mesh, cut). Both sides clamp there, so a
++    // claim that sits just at the cap threshold on one side only
++    // compares by its visible value.
++    let cap = meta.cap as f32;
++    // Lower side: the twin margin is TWIN_ULPS (32) f32 epsilons of the
++    // tile scale (reach + r + flank + 8 cells, under 40 mm here); the
++    // f32 distance error is inside that margin, so the gap is at most
++    // twice it. 96 eps * 64 mm covers that with room. The flat's
++    // golden-section path adds 1e-6 of its length (under 20 mm) to the
++    // margin: 1e-4 covers twice that.
++    let tol = 96.0 * f32::EPSILON * 64.0 + 1e-4;
++    let (mut claimed, mut deep) = (0, 0);
++    for (n, (g, w)) in got.iter().zip(want.iter()).enumerate() {
++        assert!(g.is_finite() && w.is_finite(), "texel {n}: {g} / {w}");
++        let (g, w) = (g.max(-cap), w.max(-cap));
++        assert!(g <= w, "texel {n}: the twin removes more than the f64 cut: {g} > {w}");
++        assert!(g >= w - tol, "texel {n}: the twin lags the f64 cut by more than {tol}: {g} < {w}");
++        if w > -cap {
++            claimed += 1;
++        }
++        if w >= 1.0 {
++            deep += 1;
++        }
++    }
++    // fixture sanity: the program claims many cells, and many of them
++    // lie more than 1 mm inside the swept solid (the ball's 2.5 mm
++    // radius never reaches the 2.8 mm cap, so "full" is no test here)
++    assert!(claimed > 200 && deep > 200, "{tool:?}: {claimed} claimed and {deep} deep texels");
++}
++
++#[test]
++fn the_ball_twin_never_removes_more_than_the_f64_cut() {
++    parity(BALL);
++}
++
++#[test]
++fn the_flat_twin_never_removes_more_than_the_f64_cut() {
++    parity(FLAT);
++}
++
++#[test]
++fn the_ordered_key_keeps_the_order_of_negative_zero_and_positive() {
++    let vals = [
++        f32::NEG_INFINITY,
++        -3.0e38,
++        -2.5,
++        -1.0e-30,
++        -f32::from_bits(1), // the smallest negative subnormal
++        -0.0,
++        0.0,
++        f32::from_bits(1),
++        1.0e-30,
++        1.0,
++        2.5,
++        3.0e38,
++        f32::INFINITY,
++    ];
++    for w in vals.windows(2) {
++        assert!(ordered_bits(w[0]) < ordered_bits(w[1]), "{} vs {}", w[0], w[1]);
++    }
++    for v in vals {
++        assert_eq!(from_ordered_bits(ordered_bits(v)).to_bits(), v.to_bits(), "round trip of {v}");
++    }
++}
++
++#[test]
++fn the_batch_answers_bit_for_bit_in_any_move_order() {
++    let (_, meta) = block();
++    for tool in [BALL, FLAT] {
++        let moves = program();
++        let base = twin_cut(&moves, &tool, &meta).expect("the twin cuts");
++        let mut rev = moves.clone();
++        rev.reverse();
++        let mut rot = moves.clone();
++        rot.rotate_left(2);
++        for other in [rev, rot] {
++            let got = twin_cut(&other, &tool, &meta).expect("the twin cuts");
++            let same = base.iter().zip(got.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
++            assert!(same, "{tool:?}: the move order changed the result");
++        }
++    }
++}
++
++#[test]
++fn the_work_list_covers_every_claimed_cell_inside_its_bricks() {
++    let (_, meta) = block();
++    let mut moves = program();
++    moves.push(feed(p(200.0, 200.0, 5.0), p(210.0, 200.0, 5.0))); // outside the lattice
++    let work = twin_work(&moves, &FLAT, &meta).expect("the work list");
++    assert_eq!(work.chords.len(), 5, "four feeds and the far feed; the rapid has no chord");
++    assert!(work.items.iter().all(|w| w.chord != 4), "the far feed touches no brick");
++    assert!(work.items.windows(2).all(|w| (w[0].brick, w[0].chord) < (w[1].brick, w[1].chord)));
++    let hi = |a: usize| meta.origin[a] + meta.dims[a] as i32 - 1;
++    for w in &work.items {
++        for a in 0..3 {
++            let b0 = w.brick[a] * 8;
++            assert!(b0 <= w.lo[a] && w.lo[a] <= w.hi[a] && w.hi[a] <= b0 + 7, "{w:?}");
++            assert!(meta.origin[a] <= w.lo[a] && w.hi[a] <= hi(a), "{w:?}");
++        }
++    }
++    let cut = twin_cut(&moves, &FLAT, &meta).expect("the twin cuts");
++    let floor = (-4.0 * meta.cap) as f32;
++    let [dx, dy, _] = meta.dims.map(|d| d as usize);
++    for (n, v) in cut.iter().enumerate() {
++        if *v == floor {
++            continue;
++        }
++        let key = [
++            meta.origin[0] + (n % dx) as i32,
++            meta.origin[1] + (n / dx % dy) as i32,
++            meta.origin[2] + (n / (dx * dy)) as i32,
++        ];
++        let covered = work.items.iter().any(|w| (0..3).all(|a| w.lo[a] <= key[a] && key[a] <= w.hi[a]));
++        assert!(covered, "claimed cell {key:?} is in no work item");
++    }
++}
++
++fn refusal(moves: &[Move], tool: &SdfTool, needle: &str) {
++    let (_, meta) = block();
++    match twin_cut(moves, tool, &meta) {
++        Err(StockError::Invalid(msg)) => assert!(msg.contains(needle), "{msg:?} does not name {needle:?}"),
++        other => panic!("expected a refusal naming {needle:?}, got {other:?}"),
++    }
++}
++
++#[test]
++fn degenerate_input_refuses_with_a_clean_error() {
++    let ok = [feed(p(2.0, 2.0, 5.0), p(9.0, 2.0, 5.0))];
++    refusal(&[feed(p(4.0, 4.0, 5.0), p(4.0, 4.0, 5.0))], &BALL, "zero-length");
++    refusal(&ok, &SdfTool::Ball { r: 0.0 }, "radius");
++    refusal(&ok, &SdfTool::Flat { r: 0.0, flank: 10.0 }, "radius");
++    refusal(&ok, &SdfTool::Ball { r: f64::NAN }, "radius");
++    refusal(&ok, &SdfTool::Flat { r: 3.0, flank: f64::NAN }, "flank");
++    refusal(&[feed(p(f64::NAN, 2.0, 5.0), p(9.0, 2.0, 5.0))], &FLAT, "non-finite");
++    let mut tilted = ok[0];
++    tilted.axis = Some([0.0, 0.6, 0.8]);
++    refusal(&[tilted], &BALL, "upright");
++}
++
++#[test]
++fn every_other_tool_refuses_by_name() {
++    let ok = [feed(p(2.0, 2.0, 5.0), p(9.0, 2.0, 5.0))];
++    refusal(&ok, &SdfTool::Shanked { r: 2.0, shank: 10.0 }, "shanked ball");
++    refusal(&ok, &SdfTool::Taper { r: 2.0, cot: 1.0 }, "taper");
++    refusal(&ok, &SdfTool::Drill { r: 2.0, cot: 0.6, flank: 10.0 }, "drill");
++    refusal(&ok, &SdfTool::BullNose { r: 3.0, corner: 1.0, flank: 10.0 }, "bull nose");
++}
+diff --git a/docs/decisions/2626-f32-cut-twin.md b/docs/decisions/2626-f32-cut-twin.md
+new file mode 100644
+index 000000000..3e3faaa8d
+--- /dev/null
++++ b/docs/decisions/2626-f32-cut-twin.md
+@@ -0,0 +1,48 @@
++## #2626 - GPU stock sim S1: the f32 cut twin and the brick work list
++
++**What was decided.**
++
++1. The twin sets the f32 arithmetic that the S2 WGSL kernel must copy.
++   No WGSL exists yet, so the twin follows the f64 order of
++   `field_sweep::Sweep::dist`: the capsule closed form for the ball; for
++   the upright flat, the level closed form, the plunge closed form and a
++   32-step golden section on every other move.
++2. The tile is the brick (8 cells a side). The CPU subtracts the brick
++   origin in f64 and rounds once to f32. A cell center is
++   `(local + 0.5) * cell` in f32.
++3. The twin adds a margin to each distance before it claims:
++   `TWIN_ULPS = 32` f32 epsilons of the tile scale (reach + r + flank +
++   8 cells), plus `1e-6` of the path length on the flat path (the f64
++   golden-section bracket). The f32 cut is therefore never above the
++   f64 cut. The parity test checks this with no tolerance, because the
++   f64-to-f32 pack rounding keeps order.
++4. The max law runs on the order-preserving key (flip all bits of a
++   negative, set the sign bit of a positive). The GPU can then use an
++   unsigned atomic max.
++5. The work list uses the f64 window of each chord (`Sweep::window`),
++   clipped to the lattice box of `pack_cut`. It is made in f64 on the
++   CPU. The items are sorted brick-major, then by chord.
++6. The twin refuses, by name, every tool other than the ball and the
++   flat end mill, an arc move, a tilted axis (also for the ball) and a
++   zero-length feed move. The f64 cut accepts a zero-length move as a
++   station; the issue asks the twin to refuse it.
++7. The twin writes the cut layer only. The ray-entry layers
++   (`cut_ups`, `cut_downs`) stay out: the issue makes S1 a display
++   reference and S2 writes only the cut layer.
++8. The parity test compares values after a clamp at `-cap` on the two
++   sides. A cut under `-cap` never shows (the mesh layer is at least
++   `-cap`), and a claim that sits at the `cap` threshold on one side
++   only must compare by its visible value.
++
++**Why.** The issue asks for one-sided parity ("never more removal") and
++for a refusal by name. A margin in the kernel gives the one-sided bound
++by construction. A tolerance only in the test would not.
++
++**Dropped.** A ball on a tilted axis (easy, but the issue names upright
++tools); a direct copy of `flat_tie` (the twin is conservative on the
++tie, and the f64 tie only claims more); a public change to the f64
++kernel (the twin reads the f64 window through the crate-internal API).
++
++**Cost to change later.** If S2 needs a different f32 order, change
++`cut_twin.rs` and keep the parity tests; the margin then follows the
++new error bound.
+
+From 65e391e0476231cd5f3243a502f9936d65ebf28c Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Thu, 19 Nov 2026 09:37:10 +0100
+Subject: [PATCH 2/2] style(sim): collapse the upright-axis check of the f32
+ twin (clippy)
+
+Refs #2626
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/sim/src/stock_sim/cut_twin_work.rs | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/crates/sim/src/stock_sim/cut_twin_work.rs b/crates/sim/src/stock_sim/cut_twin_work.rs
+index 302f17d16..5d04a406c 100644
+--- a/crates/sim/src/stock_sim/cut_twin_work.rs
++++ b/crates/sim/src/stock_sim/cut_twin_work.rs
+@@ -122,10 +122,10 @@ pub fn twin_work(moves: &[Move], tool: &SdfTool, meta: &LatticeMeta) -> Result<T
+         if m.arc.is_some() {
+             return Err(invalid("an arc move has no twin; only linear moves cut here".into()));
+         }
+-        if let Some(a) = m.axis {
+-            if !(a[0] == 0.0 && a[1] == 0.0 && a[2].is_finite() && a[2] > 0.0) {
+-                return Err(invalid(format!("the tool axis {a:?} is not upright; only +Z cuts here")));
+-            }
++        if let Some(a) = m.axis
++            && !(a[0] == 0.0 && a[1] == 0.0 && a[2].is_finite() && a[2] > 0.0)
++        {
++            return Err(invalid(format!("the tool axis {a:?} is not upright; only +Z cuts here")));
+         }
+         if m.from == m.to {
+             return Err(invalid("a zero-length move has no swept solid".into()));
