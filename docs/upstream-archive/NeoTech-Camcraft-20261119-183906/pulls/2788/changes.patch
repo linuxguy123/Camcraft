@@ -1,0 +1,606 @@
+From 41cf2fcf1deba9958cc8b03969bf8866be6e21bb Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 18:17:12 +0100
+Subject: [PATCH 1/2] wip(xtask): prebuild batch crates separately and run
+ suites in parallel lanes
+
+Split plan::batch's single debug build into one debug_build_crate prebuild per
+batch crate and ui so Cargo feature unification no longer forces suite steps to
+recompile and relink upstream crates. Enable Run::lanes and Run::run_lanes for
+batch (and quick fallback to batch), reading timings from batch-* or release-*
+runs via lanes::history_for while keeping ISOLATED targets, ui, and clippy alone.
+
+Refs #2727
+---
+ xtask/src/exec.rs        |  8 ++--
+ xtask/src/lanes.rs       | 26 +++++++++---
+ xtask/src/lanes_tests.rs | 86 ++++++++++++++++++++++++++++++++++++++++
+ xtask/src/main.rs        |  3 +-
+ xtask/src/plan.rs        | 27 ++++++++-----
+ xtask/src/queue.rs       | 32 +++++++++------
+ xtask/src/step_tests.rs  | 80 ++++++++++++++++++++++++++++++++++++-
+ xtask/src/tests.rs       |  4 +-
+ 8 files changed, 230 insertions(+), 36 deletions(-)
+
+diff --git a/xtask/src/exec.rs b/xtask/src/exec.rs
+index 33e1c4c4b..791f31624 100644
+--- a/xtask/src/exec.rs
++++ b/xtask/src/exec.rs
+@@ -14,6 +14,7 @@ use crate::scan::re;
+ pub struct Run {
+     pub root: PathBuf,
+     pub label: String,
++    pub lanes: bool,
+     pub dry: bool,
+     /// The job budget of the whole run (#2057): the release queue's lanes share it, a step alone gets all of it.
+     pub budget: usize,
+@@ -144,6 +145,7 @@ impl Run {
+             budget_note,
+             root: root.to_path_buf(),
+             label: label.into(),
++            lanes: matches!(label, "batch" | "release"),
+             dry,
+             log_dir,
+             clock: Instant::now(),
+@@ -157,7 +159,7 @@ impl Run {
+         for n in &plan.notes {
+             println!("{n}");
+         }
+-        let lanes = self.label == "release";
++        let lanes = self.lanes;
+         if let Some(n) = &self.budget_note {
+             println!("{n}");
+         }
+@@ -169,7 +171,7 @@ impl Run {
+             {
+                 println!("note: this machine has {n} cores; {}={n} lets the gate use them", crate::budget::ENV);
+             }
+-            self.run_release(plan)?;
++            self.run_lanes(plan)?;
+         } else {
+             for s in &plan.steps {
+                 if self.check(&format!("before {}", s.name)) {
+@@ -263,7 +265,7 @@ impl Run {
+         }
+         let bad = self.done.iter().filter(|d| !d.ok).count();
+         let mins = self.clock.elapsed().as_secs_f64() / 60.0;
+-        if self.label == "release" {
++        if self.lanes {
+             let serial: u64 = self.done.iter().map(|d| d.secs).sum();
+             println!("  summed lane wall time {serial}s (serial estimate; not a serial benchmark)");
+         }
+diff --git a/xtask/src/lanes.rs b/xtask/src/lanes.rs
+index a31fe3d0b..b116d01e1 100644
+--- a/xtask/src/lanes.rs
++++ b/xtask/src/lanes.rs
+@@ -120,14 +120,30 @@ pub const TIMINGS: &str = "timings.tsv";
+ /// time), with the file it came from; empty when no release run has recorded one. Unreadable lines are
+ /// skipped: history only orders the queue, it never selects or drops a step.
+ pub fn history(root: &Path) -> (HashMap<String, u64>, Option<PathBuf>) {
++    history_with(root, &["release-"])
++}
++
++/// The step seconds of the newest `timings.tsv` for `label` (`"release"` reads `release-*` only;
++/// `"batch"` and `"quick"` read the newest `batch-*` or `release-*` run by timestamp).
++pub fn history_for(root: &Path, label: &str) -> (HashMap<String, u64>, Option<PathBuf>) {
++    if label == "release" {
++        return history(root);
++    }
++    history_with(root, &["batch-", "release-"])
++}
++
++fn history_with(root: &Path, prefixes: &[&str]) -> (HashMap<String, u64>, Option<PathBuf>) {
+     let Ok(rd) = std::fs::read_dir(root.join("gate-logs")) else { return (HashMap::new(), None) };
+-    let mut dirs: Vec<PathBuf> = rd
++    let mut dirs: Vec<(String, PathBuf)> = rd
+         .filter_map(|e| e.ok().map(|e| e.path()))
+-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("release-")))
+-        .filter(|p| p.join(TIMINGS).is_file())
++        .filter_map(|p| {
++            let name = p.file_name()?.to_str()?;
++            let stamp = prefixes.iter().find_map(|pre| name.strip_prefix(pre))?.to_string();
++            p.join(TIMINGS).is_file().then_some((stamp, p))
++        })
+         .collect();
+-    dirs.sort();
+-    let Some(dir) = dirs.pop() else { return (HashMap::new(), None) };
++    dirs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
++    let Some((_, dir)) = dirs.pop() else { return (HashMap::new(), None) };
+     let file = dir.join(TIMINGS);
+     let text = std::fs::read_to_string(&file).unwrap_or_default();
+     (parse_timings(&text), Some(file))
+diff --git a/xtask/src/lanes_tests.rs b/xtask/src/lanes_tests.rs
+index 5350c5bdc..bda6e065f 100644
+--- a/xtask/src/lanes_tests.rs
++++ b/xtask/src/lanes_tests.rs
+@@ -198,3 +198,89 @@ fn main() {
+     assert_eq!(run(vec![step("checkout movement", &["move"])]), 1, "successful children still yield VOID after checkout movement");
+     fs::remove_dir_all(root).expect("remove fixture");
+ }
++
++#[test]
++fn batch_executor_overlaps_lanes_runs_isolated_alone_and_writes_timings() {
++    use std::{fs, process::Command};
++    struct Cleanup(std::path::PathBuf);
++    impl Drop for Cleanup {
++        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
++    }
++    let root = std::env::temp_dir().join(format!("xtask-batch-lanes-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&root);
++    let _cleanup = Cleanup(root.clone());
++    fs::create_dir_all(root.join("src")).expect("fixture dir");
++    fs::create_dir_all(root.join("crates/ui")).expect("ui dir");
++    fs::write(root.join("Cargo.toml"), "[package]\nname = \"batch-lane-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n").expect("manifest");
++    fs::write(root.join(".gitignore"), "target/\ngate-logs/\nmarkers/\n").expect("ignore");
++    fs::write(root.join("src/main.rs"), r#"
++use std::{env, fs, path::Path, thread, time::{Duration, Instant}};
++fn main() {
++    let markers = Path::new(env!("CARGO_MANIFEST_DIR")).join("markers");
++    fs::create_dir_all(&markers).unwrap();
++    let args: Vec<_> = env::args().collect();
++    let own = &args[1];
++    if own == "alone" {
++        assert!(markers.join("first").exists() && markers.join("second").exists(), "alone step must run after queued lanes");
++    }
++    fs::write(markers.join(own), "ran").unwrap();
++    if let Some(peer) = args.get(2) {
++        let start = Instant::now();
++        while !markers.join(peer).exists() {
++            assert!(start.elapsed() < Duration::from_secs(5), "peer lane never started");
++            thread::sleep(Duration::from_millis(10));
++        }
++    }
++}
++"#).expect("fixture source");
++    assert!(Command::new(crate::exec::cargo()).args(["build", "--quiet"]).current_dir(&root).status().expect("build fixture").success());
++    for args in [vec!["init", "--quiet"], vec!["add", "."], vec!["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"]] {
++        assert!(Command::new("git").args(args).current_dir(&root).status().expect("git fixture").success());
++    }
++    let step = |name: &str, extra: &[&str], dir: &str| {
++        let mut s = Step::new(name, &["run", "--quiet", "--"], dir).with(&extra.iter().map(|x| (*x).to_string()).collect::<Vec<_>>());
++        if dir == "ui" {
++            let manifest = root.join("Cargo.toml").display().to_string();
++            s = Step::new(name, &["run", "--quiet", "--manifest-path", &manifest, "--"], dir).with(&extra.iter().map(|x| (*x).to_string()).collect::<Vec<_>>());
++        }
++        s
++    };
++    let steps = vec![
++        Step::new("debug build: fixture (--no-run)", &["test", "--no-run", "--quiet"], ""),
++        step("first", &["first", "second"], ""),
++        step("second", &["second", "first"], ""),
++        step("ui suites: lib", &["alone"], "ui"),
++    ];
++    let mut runner = crate::exec::Run::new(&root, "batch", false).expect("runner");
++    runner.budget = crate::budget::DEFAULT;
++    runner.plan(&crate::plan::Plan { notes: Vec::new(), steps }).expect("execute batch fixture");
++    assert_eq!(runner.summary(), 0, "batch lanes must overlap ordinary suites and run ui alone after them");
++    assert!(root.join("markers/alone").exists());
++    let logs = fs::read_dir(root.join("gate-logs")).expect("gate-logs").filter_map(Result::ok).map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("batch-"))).expect("batch log dir");
++    let timings = fs::read_to_string(logs.join(lanes::TIMINGS)).expect("batch timings.tsv");
++    assert!(timings.contains("\tfirst\n") && timings.contains("\tsecond\n"), "{timings}");
++    let (hist, from) = lanes::history_for(&root, "batch");
++    assert!(hist.contains_key("first") && hist.contains_key("second") && from.is_some_and(|p| p.to_string_lossy().contains("batch-")), "{hist:?}");
++}
++
++#[test]
++fn batch_history_reads_newest_batch_or_falls_back_to_release() {
++    use std::fs;
++    let root = std::env::temp_dir().join(format!("xtask-batch-hist-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&root);
++    for (dir, body) in [("release-20261101-000000", "9\trel\n"), ("batch-20261102-000000", "4\tbat\n")] {
++        fs::create_dir_all(root.join("gate-logs").join(dir)).expect("log dir");
++        fs::write(root.join("gate-logs").join(dir).join(lanes::TIMINGS), body).expect("timings");
++    }
++    let (h, from) = lanes::history_for(&root, "batch");
++    assert_eq!(h.get("bat"), Some(&4));
++    assert!(from.is_some_and(|f| f.to_string_lossy().contains("batch-20261102")));
++    let (rel_h, rel_from) = lanes::history_for(&root, "release");
++    assert_eq!(rel_h.get("rel"), Some(&9));
++    assert!(!rel_h.contains_key("bat") && rel_from.is_some_and(|f| f.to_string_lossy().contains("release-20261101")));
++    // When a newer release run exists, batch uses its timings too.
++    fs::create_dir_all(root.join("gate-logs/release-20261103-000000")).expect("newer release");
++    fs::write(root.join("gate-logs/release-20261103-000000").join(lanes::TIMINGS), "7\tfresh\n").expect("timings");
++    assert_eq!(lanes::history_for(&root, "batch").0.get("fresh"), Some(&7));
++    fs::remove_dir_all(root).expect("remove fixture");
++}
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 466ab668d..e61df55bf 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -84,7 +84,7 @@ use std::process::ExitCode;
+ const USAGE: &str = "\
+ usage:
+   cargo xtask gate quick [--base main] [--heavy]   tests the diff touches (test fns where it can)
+-  cargo xtask gate batch                           one build, then one step for each debug test binary minus SLOW_BINARIES, ui, clippy (#1941)
++  cargo xtask gate batch                           per-crate debug prebuilds, then parallel lanes for each test target minus SLOW_BINARIES, ui, clippy (#1941, #2727)
+   cargo xtask gate release [--no-snapshots]        everything, plus the --ignored heavy lanes (one step per binary) and the ui snapshot lane
+                                                    (--no-snapshots: not the Windows-made pixel goldens - cut.yml on Linux, #1413)
+   cargo xtask gate test <filter> [--crate c] [--binary b] [--exact]   exactly the matching test(s)
+@@ -311,6 +311,7 @@ fn gate(root: &Path, g: &GateArgs) -> Result<i32, String> {
+                 quick::Quick::Plan(p) => p,
+                 quick::Quick::Batch(f) => {
+                     println!("shared crate / workspace touched ({f}): quick falls back to batch");
++                    run.lanes = true;
+                     plan::batch(root)
+                 }
+             }
+diff --git a/xtask/src/plan.rs b/xtask/src/plan.rs
+index 60a89b722..3a5e62db9 100644
+--- a/xtask/src/plan.rs
++++ b/xtask/src/plan.rs
+@@ -133,7 +133,7 @@ pub fn run_suites(root: &Path, dirs: &[&str], skip_slow: bool) -> Vec<Step> {
+     out
+ }
+ 
+-/// The name of the one build step of batch and release; the executor stops when it fails.
++/// The name of the one debug build step of release; the executor stops when any `--no-run` build fails.
+ pub const DEBUG_BUILD: &str = "debug build (--no-run)";
+ 
+ /// One debug `--no-run` build step for `dirs` (`-p` each), run before their per-target steps (#1941).
+@@ -147,6 +147,16 @@ pub fn debug_build(dirs: &[&str]) -> Step {
+     Step::new(DEBUG_BUILD, &[], "").with(&args)
+ }
+ 
++/// One debug `--no-run` prebuild step for a single crate `d`, keeping its own feature resolution and
++/// CWD (`crates/ui` for `ui`) so later suite steps reuse the compiled artifacts (#2727).
++pub fn debug_build_crate(d: &str) -> Step {
++    Step::new(
++        format!("debug build: {d} (--no-run)"),
++        &["test", "-j", J, "-p", &pkg(d), "--no-run"],
++        d,
++    )
++}
++
+ pub fn clippy() -> Step {
+     let mut args: Vec<String> = vec!["clippy".into(), "-j".into(), J.into()];
+     for d in CLIPPY {
+@@ -165,9 +175,10 @@ pub fn batch(root: &Path) -> Plan {
+         "batch: debug suites (kernel included) minus SLOW_BINARIES ({}), ui, clippy",
+         SLOW_BINARIES.join(", ")
+     ));
+-    plan.notes.push("one build (--no-run), then one step for each test target (#1941)".into());
+-    let built: Vec<&str> = BATCH_CRATES.iter().copied().chain(["ui"]).collect();
+-    plan.steps.push(debug_build(&built));
++    plan.notes.push("per-crate prebuilds (--no-run), then one step for each test target in parallel lanes (#1941, #2727)".into());
++    for &d in BATCH_CRATES.iter().chain(&["ui"]) {
++        plan.steps.push(debug_build_crate(d));
++    }
+     plan.steps.extend(run_suites(root, BATCH_CRATES, true));
+     plan.steps.extend(run_suites(root, &["ui"], false));
+     plan.steps.push(clippy());
+@@ -264,13 +275,7 @@ pub fn release_with(root: &Path, snapshots: bool) -> Plan {
+     }
+     plan.notes.extend(crate::known_fail::entries(root).iter().map(crate::known_fail::note));
+     let non_ui: Vec<&str> = ALL_CRATES.iter().copied().filter(|d| *d != "ui").collect();
+-    let mut build = vec!["test", "-j", J];
+-    let packages: Vec<String> = ALL_CRATES.iter().map(|d| pkg(d)).collect();
+-    for p in &packages {
+-        build.extend(["-p", p]);
+-    }
+-    build.push("--no-run");
+-    plan.steps.push(Step::new(DEBUG_BUILD, &build, ""));
++    plan.steps.push(debug_build(ALL_CRATES));
+     let mut heavy = heavy_steps(root).into_iter();
+     if let Some(build) = heavy.next() {
+         plan.steps.push(build);
+diff --git a/xtask/src/queue.rs b/xtask/src/queue.rs
+index 2475d2fa2..4da0a0903 100644
+--- a/xtask/src/queue.rs
++++ b/xtask/src/queue.rs
+@@ -1,6 +1,7 @@
+-//! The release tier's executor: builds first and alone, then heavy targets before debug suites. Each phase
+-//! drains its longest-first shared queue, then runs isolated steps one at a time with the whole budget.
+-//! Provenance: our own build law (AGENTS.md "Three gate tiers", #1703, #2057); Graham's LPT list
++//! The parallel-lanes executor for batch and release: builds first and alone, then heavy targets
++//! before debug suites. Each phase drains its longest-first shared queue, then runs isolated steps
++//! one at a time with the whole budget.
++//! Provenance: our own build law (AGENTS.md "Three gate tiers", #1703, #2057, #2727); Graham's LPT list
+ //! scheduling (see `lanes`); standard Rust scoped threads and atomics.
+ 
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+@@ -23,14 +24,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+ }
+ 
+ impl Run {
+-    /// Runs a release plan (`lanes::schedule`). A failed build stops the run; a VOID checkout stops it
+-    /// before the next step; a failed suite never stops the others. Writes `lanes::TIMINGS` for the next run.
+-    pub(crate) fn run_release(&mut self, plan: &Plan) -> Result<(), String> {
+-        let (history, from) = lanes::history(&self.root);
++    /// Runs a queued plan (`lanes::schedule`) for batch or release. A failed build stops the run; a VOID
++    /// checkout stops it before the next step; a failed suite never stops the others. Writes `lanes::TIMINGS`
++    /// for the next run.
++    pub(crate) fn run_lanes(&mut self, plan: &Plan) -> Result<(), String> {
++        let (history, from) = lanes::history_for(&self.root, &self.label);
+         let sched: Schedule = lanes::schedule(&plan.steps, &history);
+-        match &from {
+-            Some(f) => println!("queue order: heavy targets first; longest first within each phase, by {}", f.display()),
+-            None => println!("queue order: heavy targets first; plan order within each phase (no gate-logs/release-*/{} yet)", lanes::TIMINGS),
++        let has_heavy = sched.queue.iter().chain(&sched.alone).any(|&i| heavy(&plan.steps[i]));
++        let order = match &from {
++            Some(f) => format!("longest first, by {}", f.display()),
++            None => format!("plan order (no gate-logs/{}-*/{} yet)", self.label, lanes::TIMINGS),
++        };
++        if has_heavy {
++            println!("queue order: heavy targets first; {order}");
++        } else {
++            println!("queue order: {order}");
+         }
+         let result = self.run_schedule(plan, &sched);
+         if !self.dry && !self.done.is_empty() {
+@@ -45,7 +53,7 @@ impl Run {
+ 
+     fn run_schedule(&mut self, plan: &Plan, sched: &Schedule) -> Result<(), String> {
+         for &i in &sched.builds {
+-            if self.check("before a release build") {
++            if self.check(&format!("before {}", plan.steps[i].name)) {
+                 return Ok(());
+             }
+             println!("-- build alone x -j {}", self.budget);
+@@ -60,7 +68,7 @@ impl Run {
+         for is_heavy in [true, false] {
+             let queue: Vec<usize> = sched.queue.iter().copied().filter(|&i| heavy(&plan.steps[i]) == is_heavy).collect();
+             if !queue.is_empty() {
+-                if self.check("before the release queue") {
++                if self.check(&format!("before the {} queue", self.label)) {
+                     return Ok(());
+                 }
+                 let lanes = budget::lane_limit(self.budget).min(queue.len()).max(1);
+diff --git a/xtask/src/step_tests.rs b/xtask/src/step_tests.rs
+index c046468e1..5a2bf2aa8 100644
+--- a/xtask/src/step_tests.rs
++++ b/xtask/src/step_tests.rs
+@@ -59,9 +59,9 @@ fn batch_runs_lib_and_each_non_slow_binary_one_step_each() {
+         assert_eq!(targets(&p, d), want, "batch targets of {d}");
+     }
+     assert!(p.steps.iter().filter(|s| s.name.contains(" suites: ")).all(one_target));
+-    // The ui steps keep the crates/ui working directory; the build step comes first.
++    // The ui steps keep the crates/ui working directory; the prebuild steps come first.
+     assert!(p.steps.iter().filter(|s| s.name.starts_with("ui suites: ")).all(|s| s.in_ui));
+-    assert_eq!(p.steps[0].name, "debug build (--no-run)");
++    assert_eq!(p.steps[0].name, "debug build: geometry (--no-run)");
+ }
+ 
+ #[test]
+@@ -75,3 +75,79 @@ fn only_and_failed_select_one_binary_step() {
+     let again = select::apply(p, &[], Some(&stems)).expect("failed");
+     assert_eq!(again.steps.len(), 1);
+ }
++
++#[test]
++fn batch_prebuilds_each_crate_without_mixing_feature_sets() {
++    let root = root();
++    let p = plan::batch(&root);
++    let builds: Vec<&Step> = p.steps.iter().take_while(|s| crate::lanes::is_build(s)).collect();
++    let want: Vec<String> = BATCH_CRATES.iter().chain(&["ui"]).map(|d| plan::pkg(d)).collect();
++    assert_eq!(builds.len(), want.len(), "each batch crate gets its own prebuild step so features match its test steps: {builds:?}");
++    for (s, pkg) in builds.iter().zip(&want) {
++        let pkgs: Vec<&str> = s.args.windows(2).filter(|w| w[0] == "-p").map(|w| w[1].as_str()).collect();
++        assert_eq!(pkgs, [pkg.as_str()], "{}: prebuild must not mix packages/features", s.name);
++        assert_eq!(s.in_ui, pkg == "camcraft-ui", "{}", s.name);
++    }
++    assert!(p.steps[builds.len()..].iter().all(|s| !crate::lanes::is_build(s)), "all prebuilds must run before suites");
++}
++
++#[test]
++fn batch_prebuild_leaves_suite_steps_fresh_with_truck_dev_dep() {
++    struct Cleanup(PathBuf);
++    impl Drop for Cleanup {
++        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++    }
++    let fx = std::env::temp_dir().join(format!("xtask-batch-fresh-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&fx);
++    let _cleanup = Cleanup(fx.clone());
++    let write = |rel: &str, body: &str| {
++        let p = fx.join(rel);
++        std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
++        std::fs::write(p, body).expect("write");
++    };
++    let members: Vec<String> = ALL_CRATES.iter().map(|d| format!("\"crates/{d}\"")).collect();
++    write("Cargo.toml", &format!("[workspace]\nmembers = [{}]\nresolver = \"3\"\n", members.join(", ")));
++    write("crates/kernel/Cargo.toml", "[package]\nname = \"camcraft-kernel\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = []\ntruck = []\n[dev-dependencies]\ncamcraft-kernel = { path = \".\", features = [\"truck\"] }\n");
++    write("crates/kernel/src/lib.rs", "pub fn k() -> bool { cfg!(feature = \"truck\") }\n");
++    write("crates/geometry/Cargo.toml", "[package]\nname = \"camcraft-geometry\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncamcraft-kernel = { path = \"../kernel\" }\n");
++    write("crates/geometry/src/lib.rs", "pub fn g() -> bool { camcraft_kernel::k() }\n");
++    for d in ["cl", "tools", "post", "sim", "motion"] {
++        write(&format!("crates/{d}/Cargo.toml"), &format!("[package]\nname = \"camcraft-{d}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"));
++        write(&format!("crates/{d}/src/lib.rs"), "");
++    }
++    write("crates/app/Cargo.toml", "[package]\nname = \"camcraft-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncamcraft-geometry = { path = \"../geometry\" }\n");
++    write("crates/app/src/lib.rs", "pub fn a() -> bool { camcraft_geometry::g() }\n");
++    write("crates/app/tests/smoke.rs", "#[test]\nfn smoke_ok() { assert!(!camcraft_app::a()); }\n");
++    write("crates/ui/Cargo.toml", "[package]\nname = \"camcraft-ui\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncamcraft-app = { path = \"../app\" }\n");
++    write("crates/ui/src/lib.rs", "");
++
++    let p = plan::batch(&fx);
++    for build in p.steps.iter().filter(|s| crate::lanes::is_build(s)) {
++        let dir = if build.in_ui { fx.join("crates/ui") } else { fx.clone() };
++        let st = std::process::Command::new(crate::exec::cargo())
++            .args(&build.args)
++            .current_dir(&dir)
++            .env_remove("CARGO_TARGET_DIR")
++            .status()
++            .expect("run batch prebuild");
++        assert!(st.success(), "prebuild {} failed", build.name);
++    }
++    let smoke = p.steps.iter().find(|s| s.name == "app suites: smoke").expect("app smoke step");
++    let split = smoke.args.iter().position(|a| a == "--").unwrap_or(smoke.args.len());
++    let mut args = smoke.args[..split].to_vec();
++    args.push("--message-format=json".into());
++    args.extend_from_slice(&smoke.args[split..]);
++    let out = std::process::Command::new(crate::exec::cargo())
++        .args(&args)
++        .current_dir(&fx)
++        .env_remove("CARGO_TARGET_DIR")
++        .output()
++        .expect("run app smoke");
++    assert!(out.status.success(), "smoke step failed: {}", String::from_utf8_lossy(&out.stderr));
++    let stdout = String::from_utf8_lossy(&out.stdout);
++    let stale: Vec<&str> = stdout
++        .lines()
++        .filter(|l| l.contains("\"reason\":\"compiler-artifact\"") && l.contains("\"fresh\":false"))
++        .collect();
++    assert!(stale.is_empty(), "batch suite step recompiled after prebuild:\n{}", stale.join("\n"));
++}
+diff --git a/xtask/src/tests.rs b/xtask/src/tests.rs
+index 782e5b09d..d17776ffe 100644
+--- a/xtask/src/tests.rs
++++ b/xtask/src/tests.rs
+@@ -188,8 +188,8 @@ fn nothing_in_crates_plans_nothing_and_xtask_runs_its_own_tests() {
+ fn batch_skips_slow_binaries_and_release_runs_everything() {
+     let fx = fixture();
+     let b: Vec<String> = plan::batch(&fx.0).steps.iter().map(line).collect();
+-    // One build, then one step for each test target (#1941); a SLOW_BINARIES binary has none in batch.
+-    assert!(b[0].starts_with("debug build (--no-run) | test -j 6 -p camcraft-geometry"), "{b:#?}");
++    // Per-crate prebuilds, then one step for each test target (#1941, #2727); a SLOW_BINARIES binary has none in batch.
++    assert!(b[0].starts_with("debug build: geometry (--no-run) | test -j 6 -p camcraft-geometry --no-run"), "{b:#?}");
+     assert!(b.contains(&"app suites: cmds | test -j 6 -p camcraft-app --no-fail-fast --test cmds -- --test-threads=6".to_string()), "{b:#?}");
+     assert!(b.contains(&"app suites: lib | test -j 6 -p camcraft-app --no-fail-fast --lib -- --test-threads=6".to_string()));
+     assert!(b.contains(&"motion suites: waterline | test -j 6 -p camcraft-motion --no-fail-fast --test waterline -- --test-threads=6".to_string()));
+
+From 1da2bcca26b647409cd7673154b341365ccb2242 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 09:42:59 -0800
+Subject: [PATCH 2/2] fix(xtask): the batch gate runs its suites in parallel
+ lanes
+
+The batch tier builds each crate alone and then runs the suite steps in
+the lane queue of the release tier. The gate skill, the AGENTS.md tier
+row and the decision record say so. A quick gate that falls back to the
+batch plan uses the lanes too.
+
+Fixes #2727
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .claude/skills/gate/SKILL.md            | 13 ++++---
+ AGENTS.md                               |  2 +-
+ docs/decisions/2727-batch-gate-lanes.md | 45 +++++++++++++++++++++++++
+ xtask/src/exec.rs                       |  2 ++
+ xtask/src/queue.rs                      |  2 +-
+ 5 files changed, 58 insertions(+), 6 deletions(-)
+ create mode 100644 docs/decisions/2727-batch-gate-lanes.md
+
+diff --git a/.claude/skills/gate/SKILL.md b/.claude/skills/gate/SKILL.md
+index 3b1ff7fb6..f416dc157 100644
+--- a/.claude/skills/gate/SKILL.md
++++ b/.claude/skills/gate/SKILL.md
+@@ -20,7 +20,7 @@ wrappers `scripts/gate.ps1` (`-Tier quick`, `-Test <name>`) and
+ | Tier | Command | Runs |
+ |---|---|---|
+ | quick | `cargo xtask gate quick [--base main]` | Only the test binaries that the diff touches, from the gate maps and the touched crates. One build for each crate, then one step for each binary. Debug. No heavy lanes. Target: 5 minutes. |
+-| batch | `cargo xtask gate batch` | One debug build (`--no-run`), then one step for each test target (`<crate> suites: lib`, `<crate> suites: <binary>`) that is not in `SLOW_BINARIES`, the `camcraft-kernel` suites (#1702), the ui suites from `crates/ui`, clippy. No release-mode heavy lanes. Target: 20 minutes. |
++| batch | `cargo xtask gate batch` | One debug build (`--no-run`) for each crate, then one step for each test target (`<crate> suites: lib`, `<crate> suites: <binary>`) that is not in `SLOW_BINARIES`, the `camcraft-kernel` suites (#1702), the ui suites from `crates/ui`, clippy. The steps run in the parallel lanes of `lanes.rs` (#2727). No release-mode heavy lanes. Target: 20 minutes. |
+ | heavy | `cargo xtask gate heavy [--base main]` | The release `--ignored` heavy lanes that the diff reaches, also through the crate dependencies (#2568). One release build of the reached crates, then one step for each reached target. Before a PR is ready and at its review. |
+ | release | `cargo xtask gate release` | One step for each debug test target (`lib`, `bins`, each binary, `doc`) and the `--ignored` heavy lanes in release. Only at a cut. On the cut runner: `cargo xtask gate release --no-snapshots`. |
+ | test | `cargo xtask gate test <name> [--crate c] [--binary b] [--exact]` | One test by name. The plain form is `cargo test -p <crate> --test <binary> -- <name> --exact`. |
+@@ -42,12 +42,17 @@ A fix for one red step then costs one step, not a full run.
+ - Quick, batch and release plan one step for each test target, as the heavy lanes do (#1714). A step name is
+   `<crate> suites: lib`, `<crate> suites: bins`, `<crate> suites: <binary>` or `<crate> suites: doc`. The ui
+   steps are `ui suites: ...` and run in `crates/ui`.
+-- Quick and batch build one time first (`debug build (--no-run)`, or `<crate> build (--no-run)` in quick when
+-  a crate has more than one step). Each step then calls `cargo test -p <crate> --test <binary>`, which finds
++- Quick and batch build first (`debug build: <crate> (--no-run)` for each crate in batch, or
++  `<crate> build (--no-run)` in quick when a crate has more than one step). Batch builds each crate alone
++  (#2727): one build of all the crates gives a shared dependency the features of all of them, and each step
++  then compiles its crate again. Each step then calls `cargo test -p <crate> --test <binary>`, which finds
+   the build ready. A step has its own log, its own time and its own pass or fail line.
+ - Run one binary again: `cargo xtask gate batch --only "app suites: cmds"`. `--only "app suites"` selects
+   each app step. `--failed gate-logs/<run>` runs only the red steps.
+-- Quick and batch run the steps one after the other. The release tier runs them in the waves of `lanes.rs`.
++- Quick runs the steps one after the other. Batch and release run them in the lanes of `lanes.rs`: the builds
++  first and alone, then a shared queue (longest first, by the newest `timings.tsv`), then the `ISOLATED`
++  targets, the ui steps and clippy one at a time. A quick gate that falls back to batch uses the lanes too.
++  `CAMCRAFT_GATE_JOBS=<cores>` sets the job budget that the lanes share.
+ - Each step starts cargo, about 0.5 s on Windows. A batch plan has about 700 steps.
+ 
+ ## What quick selects
+diff --git a/AGENTS.md b/AGENTS.md
+index 60fe23488..a859f0c2e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -592,7 +592,7 @@ tests are in `crates/ui/tests/`; they start the real app through
+   | Tier | When | Target | Runs |
+   |---|---|---|---|
+   | quick | each patch, by the agent or gate-runner | ≤ 5 min | only the test binaries that the diff touches, one step for each binary; debug; no heavy lanes |
+-  | batch | before a batch is committed; each push to `main` | ≤ 20 min | one build, then one step for each debug test binary that is not slow (kernel and ui included), clippy |
++  | batch | before a batch is committed; each push to `main` | ≤ 20 min | one build for each crate, then one step for each debug test binary that is not slow (kernel and ui included), in parallel lanes; clippy |
+   | release | only at a cut | - | one step for each debug test binary and the `--ignored` heavy lanes in release |
+ - **Heavy lanes at review** (#2568). `cargo xtask gate heavy [--base main]`
+   maps the diff to the heavy lanes that it reaches and runs them in release
+diff --git a/docs/decisions/2727-batch-gate-lanes.md b/docs/decisions/2727-batch-gate-lanes.md
+new file mode 100644
+index 000000000..427f62449
+--- /dev/null
++++ b/docs/decisions/2727-batch-gate-lanes.md
+@@ -0,0 +1,45 @@
++## #2727 - The batch gate builds each crate alone and runs its suites in parallel lanes
++
++**What was decided.**
++
++- `plan::batch` starts with one `--no-run` build step for each crate (`debug build: <crate> (--no-run)`),
++  not one build step for all the crates.
++- `Run` has a `lanes` flag. It is on for the `batch` and `release` labels. The quick gate sets it when it
++  falls back to the batch plan. With the flag on, `Run::plan` uses the lane queue of `queue.rs`
++  (`run_lanes`, before `run_release`).
++- The batch queue takes its order from the newest `timings.tsv` of a `batch-*` or `release-*` run. The
++  release queue reads `release-*` runs only, as before.
++- The `heavy` tier of #2779 and a quick plan stay one step at a time.
++
++**Why.**
++
++- The batch tier ran about 900 steps one after the other. On a 16-core machine the load was below 3
++  (#2727).
++- `crates/kernel` has a dev-dependency on itself with the `truck` feature. One `cargo test --no-run` call
++  with all the crates gives the shared dependencies the features of all of them. A later step with one
++  `-p <crate>` resolves a smaller feature set, so cargo compiles that crate and its dependents again. One
++  build call for each crate uses the same package selection as the steps of that crate. The steps then find
++  their artifacts ready.
++- The lane queue is the code that the release tier uses since #2057 and #2461. It keeps the guarantees of
++  the gate: each step runs and has its own log, a red step fails the gate, a failed build stops the run,
++  and the checkout is read before each step (VOID).
++- The rules of `lanes::alone` apply without a change: the builds, the `ISOLATED` targets (wall-clock
++  asserts), each ui step and clippy run alone with the whole job budget.
++
++**Considered and dropped.**
++
++- One parallel prebuild for all the crates (the first proposal of the issue). It is the build that batch
++  had. Its feature set is not the feature set of the steps, so the steps compile again.
++- One prebuild call with `--workspace` feature flags that copy each step. Cargo has no flag that selects
++  the per-package feature resolution in a build of many packages.
++- The crate prebuilds in parallel lanes. Two cargo calls on one `target/` wait for the same build lock, so
++  they do not overlap. Each build call already uses the whole job budget (`-j`).
++- `cargo nextest` (measured on the issue: 18.8 min cold). It is a new tool on each runner, it does not run
++  doc-tests, and the known-fail and VOID records of the gate read libtest output. That is a larger change.
++- Lanes for each quick plan. A quick plan is short, and its build steps are for each crate already. Only
++  the fallback to the batch plan uses the lanes.
++- The same split of the debug build of the release tier. The release plan still has one debug build for
++  all the crates. This PR does not change the cut gate.
++
++**Cost to change later.** Small. `Run::lanes` is one flag, and `plan::debug_build_crate` is one function.
++To go back, give `plan::batch` the one `debug_build` step again and set the flag for `release` only.
+diff --git a/xtask/src/exec.rs b/xtask/src/exec.rs
+index 791f31624..01691df47 100644
+--- a/xtask/src/exec.rs
++++ b/xtask/src/exec.rs
+@@ -14,6 +14,8 @@ use crate::scan::re;
+ pub struct Run {
+     pub root: PathBuf,
+     pub label: String,
++    /// Batch and release run their steps in the parallel lanes of `queue` (#2727); a quick gate that falls
++    /// back to the batch plan sets it too. Else the steps run one at a time.
+     pub lanes: bool,
+     pub dry: bool,
+     /// The job budget of the whole run (#2057): the release queue's lanes share it, a step alone gets all of it.
+diff --git a/xtask/src/queue.rs b/xtask/src/queue.rs
+index 4da0a0903..65da8efd9 100644
+--- a/xtask/src/queue.rs
++++ b/xtask/src/queue.rs
+@@ -33,7 +33,7 @@ impl Run {
+         let has_heavy = sched.queue.iter().chain(&sched.alone).any(|&i| heavy(&plan.steps[i]));
+         let order = match &from {
+             Some(f) => format!("longest first, by {}", f.display()),
+-            None => format!("plan order (no gate-logs/{}-*/{} yet)", self.label, lanes::TIMINGS),
++            None => format!("plan order (no {} of an earlier run in gate-logs/ yet)", lanes::TIMINGS),
+         };
+         if has_heavy {
+             println!("queue order: heavy targets first; {order}");

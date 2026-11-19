@@ -1,0 +1,502 @@
+From 9d9df81ec47e02968ff1233d1722024f7f33c282 Mon Sep 17 00:00:00 2001
+From: mechatronics-studio
+ <67246298+mechatronics-studio@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:40:28 -0700
+Subject: [PATCH] fix(model): a linked model's digest is of the bytes the
+ import parsed
+
+ImportModel::within read the file, parsed it, then read it again for the
+link's SHA-256: a file that changed between the two reads recorded the
+newer digest over the older mesh, and the change was never imported.
+The import now reads once (geometry/import/sourced.rs): a buffered
+format hashes the buffer it parses, and STL is hashed as its streaming
+parse reads it. The kernel SHA-256 takes bytes in pieces, and the link
+check hashes a file in 1 MiB pieces instead of reading it whole.
+
+Fixes #2689
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MLU9aif5zm7mure23AKftd
+---
+ crates/app/src/commands/import_model.rs   |  22 +++--
+ crates/app/src/geometry/import/mod.rs     |   5 +
+ crates/app/src/geometry/import/sourced.rs |  74 +++++++++++++++
+ crates/app/src/geometry/import/stl.rs     |   4 +-
+ crates/app/src/model_source.rs            |  29 +++++-
+ crates/app/tests/model_link.rs            |  50 +++++++++-
+ crates/geometry/src/solidcraft.rs         |   5 +
+ crates/kernel/src/solidcraft/mod.rs       |   2 +-
+ crates/kernel/src/solidcraft/sha256.rs    | 106 ++++++++++++++++++----
+ docs/decisions/2689-one-read-digest.md    |  39 ++++++++
+ 10 files changed, 304 insertions(+), 32 deletions(-)
+ create mode 100644 crates/app/src/geometry/import/sourced.rs
+ create mode 100644 docs/decisions/2689-one-read-digest.md
+
+diff --git a/crates/app/src/commands/import_model.rs b/crates/app/src/commands/import_model.rs
+index 06b555298..d3844617f 100644
+--- a/crates/app/src/commands/import_model.rs
++++ b/crates/app/src/commands/import_model.rs
+@@ -49,13 +49,21 @@ impl ImportModel {
+     /// it), is refused by name here, before any parsing.
+     pub fn within(path: &Path, facet_budget: Option<u64>) -> Result<Self, CommandError> {
+         let budget = checked_budget(path, facet_budget)?;
+-        let graded = import::load_model_open_within(path, budget)?;
+-        let mut cmd = Self::graded(path, graded, facet_budget);
+-        // #2463: the file is read once more for its digest, after the parse.
+-        // A file that changes in between records the newer digest; the next
+-        // change imports again. An unreadable file now records no link.
+-        cmd.source = crate::model_source::read(path).ok();
+-        Ok(cmd)
++        // #2689: one read - the link records the digest of the very bytes
++        // the parse used, so a file that changes during the import is seen
++        // as changed by the next check and imported again.
++        #[cfg(not(target_arch = "wasm32"))]
++        {
++            let (graded, sha256) = import::load_model_open_sourced(path, budget)?;
++            let mut cmd = Self::graded(path, graded, facet_budget);
++            cmd.source = Some(crate::schema::ModelSource { path: path.to_string_lossy().into_owned(), sha256 });
++            Ok(cmd)
++        }
++        #[cfg(target_arch = "wasm32")]
++        {
++            let graded = import::load_model_open_within(path, budget)?;
++            Ok(Self::graded(path, graded, facet_budget))
++        }
+     }
+ 
+     /// [`ImportModel::within`] over bytes already in hand, named by the
+diff --git a/crates/app/src/geometry/import/mod.rs b/crates/app/src/geometry/import/mod.rs
+index ee4c9c21f..8472bb438 100644
+--- a/crates/app/src/geometry/import/mod.rs
++++ b/crates/app/src/geometry/import/mod.rs
+@@ -29,8 +29,13 @@ mod step_stretch;
+ #[cfg(test)]
+ mod step_thread_fixture;
+ mod step_units;
++#[cfg(not(target_arch = "wasm32"))]
++mod sourced;
+ pub mod stl;
+ 
++#[cfg(not(target_arch = "wasm32"))]
++pub use sourced::load_model_open_sourced;
++
+ use std::path::{Path, PathBuf};
+ 
+ use crate::geometry::Mesh;
+diff --git a/crates/app/src/geometry/import/sourced.rs b/crates/app/src/geometry/import/sourced.rs
+new file mode 100644
+index 000000000..9e265c771
+--- /dev/null
++++ b/crates/app/src/geometry/import/sourced.rs
+@@ -0,0 +1,74 @@
++//! A file import that keeps the SHA-256 of the bytes it parsed (#2689).
++//! The file is read once: a buffered format hashes the buffer it parses,
++//! and STL hashes its stream as the streaming parser reads it (the STL
++//! law: the file never coexists with its triangles). So a file that
++//! changes during the import records the digest of the bytes that made
++//! the mesh, and the link check imports the newer file next.
++//! Native only: the browser has no file to check again.
++//! Provenance: our own code over our importers and the kernel's FIPS
++//! 180-4 SHA-256.
++
++use std::fs::File;
++use std::io::{self, BufReader, Read, Seek, SeekFrom};
++use std::path::Path;
++
++use camcraft_geometry::solidcraft::Sha256;
++
++use super::{format_from_path, gate, mesh_outward, parse_model_open_within, stl, Format, Graded, ImportError, MAX_FILE_BYTES};
++
++/// A file that hashes every byte it hands out. A rewind to the start
++/// hashes from the start again (the ASCII STL path reads the head twice);
++/// any other seek is refused, so the digest is always of one pass.
++struct Hashing {
++    file: File,
++    hash: Sha256,
++}
++
++impl Read for Hashing {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        let n = self.file.read(buf)?;
++        if let Some(got) = buf.get(..n) {
++            self.hash.update(got);
++        }
++        Ok(n)
++    }
++}
++
++impl Seek for Hashing {
++    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++        if pos != SeekFrom::Start(0) {
++            return Err(io::Error::new(io::ErrorKind::Unsupported, "a hashed import reads in one pass"));
++        }
++        let at = self.file.seek(pos)?;
++        self.hash = Sha256::new();
++        Ok(at)
++    }
++}
++
++/// [`super::load_model_open_within`], with the SHA-256 of the bytes the
++/// parse used, as lowercase hex.
++pub fn load_model_open_sourced(path: &Path, budget: usize) -> Result<(Graded, String), ImportError> {
++    let format = format_from_path(path)?;
++    let file = File::open(path)?;
++    let size = file.metadata()?.len();
++    if size > MAX_FILE_BYTES {
++        return Err(ImportError::TooLarge);
++    }
++    if format == Format::Stl {
++        let mut src = Hashing { file, hash: Sha256::new() };
++        let parsed = stl::parse_stream(BufReader::with_capacity(stl::READ_BUF_BYTES, &mut src), Some(size));
++        let mut mesh = gate(parsed?)?;
++        // Bytes after the last facet, if the file grew: still the one pass.
++        io::copy(&mut src, &mut io::sink())?;
++        let notes = mesh_outward::turn_outward(&mut mesh)?.into_iter().collect();
++        let graded = Graded { mesh, coarse_mm: None, notes, open: None, step_source: None };
++        return Ok((graded, src.hash.finish_hex()));
++    }
++    let mut data = Vec::new();
++    file.take(MAX_FILE_BYTES.saturating_add(1)).read_to_end(&mut data)?;
++    if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES {
++        return Err(ImportError::TooLarge);
++    }
++    let digest = camcraft_geometry::solidcraft::sha256_hex(&data);
++    Ok((parse_model_open_within(&data, format, budget)?, digest))
++}
+diff --git a/crates/app/src/geometry/import/stl.rs b/crates/app/src/geometry/import/stl.rs
+index 58a84cc9c..09378f608 100644
+--- a/crates/app/src/geometry/import/stl.rs
++++ b/crates/app/src/geometry/import/stl.rs
+@@ -24,7 +24,7 @@ const FACET_BYTES: usize = 50;
+ /// The one window the streaming paths read through: 50-byte records and
+ /// physical lines are served from it by slice copy, so the disk sees
+ /// window-sized reads and the file never doubles in memory.
+-const READ_BUF_BYTES: usize = 8 << 20;
++pub(super) const READ_BUF_BYTES: usize = 8 << 20;
+ 
+ pub fn parse(data: &[u8]) -> Result<Mesh, ImportError> {
+     if data.is_empty() {
+@@ -141,7 +141,7 @@ pub fn parse_file(path: &Path) -> Result<Mesh, ImportError> {
+     parse_stream(BufReader::with_capacity(READ_BUF_BYTES, file), size)
+ }
+ 
+-fn parse_stream<R: Read + Seek>(
++pub(super) fn parse_stream<R: Read + Seek>(
+     mut src: BufReader<R>,
+     size: Option<u64>,
+ ) -> Result<Mesh, ImportError> {
+diff --git a/crates/app/src/model_source.rs b/crates/app/src/model_source.rs
+index 6fb1ab824..4b8f70c51 100644
+--- a/crates/app/src/model_source.rs
++++ b/crates/app/src/model_source.rs
+@@ -45,12 +45,35 @@ pub fn of_bytes(path: &Path, data: &[u8]) -> Option<ModelSource> {
+ }
+ 
+ /// Read `path` and give its source record. An unreadable file is an error
+-/// that names it.
++/// that names it. The file is hashed as it is read (#2689), never held
++/// whole: a linked STL may be gigabytes.
++#[cfg(not(target_arch = "wasm32"))]
+ pub fn read(path: &Path) -> Result<ModelSource, String> {
+-    let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+-    of_bytes(path, &data).ok_or_else(|| format!("{}: no SHA-256 in this build", path.display()))
++    use std::io::Read;
++    let named = |e: std::io::Error| format!("{}: {e}", path.display());
++    let mut file = std::fs::File::open(path).map_err(named)?;
++    let mut hash = camcraft_geometry::solidcraft::Sha256::new();
++    let mut buf = vec![0u8; READ_CHUNK];
++    loop {
++        let n = file.read(&mut buf).map_err(named)?;
++        match buf.get(..n) {
++            Some([]) | None => break,
++            Some(got) => hash.update(got),
++        }
++    }
++    Ok(ModelSource { path: path.to_string_lossy().into_owned(), sha256: hash.finish_hex() })
+ }
+ 
++/// A browser has no file to read again.
++#[cfg(target_arch = "wasm32")]
++pub fn read(path: &Path) -> Result<ModelSource, String> {
++    Err(format!("{}: no SHA-256 in this build", path.display()))
++}
++
++/// How much of a source file is read at a time for its digest.
++#[cfg(not(target_arch = "wasm32"))]
++const READ_CHUNK: usize = 1 << 20;
++
+ /// A recorded digest is lowercase hex of the right length; anything else in
+ /// a project file is corrupt.
+ #[must_use]
+diff --git a/crates/app/tests/model_link.rs b/crates/app/tests/model_link.rs
+index 1dba13264..0b76ba912 100644
+--- a/crates/app/tests/model_link.rs
++++ b/crates/app/tests/model_link.rs
+@@ -3,13 +3,15 @@
+ //! delete-and-undo; SetModelSource links and unlinks as one undo step;
+ //! the project file (v72) keeps it, a v71 file opens unlinked, and a
+ //! malformed source row is refused as corrupt. The MCP tool sets the link
+-//! and get_job shows it.
++//! and get_job shows it. #2689: the digest is of the one read the import
++//! parsed, and the check hashes a file in pieces.
+ //! Provenance: our own fixtures over our own commands.
+ //!
+ //! Gate map (#2463): covers app::model_source, app::commands::import_model,
+ //! app::commands::update_model, app::commands::delete_entity,
+ //! app::commands::model_link (SetModelSource), app::project (source_dto,
+-//! v72), app::mcp::model_link_tools, app::mcp::job (get_job).
++//! v72), app::mcp::model_link_tools, app::mcp::job (get_job),
++//! app::geometry::import::sourced (#2689).
+ //! Lane shape (M4.4): all tests here run in seconds.
+ 
+ use std::path::{Path, PathBuf};
+@@ -247,3 +249,47 @@ fn the_mcp_tool_links_and_unlinks_and_get_job_shows_the_source() {
+     assert!(!err, "undo: {body}");
+     assert_eq!(job_source(&mut s, 10), Value::Null, "undo reverts one step");
+ }
++
++/// A closed binary STL tetrahedron, wound outward.
++fn binary_tetra() -> Vec<u8> {
++    let (o, a, b, c) = ([0f32, 0., 0.], [10f32, 0., 0.], [0f32, 10., 0.], [0f32, 0., 10.]);
++    let faces = [([0f32, 0., -1.], [o, b, a]), ([0., -1., 0.], [o, a, c]), ([-1., 0., 0.], [o, c, b]), ([0.577, 0.577, 0.577], [a, b, c])];
++    let mut out = vec![0u8; 80];
++    out.extend_from_slice(&4u32.to_le_bytes());
++    for (n, tri) in faces {
++        for v in std::iter::once(n).chain(tri) {
++            for x in v {
++                out.extend_from_slice(&x.to_le_bytes());
++            }
++        }
++        out.extend_from_slice(&0u16.to_le_bytes());
++    }
++    out
++}
++
++/// #2689: the link records the SHA-256 of the one read the import parsed -
++/// an ASCII STL (whose head the streaming parser reads twice), a binary
++/// STL, OBJ and STEP - and the link check's streamed digest agrees.
++#[test]
++fn the_link_digest_is_of_the_one_read_the_import_parsed() {
++    let dir = Dir::new("one-read");
++    let binary = dir.0.join("tetra.stl");
++    std::fs::write(&binary, binary_tetra()).expect("write tetra");
++    for path in [dir.part(), binary, testdata("box.obj"), testdata("box.step")] {
++        let want = camcraft_geometry::solidcraft::sha256_hex(&std::fs::read(&path).expect("read"));
++        let cmd = ImportModel::new(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++        assert_eq!(cmd.source.map(|s| s.sha256), Some(want.clone()), "import digest of {}", path.display());
++        assert_eq!(model_source::read(&path).map(|s| s.sha256), Ok(want), "check digest of {}", path.display());
++    }
++}
++
++/// #2689: the link check hashes a file in pieces, never whole; a file of
++/// several pieces gives the digest of all its bytes.
++#[test]
++fn the_link_check_hashes_a_file_larger_than_one_piece_as_a_whole() {
++    let dir = Dir::new("pieces");
++    let big = dir.0.join("big.stl");
++    let data: Vec<u8> = (0..(3 << 20) + 17u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
++    std::fs::write(&big, &data).expect("write big");
++    assert_eq!(model_source::read(&big).map(|s| s.sha256), Ok(camcraft_geometry::solidcraft::sha256_hex(&data)));
++}
+diff --git a/crates/geometry/src/solidcraft.rs b/crates/geometry/src/solidcraft.rs
+index 17823bd96..475489e6d 100644
+--- a/crates/geometry/src/solidcraft.rs
++++ b/crates/geometry/src/solidcraft.rs
+@@ -22,6 +22,11 @@ pub enum SolidcraftError {
+ #[cfg(not(target_arch = "wasm32"))]
+ pub use camcraft_kernel::solidcraft::hex_digest as sha256_hex;
+ 
++/// The same SHA-256 fed in pieces (#2689): a source file is hashed as it is
++/// read, from the bytes the import parses.
++#[cfg(not(target_arch = "wasm32"))]
++pub use camcraft_kernel::solidcraft::Sha256;
++
+ /// Request cooperative cancellation after 300 seconds. The planner has no
+ /// cancellation hook, so this is not a deadline for completion.
+ #[cfg(not(target_arch = "wasm32"))]
+diff --git a/crates/kernel/src/solidcraft/mod.rs b/crates/kernel/src/solidcraft/mod.rs
+index 5237b5dca..0badf56b2 100644
+--- a/crates/kernel/src/solidcraft/mod.rs
++++ b/crates/kernel/src/solidcraft/mod.rs
+@@ -28,7 +28,7 @@ use crate::KernelError;
+ use crate::solidcore_impl::SolidcoreKernel;
+ use crate::solidcore_step::{StepSolid, build_record};
+ 
+-pub use sha256::hex_digest;
++pub use sha256::{hex_digest, Sha256};
+ pub use zip::looks_like_zip;
+ 
+ const OP: &str = "import_solidcraft";
+diff --git a/crates/kernel/src/solidcraft/sha256.rs b/crates/kernel/src/solidcraft/sha256.rs
+index 5aa5a8a37..c777b3485 100644
+--- a/crates/kernel/src/solidcraft/sha256.rs
++++ b/crates/kernel/src/solidcraft/sha256.rs
+@@ -57,29 +57,84 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+     }
+ }
+ 
+-/// The SHA-256 digest of `data`, 64 lowercase hex digits.
+-pub fn hex_digest(data: &[u8]) -> String {
+-    let mut h = H0;
+-    let (blocks, rest) = data.as_chunks::<64>();
+-    for block in blocks {
+-        compress(&mut h, block);
++/// SHA-256 over bytes that arrive in pieces (#2689): a file is hashed as
++/// it is read, so it is never held whole for its digest.
++#[derive(Clone, Debug)]
++pub struct Sha256 {
++    h: [u32; 8],
++    /// The bytes of a block not yet full.
++    buf: [u8; 64],
++    fill: usize,
++    /// The whole length so far, in bytes.
++    len: u64,
++}
++
++impl Default for Sha256 {
++    fn default() -> Self {
++        Self::new()
+     }
+-    // Padding: 0x80, zeros, then the bit length as a big-endian u64.
+-    let mut tail = [0u8; 128];
+-    tail[..rest.len()].copy_from_slice(rest);
+-    tail[rest.len()] = 0x80;
+-    let used = if rest.len() < 56 { 64 } else { 128 };
+-    let bits = (data.len() as u64).wrapping_mul(8);
+-    tail[used - 8..used].copy_from_slice(&bits.to_be_bytes());
+-    for block in tail[..used].as_chunks::<64>().0 {
+-        compress(&mut h, block);
++}
++
++impl Sha256 {
++    #[must_use]
++    pub fn new() -> Self {
++        Sha256 { h: H0, buf: [0u8; 64], fill: 0, len: 0 }
++    }
++
++    /// Hash `data` after the bytes already given.
++    pub fn update(&mut self, data: &[u8]) {
++        self.len = self.len.wrapping_add(data.len() as u64);
++        let mut data = data;
++        if self.fill > 0 {
++            let take = (64 - self.fill).min(data.len());
++            let (head, rest) = data.split_at(take);
++            self.buf[self.fill..self.fill + take].copy_from_slice(head);
++            self.fill += take;
++            data = rest;
++            if self.fill < 64 {
++                return;
++            }
++            let block = self.buf;
++            compress(&mut self.h, &block);
++            self.fill = 0;
++        }
++        let (blocks, rest) = data.as_chunks::<64>();
++        for block in blocks {
++            compress(&mut self.h, block);
++        }
++        self.buf[..rest.len()].copy_from_slice(rest);
++        self.fill = rest.len();
+     }
+-    h.iter().map(|x| format!("{x:08x}")).collect()
++
++    /// The digest of every byte given, 64 lowercase hex digits.
++    #[must_use]
++    pub fn finish_hex(self) -> String {
++        let mut h = self.h;
++        // Padding: 0x80, zeros, then the bit length as a big-endian u64.
++        let mut tail = [0u8; 128];
++        tail[..self.fill].copy_from_slice(&self.buf[..self.fill]);
++        tail[self.fill] = 0x80;
++        let used = if self.fill < 56 { 64 } else { 128 };
++        let bits = self.len.wrapping_mul(8);
++        tail[used - 8..used].copy_from_slice(&bits.to_be_bytes());
++        for block in tail[..used].as_chunks::<64>().0 {
++            compress(&mut h, block);
++        }
++        h.iter().map(|x| format!("{x:08x}")).collect()
++    }
++}
++
++/// The SHA-256 digest of `data`, 64 lowercase hex digits.
++#[must_use]
++pub fn hex_digest(data: &[u8]) -> String {
++    let mut s = Sha256::new();
++    s.update(data);
++    s.finish_hex()
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::hex_digest;
++    use super::{hex_digest, Sha256};
+ 
+     /// FIPS 180-4's examples, plus the padding edge of 55/56/64 bytes.
+     #[test]
+@@ -101,4 +156,21 @@ mod tests {
+             "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+         );
+     }
++
++    /// #2689: the digest of pieces is the digest of the whole, for every
++    /// split around the 55/56/64-byte padding edges.
++    #[test]
++    fn pieces_hash_as_the_whole() {
++        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
++        for len in [0usize, 1, 55, 56, 63, 64, 65, 119, 128, 300] {
++            let whole = hex_digest(&data[..len]);
++            for piece in [1usize, 3, 55, 64, 65, 200] {
++                let mut s = Sha256::new();
++                for chunk in data[..len].chunks(piece) {
++                    s.update(chunk);
++                }
++                assert_eq!(s.finish_hex(), whole, "len {len}, pieces of {piece}");
++            }
++        }
++    }
+ }
+diff --git a/docs/decisions/2689-one-read-digest.md b/docs/decisions/2689-one-read-digest.md
+new file mode 100644
+index 000000000..7bcf94714
+--- /dev/null
++++ b/docs/decisions/2689-one-read-digest.md
+@@ -0,0 +1,39 @@
++## #2689 - A linked model's digest is of the bytes the import parsed
++
++**What was decided.**
++
++- `ImportModel::within` reads the file once
++  (`geometry/import/sourced.rs`, `load_model_open_sourced`). A buffered
++  format (OBJ, STEP, `.sc`) hashes the buffer it parses. STL keeps its
++  streaming parse (the M5.3 E law: the file never coexists with its
++  triangles) and is hashed as the stream reads it, through a reader that
++  hashes every byte it hands out. The ASCII path rewinds to byte 0 once
++  after the sniff; the rewind starts the hash again. Any other seek is
++  refused, so the digest is always of one pass. Bytes after the last
++  binary facet, if the file grew, are read into the same pass.
++- So a file that changes during the import records the digest of the
++  bytes that made the mesh. The link check then sees the newer file as
++  changed and imports it again. Before, the digest came from a second
++  read after the parse, and a change between the two reads was missed.
++- The kernel's SHA-256 takes bytes in pieces (`Sha256`, `update`,
++  `finish_hex`); `hex_digest` is that over one piece. Pinned against the
++  one-shot digest for every split around the padding edges.
++- The link check (`model_source::read`) hashes the file in 1 MiB pieces.
++  Before, it read the whole file into memory every time a linked file
++  changed, which for a large STL broke the same memory law.
++- The browser build is unchanged: it records no link.
++
++**Why.** Found in the review of #2563 (#2689). Solidcraft's Send to
++CamCraft (tangency-labs/solidcraft#18936) saves the design while CamCraft
++may still be importing the previous save; that change must not be lost.
++
++**Considered and dropped.**
++
++- Read STL into memory like the other formats: one line, but it breaks
++  the streaming law for the largest files.
++- Compare the file's size and time before and after the parse, and
++  record no digest on a change: it would unlink the model, or need a
++  marker digest that is not a real one.
++
++**Cost to change later.** Low: one module, one kernel type; the tests in
++`crates/app/tests/model_link.rs` and `sha256.rs` pin the behaviour.

@@ -1,0 +1,4116 @@
+From 1c279c1ddb1754b2f8c8995ffd740422254a1d92 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Mon, 16 Nov 2026 21:19:15 +0100
+Subject: [PATCH 1/3] fix(ui): cache pick highlight geometry and batch stroke
+ draws
+
+Fixes #2201
+---
+ crates/app/src/commands/mod.rs                |  12 +
+ crates/app/src/model.rs                       |  19 +
+ crates/app/src/model/geometry.rs              |  35 +-
+ crates/app/src/operation/selection.rs         |   6 +-
+ crates/app/src/operation/stamp.rs             |   7 +-
+ crates/app/src/operation/stitch.rs            |   2 +-
+ crates/app/src/pick/face.rs                   |   2 +-
+ crates/app/src/pick/feature_sel.rs            |   2 +-
+ crates/geometry/src/geometry/feature.rs       |  31 +-
+ crates/geometry/src/geometry/feature/index.rs | 181 ++++++++
+ crates/geometry/src/geometry/feature/runs.rs  |   6 +-
+ crates/ui/src/edge_pick.rs                    |   2 +-
+ crates/ui/src/egui_app/browser_tree.rs        |  73 ++--
+ crates/ui/src/egui_app/geo_page.rs            |  11 +-
+ crates/ui/src/egui_app/op_page.rs             | 127 +++---
+ crates/ui/src/egui_app/shell.rs               |  17 +-
+ crates/ui/src/egui_app/shell_web.rs           |   4 +-
+ crates/ui/src/egui_app/shell_window/frame.rs  |   4 +-
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ .../ui/src/egui_app/tests/highlight_perf.rs   | 388 ++++++++++++++++++
+ crates/ui/src/egui_app/view_pass.rs           |   6 +-
+ crates/ui/src/egui_app/world.rs               |  93 ++++-
+ crates/ui/src/frame_cache.rs                  | 373 +++++++++++++++++
+ crates/ui/src/interact.rs                     | 311 ++++++--------
+ crates/ui/src/lib.rs                          |   4 +
+ crates/ui/src/panel_cache.rs                  | 282 +++++++++++++
+ crates/ui/src/pick_highlight.rs               | 313 ++++++++++++++
+ crates/ui/src/pick_highlight_mesh.rs          | 301 ++++++++++++++
+ crates/ui/src/pick_ink.rs                     |  44 +-
+ crates/ui/src/state.rs                        |  18 +-
+ crates/ui/src/viewport.rs                     |   1 +
+ docs/decisions/2201-highlighter-frame-perf.md |  28 ++
+ 32 files changed, 2366 insertions(+), 339 deletions(-)
+ create mode 100644 crates/geometry/src/geometry/feature/index.rs
+ create mode 100644 crates/ui/src/egui_app/tests/highlight_perf.rs
+ create mode 100644 crates/ui/src/frame_cache.rs
+ create mode 100644 crates/ui/src/panel_cache.rs
+ create mode 100644 crates/ui/src/pick_highlight.rs
+ create mode 100644 crates/ui/src/pick_highlight_mesh.rs
+ create mode 100644 docs/decisions/2201-highlighter-frame-perf.md
+
+diff --git a/crates/app/src/commands/mod.rs b/crates/app/src/commands/mod.rs
+index e1c05c217..c90c3dca4 100644
+--- a/crates/app/src/commands/mod.rs
++++ b/crates/app/src/commands/mod.rs
+@@ -320,6 +320,18 @@ impl History {
+         self.done.iter().map(|entry| entry.id).collect()
+     }
+ 
++    /// Cheap fingerprint of the timeline state for frame-level view caches.
++    #[must_use]
++    pub fn revision_token(&self) -> (u64, usize, u64, usize, u64) {
++        (
++            self.identity,
++            self.done.len(),
++            self.done.last().map_or(0, |e| e.id),
++            self.redo.len(),
++            self.redo.last().map_or(0, |e| e.id),
++        )
++    }
++
+     pub fn is_empty(&self) -> bool {
+         self.done.is_empty() && self.redo.is_empty()
+     }
+diff --git a/crates/app/src/model.rs b/crates/app/src/model.rs
+index 64a16958b..3089a2056 100644
+--- a/crates/app/src/model.rs
++++ b/crates/app/src/model.rs
+@@ -271,6 +271,25 @@ pub fn has_toolpath(world: &World, entity: &Entity) -> bool {
+         .is_some()
+ }
+ 
++/// True when the operation has a cached toolpath with at least one move
++/// (without cloning the move vector).
++#[must_use]
++pub fn toolpath_nonempty(world: &World, entity: &Entity) -> bool {
++    entity
++        .entity_view(world)
++        .try_get::<&Toolpath>(|t| !t.path.is_empty())
++        .unwrap_or(false)
++}
++
++/// Count of warnings on an operation's cached toolpath without cloning it.
++#[must_use]
++pub fn toolpath_warning_count(world: &World, entity: &Entity) -> usize {
++    entity
++        .entity_view(world)
++        .try_get::<&Toolpath>(|t| t.warnings.len())
++        .unwrap_or(0)
++}
++
+ /// Facets with the entity's rigid transform applied - the frame the
+ /// slicers, regions and generators work in.
+ #[must_use]
+diff --git a/crates/app/src/model/geometry.rs b/crates/app/src/model/geometry.rs
+index 4d6f7822c..979482784 100644
+--- a/crates/app/src/model/geometry.rs
++++ b/crates/app/src/model/geometry.rs
+@@ -22,15 +22,48 @@ thread_local! {
+     /// per-frame hover (M1.5).
+     static FEATURES_CACHE: std::cell::RefCell<Vec<(u64, std::sync::Arc<Features>)>> =
+         const { std::cell::RefCell::new(Vec::new()) };
++    /// Pointer-keyed MRU over the live `Arc<[Triangle]>` on each entity so
++    /// repeated `features_of` calls on an unchanged mesh skip `digest_of`.
++    static SHARED_FEATURES_CACHE: std::cell::RefCell<Vec<SharedFeaturesEntry>> =
++        const { std::cell::RefCell::new(Vec::new()) };
+ }
+ 
++type SharedFeaturesEntry = (std::sync::Weak<[Triangle]>, std::sync::Arc<Features>);
++
+ /// Feature topology (faces, loops, feature edges) of a model's LOCAL
+ /// facets, memoized by content. `None` only for a facet-less entity;
+ /// garbage facets still return complete (degenerate-tagged) features.
+ #[must_use]
+ pub fn features_of(world: &World, entity: &Entity) -> Option<std::sync::Arc<Features>> {
+     let tris = facets_of(world, entity)?;
+-    Some(features_of_local(&tris))
++    Some(features_of_shared(&tris))
++}
++
++fn features_of_shared(tris: &std::sync::Arc<[Triangle]>) -> std::sync::Arc<Features> {
++    if tris.is_empty() {
++        return std::sync::Arc::new(Features::default());
++    }
++    if let Some(hit) = SHARED_FEATURES_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        cache.retain(|(w, _)| w.strong_count() > 0);
++        let i = cache
++            .iter()
++            .position(|(w, _)| std::ptr::eq(w.as_ptr(), std::sync::Arc::as_ptr(tris)))?;
++        cache[i..].rotate_left(1);
++        cache.last().map(|(_, f)| f.clone())
++    }) {
++        return hit;
++    }
++    let f = features_of_local(tris);
++    SHARED_FEATURES_CACHE.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        cache.retain(|(w, _)| w.strong_count() > 0);
++        if cache.len() >= 32 {
++            cache.remove(0);
++        }
++        cache.push((std::sync::Arc::downgrade(tris), f.clone()));
++    });
++    f
+ }
+ 
+ /// The cache chokepoint, exposed for callers already holding the facets.
+diff --git a/crates/app/src/operation/selection.rs b/crates/app/src/operation/selection.rs
+index 69ddf127e..07f27dfc0 100644
+--- a/crates/app/src/operation/selection.rs
++++ b/crates/app/src/operation/selection.rs
+@@ -133,7 +133,7 @@ pub(super) fn drive_chains(world: &World, items: &[GeoSel]) -> Result<Vec<Vec<Po
+         let label = format!("{} of '{}'", g.feature, g.entity);
+         match g.feature {
+             FeatureSel::Chain(cid) => {
+-                let Some(c) = feature::resolve_chain(&features, cid) else {
++                let Some(c) = feature::resolve_chain_arc(&features, cid) else {
+                     return Err(GenError::Invalid(format!(
+                         "{label} is no longer in the model: re-pick it"
+                     )));
+@@ -348,7 +348,7 @@ pub(super) fn selection_geometry_in(
+                 }
+             }
+             FeatureSel::Chain(cid) => {
+-                let Some(c) = feature::resolve_chain(&features, cid) else {
++                let Some(c) = feature::resolve_chain_arc(&features, cid) else {
+                     return Err(GenError::Invalid(format!(
+                         "{label} is no longer in the model: re-pick it"
+                     )));
+@@ -407,7 +407,7 @@ pub(super) fn selection_geometry_in(
+                 push_loop(&label, xy, &mut loops, &mut rims)?;
+             }
+             FeatureSel::Patch(pid) => {
+-                let Some(rings) = feature::patch_rings(&features, pid) else {
++                let Some(rings) = feature::patch_rings_arc(&features, pid) else {
+                     return Err(GenError::Invalid(format!(
+                         "{label} is no longer in the model: re-pick it"
+                     )));
+diff --git a/crates/app/src/operation/stamp.rs b/crates/app/src/operation/stamp.rs
+index ec59495b3..1189590a0 100644
+--- a/crates/app/src/operation/stamp.rs
++++ b/crates/app/src/operation/stamp.rs
+@@ -244,11 +244,8 @@ pub fn status_of(world: &World, entity: &flecs_ecs::prelude::Entity) -> OpStatus
+     let Some(op) = model::operation_of(world, entity) else {
+         return OpStatus::Never;
+     };
+-    let Some(cache) = model::toolpath_of(world, entity) else {
+-        return OpStatus::Never;
+-    };
+-    if cache.path.is_empty() {
+-        return OpStatus::Never; // a cache with no moves is no cache
++    if !model::toolpath_nonempty(world, entity) {
++        return OpStatus::Never; // no cache or a cache with no moves is no cache
+     }
+     let name = model::name_of(world, entity).unwrap_or_default();
+     match (op.stamp, op_stamp(world, &op, &name)) {
+diff --git a/crates/app/src/operation/stitch.rs b/crates/app/src/operation/stitch.rs
+index 83a40bfc5..47dd4ca60 100644
+--- a/crates/app/src/operation/stitch.rs
++++ b/crates/app/src/operation/stitch.rs
+@@ -83,7 +83,7 @@ pub(super) fn gather_runs(
+         let Some(features) = model::features_of(world, &entity) else {
+             continue;
+         };
+-        let Some(c) = feature::resolve_chain(&features, cid) else {
++        let Some(c) = feature::resolve_chain_arc(&features, cid) else {
+             continue;
+         };
+         if c.closed {
+diff --git a/crates/app/src/pick/face.rs b/crates/app/src/pick/face.rs
+index 9c470b737..4be4017d9 100644
+--- a/crates/app/src/pick/face.rs
++++ b/crates/app/src/pick/face.rs
+@@ -79,7 +79,7 @@ pub fn face_origin(world: &World, entity: &str, sel: FeatureSel) -> Result<FaceO
+             (f.facets.iter().map(|&i| i as usize).collect(), Some(f.normal))
+         }
+         FeatureSel::Patch(pid) => {
+-            let p = feature::patches(&features).into_iter().find(|p| p.id == pid).ok_or(gone)?;
++            let p = feature::patches_arc(&features).into_iter().find(|p| p.id == pid).ok_or(gone)?;
+             let facets = features
+                 .faces
+                 .iter()
+diff --git a/crates/app/src/pick/feature_sel.rs b/crates/app/src/pick/feature_sel.rs
+index b38669189..f01aeb651 100644
+--- a/crates/app/src/pick/feature_sel.rs
++++ b/crates/app/src/pick/feature_sel.rs
+@@ -110,7 +110,7 @@ pub fn check_pickable(world: &World, g: &GeoSel) -> Result<(), String> {
+                 g.feature, g.entity
+             ))
+         }
+-        FeatureSel::Chain(id) => match feature::resolve_chain(&graph.features, id) {
++        FeatureSel::Chain(id) => match feature::resolve_chain_arc(&graph.features, id) {
+             Some(c) if !is_feature_chain(&graph, &c) => Err(format!(
+                 "{} of '{}' runs along the mesh's own triangles, not a model edge - pick an edge where two \
+                  faces meet",
+diff --git a/crates/geometry/src/geometry/feature.rs b/crates/geometry/src/geometry/feature.rs
+index b5bb94682..54c18def2 100644
+--- a/crates/geometry/src/geometry/feature.rs
++++ b/crates/geometry/src/geometry/feature.rs
+@@ -46,6 +46,8 @@ use std::hash::{Hash, Hasher};
+ 
+ use crate::geometry::Triangle;
+ 
++mod index;
++pub use index::{patch_rings_arc, patches_arc, resolve_chain_arc};
+ mod runs;
+ pub use runs::{RUN_LENGTH_RATIO, edge_runs, resolve_chain, run_containing, run_of_edges};
+ mod vertex;
+@@ -548,14 +550,14 @@ pub fn features_of_facets(facets: &[Triangle]) -> Features {
+ pub fn digest_of(facets: &[Triangle]) -> u64 {
+     let mut digs: Vec<u64> = Vec::with_capacity(facets.len());
+     for tri in facets {
+-        let mut corners: Vec<Option<Pos>> = vec![
++        let mut corners: [Option<Pos>; 3] = [
+             weld_pos(&[tri.a.x, tri.a.y, tri.a.z]),
+             weld_pos(&[tri.b.x, tri.b.y, tri.b.z]),
+             weld_pos(&[tri.c.x, tri.c.y, tri.c.z]),
+         ];
+-        corners.sort_by_key(|c| *c); // None first, then lattice order
++        corners.sort_unstable(); // None first, then lattice order
+         let mut h = DefaultHasher::new();
+-        corners.hash(&mut h);
++        corners.as_slice().hash(&mut h);
+         digs.push(h.finish());
+     }
+     digs.sort_unstable();
+@@ -1020,9 +1022,10 @@ pub struct PatchRing {
+ /// so facet and group order cannot move anything.
+ #[must_use]
+ pub fn patches(features: &Features) -> Vec<Patch> {
++    let (lattice, flat) = patch_lattice(features);
+     let mut out: Vec<Patch> = Vec::new();
+     for g in patch_groups(features) {
+-        let (id, _) = patch_identity(features, &g);
++        let (id, _) = patch_identity_with_lattice(features, &g, &lattice, &flat);
+         let mut faces: Vec<FaceId> = g.iter().map(|f| f.id).collect();
+         faces.sort_unstable();
+         out.push(Patch { id, faces });
+@@ -1036,8 +1039,9 @@ pub fn patches(features: &Features) -> Vec<Patch> {
+ /// the pick - the caller says "re-pick", it never guesses a successor).
+ #[must_use]
+ pub fn patch_rings(features: &Features, id: PatchId) -> Option<Vec<PatchRing>> {
++    let (lattice, flat) = patch_lattice(features);
+     for g in patch_groups(features) {
+-        let (pid, rings) = patch_identity(features, &g);
++        let (pid, rings) = patch_identity_with_lattice(features, &g, &lattice, &flat);
+         if pid == id {
+             return Some(rings);
+         }
+@@ -1045,6 +1049,12 @@ pub fn patch_rings(features: &Features, id: PatchId) -> Option<Vec<PatchRing>> {
+     None
+ }
+ 
++fn patch_lattice(features: &Features) -> (Vec<Option<Pos>>, Vec<Pos>) {
++    let lattice: Vec<Option<Pos>> = features.verts.iter().map(weld_pos).collect();
++    let flat: Vec<Pos> = lattice.iter().filter_map(|p| *p).collect();
++    (lattice, flat)
++}
++
+ /// Faces grouped by their shared pre-split patch root, keeping only the
+ /// groups big enough to be a weld. Every facet of a face carries the same
+ /// root (clustering's `(root, plane)` grouping ensures it), and invalid
+@@ -1069,11 +1079,15 @@ fn patch_groups(features: &Features) -> Vec<Vec<&Face>> {
+ /// signatures. Total on any input: a vertex too extreme to return to the
+ /// lattice skips the segment fold and contributes raw bits instead -
+ /// still deterministic, never a panic.
+-fn patch_identity(features: &Features, g: &[&Face]) -> (PatchId, Vec<PatchRing>) {
++fn patch_identity_with_lattice(
++    features: &Features,
++    g: &[&Face],
++    lattice: &[Option<Pos>],
++    flat: &[Pos],
++) -> (PatchId, Vec<PatchRing>) {
+     let rings = patch_boundary(g);
+     let mut h = DefaultHasher::new();
+     h.write_u8(b'P');
+-    let lattice: Vec<Option<Pos>> = features.verts.iter().map(weld_pos).collect();
+     let mut segs: Vec<(Pos, Pos)> = Vec::new();
+     let mut flags: Vec<u8> = Vec::new();
+     for r in &rings {
+@@ -1083,8 +1097,7 @@ fn patch_identity(features: &Features, g: &[&Face]) -> (PatchId, Vec<PatchRing>)
+                 .iter()
+                 .all(|&v| lattice.get(v as usize).is_some_and(|p| p.is_some()))
+         {
+-            let flat: Vec<Pos> = lattice.iter().filter_map(|p| *p).collect();
+-            ring_segments(&r.verts, &flat, r.closed, &mut segs);
++            ring_segments(&r.verts, flat, r.closed, &mut segs);
+         } else {
+             for &v in &r.verts {
+                 if let Some(p) = features.verts.get(v as usize) {
+diff --git a/crates/geometry/src/geometry/feature/index.rs b/crates/geometry/src/geometry/feature/index.rs
+new file mode 100644
+index 000000000..f4c2885f2
+--- /dev/null
++++ b/crates/geometry/src/geometry/feature/index.rs
+@@ -0,0 +1,181 @@
++//! Cached lookup indexes for shared `Arc<Features>` instances so repeated
++//! selection, stitch, and highlight queries resolve chains and patches in O(1)
++//! without re-walking all feature chains or patch groups per call.
++//!
++//! Provenance: our own per-Features lookup index built over `geometry::feature` primitives.
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::sync::{Arc, Weak};
++
++use super::*;
++
++const INDEX_CACHE_CAP: usize = 32;
++
++type ChainMap = HashMap<ChainId, Chain>;
++type PatchIndex = (Vec<Patch>, HashMap<PatchId, Vec<PatchRing>>);
++
++#[derive(Default)]
++struct FeatureIndex {
++    chains_and_runs: Option<ChainMap>,
++    singletons: Option<ChainMap>,
++    patches: Option<PatchIndex>,
++}
++
++thread_local! {
++    static INDEX_CACHE: RefCell<Vec<(Weak<Features>, FeatureIndex)>> = const { RefCell::new(Vec::new()) };
++}
++
++fn with_index<R>(features: &Arc<Features>, f: impl FnOnce(&mut FeatureIndex) -> R) -> R {
++    INDEX_CACHE.with(|cell| {
++        let mut entries = cell.borrow_mut();
++        entries.retain(|(weak, _)| weak.strong_count() > 0);
++        if let Some(pos) = entries
++            .iter()
++            .position(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(features)))
++        {
++            entries[pos..].rotate_left(1);
++            if let Some((_, idx)) = entries.last_mut() {
++                return f(idx);
++            }
++        }
++        if entries.len() >= INDEX_CACHE_CAP {
++            entries.remove(0);
++        }
++        entries.push((Arc::downgrade(features), FeatureIndex::default()));
++        if let Some((_, idx)) = entries.last_mut() {
++            return f(idx);
++        }
++        let mut fallback = FeatureIndex::default();
++        f(&mut fallback)
++    })
++}
++
++fn build_chains_and_runs(features: &Features) -> HashMap<ChainId, Chain> {
++    let cs = chains(features);
++    let mut map = HashMap::with_capacity(cs.len().saturating_mul(2));
++    for c in &cs {
++        map.entry(c.id).or_insert_with(|| c.clone());
++    }
++    let lattice = runs::lattice_of(features);
++    let mut runs_buf = Vec::new();
++    for c in &cs {
++        runs_buf.clear();
++        runs::split_into(features, &lattice, c, &mut runs_buf);
++        for r in &runs_buf {
++            map.entry(r.id).or_insert_with(|| r.clone());
++        }
++    }
++    map
++}
++
++fn build_singletons(features: &Features) -> HashMap<ChainId, Chain> {
++    let lattice = runs::lattice_of(features);
++    let mut map = HashMap::with_capacity(features.edges.len());
++    for i in 0..features.edges.len() as u32 {
++        if let Some(r) = runs::run_with(features, &lattice, &[i]) {
++            map.entry(r.id).or_insert(r);
++        }
++    }
++    map
++}
++
++fn build_patches(features: &Features) -> PatchIndex {
++    let (lattice, flat) = patch_lattice(features);
++    let groups = patch_groups(features);
++    let mut list = Vec::with_capacity(groups.len());
++    let mut rings_map = HashMap::with_capacity(groups.len());
++    for g in groups {
++        let (pid, rings) = patch_identity_with_lattice(features, &g, &lattice, &flat);
++        let mut faces: Vec<FaceId> = g.iter().map(|f| f.id).collect();
++        faces.sort_unstable();
++        list.push(Patch { id: pid, faces });
++        rings_map.entry(pid).or_insert(rings);
++    }
++    list.sort_unstable_by_key(|p| p.id);
++    (list, rings_map)
++}
++
++/// Cached variant of [`resolve_chain`] for shared `Arc<Features>` values.
++/// Produces the exact same chain, run, or Alt-pick singleton as `resolve_chain`.
++#[must_use]
++pub fn resolve_chain_arc(features: &Arc<Features>, id: ChainId) -> Option<Chain> {
++    with_index(features, |idx| {
++        let main = idx
++            .chains_and_runs
++            .get_or_insert_with(|| build_chains_and_runs(features));
++        if let Some(c) = main.get(&id) {
++            return Some(c.clone());
++        }
++        let singles = idx
++            .singletons
++            .get_or_insert_with(|| build_singletons(features));
++        singles.get(&id).cloned()
++    })
++}
++
++/// Cached variant of [`patch_rings`] for shared `Arc<Features>` values.
++#[must_use]
++pub fn patch_rings_arc(features: &Arc<Features>, id: PatchId) -> Option<Vec<PatchRing>> {
++    with_index(features, |idx| {
++        let (_, map) = idx.patches.get_or_insert_with(|| build_patches(features));
++        map.get(&id).cloned()
++    })
++}
++
++/// Cached variant of [`patches`] for shared `Arc<Features>` values.
++#[must_use]
++pub fn patches_arc(features: &Arc<Features>) -> Vec<Patch> {
++    with_index(features, |idx| {
++        let (list, _) = idx.patches.get_or_insert_with(|| build_patches(features));
++        list.clone()
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::geometry::primitives::{cube, cylinder};
++    use crate::geometry::Point3;
++
++    #[test]
++    fn resolve_chain_arc_matches_uncached_for_chains_runs_singletons_and_missing() {
++        let mesh = cube(Point3::ZERO, Point3::new(40.0, 25.0, 10.0));
++        let f = Arc::new(features_of_facets(&mesh.facets));
++        for c in chains(&f) {
++            let a = resolve_chain_arc(&f, c.id);
++            let b = resolve_chain(&f, c.id);
++            assert_eq!(a.as_ref().map(|x| (&x.edges, x.closed, x.id)), b.as_ref().map(|x| (&x.edges, x.closed, x.id)));
++        }
++        for r in edge_runs(&f) {
++            let a = resolve_chain_arc(&f, r.id);
++            let b = resolve_chain(&f, r.id);
++            assert_eq!(a.as_ref().map(|x| (&x.edges, x.closed, x.id)), b.as_ref().map(|x| (&x.edges, x.closed, x.id)));
++        }
++        if !f.edges.is_empty() {
++            let single = run_of_edges(&f, &[0]).expect("singleton run");
++            let a = resolve_chain_arc(&f, single.id);
++            let b = resolve_chain(&f, single.id);
++            assert_eq!(a.as_ref().map(|x| (&x.edges, x.closed, x.id)), b.as_ref().map(|x| (&x.edges, x.closed, x.id)));
++        }
++        assert!(resolve_chain_arc(&f, 0xDEAD_BEEF_CAFE_BABE).is_none());
++    }
++
++    #[test]
++    fn patch_apis_arc_match_uncached() {
++        let mesh = cylinder(20.0, 10.0, 24);
++        let f = Arc::new(features_of_facets(&mesh.facets));
++        let uncached = patches(&f);
++        let cached = patches_arc(&f);
++        assert!(!uncached.is_empty(), "cylinder produces a smooth cylindrical patch");
++        assert_eq!(cached.len(), uncached.len());
++        for (c, u) in cached.iter().zip(uncached.iter()) {
++            assert_eq!(c.id, u.id);
++            assert_eq!(c.faces, u.faces);
++            let cr = patch_rings_arc(&f, c.id);
++            let ur = patch_rings(&f, u.id);
++            assert_eq!(cr.as_ref().map(|v| v.len()), ur.as_ref().map(|v| v.len()));
++        }
++        assert!(patch_rings_arc(&f, 0xDEAD_BEEF_CAFE_BABE).is_none());
++    }
++}
+diff --git a/crates/geometry/src/geometry/feature/runs.rs b/crates/geometry/src/geometry/feature/runs.rs
+index b283bb34a..c3b35112e 100644
+--- a/crates/geometry/src/geometry/feature/runs.rs
++++ b/crates/geometry/src/geometry/feature/runs.rs
+@@ -22,7 +22,7 @@ pub const RUN_LENGTH_RATIO: f64 = 2.0;
+ 
+ const SENTINEL: Pos = (i64::MIN, i64::MIN, i64::MIN);
+ 
+-fn lattice_of(features: &Features) -> Vec<Pos> {
++pub(super) fn lattice_of(features: &Features) -> Vec<Pos> {
+     features.verts.iter().map(|p| weld_pos(p).unwrap_or(SENTINEL)).collect()
+ }
+ 
+@@ -59,7 +59,7 @@ fn walk(features: &Features, edges: &[u32]) -> Option<Vec<u32>> {
+     vs.iter().all(|&v| (v as usize) < n).then_some(vs)
+ }
+ 
+-fn run_with(features: &Features, lattice: &[Pos], edges: &[u32]) -> Option<Chain> {
++pub(super) fn run_with(features: &Features, lattice: &[Pos], edges: &[u32]) -> Option<Chain> {
+     let vs = walk(features, edges)?;
+     let closed = vs.first() == vs.last() && edges.len() >= 3;
+     let ring = if closed { &vs[..vs.len() - 1] } else { &vs[..] };
+@@ -91,7 +91,7 @@ fn parts(a: f64, b: f64) -> bool {
+ }
+ 
+ /// Split one tangent chain into its runs (see the module law).
+-fn split_into(features: &Features, lattice: &[Pos], c: &Chain, out: &mut Vec<Chain>) {
++pub(super) fn split_into(features: &Features, lattice: &[Pos], c: &Chain, out: &mut Vec<Chain>) {
+     let n = c.edges.len();
+     let whole = |out: &mut Vec<Chain>| out.push(c.clone());
+     let Some(vs) = walk(features, &c.edges) else {
+diff --git a/crates/ui/src/edge_pick.rs b/crates/ui/src/edge_pick.rs
+index cf3639a6d..cd3fe6358 100644
+--- a/crates/ui/src/edge_pick.rs
++++ b/crates/ui/src/edge_pick.rs
+@@ -74,7 +74,7 @@ fn edges_of(state: &State, g: &GeoSel) -> Vec<u32> {
+     let FeatureSel::Chain(id) = g.feature else { return Vec::new() };
+     model::find_by_name(&state.world, &g.entity)
+         .and_then(|e| model::features_of(&state.world, &e))
+-        .and_then(|f| feature::resolve_chain(&f, id))
++        .and_then(|f| feature::resolve_chain_arc(&f, id))
+         .map_or(Vec::new(), |c| c.edges)
+ }
+ 
+diff --git a/crates/ui/src/egui_app/browser_tree.rs b/crates/ui/src/egui_app/browser_tree.rs
+index 4557a5b7a..a93f8bcbf 100644
+--- a/crates/ui/src/egui_app/browser_tree.rs
++++ b/crates/ui/src/egui_app/browser_tree.rs
+@@ -299,47 +299,60 @@ fn op_row(
+     rows: &mut Vec<painted::Row>,
+     leaves: &mut Vec<Leaf>,
+ ) {
+-    let w = &state.world;
+-    let (kind, icon) = model::operation_of(w, entity)
+-        .map(|op| {
+-            let k = op.params.kind();
+-            (k.to_string(), op_icon(k))
+-        })
+-        .unwrap_or_else(|| (String::new(), Icon::Generate));
+-    let status = operation::status_of(w, entity);
+-    let tag = match status {
++    let meta = state.panel_cache.browser_op_cached(state, name, || {
++        let w = &state.world;
++        let op = model::operation_of(w, entity);
++        let (kind_label, kind_type) = op
++            .as_ref()
++            .map(|o| {
++                let k = o.params.kind();
++                (k.to_string(), Some(k))
++            })
++            .unwrap_or_else(|| (String::new(), None));
++        let status = operation::status_of(w, entity);
++        let warns = model::toolpath_warning_count(w, entity);
++        let flow = op.map_or_else(String::new, |o| {
++            let mut s = String::new();
++            if o.suppressed {
++                s.push_str("  SUPPRESSED");
++            }
++            if !o.after.is_default() {
++                s.push_str("  then ");
++                s.push_str(o.after.label());
++            }
++            s
++        });
++        let problem = operation::tool_gate::tool_problem_of(w, entity);
++        let label = model::operation_label(w, name, entity);
++        crate::panel_cache::BrowserOpCached {
++            kind_label,
++            kind_type,
++            status,
++            warns,
++            flow,
++            problem,
++            label,
++        }
++    });
++    let icon = meta.kind_type.map_or(Icon::Generate, op_icon);
++    let tag = match meta.status {
+         operation::OpStatus::Never => "never",
+         operation::OpStatus::Ok => "ok",
+         operation::OpStatus::Stale => "STALE",
+     };
+-    let warns = model::toolpath_of(w, entity).map_or(0, |tp| tp.warnings.len());
+-    let warn_text = match warns {
++    let warn_text = match meta.warns {
+         0 => String::new(),
+         1 => "  1 warning".to_owned(),
+         n => format!("  {n} warnings"),
+     };
+-    // #110: a suppressed op and a stop / home after it say so on the row.
+-    let flow = model::operation_of(w, entity).map_or_else(String::new, |op| {
+-        let mut s = String::new();
+-        if op.suppressed {
+-            s.push_str("  SUPPRESSED");
+-        }
+-        if !op.after.is_default() {
+-            s.push_str("  then ");
+-            s.push_str(op.after.label());
+-        }
+-        s
+-    });
+-    let problem = operation::tool_gate::tool_problem_of(w, entity);
+-    let badge = status_badge(status, problem.is_some(), warns);
+-    let suffix = match problem {
+-        Some(why) => format!("{kind}  BLOCKED{warn_text}{flow}  {why}"),
+-        None => format!("{kind}  {tag}{warn_text}{flow}"),
++    let badge = status_badge(meta.status, meta.problem.is_some(), meta.warns);
++    let suffix = match &meta.problem {
++        Some(why) => format!("{}  BLOCKED{warn_text}{}  {why}", meta.kind_label, meta.flow),
++        None => format!("{}  {tag}{warn_text}{}", meta.kind_label, meta.flow),
+     };
+     let hidden = state.hidden_paths.iter().any(|p| p == name);
+     let selected = matches!(t, UiTarget::Operation(n) if n == name);
+-    let label = model::operation_label(w, name, entity);
+-    push_row(rows, leaves, label, suffix, painted::Kind::Op, Some(icon), selected, hidden, depth, Leaf::Op(name.to_owned()));
++    push_row(rows, leaves, meta.label, suffix, painted::Kind::Op, Some(icon), selected, hidden, depth, Leaf::Op(name.to_owned()));
+     if let Some(row) = rows.last_mut() {
+         row.badge = Some(badge);
+     }
+diff --git a/crates/ui/src/egui_app/geo_page.rs b/crates/ui/src/egui_app/geo_page.rs
+index b9ca1f0e1..c110515dc 100644
+--- a/crates/ui/src/egui_app/geo_page.rs
++++ b/crates/ui/src/egui_app/geo_page.rs
+@@ -81,9 +81,11 @@ fn body(ui: &mut Ui, state: &mut State, target: &str, live_setup: Option<&str>,
+         // #187: the 3-2-1 alignment reads the picks as datums - a flat
+         // face for Z, a straight edge for X, a vertex or bore for the
+         // origin. The app builds the frame (or names what to re-pick).
+-        let aligned = camcraft_app::pick::align_321(&state.world, &state.op_ui.geo);
++        let aligned = state.panel_cache.align_321_cached(state, || {
++            camcraft_app::pick::align_321(&state.world, &state.op_ui.geo).map(|_| ())
++        });
+         let tip = match &aligned {
+-            Ok(_) => "place the WCS slot chosen in the WCS pane: Z out of the picked flat face, X along the picked \
++            Ok(()) => "place the WCS slot chosen in the WCS pane: Z out of the picked flat face, X along the picked \
+                       edge, origin at the picked vertex or bore (else the edge's end), on the face"
+                 .to_owned(),
+             Err(why) => format!("3-2-1 alignment: {why}"),
+@@ -96,8 +98,9 @@ fn body(ui: &mut Ui, state: &mut State, target: &str, live_setup: Option<&str>,
+             crate::vertex_pick::queue_wcs_321(state);
+         }
+     }
+-    let (notes, refusal) =
+-        operation::selection_account(&state.world, live_setup, &state.op_ui.geo.clone(), &state.op_ui.params.clone());
++    let (notes, refusal) = state.panel_cache.selection_account_cached(state, live_setup, || {
++        operation::selection_account(&state.world, live_setup, &state.op_ui.geo, &state.op_ui.params)
++    });
+     for note in notes {
+         ui.label(RichText::new(note).weak());
+     }
+diff --git a/crates/ui/src/egui_app/op_page.rs b/crates/ui/src/egui_app/op_page.rs
+index 174c96be7..c79411875 100644
+--- a/crates/ui/src/egui_app/op_page.rs
++++ b/crates/ui/src/egui_app/op_page.rs
+@@ -137,9 +137,9 @@ pub(super) fn operation_page(ui: &mut Ui, state: &mut State, name: &str, pal: &T
+             // the picks that say where it is.
+             super::boundary::boundary_group(ui, state);
+         }
+-        if let Some(note) =
++        if let Some(note) = state.panel_cache.unresolved_note_cached(state, live_setup.as_deref(), || {
+             unresolved_note(&state.world, live_setup.as_deref(), Some(&state.op_ui.src()), &state.op_ui.params)
+-        {
++        }) {
+             ui.colored_label(text_inks(ui, &state.world).warn, note);
+         }
+     });
+@@ -285,55 +285,86 @@ fn coolant_row(ui: &mut Ui, state: &mut State, target: &str, live: Option<&Opera
+     ui.end_row();
+ }
+ 
++fn tone_to_u8(tone: super::layout::Tone) -> u8 {
++    match tone {
++        super::layout::Tone::Ok => 0,
++        super::layout::Tone::Warn => 1,
++        super::layout::Tone::Error => 2,
++        super::layout::Tone::Quiet => 3,
++    }
++}
++
++fn tone_from_u8(code: u8) -> super::layout::Tone {
++    match code {
++        0 => super::layout::Tone::Ok,
++        1 => super::layout::Tone::Warn,
++        2 => super::layout::Tone::Error,
++        _ => super::layout::Tone::Quiet,
++    }
++}
++
++fn status_banner_data(state: &State, target: &str) -> crate::panel_cache::OpBannerCached {
++    state.panel_cache.op_banner_cached(state, target, || {
++        use super::layout::Tone;
++        let ent = model::find_by_name(&state.world, target);
++        let tp = ent.as_ref().and_then(|e| model::toolpath_of(&state.world, e));
++        let focus: Vec<Option<[f64; 3]>> = tp
++            .as_ref()
++            .map(crate::path_lines::warning_focus)
++            .unwrap_or_default();
++        let (moves, warnings, notes): (usize, Vec<Warning>, Vec<String>) = tp
++            .map(|t| (t.path.len(), t.warnings, t.path.notes))
++            .unwrap_or((0, Vec::new(), Vec::new()));
++        let blocked = ent
++            .as_ref()
++            .and_then(|e| operation::tool_gate::tool_problem_of(&state.world, e));
++        let st = ent.as_ref().map(|e| operation::status_of(&state.world, e));
++        let mut details: Vec<String> = fold_warnings(&warnings);
++        details.extend(super::approach_page::entry_status_lines(&notes));
++        details.extend(state.struck_lines(target));
++        let n = details.len();
++        let tail = match n {
++            0 => String::new(),
++            1 => " · 1 warning".to_owned(),
++            n => format!(" · {n} warnings"),
++        };
++        let (line, tone) = match (blocked, st) {
++            (Some(why), _) => (format!("Blocked · {why} · {moves} moves cached"), Tone::Error),
++            (None, Some(OpStatus::Never) | None) => ("Status: never generated".to_owned(), Tone::Quiet),
++            (None, Some(OpStatus::Ok)) => (
++                format!("OK · {moves} moves{tail}"),
++                if n > 0 { Tone::Warn } else { Tone::Ok },
++            ),
++            (None, Some(OpStatus::Stale)) => {
++                let reason = ent
++                    .as_ref()
++                    .and_then(|e| operation::stale_reason(&state.world, e))
++                    .unwrap_or_else(|| "inputs moved since generation".to_owned());
++                (format!("Stale · {reason} · {moves} moves cached{tail}"), Tone::Warn)
++            }
++        };
++        crate::panel_cache::OpBannerCached {
++            line,
++            tone: tone_to_u8(tone),
++            details,
++            focus,
++        }
++    })
++}
++
+ /// The status banner's line and details, from the world (pure; the
+ /// tests read it). M10.1 C: the tool law's verdict outranks the stamp.
++#[cfg(test)]
+ pub(super) fn status_text(state: &State, target: &str) -> (String, super::layout::Tone, Vec<String>) {
+-    use super::layout::Tone;
+-    let ent = model::find_by_name(&state.world, target);
+-    let (moves, warnings, notes): (usize, Vec<Warning>, Vec<String>) = ent
+-        .as_ref()
+-        .and_then(|e| model::toolpath_of(&state.world, e))
+-        .map(|tp| (tp.path.len(), tp.warnings, tp.path.notes))
+-        .unwrap_or((0, Vec::new(), Vec::new()));
+-    let blocked = ent.as_ref().and_then(|e| operation::tool_gate::tool_problem_of(&state.world, e));
+-    let st = ent.as_ref().map(|e| operation::status_of(&state.world, e));
+-    let mut details: Vec<String> = fold_warnings(&warnings);
+-    details.extend(super::approach_page::entry_status_lines(&notes));
+-    // #339 slice 4: who the fixture warnings strike, or that no single
+-    // fixture reproduces them - said, never guessed.
+-    details.extend(state.struck_lines(target));
+-    let n = details.len();
+-    let tail = match n {
+-        0 => String::new(),
+-        1 => " · 1 warning".to_owned(),
+-        n => format!(" · {n} warnings"),
+-    };
+-    let (line, tone) = match (blocked, st) {
+-        (Some(why), _) => (format!("Blocked · {why} · {moves} moves cached"), Tone::Error),
+-        (None, Some(OpStatus::Never) | None) => ("Status: never generated".to_owned(), Tone::Quiet),
+-        (None, Some(OpStatus::Ok)) => (format!("OK · {moves} moves{tail}"), if n > 0 { Tone::Warn } else { Tone::Ok }),
+-        (None, Some(OpStatus::Stale)) => {
+-            // M3.1 C: say which input moved, not just that one did.
+-            let reason = ent
+-                .as_ref()
+-                .and_then(|e| operation::stale_reason(&state.world, e))
+-                .unwrap_or_else(|| "inputs moved since generation".to_owned());
+-            (format!("Stale · {reason} · {moves} moves cached{tail}"), Tone::Warn)
+-        }
+-    };
+-    (line, tone, details)
++    let cached = status_banner_data(state, target);
++    (cached.line, tone_from_u8(cached.tone), cached.details)
+ }
+ 
+ fn status(ui: &mut Ui, state: &mut State, target: &str, pal: &Tokens) {
+     use super::layout::Tone;
+-    let (line, tone, details) = status_text(state, target);
+-    // #261: a warning line that names a move frames it on click (the
+-    // fold lines lead `details`, aligned with `warning_focus`).
+-    let focus: Vec<Option<[f64; 3]>> = model::find_by_name(&state.world, target)
+-        .and_then(|e| model::toolpath_of(&state.world, &e))
+-        .map(|tp| crate::path_lines::warning_focus(&tp))
+-        .unwrap_or_default();
+-    let links: Vec<bool> = focus.iter().map(Option::is_some).collect();
++    let cached = status_banner_data(state, target);
++    let tone = tone_from_u8(cached.tone);
++    let links: Vec<bool> = cached.focus.iter().map(Option::is_some).collect();
+     let inks = text_inks(ui, &state.world);
+     let ink = match tone {
+         Tone::Ok => pal.accent,
+@@ -341,8 +372,8 @@ fn status(ui: &mut Ui, state: &mut State, target: &str, pal: &Tokens) {
+         Tone::Error => inks.error,
+         Tone::Quiet => pal.text_dim,
+     };
+-    if let Some(p) = status_banner_located(ui, "op_status", &line, ink, &details, &links)
+-        .and_then(|i| focus.get(i).copied().flatten())
++    if let Some(p) = status_banner_located(ui, "op_status", &cached.line, ink, &cached.details, &links)
++        .and_then(|i| cached.focus.get(i).copied().flatten())
+     {
+         // View state, like every camera move: no command (AGENTS.md).
+         crate::actions::frame_at(state, p);
+@@ -355,8 +386,8 @@ fn actions(ui: &mut Ui, state: &mut State, target: &str, live: Option<&Operation
+     // Apply never reads as a dead button: the hint says why it is dark,
+     // or which edited field the door will refuse (crate::feedback).
+     let apply_hint = crate::feedback::apply_hint(live.map(|o| &o.params), &state.op_ui.params, unchanged);
+-    let has_path =
+-        exists && model::find_by_name(&state.world, target).and_then(|e| model::toolpath_of(&state.world, &e)).is_some();
++    let has_path = exists
++        && model::find_by_name(&state.world, target).is_some_and(|e| model::has_toolpath(&state.world, &e));
+     let inks = text_inks(ui, &state.world);
+     if let Some(msg) = state.error_for(ErrorScope::Operation).map(str::to_owned) {
+         // #261 part 2: a refusal that names its spot is a link that
+diff --git a/crates/ui/src/egui_app/shell.rs b/crates/ui/src/egui_app/shell.rs
+index f6ce34322..b3d8632e6 100644
+--- a/crates/ui/src/egui_app/shell.rs
++++ b/crates/ui/src/egui_app/shell.rs
+@@ -618,15 +618,18 @@ fn viewport_panel(
+         // #1507: the Geometry-list row hover, strong: a dark halo, then the
+         // row-hover ink.
+         {
+-            let segs = interact::row_hover_segments(state, aspect);
+             let ink = rgb8(super::ground_ink::overlay(super::ground_ink::Overlay::RowHover));
+             let halo = egui::Color32::from_black_alpha(200);
+-            for (a, b) in &segs {
+-                ui.painter().line_segment([to_px(*a), to_px(*b)], egui::Stroke::new(interact::ROW_HOVER_HALO_PX, halo));
+-            }
+-            for (a, b) in &segs {
+-                ui.painter().line_segment([to_px(*a), to_px(*b)], egui::Stroke::new(interact::ROW_HOVER_PX, ink));
+-            }
++            crate::pick_highlight_mesh::paint_row_hover(
++                ui.painter(),
++                state,
++                aspect,
++                &to_px,
++                interact::ROW_HOVER_PX,
++                interact::ROW_HOVER_HALO_PX,
++                ink,
++                halo,
++            );
+         }
+         // #979: the pick box's rubber band - solid for a window, dashed
+         // for a crossing box.
+diff --git a/crates/ui/src/egui_app/shell_web.rs b/crates/ui/src/egui_app/shell_web.rs
+index 9babca272..e547db96b 100644
+--- a/crates/ui/src/egui_app/shell_web.rs
++++ b/crates/ui/src/egui_app/shell_web.rs
+@@ -213,8 +213,8 @@ impl eframe::App for WebShell {
+             return;
+         };
+         let (device, queue) = (&rs.device, &rs.queue);
+-        let scene = world::collect(&self.state);
+-        view_pass::sync_scene(&mut self.view, device, queue, &scene, &mut self.scene_digest);
++        let (scene, digest) = world::collect_shared(&self.state);
++        view_pass::sync_scene(&mut self.view, device, queue, &scene, digest, &mut self.scene_digest);
+ 
+         // Size the 3D target from last frame's layout, like the native shell.
+         let scale = f64::from(ui.ctx().pixels_per_point()).clamp(0.1, 8.0);
+diff --git a/crates/ui/src/egui_app/shell_window/frame.rs b/crates/ui/src/egui_app/shell_window/frame.rs
+index 0dd77210b..10206e95c 100644
+--- a/crates/ui/src/egui_app/shell_window/frame.rs
++++ b/crates/ui/src/egui_app/shell_window/frame.rs
+@@ -37,7 +37,7 @@ impl Shell {
+         // #866: a modal file dialog's open time is the user's, not ours.
+         self.frame_watch.excuse(crate::file_dialog::take_waited(), now());
+         self.frame_watch.mark("commands", now());
+-        let scene = world::collect(&self.state);
++        let (scene, digest) = world::collect_shared(&self.state);
+ 
+         let Self {
+             window,
+@@ -87,7 +87,7 @@ impl Shell {
+             return;
+         };
+ 
+-        view_pass::sync_scene(view, device, queue, &scene, scene_digest);
++        view_pass::sync_scene(view, device, queue, &scene, digest, scene_digest);
+ 
+         let scale = window.scale_factor().clamp(0.1, 8.0);
+         let raw_input = winit_state.take_egui_input(window);
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index a3c592691..bce5b9d95 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -198,6 +198,8 @@ mod import_outward;
+ mod ribbon_accesskit;
+ // #1946: native AI chat dock panel, worker, Inbox::channel MCP dispatch, and offline UI tests.
+ mod ai_chat;
++// #2201: edge/face selection highlight draw & rebuild count per frame.
++mod highlight_perf;
+ 
+ /// What the per-frame state of `Shell` is, minus the GPU half: the fields
+ /// `shell_layout` touches, so the harness exercises the window's real body.
+diff --git a/crates/ui/src/egui_app/tests/highlight_perf.rs b/crates/ui/src/egui_app/tests/highlight_perf.rs
+new file mode 100644
+index 000000000..34ceea3df
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/highlight_perf.rs
+@@ -0,0 +1,388 @@
++//! #2201 reproduction & pin: selected edge/patch highlight draw count, build
++//! count across idle/orbit/hover frames, and multi-op 45k-tri UI stability.
++//! Provenance: our own reproduction fixture and shape/build-count assertions over
++//! `shell_layout`, `pick_ink`, `pick_highlight`, and `world::collect`.
++
++use camcraft_app::commands::{ImportModel, LoadMachine};
++use camcraft_app::geometry::{Mesh, Point3, Triangle, cylinder, feature};
++use camcraft_app::operation::{FeatureSel, GeoSel, OpType, SrcRef};
++
++use super::*;
++
++/// Closed watertight extruded rounded-lobe prism (~4,300+ triangles) whose top
++/// rim splits into distinct multi-chord curved runs and straight stretches in
++/// `feature::edge_runs`.
++fn chamfered_multi_run_solid() -> Mesh {
++    let mut ring: Vec<[f64; 2]> = Vec::new();
++    let lobes = [
++        ([20.0, 0.0], -60.0_f64, 60.0_f64, 15.0_f64),
++        ([0.0, 30.0], 60.0_f64, 180.0_f64, 15.0_f64),
++        ([-20.0, 0.0], 180.0_f64, 300.0_f64, 15.0_f64),
++    ];
++    for (center, a0_deg, a1_deg, r) in lobes {
++        let steps = 30usize;
++        for k in 0..=steps {
++            let deg = a0_deg + (a1_deg - a0_deg) * (k as f64) / (steps as f64);
++            let a = deg.to_radians();
++            ring.push([center[0] + r * a.cos(), center[1] + r * a.sin()]);
++        }
++    }
++    let n = ring.len();
++    let z_levels = [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 19.0, 20.0];
++    let mut tris = Vec::new();
++    for w in z_levels.windows(2) {
++        let (z0, z1) = (w[0], w[1]);
++        let inset0 = if z0 >= 18.0 { (z0 - 18.0) * 0.5 } else { 0.0 };
++        let inset1 = if z1 >= 18.0 { (z1 - 18.0) * 0.5 } else { 0.0 };
++        let pt = |i: usize, z: f64, inset: f64| -> Point3 {
++            let [x, y] = ring[i];
++            let scale = if inset > 0.0 {
++                let d = (x * x + y * y).sqrt().max(1.0);
++                (d - inset) / d
++            } else {
++                1.0
++            };
++            Point3::new(x * scale, y * scale, z)
++        };
++        for i in 0..n {
++            let j = (i + 1) % n;
++            let a0 = pt(i, z0, inset0);
++            let b0 = pt(j, z0, inset0);
++            let b1 = pt(j, z1, inset1);
++            let a1 = pt(i, z1, inset1);
++            tris.push(Triangle::new(a0, b0, b1));
++            tris.push(Triangle::new(a0, b1, a1));
++        }
++    }
++    let bot_c = Point3::new(0.0, 10.0, 0.0);
++    let top_c = Point3::new(0.0, 10.0, 20.0);
++    let top_inset = 1.0_f64;
++    for i in 0..n {
++        let j = (i + 1) % n;
++        let ba = Point3::new(ring[i][0], ring[i][1], 0.0);
++        let bb = Point3::new(ring[j][0], ring[j][1], 0.0);
++        tris.push(Triangle::new(bot_c, bb, ba));
++
++        let scale_i = ((ring[i][0] * ring[i][0] + ring[i][1] * ring[i][1]).sqrt().max(1.0) - top_inset)
++            / (ring[i][0] * ring[i][0] + ring[i][1] * ring[i][1]).sqrt().max(1.0);
++        let scale_j = ((ring[j][0] * ring[j][0] + ring[j][1] * ring[j][1]).sqrt().max(1.0) - top_inset)
++            / (ring[j][0] * ring[j][0] + ring[j][1] * ring[j][1]).sqrt().max(1.0);
++        let ta = Point3::new(ring[i][0] * scale_i, ring[i][1] * scale_i, 20.0);
++        let tb = Point3::new(ring[j][0] * scale_j, ring[j][1] * scale_j, 20.0);
++        tris.push(Triangle::new(top_c, ta, tb));
++    }
++    Mesh::from_facets(tris)
++}
++
++fn count_pick_highlight_shapes(h: &Harness<'static, ShellUi>) -> usize {
++    let pick_rgb = crate::egui_app::ground_ink::overlay(crate::egui_app::ground_ink::Overlay::Pick);
++    let pick_color = egui::Color32::from_rgb(
++        (pick_rgb[0] * 255.0).clamp(0.0, 255.0) as u8,
++        (pick_rgb[1] * 255.0).clamp(0.0, 255.0) as u8,
++        (pick_rgb[2] * 255.0).clamp(0.0, 255.0) as u8,
++    );
++    let halo_color = egui::Color32::from_black_alpha(crate::pick_ink::HALO_ALPHA);
++    let ([vx0, vy0], [vx1, vy1]) = h.state().state.viewport_rect;
++    let vp_rect = egui::Rect::from_min_max(egui::pos2(vx0, vy0), egui::pos2(vx1, vy1));
++
++    fn walk(shape: &egui::Shape, pick_color: egui::Color32, halo_color: egui::Color32) -> usize {
++        match shape {
++            egui::Shape::LineSegment { stroke, .. } => usize::from(
++                (stroke.color == pick_color && (stroke.width - crate::pick_ink::SELECTED_PX).abs() < 0.01)
++                    || (stroke.color == halo_color
++                        && (stroke.width - (crate::pick_ink::SELECTED_PX + crate::pick_ink::HALO_EXTRA_PX)).abs()
++                            < 0.01),
++            ),
++            egui::Shape::Path(p) => usize::from(
++                (p.stroke.color == egui::epaint::ColorMode::Solid(pick_color)
++                    && (p.stroke.width - crate::pick_ink::SELECTED_PX).abs() < 0.01)
++                    || (p.stroke.color == egui::epaint::ColorMode::Solid(halo_color)
++                        && (p.stroke.width - (crate::pick_ink::SELECTED_PX + crate::pick_ink::HALO_EXTRA_PX)).abs()
++                            < 0.01),
++            ),
++            egui::Shape::Mesh(m) => {
++                usize::from(m.vertices.iter().any(|v| v.color == pick_color || v.color == halo_color))
++            }
++            egui::Shape::Vec(v) => v.iter().map(|s| walk(s, pick_color, halo_color)).sum(),
++            _ => 0,
++        }
++    }
++
++    h.output()
++        .shapes
++        .iter()
++        .filter(|cs| cs.clip_rect.intersects(vp_rect))
++        .map(|cs| walk(&cs.shape, pick_color, halo_color))
++        .sum()
++}
++
++fn setup_adaptive_with_part(mesh: Mesh) -> (ShellUi, Vec<feature::Chain>) {
++    let mut sh = ShellUi::blank();
++    let st = &mut sh.state;
++    st.history.execute(&st.world, ImportModel::from_mesh("Part", mesh));
++    st.doc_version += 1;
++    let tool = camcraft_app::tools::catalog().into_iter().find(|(n, _)| *n == "EM-0800-4FL").expect("tool").1;
++    st.pending.push_back(CommandKind::StockFit { margin: 2.0, shape: 0 });
++    st.pending.push_back(CommandKind::AddTool { name: "EM-0800-4FL".into(), tool });
++    let adaptive_params = crate::operations::quick_params(OpType::Adaptive2D.ordinal());
++    st.pending.push_back(CommandKind::CreateOperation {
++        name: "2D Adaptive1".into(),
++        tool: "EM-0800-4FL".into(),
++        src: SrcRef::Stock,
++        params: adaptive_params,
++    });
++    st.pending.push_back(CommandKind::Select(Some("2D Adaptive1".into())));
++    st.pending.push_back(CommandKind::FrameAll);
++    st.settle();
++    st.ui_target = UiTarget::Operation("2D Adaptive1".into());
++    st.geo_pick = GeoPick::Edge;
++    let part = model::find_by_name(&st.world, "Part").expect("Part");
++    let features = model::features_of(&st.world, &part).expect("features");
++    let mut runs = feature::edge_runs(&features);
++    runs.sort_by_key(|a| std::cmp::Reverse(a.edges.len()));
++    (sh, runs)
++}
++
++#[test]
++fn three_selected_edge_pieces_draw_as_a_single_batched_highlight() {
++    let (mut sh, runs) = setup_adaptive_with_part(chamfered_multi_run_solid());
++    assert!(runs.len() >= 9, "expected >=9 edge runs, got {}", runs.len());
++    let picks3: Vec<GeoSel> =
++        runs.iter().take(3).map(|r| GeoSel { entity: "Part".into(), feature: FeatureSel::Chain(r.id) }).collect();
++    sh.state.pending.push_back(CommandKind::SetOperationGeometry { name: "2D Adaptive1".into(), items: picks3 });
++    sh.state.settle();
++    sh.state.sync_ops_ui();
++
++    let mut h = Harness::builder().with_size(Vec2::new(1280.0, 720.0)).build_ui_state(frame, sh);
++    h.run();
++    let draws3 = count_pick_highlight_shapes(&h);
++    assert!((1..=2).contains(&draws3), "3 pieces must draw as 1-2 batched shapes, got {draws3}");
++
++    let picks9: Vec<GeoSel> =
++        runs.into_iter().take(9).map(|r| GeoSel { entity: "Part".into(), feature: FeatureSel::Chain(r.id) }).collect();
++    {
++        let st = &mut h.state_mut().state;
++        st.pending.push_back(CommandKind::SetOperationGeometry { name: "2D Adaptive1".into(), items: picks9 });
++        st.settle();
++        st.sync_ops_ui();
++    }
++    h.step();
++    let draws9 = count_pick_highlight_shapes(&h);
++    assert!((1..=2).contains(&draws9), "9 pieces must draw as 1-2 batched shapes, got {draws9}");
++}
++
++#[test]
++fn selected_highlight_builds_once_at_selection_and_zero_times_across_orbit_idle_and_hover() {
++    let (sh, runs) = setup_adaptive_with_part(chamfered_multi_run_solid());
++    let mut h = Harness::builder().with_size(Vec2::new(1280.0, 720.0)).build_ui_state(frame, sh);
++    h.run();
++    assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 0, "0 picks -> 0 builds");
++    let picks: Vec<GeoSel> =
++        runs.into_iter().take(3).map(|r| GeoSel { entity: "Part".into(), feature: FeatureSel::Chain(r.id) }).collect();
++    {
++        let st = &mut h.state_mut().state;
++        st.pending.push_back(CommandKind::SetOperationGeometry { name: "2D Adaptive1".into(), items: picks });
++        st.settle();
++        st.sync_ops_ui();
++    }
++    h.step();
++    assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 1, "1 build on select");
++    assert!((1..=2).contains(&count_pick_highlight_shapes(&h)));
++    let ([x0, y0], [x1, y1]) = h.state().state.viewport_rect;
++    let center = egui::pos2(0.5 * (x0 + x1), 0.5 * (y0 + y1));
++    for i in 0..5 {
++        if i % 2 == 0 {
++            h.state_mut().state.cam.orbit(12.0, -4.0);
++        } else {
++            h.input_mut().events.push(Event::PointerMoved(center + egui::vec2(i as f32 * 5.0, 0.0)));
++        }
++        h.step();
++        assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 1, "0 extra builds on frame {i}");
++        assert!((1..=2).contains(&count_pick_highlight_shapes(&h)));
++    }
++}
++
++#[test]
++fn selected_welded_patch_draws_as_batched_highlight_with_single_build() {
++    let mut sh = ShellUi::blank();
++    let patch_id = {
++        let st = &mut sh.state;
++        st.history.execute(&st.world, ImportModel::from_mesh("Cyl", cylinder(60.0, 20.0, 48)));
++        st.doc_version += 1;
++        let tool = camcraft_app::tools::catalog()
++            .into_iter()
++            .find(|(n, _)| *n == "EM-0800-4FL")
++            .expect("EM-0800-4FL")
++            .1;
++        st.pending.push_back(CommandKind::StockFit { margin: 2.0, shape: 0 });
++        st.pending.push_back(CommandKind::AddTool { name: "EM-0800-4FL".into(), tool });
++        let params = crate::operations::quick_params(OpType::Contour.ordinal());
++        st.pending.push_back(CommandKind::CreateOperation {
++            name: "Contour1".into(),
++            tool: "EM-0800-4FL".into(),
++            src: SrcRef::Stock,
++            params,
++        });
++        st.pending.push_back(CommandKind::Select(Some("Contour1".into())));
++        st.pending.push_back(CommandKind::FrameAll);
++        st.settle();
++        let cyl = model::find_by_name(&st.world, "Cyl").expect("Cyl");
++        let features = model::features_of(&st.world, &cyl).expect("features");
++        feature::patches_arc(&features).into_iter().next().expect("welded patch").id
++    };
++    sh.state.ui_target = UiTarget::Operation("Contour1".into());
++    sh.state.pending.push_back(CommandKind::SetOperationGeometry {
++        name: "Contour1".into(),
++        items: vec![GeoSel { entity: "Cyl".into(), feature: FeatureSel::Patch(patch_id) }],
++    });
++    sh.state.settle();
++    sh.state.sync_ops_ui();
++
++    let mut h = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, sh);
++    h.run();
++    assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 1);
++    let draws = count_pick_highlight_shapes(&h);
++    assert!((1..=2).contains(&draws), "welded patch must draw as 1-2 batched shapes, got {draws}");
++
++    for _ in 0..3 {
++        h.state_mut().state.cam.orbit(8.0, 3.0);
++        h.step();
++        assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 1);
++    }
++}
++
++fn dense_stacked_cylinder() -> Mesh {
++    let segs = 120usize;
++    let bands = 188usize;
++    let r = 30.0_f64;
++    let h = 12.0_f64;
++    let ring: Vec<[f64; 2]> = (0..segs)
++        .map(|i| {
++            let a = std::f64::consts::TAU * (i as f64) / (segs as f64);
++            [r * a.cos(), r * a.sin()]
++        })
++        .collect();
++    let mut tris = Vec::with_capacity(segs * 2 * (bands + 1));
++    for b in 0..bands {
++        let z0 = h * (b as f64) / (bands as f64);
++        let z1 = h * ((b + 1) as f64) / (bands as f64);
++        for i in 0..segs {
++            let j = (i + 1) % segs;
++            let a0 = Point3::new(ring[i][0], ring[i][1], z0);
++            let b0 = Point3::new(ring[j][0], ring[j][1], z0);
++            let b1 = Point3::new(ring[j][0], ring[j][1], z1);
++            let a1 = Point3::new(ring[i][0], ring[i][1], z1);
++            tris.push(Triangle::new(a0, b0, b1));
++            tris.push(Triangle::new(a0, b1, a1));
++        }
++    }
++    let bot_c = Point3::new(0.0, 0.0, 0.0);
++    let top_c = Point3::new(0.0, 0.0, h);
++    for i in 0..segs {
++        let j = (i + 1) % segs;
++        let ba = Point3::new(ring[i][0], ring[i][1], 0.0);
++        let bb = Point3::new(ring[j][0], ring[j][1], 0.0);
++        tris.push(Triangle::new(bot_c, bb, ba));
++        let ta = Point3::new(ring[i][0], ring[i][1], h);
++        let tb = Point3::new(ring[j][0], ring[j][1], h);
++        tris.push(Triangle::new(top_c, ta, tb));
++    }
++    Mesh::from_facets(tris)
++}
++
++#[test]
++fn dense_45k_model_with_multiple_ops_and_many_limit_findings_stays_stable_across_frames() {
++    let mesh = dense_stacked_cylinder();
++    assert!(mesh.facets.len() >= 45_000, "expected >=45k tris, got {}", mesh.facets.len());
++    let mut sh = ShellUi::blank();
++    {
++        let st = &mut sh.state;
++        st.history.execute(&st.world, ImportModel::from_mesh("Dense", mesh));
++        st.doc_version += 1;
++        let tool = camcraft_app::tools::catalog()
++            .into_iter()
++            .find(|(n, _)| *n == "EM-0600-4FL")
++            .expect("EM-0600-4FL")
++            .1;
++        st.pending.push_back(CommandKind::StockFit { margin: 2.0, shape: 0 });
++        st.pending.push_back(CommandKind::AddTool { name: "EM-0600-4FL".into(), tool });
++        let tight = camcraft_app::machine::Machine {
++            model: "TightTravel".into(),
++            axes: vec![
++                camcraft_app::machine::AxisLimits { name: "X".into(), travel: Some((0.0, 5.0)), ..Default::default() },
++                camcraft_app::machine::AxisLimits { name: "Y".into(), travel: Some((0.0, 5.0)), ..Default::default() },
++                camcraft_app::machine::AxisLimits { name: "Z".into(), travel: Some((-100.0, 100.0)), ..Default::default() },
++            ],
++            ..Default::default()
++        };
++        let cmd = LoadMachine::new(&st.world, "tight.mch".into(), Some(tight)).expect("load machine");
++        st.history.execute(&st.world, cmd);
++        st.doc_version += 1;
++
++        let face_params = crate::operations::quick_params(OpType::Face.ordinal());
++        let mut contour_params = crate::operations::quick_params(OpType::Contour.ordinal());
++        if let camcraft_app::operation::OpParams::Contour { stepdown, .. } = &mut contour_params {
++            *stepdown = 1.0;
++        }
++        let dense = model::find_by_name(&st.world, "Dense").expect("Dense");
++        let features = model::features_of(&st.world, &dense).expect("features");
++        let rim = feature::edge_runs(&features)
++            .into_iter()
++            .filter(|r| r.closed)
++            .max_by_key(|r| r.edges.len())
++            .expect("closed rim run");
++        st.pending.push_back(CommandKind::CreateOperation {
++            name: "Face1".into(),
++            tool: "EM-0600-4FL".into(),
++            src: SrcRef::Stock,
++            params: face_params,
++        });
++        st.pending.push_back(CommandKind::CreateOperation {
++            name: "2D Contour1".into(),
++            tool: "EM-0600-4FL".into(),
++            src: SrcRef::Selection(vec![GeoSel { entity: "Dense".into(), feature: FeatureSel::Chain(rim.id) }]),
++            params: contour_params,
++        });
++        st.pending.push_back(CommandKind::GenerateOperation("Face1".into()));
++        st.pending.push_back(CommandKind::GenerateOperation("2D Contour1".into()));
++        st.pending.push_back(CommandKind::Select(Some("2D Contour1".into())));
++        st.pending.push_back(CommandKind::FrameAll);
++        st.settle();
++        st.ui_target = UiTarget::Operation("2D Contour1".into());
++        st.sync_ops_ui();
++
++        let face_ent = model::find_by_name(&st.world, "Face1").expect("Face1");
++        let op_ent = model::find_by_name(&st.world, "2D Contour1").expect("Contour1");
++        assert!(model::toolpath_nonempty(&st.world, &face_ent), "Face1 path: {}", st.status);
++        assert!(model::toolpath_nonempty(&st.world, &op_ent), "2D Contour1 path: {}", st.status);
++        let (_, mounted) = camcraft_app::machine::of(&st.world);
++        let check = camcraft_app::machine::check_document(&st.world, mounted.as_ref().expect("machine"))
++            .expect("machine check");
++        let total = check.problems.len() + check.more;
++        assert!(total > 600, "expected >600 machine limit findings, got {total}");
++    }
++
++    let mut h = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, sh);
++    h.run();
++
++    let builds_before = crate::pick_highlight::selection_builds(&h.state().state);
++    assert_eq!(builds_before, 1);
++    for _ in 0..5 {
++        h.step();
++    }
++    assert_eq!(crate::pick_highlight::selection_builds(&h.state().state), 1);
++    assert!((1..=2).contains(&count_pick_highlight_shapes(&h)));
++    assert!(
++        crate::egui_app::view_pass::state_redraw_delay(
++            &h.state().state,
++            std::time::Duration::MAX,
++            false,
++        )
++        .is_none(),
++        "idle 45k multi-op document must not request continuous repaints"
++    );
++}
+diff --git a/crates/ui/src/egui_app/view_pass.rs b/crates/ui/src/egui_app/view_pass.rs
+index 8842812bd..b48ccd6a1 100644
+--- a/crates/ui/src/egui_app/view_pass.rs
++++ b/crates/ui/src/egui_app/view_pass.rs
+@@ -24,13 +24,13 @@ pub(crate) fn sync_scene(
+     device: &wgpu::Device,
+     queue: &wgpu::Queue,
+     scene: &world::Scene,
++    digest: u64,
+     scene_digest: &mut u64,
+ ) {
+-    let d = scene.digest();
+-    if d != *scene_digest {
++    if digest != *scene_digest {
+         view.set_document(device, queue, &scene.parts);
+         view.set_overlay(device, queue, &scene.overlay);
+-        *scene_digest = d;
++        *scene_digest = digest;
+     }
+ }
+ 
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 823f5f5ca..9ca0586b5 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -35,6 +35,7 @@ use crate::viewport::GpuPart;
+ 
+ /// The shell's whole scene for one frame: what `View3D::set_document` and
+ /// `set_overlay` take.
++#[derive(Clone)]
+ pub struct Scene {
+     pub parts: Vec<GpuPart>,
+     pub overlay: Vec<[f32; 6]>,
+@@ -176,23 +177,97 @@ fn contour_params() -> OpParams {
+ /// upload.
+ #[must_use]
+ pub fn collect(state: &State) -> Scene {
++    collect_shared(state).0.as_ref().clone()
++}
++
++pub(crate) fn collect_shared(state: &State) -> (std::sync::Arc<Scene>, u64) {
++    let transient = state.sim.is_some()
++        || state.program_sim.is_some()
++        || crate::machined::mesh(state).is_some()
++        || state.boundary_view.shown
++        || state.boundary_pick.is_some()
++        || state.locate_pick.is_some()
++        || state.plane_pick.is_some()
++        || state.points_pick.is_some()
++        || state.axis_pick.is_some()
++        || state.feedback_live();
++    if transient {
++        let s = collect_uncached(state);
++        let d = s.digest();
++        return (std::sync::Arc::new(s), d);
++    }
++    let key = scene_cache_key(state);
++    state.frame_cache.scene_cached(&key, || {
++        let s = collect_uncached(state);
++        let d = s.digest();
++        (s, d)
++    })
++}
++
++fn collect_uncached(state: &State) -> Scene {
+     Scene { parts: collect_parts(state), overlay: collect_overlay(state) }
+ }
+ 
++fn scene_cache_key(state: &State) -> crate::frame_cache::SceneCacheKey {
++    let ui_target_op = match state.pane_target() {
++        UiTarget::Operation(n) => Some(n),
++        _ => None,
++    };
++    crate::frame_cache::SceneCacheKey {
++        stamp: crate::frame_cache::WorldStamp::of(state),
++        selected: crate::frame_cache::selected_entity_names(state),
++        ui_target_op,
++        hidden_models: state.hidden_models.clone(),
++        hidden_stocks: state.hidden_stocks.clone(),
++        hidden_offsets: state.hidden_offsets.clone(),
++        hidden_paths: state.hidden_paths.clone(),
++        shown_setups: state.shown_setups.clone(),
++        active_setup: camcraft_app::setup::active(&state.world),
++        incoming_key: (
++            crate::incoming_view::mesh(state).is_some(),
++            crate::incoming_view::wanted(state),
++            state.incoming_view.measured,
++        ),
++        show_world_axes: state.show_world_axes,
++        show_all_paths: state.show_all_paths,
++        show_work_envelope: state.show_work_envelope,
++        show_gizmo_names: state.show_gizmo_names,
++        cam_dist_bits: state.cam.dist.to_bits(),
++        cam_target_bits: state.cam.target.map(f64::to_bits),
++        wcs_pick_anchor: state.wcs_ui.pick_anchor,
++        wcs_anchor_xy: state.wcs_ui.anchor_xy,
++        wcs_anchor_z: state.wcs_ui.anchor_z,
++        wcs_anchor_source: state.wcs_ui.anchor_source,
++        op_name: state.op_ui.name.clone(),
++        op_params: state.op_ui.params.clone(),
++        op_area: state.op_ui.area.clone(),
++        op_src_kind: state.op_ui.src_kind,
++        op_src_name: state.op_ui.src_name.clone(),
++        op_geo: state.op_ui.geo.clone(),
++        viewport_rgba: super::theme::current().viewport.to_array(),
++        cvd_idx: crate::frame_cache::cvd_code(state),
++    }
++}
++
+ // ---------------------------------------------------------------- parts
+ 
+ fn world_verts(state: &State, entity: &flecs_ecs::prelude::Entity) -> Vec<[f32; 3]> {
+     let tris = model::facets_of(&state.world, entity).unwrap_or_default();
+-    // #326: the part where the active setup holds it.
+-    let loc = camcraft_app::setup_align::view_pose(&state.world, entity).unwrap_or_default();
+-    let mut verts = Vec::with_capacity(tris.len() * 3);
+-    for t in tris.iter() {
+-        for p in [t.a, t.b, t.c] {
+-            let p = transform_point(p, loc.pos, loc.rot);
+-            verts.push([ftoz(p.x), ftoz(p.y), ftoz(p.z)]);
++    let ptr = std::sync::Arc::as_ptr(&tris).cast::<()>() as usize;
++    let pose = crate::frame_cache::pose_bits(state, entity);
++    let cached = state.frame_cache.world_verts_cached(ptr, tris.len(), pose, || {
++        // #326: the part where the active setup holds it.
++        let loc = camcraft_app::setup_align::view_pose(&state.world, entity).unwrap_or_default();
++        let mut verts = Vec::with_capacity(tris.len() * 3);
++        for t in tris.iter() {
++            for p in [t.a, t.b, t.c] {
++                let p = transform_point(p, loc.pos, loc.rot);
++                verts.push([ftoz(p.x), ftoz(p.y), ftoz(p.z)]);
++            }
+         }
+-    }
+-    verts
++        verts
++    });
++    (*cached).clone()
+ }
+ 
+ /// Models (minus browser-eye-hidden), then the stock solid, then the
+diff --git a/crates/ui/src/frame_cache.rs b/crates/ui/src/frame_cache.rs
+new file mode 100644
+index 000000000..33dfc8dd2
+--- /dev/null
++++ b/crates/ui/src/frame_cache.rs
+@@ -0,0 +1,373 @@
++//! Per-`State` caches for world-space scene data: transformed entity vertices,
++//! cached cutting regions and outlines, and toolpath overlay lines. Every entry
++//! keys against `WorldStamp` and exact UI visibility/draft inputs.
++//!
++//! Provenance: our own per-frame scene cache; no external code or vendor material.
++
++use std::sync::{Arc, Mutex};
++
++use camcraft_app::geo2d::Region;
++use camcraft_app::model;
++use camcraft_app::operation::{AreaControls, GeoSel, OpParams};
++use flecs_ecs::prelude::Entity;
++
++use crate::egui_app::world::Scene;
++use crate::state::State;
++
++const WORLD_VERTS_CAP: usize = 32;
++
++/// Combined revision token for `state.world`, `state.selection_version`, and
++/// `state.history` (catches both command runs and direct history execution in tests).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct WorldStamp {
++    pub doc_version: u64,
++    pub selection_version: u64,
++    pub history: (u64, usize, u64, usize, u64),
++}
++
++impl WorldStamp {
++    #[must_use]
++    pub(crate) fn of(state: &State) -> Self {
++        Self {
++            doc_version: state.doc_version,
++            selection_version: state.selection_version,
++            history: state.history.revision_token(),
++        }
++    }
++}
++
++/// Entity-level guard verifying visibility, facet allocation pointer, revision
++/// counter, and aligned setup pose without touching triangle buffers.
++#[derive(Clone, PartialEq, Eq)]
++pub(crate) struct EntityGuard {
++    name: String,
++    hidden: bool,
++    rev: u64,
++    facets_ptr: usize,
++    pose: [u64; 7],
++}
++
++impl EntityGuard {
++    #[must_use]
++    pub(crate) fn capture(state: &State, name: &str) -> Self {
++        let hidden = state.hidden_in_view(name);
++        if hidden {
++            return Self {
++                name: name.to_owned(),
++                hidden: true,
++                rev: 0,
++                facets_ptr: 0,
++                pose: [0; 7],
++            };
++        }
++        let Some(entity) = model::find_by_name(&state.world, name) else {
++            return Self {
++                name: name.to_owned(),
++                hidden: false,
++                rev: 0,
++                facets_ptr: 0,
++                pose: [0; 7],
++            };
++        };
++        let rev = model::rev_of(&state.world, &entity);
++        let facets_ptr = model::facets_of(&state.world, &entity)
++            .map_or(0, |a| Arc::as_ptr(&a).cast::<()>() as usize);
++        Self {
++            name: name.to_owned(),
++            hidden: false,
++            rev,
++            facets_ptr,
++            pose: pose_bits(state, &entity),
++        }
++    }
++
++    #[must_use]
++    pub(crate) fn matches(&self, state: &State) -> bool {
++        let hidden = state.hidden_in_view(&self.name);
++        if hidden != self.hidden {
++            return false;
++        }
++        if hidden {
++            return true;
++        }
++        let Some(entity) = model::find_by_name(&state.world, &self.name) else {
++            return self.rev == 0 && self.facets_ptr == 0;
++        };
++        let rev = model::rev_of(&state.world, &entity);
++        let facets_ptr = model::facets_of(&state.world, &entity)
++            .map_or(0, |a| Arc::as_ptr(&a).cast::<()>() as usize);
++        rev == self.rev && facets_ptr == self.facets_ptr && pose_bits(state, &entity) == self.pose
++    }
++}
++
++#[must_use]
++pub(crate) fn pose_bits(state: &State, entity: &Entity) -> [u64; 7] {
++    let loc = camcraft_app::setup_align::view_pose(&state.world, entity).unwrap_or_default();
++    [
++        loc.pos.x.to_bits(),
++        loc.pos.y.to_bits(),
++        loc.pos.z.to_bits(),
++        loc.rot[0].to_bits(),
++        loc.rot[1].to_bits(),
++        loc.rot[2].to_bits(),
++        loc.rot[3].to_bits(),
++    ]
++}
++
++#[must_use]
++pub(crate) fn guards_for_picks(state: &State, picks: &[GeoSel]) -> Vec<EntityGuard> {
++    let mut names: Vec<&str> = Vec::new();
++    for g in picks {
++        if !names.contains(&g.entity.as_str()) {
++            names.push(&g.entity);
++        }
++    }
++    names.into_iter().map(|n| EntityGuard::capture(state, n)).collect()
++}
++
++#[must_use]
++pub(crate) fn selected_entity_names(state: &State) -> Vec<String> {
++    model::named_entities(&state.world)
++        .into_iter()
++        .filter(|(_, e)| model::is_selected(&state.world, e))
++        .map(|(n, _)| n)
++        .collect()
++}
++
++#[must_use]
++pub(crate) fn viewport_is_light() -> bool {
++    crate::egui_app::ground_ink::light_ground(crate::egui_app::theme::current().viewport)
++}
++
++#[must_use]
++pub(crate) fn cvd_code(state: &State) -> u8 {
++    use camcraft_app::schema::ColorVision;
++    match camcraft_app::commands::color_vision_of(&state.world) {
++        ColorVision::Off => 0,
++        ColorVision::Protan => 1,
++        ColorVision::Deutan => 2,
++        ColorVision::Tritan => 3,
++    }
++}
++
++#[derive(Clone, PartialEq, Eq)]
++struct RegionsKey {
++    stamp: WorldStamp,
++    selected: Vec<String>,
++    hidden_paths: Vec<String>,
++    light: bool,
++}
++
++#[derive(Clone, PartialEq, Eq)]
++struct ToolpathLinesKey {
++    stamp: WorldStamp,
++    selected: Vec<String>,
++    hidden_paths: Vec<String>,
++    shown_setups: Vec<String>,
++    show_all_paths: bool,
++    arm_bits: u64,
++    light: bool,
++    cvd_idx: u8,
++}
++
++#[derive(Clone, PartialEq)]
++pub(crate) struct SceneCacheKey {
++    pub stamp: WorldStamp,
++    pub selected: Vec<String>,
++    pub ui_target_op: Option<String>,
++    pub hidden_models: Vec<String>,
++    pub hidden_stocks: Vec<String>,
++    pub hidden_offsets: Vec<String>,
++    pub hidden_paths: Vec<String>,
++    pub shown_setups: Vec<String>,
++    pub active_setup: Option<String>,
++    pub incoming_key: (bool, Option<String>, u64),
++    pub show_world_axes: bool,
++    pub show_all_paths: bool,
++    pub show_work_envelope: bool,
++    pub show_gizmo_names: bool,
++    pub cam_dist_bits: u64,
++    pub cam_target_bits: [u64; 3],
++    pub wcs_pick_anchor: bool,
++    pub wcs_anchor_xy: usize,
++    pub wcs_anchor_z: usize,
++    pub wcs_anchor_source: usize,
++    pub op_name: String,
++    pub op_params: OpParams,
++    pub op_area: AreaControls,
++    pub op_src_kind: usize,
++    pub op_src_name: String,
++    pub op_geo: Vec<GeoSel>,
++    pub viewport_rgba: [u8; 4],
++    pub cvd_idx: u8,
++}
++
++struct WorldVertsEntry {
++    facets_ptr: usize,
++    facets_len: usize,
++    pose: [u64; 7],
++    verts: Arc<Vec<[f32; 3]>>,
++}
++
++pub(crate) type RegionsArc = Arc<Vec<(f64, Option<Region>)>>;
++pub(crate) type LinesArc = Arc<Vec<[f32; 6]>>;
++
++struct RegionsCached {
++    key: RegionsKey,
++    regions: RegionsArc,
++    lines: LinesArc,
++}
++
++struct SceneCached {
++    key: SceneCacheKey,
++    scene: Arc<Scene>,
++    digest: u64,
++}
++
++#[derive(Default)]
++struct FrameCacheInner {
++    world_verts: Vec<WorldVertsEntry>,
++    regions: Option<RegionsCached>,
++    toolpath_lines: Option<(ToolpathLinesKey, Arc<Vec<[f32; 6]>>)>,
++    scene: Option<SceneCached>,
++}
++
++/// Interior-mutable scene cache held on `State`.
++#[derive(Default)]
++pub(crate) struct FrameCache {
++    inner: Mutex<FrameCacheInner>,
++}
++
++fn lock_inner(cache: &FrameCache) -> std::sync::MutexGuard<'_, FrameCacheInner> {
++    cache
++        .inner
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++impl FrameCache {
++    pub(crate) fn world_verts_cached(
++        &self,
++        facets_ptr: usize,
++        facets_len: usize,
++        pose: [u64; 7],
++        build: impl FnOnce() -> Vec<[f32; 3]>,
++    ) -> Arc<Vec<[f32; 3]>> {
++        {
++            let mut inner = lock_inner(self);
++            if let Some(i) = inner.world_verts.iter().position(|e| {
++                e.facets_ptr == facets_ptr && e.facets_len == facets_len && e.pose == pose
++            }) {
++                inner.world_verts[i..].rotate_left(1);
++                if let Some(entry) = inner.world_verts.last() {
++                    return Arc::clone(&entry.verts);
++                }
++            }
++        }
++        let verts = Arc::new(build());
++        let mut inner = lock_inner(self);
++        if let Some(i) = inner.world_verts.iter().position(|e| {
++            e.facets_ptr == facets_ptr && e.facets_len == facets_len && e.pose == pose
++        }) {
++            return Arc::clone(&inner.world_verts[i].verts);
++        }
++        if inner.world_verts.len() >= WORLD_VERTS_CAP {
++            inner.world_verts.remove(0);
++        }
++        inner.world_verts.push(WorldVertsEntry {
++            facets_ptr,
++            facets_len,
++            pose,
++            verts: Arc::clone(&verts),
++        });
++        verts
++    }
++
++    pub(crate) fn regions_and_lines(
++        &self,
++        state: &State,
++        selected: Vec<String>,
++        light: bool,
++        build: impl FnOnce() -> (Vec<(f64, Option<Region>)>, Vec<[f32; 6]>),
++    ) -> (RegionsArc, LinesArc) {
++        let key = RegionsKey {
++            stamp: WorldStamp::of(state),
++            selected,
++            hidden_paths: state.hidden_paths.clone(),
++            light,
++        };
++        {
++            let inner = lock_inner(self);
++            if let Some(c) = &inner.regions
++                && c.key == key
++            {
++                return (Arc::clone(&c.regions), Arc::clone(&c.lines));
++            }
++        }
++        let (regs, lines) = build();
++        let regions = Arc::new(regs);
++        let lines = Arc::new(lines);
++        let mut inner = lock_inner(self);
++        inner.regions = Some(RegionsCached {
++            key,
++            regions: Arc::clone(&regions),
++            lines: Arc::clone(&lines),
++        });
++        (regions, lines)
++    }
++
++    pub(crate) fn toolpath_lines_cached(
++        &self,
++        state: &State,
++        selected: Vec<String>,
++        arm_bits: u64,
++        build: impl FnOnce() -> Vec<[f32; 6]>,
++    ) -> Arc<Vec<[f32; 6]>> {
++        let key = ToolpathLinesKey {
++            stamp: WorldStamp::of(state),
++            selected,
++            hidden_paths: state.hidden_paths.clone(),
++            shown_setups: state.shown_setups.clone(),
++            show_all_paths: state.show_all_paths,
++            arm_bits,
++            light: viewport_is_light(),
++            cvd_idx: cvd_code(state),
++        };
++        {
++            let inner = lock_inner(self);
++            if let Some((k, lines)) = &inner.toolpath_lines
++                && *k == key
++            {
++                return Arc::clone(lines);
++            }
++        }
++        let lines = Arc::new(build());
++        let mut inner = lock_inner(self);
++        inner.toolpath_lines = Some((key, Arc::clone(&lines)));
++        lines
++    }
++
++    pub(crate) fn scene_cached(
++        &self,
++        key: &SceneCacheKey,
++        build: impl FnOnce() -> (Scene, u64),
++    ) -> (Arc<Scene>, u64) {
++        {
++            let inner = lock_inner(self);
++            if let Some(c) = &inner.scene
++                && c.key == *key
++            {
++                return (Arc::clone(&c.scene), c.digest);
++            }
++        }
++        let (scene, digest) = build();
++        let scene = Arc::new(scene);
++        let mut inner = lock_inner(self);
++        inner.scene = Some(SceneCached {
++            key: key.clone(),
++            scene: Arc::clone(&scene),
++            digest,
++        });
++        (scene, digest)
++    }
++}
+diff --git a/crates/ui/src/interact.rs b/crates/ui/src/interact.rs
+index 9aa95c0bb..b2fb6a547 100644
+--- a/crates/ui/src/interact.rs
++++ b/crates/ui/src/interact.rs
+@@ -516,14 +516,13 @@ pub(crate) fn gizmos(state: &State) -> Vec<Gizmo> {
+ /// the whole feature, so a ring half off-screen still draws honestly.
+ /// Gone entities, hidden models, deleted features and stale ids draw
+ /// nothing - a highlight must never promise a pick the click cannot make.
++#[cfg(test)]
+ pub(crate) fn hover_features(state: &State, aspect: f64) -> Vec<([f32; 2], [f32; 2])> {
+-    let mut out = Vec::new();
+-    if let Some(hit) = &state.hover
+-        && let Some(sel) = hit.feature
+-    {
+-        feature_segments(state, &hit.entity, sel, aspect, &mut out);
++    if !aspect.is_finite() || aspect <= 0.0 || state.hover.as_ref().and_then(|h| h.feature).is_none() {
++        return Vec::new();
+     }
+-    out
++    let resolved = crate::pick_highlight::resolved_hover(state);
++    crate::pick_highlight::project_segments(&resolved, true, &state.cam.mvp(aspect), aspect)
+ }
+ 
+ /// Stroke width of the Geometry-list row hover (#1507), over a
+@@ -537,12 +536,13 @@ pub(crate) const ROW_HOVER_HALO_PX: f32 = 7.0;
+ /// button) is hovered over (`state.geo_hover_drawn`, #1507), drawn strongly by the
+ /// shell. Same resolution rules as [`hover_features`]: stale, hidden and
+ /// gone draw nothing.
++#[cfg(test)]
+ pub(crate) fn row_hover_segments(state: &State, aspect: f64) -> Vec<([f32; 2], [f32; 2])> {
+-    let mut out = Vec::new();
+-    if let Some(g) = &state.geo_hover_drawn {
+-        feature_segments(state, &g.entity, g.feature, aspect, &mut out);
++    if !aspect.is_finite() || aspect <= 0.0 || state.geo_hover_drawn.is_none() {
++        return Vec::new();
+     }
+-    out
++    let resolved = crate::pick_highlight::resolved_row_hover(state);
++    crate::pick_highlight::project_segments(&resolved, true, &state.cam.mvp(aspect), aspect)
+ }
+ 
+ /// One (entity, feature) resolved to viewport-uv segments: gone entities,
+@@ -580,14 +580,14 @@ pub(crate) fn feature_segments(
+             }
+         }
+         FeatureSel::Chain(cid) => {
+-            let Some(chain) = feature::resolve_chain(&features, cid) else {
++            let Some(chain) = feature::resolve_chain_arc(&features, cid) else {
+                 return;
+             };
+             let pts = feature::chain_points(&features, &chain);
+             push_poly(&mvp, &loc, &pts, chain.closed, out);
+         }
+         FeatureSel::Patch(pid) => {
+-            let Some(rings) = feature::patch_rings(&features, pid) else {
++            let Some(rings) = feature::patch_rings_arc(&features, pid) else {
+                 return; // stale id: the model re-meshed under the hover
+             };
+             for r in &rings {
+@@ -994,40 +994,42 @@ pub(crate) fn ftoz(v: f64) -> f32 {
+ /// can drift from what the viewport actually paints.
+ #[must_use]
+ pub fn toolpath_lines(state: &State) -> Vec<[f32; 6]> {
+-    let mut out = Vec::new();
+     let arm = chevron_arm(state);
+-    // M13.4: the move kinds wear the viewer's colour-vision palette
+-    // (Off = the three consts above, unchanged).
+-    let pal = crate::egui_app::colorvision::palette_of(&state.world);
+-    for (name, entity) in camcraft_app::setup::operation_order(&state.world) {
+-        // Browser-eye hidden: the cache still exists and still posts, it
+-        // just does not draw (display state, never a geometry change).
+-        if state.hidden_paths.contains(&name) || state.op_hidden_by_setup(&name) {
+-            continue;
+-        }
+-        let Some(cache) = model::toolpath_of(&state.world, &entity) else {
+-            continue;
+-        };
+-        let selected = model::is_selected(&state.world, &entity);
+-        if !selected && !state.show_all_paths {
+-            continue;
+-        }
+-        let dim = if selected { 1.0 } else { OTHERS_DIM };
+-        // #261: warned moves wear the gouge colour (crate::path_lines).
+-        if !crate::path_lines::cache_lines(&mut out, &cache, pal, dim, arm) {
++    let selected = crate::frame_cache::selected_entity_names(state);
++    let ops = state
++        .frame_cache
++        .toolpath_lines_cached(state, selected, arm.to_bits(), || {
++            let mut out = Vec::new();
++            let pal = crate::egui_app::colorvision::palette_of(&state.world);
++            for (name, entity) in camcraft_app::setup::operation_order(&state.world) {
++                if state.hidden_paths.contains(&name) || state.op_hidden_by_setup(&name) {
++                    continue;
++                }
++                let Some(cache) = model::toolpath_of(&state.world, &entity) else {
++                    continue;
++                };
++                let selected = model::is_selected(&state.world, &entity);
++                if !selected && !state.show_all_paths {
++                    continue;
++                }
++                let dim = if selected { 1.0 } else { OTHERS_DIM };
++                if !crate::path_lines::cache_lines(&mut out, &cache, pal, dim, arm) {
++                    return out;
++                }
++            }
++            out
++        });
++    let mut out = ops.as_ref().clone();
++    if state.refusal_ghost().is_some() || state.refusal_focus().is_some() {
++        let pal = crate::egui_app::colorvision::palette_of(&state.world);
++        if let Some(g) = state.refusal_ghost()
++            && !crate::refusal_ghost::ghost_lines(&mut out, g, pal, arm)
++        {
+             return out;
+         }
+-    }
+-    // #261 part 3: and draws the moves it had built as a dashed ghost
+-    // (crate::refusal_ghost) - off the refusal, never off the operation.
+-    if let Some(g) = state.refusal_ghost()
+-        && !crate::refusal_ghost::ghost_lines(&mut out, g, pal, arm)
+-    {
+-        return out;
+-    }
+-    // #261 part 2: a standing generate refusal marks the spot it names.
+-    if let Some(at) = state.refusal_focus() {
+-        crate::path_lines::refusal_mark(&mut out, at, pal, arm);
++        if let Some(at) = state.refusal_focus() {
++            crate::path_lines::refusal_mark(&mut out, at, pal, arm);
++        }
+     }
+     out
+ }
+@@ -1124,46 +1126,63 @@ pub(crate) fn capped(mut lines: Vec<[f32; 6]>) -> Vec<[f32; 6]> {
+ /// one source each - so the outline cannot disagree with the path, and an
+ /// operation whose source vanished shows nothing rather than a stale
+ /// outline.
+-pub(crate) fn region_lines(state: &State) -> Vec<[f32; 6]> {
+-    let mut out = Vec::new();
+-    for (name, entity) in model::named_entities(&state.world) {
+-        if state.hidden_paths.contains(&name)
+-            || !model::is_operation(&state.world, &entity)
+-            || !model::is_selected(&state.world, &entity)
+-        {
+-            continue;
+-        }
+-        let Some(op) = model::operation_of(&state.world, &entity) else {
+-            continue;
+-        };
+-        let Some(z) = operation::region_z(&state.world, op.setup.as_deref(), Some(&op.src), &op.params) else {
+-            continue; // the region plane's source is gone - draw nothing
+-                      // rather than an outline at a guessed level
+-        };
+-        if let Some(region) = operation::region_of(&state.world, &op) {
+-            for l in region.loops() {
+-                let pts = l.points();
+-                if pts.len() < 3 {
+-                    continue; // a closed ring needs three corners; never mod 0
++fn regions_and_lines_cached(
++    state: &State,
++) -> (
++    crate::frame_cache::RegionsArc,
++    crate::frame_cache::LinesArc,
++) {
++    let selected = crate::frame_cache::selected_entity_names(state);
++    let light = crate::frame_cache::viewport_is_light();
++    state.frame_cache.regions_and_lines(state, selected, light, || {
++        let mut regs = Vec::new();
++        let mut lines = Vec::new();
++        let region_rgb = overlay(Overlay::Region);
++        for (name, entity) in model::named_entities(&state.world) {
++            if state.hidden_paths.contains(&name)
++                || !model::is_operation(&state.world, &entity)
++                || !model::is_selected(&state.world, &entity)
++            {
++                continue;
++            }
++            let Some(op) = model::operation_of(&state.world, &entity) else {
++                continue;
++            };
++            let Some(z) = operation::region_z(&state.world, op.setup.as_deref(), Some(&op.src), &op.params) else {
++                continue;
++            };
++            let region = operation::region_of(&state.world, &op);
++            let chains = operation::chains_of(&state.world, &op);
++            if let Some(r) = &region {
++                for l in r.loops() {
++                    let pts = l.points();
++                    if pts.len() < 3 {
++                        continue;
++                    }
++                    for i in 0..pts.len() {
++                        let a = Point3::new(pts[i].x, pts[i].y, z);
++                        let q = pts[(i + 1) % pts.len()];
++                        push_line(&mut lines, a, Point3::new(q.x, q.y, z), region_rgb);
++                    }
+                 }
+-                for i in 0..pts.len() {
+-                    let a = Point3::new(pts[i].x, pts[i].y, z);
+-                    let q = pts[(i + 1) % pts.len()];
+-                    push_line(&mut out, a, Point3::new(q.x, q.y, z), overlay(Overlay::Region));
++            }
++            for run in &chains {
++                for w in run.windows(2) {
++                    let a = Point3::new(w[0].x, w[0].y, z);
++                    let b = Point3::new(w[1].x, w[1].y, z);
++                    push_line(&mut lines, a, b, region_rgb);
+                 }
+             }
+-        }
+-        // Centerline runs: open polylines, no closing chord - the run's
+-        // ends are where the path stops, and the outline says so.
+-        for run in operation::chains_of(&state.world, &op) {
+-            for w in run.windows(2) {
+-                let a = Point3::new(w[0].x, w[0].y, z);
+-                let b = Point3::new(w[1].x, w[1].y, z);
+-                push_line(&mut out, a, b, overlay(Overlay::Region));
++            if region.is_some() || !chains.is_empty() {
++                regs.push((z, region));
+             }
+         }
+-    }
+-    out
++        (regs, lines)
++    })
++}
++
++pub(crate) fn region_lines(state: &State) -> Vec<[f32; 6]> {
++    regions_and_lines_cached(state).1.as_ref().clone()
+ }
+ 
+ /// The region outline's orange, shared by `region_lines` and the height
+@@ -1180,25 +1199,7 @@ pub(crate) const REGION_RGB: [f32; 3] = [0.95, 0.58, 0.15];
+ /// with the selection about who is shown - and a translucent fill never
+ /// covers where no outline stands.
+ pub(crate) fn shown_regions(state: &State) -> Vec<(f64, Option<Region>)> {
+-    let mut out = Vec::new();
+-    for (name, entity) in model::named_entities(&state.world) {
+-        if state.hidden_paths.contains(&name)
+-            || !model::is_operation(&state.world, &entity)
+-            || !model::is_selected(&state.world, &entity)
+-        {
+-            continue;
+-        }
+-        let Some(op) = model::operation_of(&state.world, &entity) else {
+-            continue;
+-        };
+-        let region = operation::region_of(&state.world, &op);
+-        if let Some(z) = operation::region_z(&state.world, op.setup.as_deref(), Some(&op.src), &op.params)
+-            && (region.is_some() || !operation::chains_of(&state.world, &op).is_empty())
+-        {
+-            out.push((z, region));
+-        }
+-    }
+-    out
++    regions_and_lines_cached(state).0.as_ref().clone()
+ }
+ 
+ /// The levels of [`shown_regions`] - one truth, read at the height-plane
+@@ -1683,7 +1684,37 @@ pub(crate) fn height_plane_lines(state: &State) -> Vec<[f32; 6]> {
+ /// place while orbiting. A vanished pick - hidden model, deleted entity,
+ /// stale id - draws nothing rather than a ghost, the hover rule again.
+ pub(crate) fn selection_feature_lines(state: &State) -> Vec<[f32; 6]> {
+-    feature_lines(state, &shown_picks(state))
++    let resolved = crate::pick_highlight::resolved_selected(state);
++    let pick_rgb = overlay(Overlay::Pick);
++    let mut out = Vec::new();
++    for poly in &resolved.polylines {
++        let n = poly.pts.len();
++        if n < 2 || (poly.closed && n < 3) {
++            continue;
++        }
++        let last = if poly.closed { n } else { n - 1 };
++        for i in 0..last {
++            let p = poly.pts[i];
++            let q = poly.pts[(i + 1) % n];
++            push_line(
++                &mut out,
++                Point3::new(p[0], p[1], p[2]),
++                Point3::new(q[0], q[1], q[2]),
++                pick_rgb,
++            );
++        }
++    }
++    if !resolved.vertices.is_empty() {
++        let arm = (gizmo_len(state) * 0.05).max(0.5);
++        for &c in &resolved.vertices {
++            for d in [[arm, 0.0, 0.0], [0.0, arm, 0.0], [0.0, 0.0, arm]] {
++                let a = Point3::new(c[0] - d[0], c[1] - d[1], c[2] - d[2]);
++                let b = Point3::new(c[0] + d[0], c[1] + d[1], c[2] + d[2]);
++                push_line(&mut out, a, b, pick_rgb);
++            }
++        }
++    }
++    out
+ }
+ 
+ /// The picks shown: the collecting Setups page draft, else the open operation's.
+@@ -1717,87 +1748,3 @@ pub(crate) fn shown_picks(state: &State) -> Vec<GeoSel> {
+ 
+ /// The pick violet: the 3D outlines and the picked points' screen marks.
+ pub(crate) const PICK_RGB: [f32; 3] = [0.72, 0.44, 0.86];
+-
+-/// The picks' outlines in 3D, violet (see [`selection_feature_lines`]).
+-fn feature_lines(state: &State, items: &[GeoSel]) -> Vec<[f32; 6]> {
+-    let mut out = Vec::new();
+-    for item in items {
+-        if state.hidden_in_view(&item.entity) {
+-            continue; // display-off models are transparent to picking and drawing
+-        }
+-        let Some(entity) = model::find_by_name(&state.world, &item.entity) else {
+-            continue;
+-        };
+-        let Some(features) = model::features_of(&state.world, &entity) else {
+-            continue;
+-        };
+-        let loc = camcraft_app::setup_align::view_pose(&state.world, &entity).unwrap_or_default(); // #326
+-        let draw = |out: &mut Vec<[f32; 6]>, pts: &[[f64; 3]], closed: bool| {
+-            let n = pts.len();
+-            if n < 2 || (closed && n < 3) {
+-                return; // never mod 0; a ring needs three corners
+-            }
+-            let last = if closed { n } else { n - 1 };
+-            for i in 0..last {
+-                let a = transform_point(Point3::new(pts[i][0], pts[i][1], pts[i][2]), loc.pos, loc.rot);
+-                let q = &pts[(i + 1) % n];
+-                let b = transform_point(Point3::new(q[0], q[1], q[2]), loc.pos, loc.rot);
+-                push_line(out, a, b, overlay(Overlay::Pick));
+-            }
+-        };
+-        match item.feature {
+-            FeatureSel::Face(fid) => {
+-                let Some(face) = features.faces.iter().find(|f| f.id == fid) else {
+-                    continue; // stale id: the model re-meshed since the pick
+-                };
+-                for l in &face.loops {
+-                    let pts: Vec<[f64; 3]> = l
+-                        .verts
+-                        .iter()
+-                        .filter_map(|&vi| features.verts.get(vi as usize).copied())
+-                        .collect();
+-                    draw(&mut out, &pts, !matches!(l.kind, feature::LoopKind::Open));
+-                }
+-            }
+-            FeatureSel::Chain(cid) => {
+-                let Some(chain) = feature::resolve_chain(&features, cid) else {
+-                    continue;
+-                };
+-                let pts = feature::chain_points(&features, &chain);
+-                draw(&mut out, &pts, chain.closed);
+-            }
+-            FeatureSel::Patch(pid) => {
+-                // The weld's outline, not the seams inside it: the seam
+-                // edges are exactly what the patch dissolved, and
+-                // drawing them would advertise strips the pick is not.
+-                let Some(rings) = feature::patch_rings(&features, pid) else {
+-                    continue; // stale id: the model re-meshed since the pick
+-                };
+-                for r in &rings {
+-                    let pts: Vec<[f64; 3]> = r
+-                        .verts
+-                        .iter()
+-                        .filter_map(|&vi| features.verts.get(vi as usize).copied())
+-                        .collect();
+-                    draw(&mut out, &pts, r.closed);
+-                }
+-            }
+-            FeatureSel::Vertex(vid) => {
+-                // A point has no outline: a small 3-axis cross pins it.
+-                let Some(v) = feature::resolve_vertex(&features, vid)
+-                    .and_then(|vi| features.verts.get(vi as usize))
+-                else {
+-                    continue; // stale id: the model re-meshed since the pick
+-                };
+-                let c = transform_point(Point3::new(v[0], v[1], v[2]), loc.pos, loc.rot);
+-                let arm = (gizmo_len(state) * 0.05).max(0.5);
+-                for d in [[arm, 0.0, 0.0], [0.0, arm, 0.0], [0.0, 0.0, arm]] {
+-                    let a = Point3::new(c.x - d[0], c.y - d[1], c.z - d[2]);
+-                    let b = Point3::new(c.x + d[0], c.y + d[1], c.z + d[2]);
+-                    push_line(&mut out, a, b, overlay(Overlay::Pick));
+-                }
+-            }
+-        }
+-    }
+-    out
+-}
+diff --git a/crates/ui/src/lib.rs b/crates/ui/src/lib.rs
+index 884e5e251..043d42eee 100644
+--- a/crates/ui/src/lib.rs
++++ b/crates/ui/src/lib.rs
+@@ -34,6 +34,10 @@ pub mod slot_manual_viz;
+ pub mod plate_viz;
+ pub mod boundary_summary;
+ pub mod edge_pick;
++pub(crate) mod frame_cache;
++pub(crate) mod panel_cache;
++pub(crate) mod pick_highlight;
++pub(crate) mod pick_highlight_mesh;
+ pub mod pick_ink;
+ pub mod feature_click;
+ pub mod egui_app;
+diff --git a/crates/ui/src/panel_cache.rs b/crates/ui/src/panel_cache.rs
+new file mode 100644
+index 000000000..8d07041b6
+--- /dev/null
++++ b/crates/ui/src/panel_cache.rs
+@@ -0,0 +1,282 @@
++//! Per-`State` caches for dock panel queries: Geometry tab chips, 3-2-1 datum
++//! check, selection account, operation status banner, and browser op rows.
++//!
++//! Provenance: our own per-frame panel query cache; no external code or vendor material.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use camcraft_app::operation::{GeoSel, OpParams, OpStatus};
++
++use crate::frame_cache::{EntityGuard, WorldStamp, cvd_code, guards_for_picks};
++use crate::state::{GeoChip, State};
++
++#[derive(Clone, PartialEq)]
++struct GeoChipsKey {
++    stamp: WorldStamp,
++    unit_idx: u8,
++    geo: Vec<GeoSel>,
++    guards: Vec<EntityGuard>,
++}
++
++#[derive(Clone, PartialEq)]
++struct AlignKey {
++    stamp: WorldStamp,
++    geo: Vec<GeoSel>,
++    guards: Vec<EntityGuard>,
++}
++
++#[derive(Clone, PartialEq)]
++struct SelectionAccountKey {
++    stamp: WorldStamp,
++    live_setup: Option<String>,
++    geo: Vec<GeoSel>,
++    params: OpParams,
++    guards: Vec<EntityGuard>,
++}
++
++#[derive(Clone, PartialEq)]
++struct UnresolvedNoteKey {
++    stamp: WorldStamp,
++    live_setup: Option<String>,
++    src_kind: usize,
++    src_name: String,
++    geo: Vec<GeoSel>,
++    params: OpParams,
++}
++
++#[derive(Clone, PartialEq, Eq)]
++struct OpStatusKey {
++    stamp: WorldStamp,
++    target: String,
++    cvd_idx: u8,
++}
++
++#[derive(Clone)]
++pub(crate) struct OpBannerCached {
++    pub line: String,
++    pub tone: u8,
++    pub details: Vec<String>,
++    pub focus: Vec<Option<[f64; 3]>>,
++}
++
++#[derive(Clone)]
++pub(crate) struct BrowserOpCached {
++    pub kind_label: String,
++    pub kind_type: Option<camcraft_app::operation::OpType>,
++    pub status: OpStatus,
++    pub warns: usize,
++    pub flow: String,
++    pub problem: Option<String>,
++    pub label: String,
++}
++
++type AccountValue = (Vec<String>, Option<String>);
++
++#[derive(Default)]
++struct PanelCacheInner {
++    geo_chips: Option<(GeoChipsKey, Vec<GeoChip>)>,
++    align_321: Option<(AlignKey, Result<(), String>)>,
++    selection_account: Option<(SelectionAccountKey, AccountValue)>,
++    unresolved_note: Option<(UnresolvedNoteKey, Option<String>)>,
++    op_banner: Option<(OpStatusKey, OpBannerCached)>,
++    browser_ops: Option<(WorldStamp, HashMap<String, BrowserOpCached>)>,
++}
++
++/// Interior-mutable panel cache stored on `State`.
++#[derive(Default)]
++pub(crate) struct PanelCache {
++    inner: Mutex<PanelCacheInner>,
++}
++
++fn lock_inner(cache: &PanelCache) -> std::sync::MutexGuard<'_, PanelCacheInner> {
++    cache
++        .inner
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++fn unit_code(state: &State) -> u8 {
++    match camcraft_app::units::of(&state.world) {
++        camcraft_app::geometry::units::Unit::Millimeters => 0,
++        camcraft_app::geometry::units::Unit::Inches => 1,
++    }
++}
++
++impl PanelCache {
++    pub(crate) fn geo_chips_cached(
++        &self,
++        state: &State,
++        build: impl FnOnce() -> Vec<GeoChip>,
++    ) -> Vec<GeoChip> {
++        let stamp = WorldStamp::of(state);
++        let unit = unit_code(state);
++        {
++            let inner = lock_inner(self);
++            if let Some((k, chips)) = &inner.geo_chips
++                && k.stamp == stamp
++                && k.unit_idx == unit
++                && k.geo == state.op_ui.geo
++                && k.guards.iter().all(|g| g.matches(state))
++            {
++                return chips.clone();
++            }
++        }
++        let chips = build();
++        let key = GeoChipsKey {
++            stamp,
++            unit_idx: unit,
++            geo: state.op_ui.geo.clone(),
++            guards: guards_for_picks(state, &state.op_ui.geo),
++        };
++        let mut inner = lock_inner(self);
++        inner.geo_chips = Some((key, chips.clone()));
++        chips
++    }
++
++    pub(crate) fn align_321_cached(
++        &self,
++        state: &State,
++        build: impl FnOnce() -> Result<(), String>,
++    ) -> Result<(), String> {
++        let stamp = WorldStamp::of(state);
++        {
++            let inner = lock_inner(self);
++            if let Some((k, res)) = &inner.align_321
++                && k.stamp == stamp
++                && k.geo == state.op_ui.geo
++                && k.guards.iter().all(|g| g.matches(state))
++            {
++                return res.clone();
++            }
++        }
++        let res = build();
++        let key = AlignKey {
++            stamp,
++            geo: state.op_ui.geo.clone(),
++            guards: guards_for_picks(state, &state.op_ui.geo),
++        };
++        let mut inner = lock_inner(self);
++        inner.align_321 = Some((key, res.clone()));
++        res
++    }
++
++    pub(crate) fn selection_account_cached(
++        &self,
++        state: &State,
++        live_setup: Option<&str>,
++        build: impl FnOnce() -> (Vec<String>, Option<String>),
++    ) -> (Vec<String>, Option<String>) {
++        let stamp = WorldStamp::of(state);
++        {
++            let inner = lock_inner(self);
++            if let Some((k, val)) = &inner.selection_account
++                && k.stamp == stamp
++                && k.live_setup.as_deref() == live_setup
++                && k.geo == state.op_ui.geo
++                && k.params == state.op_ui.params
++                && k.guards.iter().all(|g| g.matches(state))
++            {
++                return val.clone();
++            }
++        }
++        let val = build();
++        let key = SelectionAccountKey {
++            stamp,
++            live_setup: live_setup.map(str::to_owned),
++            geo: state.op_ui.geo.clone(),
++            params: state.op_ui.params.clone(),
++            guards: guards_for_picks(state, &state.op_ui.geo),
++        };
++        let mut inner = lock_inner(self);
++        inner.selection_account = Some((key, val.clone()));
++        val
++    }
++
++    pub(crate) fn unresolved_note_cached(
++        &self,
++        state: &State,
++        live_setup: Option<&str>,
++        build: impl FnOnce() -> Option<String>,
++    ) -> Option<String> {
++        let stamp = WorldStamp::of(state);
++        {
++            let inner = lock_inner(self);
++            if let Some((k, note)) = &inner.unresolved_note
++                && k.stamp == stamp
++                && k.live_setup.as_deref() == live_setup
++                && k.src_kind == state.op_ui.src_kind
++                && k.src_name == state.op_ui.src_name
++                && k.geo == state.op_ui.geo
++                && k.params == state.op_ui.params
++            {
++                return note.clone();
++            }
++        }
++        let note = build();
++        let key = UnresolvedNoteKey {
++            stamp,
++            live_setup: live_setup.map(str::to_owned),
++            src_kind: state.op_ui.src_kind,
++            src_name: state.op_ui.src_name.clone(),
++            geo: state.op_ui.geo.clone(),
++            params: state.op_ui.params.clone(),
++        };
++        let mut inner = lock_inner(self);
++        inner.unresolved_note = Some((key, note.clone()));
++        note
++    }
++
++    pub(crate) fn op_banner_cached(
++        &self,
++        state: &State,
++        target: &str,
++        build: impl FnOnce() -> OpBannerCached,
++    ) -> OpBannerCached {
++        let key = OpStatusKey {
++            stamp: WorldStamp::of(state),
++            target: target.to_owned(),
++            cvd_idx: cvd_code(state),
++        };
++        {
++            let inner = lock_inner(self);
++            if let Some((k, val)) = &inner.op_banner
++                && *k == key
++            {
++                return val.clone();
++            }
++        }
++        let val = build();
++        let mut inner = lock_inner(self);
++        inner.op_banner = Some((key, val.clone()));
++        val
++    }
++
++    pub(crate) fn browser_op_cached(
++        &self,
++        state: &State,
++        name: &str,
++        build: impl FnOnce() -> BrowserOpCached,
++    ) -> BrowserOpCached {
++        let stamp = WorldStamp::of(state);
++        {
++            let inner = lock_inner(self);
++            if let Some((cached_stamp, map)) = &inner.browser_ops
++                && *cached_stamp == stamp
++                && let Some(entry) = map.get(name)
++            {
++                return entry.clone();
++            }
++        }
++        let entry = build();
++        let mut inner = lock_inner(self);
++        if inner.browser_ops.as_ref().is_some_and(|(s, _)| *s != stamp) {
++            inner.browser_ops = None;
++        }
++        let (_, map) = inner
++            .browser_ops
++            .get_or_insert_with(|| (stamp, HashMap::new()));
++        map.insert(name.to_owned(), entry.clone());
++        entry
++    }
++}
+diff --git a/crates/ui/src/pick_highlight.rs b/crates/ui/src/pick_highlight.rs
+new file mode 100644
+index 000000000..5f02393a4
+--- /dev/null
++++ b/crates/ui/src/pick_highlight.rs
+@@ -0,0 +1,313 @@
++//! Cached world-space highlight polylines for selected picks, viewport hover,
++//! and Geometry-row hover. Resolves `GeoSel` picks once at selection time instead
++//! of re-walking features per frame.
++//!
++//! Provenance: our own selection highlight cache built over `geometry::feature`.
++
++use std::sync::{Arc, Mutex};
++
++use camcraft_app::geometry::{Point3, feature, transform_point};
++use camcraft_app::model;
++use camcraft_app::operation::{FeatureSel, GeoSel};
++
++use crate::frame_cache::{EntityGuard, WorldStamp, guards_for_picks};
++use crate::state::State;
++
++/// One resolved feature outline in world space.
++#[derive(Clone, Debug)]
++pub(crate) struct WorldPolyline {
++    pub pts: Vec<[f64; 3]>,
++    pub closed: bool,
++}
++
++/// Cached resolved geometry for a set of picks or one hovered feature.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct ResolvedHighlights {
++    pub id: u64,
++    pub polylines: Vec<WorldPolyline>,
++    pub vertices: Vec<[f64; 3]>,
++}
++
++#[derive(Clone, PartialEq)]
++struct SelectionKey {
++    stamp: WorldStamp,
++    op_ui_name: String,
++    picks: Vec<GeoSel>,
++    hidden_models: Vec<String>,
++    hidden_stocks: Vec<String>,
++    hidden_paths: Vec<String>,
++    shown_setups: Vec<String>,
++    guards: Vec<EntityGuard>,
++}
++
++#[derive(Clone, PartialEq)]
++struct SingleKey {
++    stamp: WorldStamp,
++    pick: Option<GeoSel>,
++    hidden: bool,
++    guard: Option<EntityGuard>,
++}
++
++#[derive(Default)]
++pub(crate) struct HighlightInner {
++    pub(crate) next_id: u64,
++    pub(crate) selection_builds: u64,
++    selection: Option<(SelectionKey, Arc<ResolvedHighlights>)>,
++    hover: Option<(SingleKey, Arc<ResolvedHighlights>)>,
++    row_hover: Option<(SingleKey, Arc<ResolvedHighlights>)>,
++    pub(crate) selected_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
++    pub(crate) hover_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
++    pub(crate) row_hover_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
++}
++
++/// Per-`State` cache of resolved pick outlines and batched screen meshes.
++#[derive(Default)]
++pub(crate) struct HighlightCache {
++    pub(crate) inner: Mutex<HighlightInner>,
++}
++
++pub(crate) fn lock(state: &State) -> std::sync::MutexGuard<'_, HighlightInner> {
++    state
++        .pick_highlight
++        .inner
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++/// Number of times selected-feature world polylines were rebuilt for this state.
++#[cfg(test)]
++#[must_use]
++pub(crate) fn selection_builds(state: &State) -> u64 {
++    lock(state).selection_builds
++}
++
++fn append_feature(
++    state: &State,
++    item: &GeoSel,
++    polylines: &mut Vec<WorldPolyline>,
++    vertices: &mut Vec<[f64; 3]>,
++) {
++    if state.hidden_in_view(&item.entity) {
++        return;
++    }
++    let Some(entity) = model::find_by_name(&state.world, &item.entity) else {
++        return;
++    };
++    let Some(features) = model::features_of(&state.world, &entity) else {
++        return;
++    };
++    let loc = camcraft_app::setup_align::view_pose(&state.world, &entity).unwrap_or_default();
++    let world_pts = |pts: &[[f64; 3]]| -> Vec<[f64; 3]> {
++        pts.iter()
++            .map(|p| {
++                let w = transform_point(Point3::new(p[0], p[1], p[2]), loc.pos, loc.rot);
++                [w.x, w.y, w.z]
++            })
++            .collect()
++    };
++    match item.feature {
++        FeatureSel::Face(fid) => {
++            let Some(face) = features.faces.iter().find(|f| f.id == fid) else {
++                return;
++            };
++            for l in &face.loops {
++                let local: Vec<[f64; 3]> = l
++                    .verts
++                    .iter()
++                    .filter_map(|&vi| features.verts.get(vi as usize).copied())
++                    .collect();
++                polylines.push(WorldPolyline {
++                    pts: world_pts(&local),
++                    closed: !matches!(l.kind, feature::LoopKind::Open),
++                });
++            }
++        }
++        FeatureSel::Chain(cid) => {
++            let Some(chain) = feature::resolve_chain_arc(&features, cid) else {
++                return;
++            };
++            let local = feature::chain_points(&features, &chain);
++            polylines.push(WorldPolyline {
++                pts: world_pts(&local),
++                closed: chain.closed,
++            });
++        }
++        FeatureSel::Patch(pid) => {
++            let Some(rings) = feature::patch_rings_arc(&features, pid) else {
++                return;
++            };
++            for r in &rings {
++                let local: Vec<[f64; 3]> = r
++                    .verts
++                    .iter()
++                    .filter_map(|&vi| features.verts.get(vi as usize).copied())
++                    .collect();
++                polylines.push(WorldPolyline {
++                    pts: world_pts(&local),
++                    closed: r.closed,
++                });
++            }
++        }
++        FeatureSel::Vertex(vid) => {
++            let Some(v) = feature::resolve_vertex(&features, vid)
++                .and_then(|vi| features.verts.get(vi as usize))
++            else {
++                return;
++            };
++            let w = transform_point(Point3::new(v[0], v[1], v[2]), loc.pos, loc.rot);
++            vertices.push([w.x, w.y, w.z]);
++        }
++    }
++}
++
++fn next_resolved(
++    inner: &mut HighlightInner,
++    polylines: Vec<WorldPolyline>,
++    vertices: Vec<[f64; 3]>,
++) -> Arc<ResolvedHighlights> {
++    inner.next_id = inner.next_id.wrapping_add(1);
++    Arc::new(ResolvedHighlights {
++        id: inner.next_id,
++        polylines,
++        vertices,
++    })
++}
++
++/// Cached resolved world outlines and points for the currently shown selection.
++pub(crate) fn resolved_selected(state: &State) -> Arc<ResolvedHighlights> {
++    let stamp = WorldStamp::of(state);
++    let picks = crate::interact::shown_picks(state);
++    {
++        let inner = lock(state);
++        if let Some((key, cached)) = &inner.selection
++            && key.stamp == stamp
++            && key.op_ui_name == state.op_ui.name
++            && key.picks == picks
++            && key.hidden_models == state.hidden_models
++            && key.hidden_stocks == state.hidden_stocks
++            && key.hidden_paths == state.hidden_paths
++            && key.shown_setups == state.shown_setups
++            && key.guards.iter().all(|g| g.matches(state))
++        {
++            return Arc::clone(cached);
++        }
++    }
++    let guards = guards_for_picks(state, &picks);
++    let mut polylines = Vec::new();
++    let mut vertices = Vec::new();
++    for item in &picks {
++        append_feature(state, item, &mut polylines, &mut vertices);
++    }
++    let key = SelectionKey {
++        stamp,
++        op_ui_name: state.op_ui.name.clone(),
++        picks,
++        hidden_models: state.hidden_models.clone(),
++        hidden_stocks: state.hidden_stocks.clone(),
++        hidden_paths: state.hidden_paths.clone(),
++        shown_setups: state.shown_setups.clone(),
++        guards,
++    };
++    let mut inner = lock(state);
++    let empty_unchanged = key.picks.is_empty()
++        && inner
++            .selection
++            .as_ref()
++            .is_some_and(|(old_key, _)| old_key.picks.is_empty());
++    let resolved = next_resolved(&mut inner, polylines, vertices);
++    if !(key.picks.is_empty() && (empty_unchanged || inner.selection_builds == 0)) {
++        inner.selection_builds = inner.selection_builds.saturating_add(1);
++    }
++    inner.selection = Some((key, Arc::clone(&resolved)));
++    resolved
++}
++
++fn resolve_single_cached(
++    state: &State,
++    pick: Option<GeoSel>,
++    get_slot: impl Fn(&mut HighlightInner) -> &mut Option<(SingleKey, Arc<ResolvedHighlights>)>,
++) -> Arc<ResolvedHighlights> {
++    let stamp = WorldStamp::of(state);
++    let hidden = pick
++        .as_ref()
++        .is_some_and(|p| state.hidden_in_view(&p.entity));
++    {
++        let mut inner = lock(state);
++        if let Some((key, cached)) = get_slot(&mut inner)
++            && key.stamp == stamp
++            && key.pick == pick
++            && key.hidden == hidden
++            && key.guard.as_ref().is_none_or(|g| g.matches(state))
++        {
++            return Arc::clone(cached);
++        }
++    }
++    let guard = pick
++        .as_ref()
++        .map(|p| EntityGuard::capture(state, &p.entity));
++    let mut polylines = Vec::new();
++    let mut vertices = Vec::new();
++    if let Some(item) = &pick {
++        append_feature(state, item, &mut polylines, &mut vertices);
++    }
++    let key = SingleKey {
++        stamp,
++        pick,
++        hidden,
++        guard,
++    };
++    let mut inner = lock(state);
++    let resolved = next_resolved(&mut inner, polylines, vertices);
++    *get_slot(&mut inner) = Some((key, Arc::clone(&resolved)));
++    resolved
++}
++
++pub(crate) fn resolved_hover(state: &State) -> Arc<ResolvedHighlights> {
++    let pick = state.hover.as_ref().and_then(|hit| {
++        hit.feature.map(|feature| GeoSel {
++            entity: hit.entity.clone(),
++            feature,
++        })
++    });
++    resolve_single_cached(state, pick, |inner| &mut inner.hover)
++}
++
++pub(crate) fn resolved_row_hover(state: &State) -> Arc<ResolvedHighlights> {
++    resolve_single_cached(state, state.geo_hover_drawn.clone(), |inner| &mut inner.row_hover)
++}
++
++/// Project cached world polylines (and optional vertex crosses) to viewport UV segments.
++#[cfg(test)]
++pub(crate) fn project_segments(
++    resolved: &ResolvedHighlights,
++    include_vertices: bool,
++    mvp: &[[f32; 4]; 4],
++    aspect: f64,
++) -> Vec<([f32; 2], [f32; 2])> {
++    let mut out = Vec::new();
++    for poly in &resolved.polylines {
++        let n = poly.pts.len();
++        if n < 2 {
++            continue;
++        }
++        let uvs: Vec<Option<[f32; 2]>> = poly
++            .pts
++            .iter()
++            .map(|&p| crate::interact::project_uv(mvp, p))
++            .collect();
++        let last = if poly.closed { n } else { n - 1 };
++        for i in 0..last {
++            if let (Some(a), Some(b)) = (uvs[i], uvs[(i + 1) % n])
++                && a != b
++            {
++                out.push((a, b));
++            }
++        }
++    }
++    if include_vertices {
++        for &w in &resolved.vertices {
++            crate::vertex_pick::vertex_marker(mvp, w, aspect, &mut out);
++        }
++    }
++    out
++}
+diff --git a/crates/ui/src/pick_highlight_mesh.rs b/crates/ui/src/pick_highlight_mesh.rs
+new file mode 100644
+index 000000000..e98a1de7b
+--- /dev/null
++++ b/crates/ui/src/pick_highlight_mesh.rs
+@@ -0,0 +1,301 @@
++//! Single-mesh epaint tessellation and screen-space mesh caching for selected
++//! and hovered pick highlights.
++//!
++//! Provenance: our own single-mesh stroke batcher over `egui::epaint::Tessellator`.
++
++use crate::pick_highlight::{
++    HighlightInner, ResolvedHighlights, WorldPolyline, lock, resolved_hover, resolved_row_hover,
++    resolved_selected,
++};
++use crate::state::State;
++
++#[derive(Clone, PartialEq, Eq)]
++pub(crate) struct MeshKey {
++    resolved_id: u64,
++    aspect_bits: u64,
++    mvp_bits: [[u32; 4]; 4],
++    p0_bits: [u32; 2],
++    p1_bits: [u32; 2],
++    ppp_bits: u32,
++    clip_bits: [u32; 4],
++    px_bits: u32,
++    halo_px_bits: u32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++    include_vertices: bool,
++}
++
++pub(crate) struct CachedMesh {
++    key: MeshKey,
++    mesh: Option<egui::Mesh>,
++}
++
++fn push_screen_polyline_runs(
++    poly: &WorldPolyline,
++    mvp: &[[f32; 4]; 4],
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    out: &mut Vec<(Vec<egui::Pos2>, bool)>,
++) {
++    let n = poly.pts.len();
++    if n < 2 {
++        return;
++    }
++    let proj: Vec<Option<egui::Pos2>> = poly
++        .pts
++        .iter()
++        .map(|&p| {
++            crate::interact::project_uv(mvp, p)
++                .map(to_px)
++                .filter(|q| q.is_finite())
++        })
++        .collect();
++    if let Some(none_idx) = proj.iter().position(Option::is_none) {
++        let mut run: Vec<egui::Pos2> = Vec::new();
++        let start = if poly.closed { (none_idx + 1) % n } else { 0 };
++        for step in 0..n {
++            let idx = (start + step) % n;
++            match proj[idx] {
++                Some(pt) => {
++                    if run.last().copied() != Some(pt) {
++                        run.push(pt);
++                    }
++                }
++                None => {
++                    if run.len() >= 2 {
++                        out.push((std::mem::take(&mut run), false));
++                    } else {
++                        run.clear();
++                    }
++                }
++            }
++        }
++        if run.len() >= 2 {
++            out.push((run, false));
++        }
++        return;
++    }
++    let mut screen = Vec::with_capacity(n);
++    for pt in proj.into_iter().flatten() {
++        if screen.last().copied() != Some(pt) {
++            screen.push(pt);
++        }
++    }
++    if poly.closed && screen.len() >= 3 {
++        out.push((screen, true));
++    } else if screen.len() >= 2 {
++        out.push((screen, false));
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn build_batched_mesh(
++    painter: &egui::Painter,
++    resolved: &ResolvedHighlights,
++    include_vertices: bool,
++    mvp: &[[f32; 4]; 4],
++    aspect: f64,
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    px: f32,
++    halo_px: f32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++) -> Option<egui::Mesh> {
++    let mut paths: Vec<(Vec<egui::Pos2>, bool)> = Vec::with_capacity(resolved.polylines.len());
++    for poly in &resolved.polylines {
++        push_screen_polyline_runs(poly, mvp, to_px, &mut paths);
++    }
++    if include_vertices && !resolved.vertices.is_empty() {
++        let mut uv_segs = Vec::with_capacity(resolved.vertices.len() * 4);
++        for &w in &resolved.vertices {
++            crate::vertex_pick::vertex_marker(mvp, w, aspect, &mut uv_segs);
++        }
++        for (a, b) in uv_segs {
++            let pa = to_px(a);
++            let pb = to_px(b);
++            if pa.is_finite() && pb.is_finite() && pa != pb {
++                paths.push((vec![pa, pb], false));
++            }
++        }
++    }
++    if paths.is_empty() {
++        return None;
++    }
++    let ppp = painter.ctx().pixels_per_point();
++    let options = painter.ctx().tessellation_options(|o| *o);
++    let mut tess = egui::epaint::Tessellator::new(ppp, options, [1, 1], Vec::new());
++    tess.set_clip_rect(painter.clip_rect());
++    let mut mesh = egui::Mesh::default();
++    let stroke_pass = |tess: &mut egui::epaint::Tessellator,
++                       mesh: &mut egui::Mesh,
++                       stroke: egui::Stroke| {
++        for (pts, closed) in &paths {
++            let shape = if *closed {
++                egui::epaint::PathShape::closed_line(pts.clone(), stroke)
++            } else {
++                egui::epaint::PathShape::line(pts.clone(), stroke)
++            };
++            tess.tessellate_path(&shape, mesh);
++        }
++    };
++    if halo_px > 0.0 {
++        stroke_pass(&mut tess, &mut mesh, egui::Stroke::new(halo_px, halo));
++    }
++    if px > 0.0 {
++        stroke_pass(&mut tess, &mut mesh, egui::Stroke::new(px, ink));
++    }
++    (!mesh.vertices.is_empty() && !mesh.indices.is_empty()).then_some(mesh)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn paint_batched(
++    painter: &egui::Painter,
++    state: &State,
++    resolved: &ResolvedHighlights,
++    include_vertices: bool,
++    aspect: f64,
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    px: f32,
++    halo_px: f32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++    get_slot: impl Fn(&mut HighlightInner) -> &mut Option<CachedMesh>,
++) {
++    if !aspect.is_finite()
++        || aspect <= 0.0
++        || (resolved.polylines.is_empty() && (!include_vertices || resolved.vertices.is_empty()))
++    {
++        return;
++    }
++    let mvp = state.cam.mvp(aspect);
++    let p0 = to_px([0.0, 0.0]);
++    let p1 = to_px([1.0, 1.0]);
++    let clip = painter.clip_rect();
++    let key = MeshKey {
++        resolved_id: resolved.id,
++        aspect_bits: aspect.to_bits(),
++        mvp_bits: mvp.map(|r| r.map(f32::to_bits)),
++        p0_bits: [p0.x.to_bits(), p0.y.to_bits()],
++        p1_bits: [p1.x.to_bits(), p1.y.to_bits()],
++        ppp_bits: painter.ctx().pixels_per_point().to_bits(),
++        clip_bits: [
++            clip.min.x.to_bits(),
++            clip.min.y.to_bits(),
++            clip.max.x.to_bits(),
++            clip.max.y.to_bits(),
++        ],
++        px_bits: px.to_bits(),
++        halo_px_bits: halo_px.to_bits(),
++        ink,
++        halo,
++        include_vertices,
++    };
++    {
++        let mut inner = lock(state);
++        if let Some(cached) = get_slot(&mut inner)
++            && cached.key == key
++        {
++            if let Some(m) = &cached.mesh {
++                painter.add(egui::Shape::mesh(m.clone()));
++            }
++            return;
++        }
++    }
++    let mesh = build_batched_mesh(
++        painter,
++        resolved,
++        include_vertices,
++        &mvp,
++        aspect,
++        to_px,
++        px,
++        halo_px,
++        ink,
++        halo,
++    );
++    if let Some(m) = &mesh {
++        painter.add(egui::Shape::mesh(m.clone()));
++    }
++    let mut inner = lock(state);
++    *get_slot(&mut inner) = Some(CachedMesh { key, mesh });
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn paint_selected(
++    painter: &egui::Painter,
++    state: &State,
++    aspect: f64,
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    px: f32,
++    halo_px: f32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++) {
++    let resolved = resolved_selected(state);
++    paint_batched(
++        painter,
++        state,
++        &resolved,
++        false,
++        aspect,
++        to_px,
++        px,
++        halo_px,
++        ink,
++        halo,
++        |inner| &mut inner.selected_mesh,
++    );
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn paint_hover(
++    painter: &egui::Painter,
++    state: &State,
++    aspect: f64,
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    px: f32,
++    halo_px: f32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++) {
++    let resolved = resolved_hover(state);
++    paint_batched(
++        painter,
++        state,
++        &resolved,
++        true,
++        aspect,
++        to_px,
++        px,
++        halo_px,
++        ink,
++        halo,
++        |inner| &mut inner.hover_mesh,
++    );
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn paint_row_hover(
++    painter: &egui::Painter,
++    state: &State,
++    aspect: f64,
++    to_px: &impl Fn([f32; 2]) -> egui::Pos2,
++    px: f32,
++    halo_px: f32,
++    ink: egui::Color32,
++    halo: egui::Color32,
++) {
++    let resolved = resolved_row_hover(state);
++    paint_batched(
++        painter,
++        state,
++        &resolved,
++        true,
++        aspect,
++        to_px,
++        px,
++        halo_px,
++        ink,
++        halo,
++        |inner| &mut inner.row_hover_mesh,
++    );
++}
+diff --git a/crates/ui/src/pick_ink.rs b/crates/ui/src/pick_ink.rs
+index 194e0f201..0acaff1b1 100644
+--- a/crates/ui/src/pick_ink.rs
++++ b/crates/ui/src/pick_ink.rs
+@@ -9,8 +9,6 @@
+ //! Provenance: our own overlay styling; the stroke widths are plain UI
+ //! choices, no vendor material consulted.
+ 
+-use camcraft_app::operation::FeatureSel;
+-
+ use crate::egui_app::ground_ink::{Overlay, overlay};
+ use crate::state::State;
+ 
+@@ -25,18 +23,6 @@ pub const HALO_EXTRA_PX: f32 = 2.5;
+ /// or a dark model.
+ pub const HALO_ALPHA: u8 = 200;
+ 
+-/// Screen segments of the selected picks (viewport uv), points excluded:
+-/// those draw as their own diamonds (`vertex_pick::picked_point_marks`).
+-pub(crate) fn selected_segments(state: &State, aspect: f64) -> Vec<([f32; 2], [f32; 2])> {
+-    let mut out = Vec::new();
+-    for g in crate::interact::shown_picks(state) {
+-        if !matches!(g.feature, FeatureSel::Vertex(_)) {
+-            crate::interact::feature_segments(state, &g.entity, g.feature, aspect, &mut out);
+-        }
+-    }
+-    out
+-}
+-
+ /// Paint the selected picks, then the hover over them. `to_px` maps a
+ /// viewport uv into the pane; `ink` turns an overlay rgb into a colour.
+ pub(crate) fn paint(
+@@ -47,16 +33,26 @@ pub(crate) fn paint(
+     ink: impl Fn([f32; 3]) -> egui::Color32,
+ ) {
+     let halo = egui::Color32::from_black_alpha(HALO_ALPHA);
+-    let stroke = |segs: Vec<([f32; 2], [f32; 2])>, px: f32, rgb: [f32; 3]| {
+-        for (a, b) in &segs {
+-            painter.line_segment([to_px(*a), to_px(*b)], egui::Stroke::new(px + HALO_EXTRA_PX, halo));
+-        }
+-        for (a, b) in &segs {
+-            painter.line_segment([to_px(*a), to_px(*b)], egui::Stroke::new(px, ink(rgb)));
+-        }
+-    };
+-    stroke(selected_segments(state, aspect), SELECTED_PX, overlay(Overlay::Pick));
+-    stroke(crate::interact::hover_features(state, aspect), HOVER_PX, overlay(Overlay::Hover));
++    crate::pick_highlight_mesh::paint_selected(
++        painter,
++        state,
++        aspect,
++        &to_px,
++        SELECTED_PX,
++        SELECTED_PX + HALO_EXTRA_PX,
++        ink(overlay(Overlay::Pick)),
++        halo,
++    );
++    crate::pick_highlight_mesh::paint_hover(
++        painter,
++        state,
++        aspect,
++        &to_px,
++        HOVER_PX,
++        HOVER_PX + HALO_EXTRA_PX,
++        ink(overlay(Overlay::Hover)),
++        halo,
++    );
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index bff31b187..9ca336519 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1947,6 +1947,9 @@ pub struct State {
+     /// Display-only and ephemeral: never cached on the operation, freed
+     /// with the refusal it belongs to.
+     pub feedback_ghost: Option<camcraft_app::machining2d::Ghost>,
++    pub(crate) pick_highlight: crate::pick_highlight::HighlightCache,
++    pub(crate) frame_cache: crate::frame_cache::FrameCache,
++    pub(crate) panel_cache: crate::panel_cache::PanelCache,
+ }
+ 
+ /// Which page of the Operations pane a refused command's message belongs
+@@ -2194,6 +2197,9 @@ impl State {
+             feedback_ctx: None,
+             feedback_at: None,
+             feedback_ghost: None,
++            pick_highlight: Default::default(),
++            frame_cache: Default::default(),
++            panel_cache: Default::default(),
+         }
+     }
+ 
+@@ -2519,6 +2525,12 @@ impl State {
+     /// "missing" - removing it is always safe, because the reduced list
+     /// only gets shorter.
+     pub fn geo_chips(&self) -> Vec<GeoChip> {
++        self.panel_cache.geo_chips_cached(self, || {
++            self.geo_chips_uncached()
++        })
++    }
++
++    fn geo_chips_uncached(&self) -> Vec<GeoChip> {
+         // Open runs are pieces of one loop the user watches get
+         // completed: the "2 of 3" in a run's label counts chain picks
+         // of the same entity, in pick order.
+@@ -2583,7 +2595,7 @@ impl State {
+                         let found = model::find_by_name(&self.world, &g.entity)
+                             .and_then(|e| model::features_of(&self.world, &e))
+                             .map(|f| {
+-                                let c = feature::resolve_chain(&f, id)?;
++                                let c = feature::resolve_chain_arc(&f, id)?;
+                                 let pts = feature::chain_points(&f, &c);
+                                 Some((c, pts))
+                             })
+@@ -2651,7 +2663,7 @@ impl State {
+                         let found = model::find_by_name(&self.world, &g.entity)
+                             .and_then(|e| model::features_of(&self.world, &e))
+                             .and_then(|f| {
+-                                let strips = feature::patches(&f)
++                                let strips = feature::patches_arc(&f)
+                                     .into_iter()
+                                     .find(|p| p.id == id)?
+                                     .faces
+@@ -2659,7 +2671,7 @@ impl State {
+                                 let mut seen: Vec<Vec<(i64, i64)>> = Vec::new();
+                                 let mut closed: Vec<Vec<[f64; 3]>> = Vec::new();
+                                 let mut open = false;
+-                                for r in feature::patch_rings(&f, id)? {
++                                for r in feature::patch_rings_arc(&f, id)? {
+                                     let pts: Vec<[f64; 3]> = r
+                                         .verts
+                                         .iter()
+diff --git a/crates/ui/src/viewport.rs b/crates/ui/src/viewport.rs
+index a063e2fee..6dda6f6e1 100644
+--- a/crates/ui/src/viewport.rs
++++ b/crates/ui/src/viewport.rs
+@@ -193,6 +193,7 @@ const OVERLAY_STRIDE: u64 = 24;
+ /// colour. Above every stock class (0..=3), which only `fs_stock` reads.
+ pub const STRUCK_CLASS: f32 = 4.0;
+ 
++#[derive(Clone)]
+ pub struct GpuPart {
+     pub verts: Vec<[f32; 3]>,
+     pub selected: bool,
+diff --git a/docs/decisions/2201-highlighter-frame-perf.md b/docs/decisions/2201-highlighter-frame-perf.md
+new file mode 100644
+index 000000000..130225c3b
+--- /dev/null
++++ b/docs/decisions/2201-highlighter-frame-perf.md
+@@ -0,0 +1,28 @@
++## #2201 - Cache highlight geometry resolution, batch pick strokes into a single mesh, and cache per-frame view state
++
++**What was decided:**
++
++- Add `feature::index` (`resolve_chain_arc`, `patch_rings_arc`, `patches_arc`) with a thread-local weak-referenced lookup index (`Weak<Features>`, cap 32) built lazily per `Arc<Features>`. Avoid heap allocations in `feature::digest_of` and hoist lattice calculation out of `patches` and `patch_rings`.
++- Add `SHARED_FEATURES_CACHE` (`Weak<[Triangle]>`, cap 32) in `app::model::geometry::features_of` so repeated reads on unchanged meshes skip re-hashing triangles.
++- Add non-cloning `model::toolpath_nonempty` and `model::toolpath_warning_count` and use them in `operation::stamp::status_of` and `browser_tree::op_row`.
++- Add `History::revision_token` so view caches catch both `doc_version` bumps and direct `History::execute` calls in tests.
++- Add `ui::pick_highlight` (`HighlightCache` on `State`) to resolve selected, hovered, and row-hovered outlines into world polylines once per selection, visibility, or entity change.
++- Add `ui::pick_highlight_mesh` using `egui::epaint::Tessellator` to draw each highlight layer (halo + ink) as a single `egui::Shape::Mesh` cached per viewport camera state.
++- Add `ui::frame_cache::FrameCache` and `ui::panel_cache::PanelCache` on `State` to cache transformed entity vertices, cutting regions and outlines, toolpath overlay lines, non-transient `world::Scene` + digest, Geometry tab chips, 3-2-1 datum checks, selection account, unresolved notes, operation status banners, and browser operation rows.
++
++**Why:**
++
++- On models with many chains or facets, `features_of` re-hashed every triangle and `resolve_chain` re-walked and split every chain on every frame.
++- `pick_ink::paint` and `shell::viewport_panel` emitted two individual `Shape::LineSegment` shapes per projected segment on every frame instead of one batched mesh.
++- `world::collect`, `view_pass::sync_scene`, `browser_tree::op_row`, `op_page::status`, and `geo_page::body` rebuilt and cloned toolpaths, vertices, warnings, and selection geometry on every frame even when the document did not change.
++
++**What was considered and dropped:**
++
++- Caching `&Features` by raw reference address inside `geometry::feature`: dropped because stack-moved `Features` values in unit tests can reuse stack addresses. `Weak<Features>` on `Arc<Features>` keys strictly on live allocations (`strong_count() > 0`).
++- Adding internal `OnceLock` cache fields to `pub struct Features`: dropped because geometry tests construct `Features { ... }` with struct literals.
++- Grouping highlights with `egui::Shape::Vec`: dropped because `epaint` still tessellates each child shape individually and test shape counters observe multiple shapes. `Tessellator::tessellate_path` produces a single `egui::Mesh` with halo behind ink.
++- Keying whole-scene caches only on `state.doc_version`: dropped because direct `History::execute`, `SelectEntity`, and draft UI edits can mutate state without incrementing `doc_version`. Keying on `History::revision_token()`, `selected_entity_names`, UI drafts, and `EntityGuard` pointer/pose checks keeps caches exact.
++
++**What it would cost to change later:**
++
++- Low. The geometry index sits behind additive `*_arc` helpers with existing `resolve_chain` and `patch_rings` signatures intact. `FrameCache`, `PanelCache`, and `HighlightCache` are internal `State` caches that can be cleared or bypassed independently without affecting document persistence or toolpath generation.
+
+From b654e05021fae7900e4c662b234c1c2733aed0d8 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 16 Nov 2026 13:16:03 -0800
+Subject: [PATCH 2/3] fix(ui): keep source Weak in world vertex cache
+
+Fixes #2201
+---
+ crates/ui/src/egui_app/world.rs    |  7 ++-
+ crates/ui/src/frame_cache.rs       | 32 ++++++----
+ crates/ui/src/frame_cache_tests.rs | 99 ++++++++++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 15 deletions(-)
+ create mode 100644 crates/ui/src/frame_cache_tests.rs
+
+diff --git a/crates/ui/src/egui_app/world.rs b/crates/ui/src/egui_app/world.rs
+index 9ca0586b5..64178f4fa 100644
+--- a/crates/ui/src/egui_app/world.rs
++++ b/crates/ui/src/egui_app/world.rs
+@@ -252,10 +252,11 @@ fn scene_cache_key(state: &State) -> crate::frame_cache::SceneCacheKey {
+ // ---------------------------------------------------------------- parts
+ 
+ fn world_verts(state: &State, entity: &flecs_ecs::prelude::Entity) -> Vec<[f32; 3]> {
+-    let tris = model::facets_of(&state.world, entity).unwrap_or_default();
+-    let ptr = std::sync::Arc::as_ptr(&tris).cast::<()>() as usize;
++    let Some(tris) = model::facets_of(&state.world, entity) else {
++        return Vec::new();
++    };
+     let pose = crate::frame_cache::pose_bits(state, entity);
+-    let cached = state.frame_cache.world_verts_cached(ptr, tris.len(), pose, || {
++    let cached = state.frame_cache.world_verts_cached(&tris, pose, || {
+         // #326: the part where the active setup holds it.
+         let loc = camcraft_app::setup_align::view_pose(&state.world, entity).unwrap_or_default();
+         let mut verts = Vec::with_capacity(tris.len() * 3);
+diff --git a/crates/ui/src/frame_cache.rs b/crates/ui/src/frame_cache.rs
+index 33dfc8dd2..b5e755512 100644
+--- a/crates/ui/src/frame_cache.rs
++++ b/crates/ui/src/frame_cache.rs
+@@ -4,9 +4,10 @@
+ //!
+ //! Provenance: our own per-frame scene cache; no external code or vendor material.
+ 
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, Weak};
+ 
+ use camcraft_app::geo2d::Region;
++use camcraft_app::geometry::Triangle;
+ use camcraft_app::model;
+ use camcraft_app::operation::{AreaControls, GeoSel, OpParams};
+ use flecs_ecs::prelude::Entity;
+@@ -203,7 +204,7 @@ pub(crate) struct SceneCacheKey {
+ }
+ 
+ struct WorldVertsEntry {
+-    facets_ptr: usize,
++    facets: Weak<[Triangle]>,
+     facets_len: usize,
+     pose: [u64; 7],
+     verts: Arc<Vec<[f32; 3]>>,
+@@ -248,16 +249,20 @@ fn lock_inner(cache: &FrameCache) -> std::sync::MutexGuard<'_, FrameCacheInner>
+ impl FrameCache {
+     pub(crate) fn world_verts_cached(
+         &self,
+-        facets_ptr: usize,
+-        facets_len: usize,
++        facets: &Arc<[Triangle]>,
+         pose: [u64; 7],
+         build: impl FnOnce() -> Vec<[f32; 3]>,
+     ) -> Arc<Vec<[f32; 3]>> {
++        let matches = |e: &WorldVertsEntry| {
++            e.facets.strong_count() > 0
++                && std::ptr::eq(e.facets.as_ptr(), Arc::as_ptr(facets))
++                && e.facets_len == facets.len()
++                && e.pose == pose
++        };
+         {
+             let mut inner = lock_inner(self);
+-            if let Some(i) = inner.world_verts.iter().position(|e| {
+-                e.facets_ptr == facets_ptr && e.facets_len == facets_len && e.pose == pose
+-            }) {
++            inner.world_verts.retain(|e| e.facets.strong_count() > 0);
++            if let Some(i) = inner.world_verts.iter().position(matches) {
+                 inner.world_verts[i..].rotate_left(1);
+                 if let Some(entry) = inner.world_verts.last() {
+                     return Arc::clone(&entry.verts);
+@@ -266,17 +271,16 @@ impl FrameCache {
+         }
+         let verts = Arc::new(build());
+         let mut inner = lock_inner(self);
+-        if let Some(i) = inner.world_verts.iter().position(|e| {
+-            e.facets_ptr == facets_ptr && e.facets_len == facets_len && e.pose == pose
+-        }) {
++        inner.world_verts.retain(|e| e.facets.strong_count() > 0);
++        if let Some(i) = inner.world_verts.iter().position(matches) {
+             return Arc::clone(&inner.world_verts[i].verts);
+         }
+         if inner.world_verts.len() >= WORLD_VERTS_CAP {
+             inner.world_verts.remove(0);
+         }
+         inner.world_verts.push(WorldVertsEntry {
+-            facets_ptr,
+-            facets_len,
++            facets: Arc::downgrade(facets),
++            facets_len: facets.len(),
+             pose,
+             verts: Arc::clone(&verts),
+         });
+@@ -371,3 +375,7 @@ impl FrameCache {
+         (scene, digest)
+     }
+ }
++
++#[cfg(test)]
++#[path = "frame_cache_tests.rs"]
++mod tests;
+diff --git a/crates/ui/src/frame_cache_tests.rs b/crates/ui/src/frame_cache_tests.rs
+new file mode 100644
+index 000000000..98405957c
+--- /dev/null
++++ b/crates/ui/src/frame_cache_tests.rs
+@@ -0,0 +1,99 @@
++//! Pinning tests for `FrameCache::world_verts_cached` source allocation lifetime
++//! and `world::collect` vertex freshness after facet replacement.
++//! Provenance: our own unit tests for PR #2256 review finding 1.
++
++use std::sync::Arc;
++
++use camcraft_app::geometry::{Point3, Triangle, cube};
++use camcraft_app::model;
++
++use super::{FrameCache, lock_inner};
++use crate::egui_app::world;
++use crate::state::State;
++
++fn single_tri(x: f64) -> Arc<[Triangle]> {
++    Arc::from(vec![Triangle::new(
++        Point3::new(x, 0.0, 0.0),
++        Point3::new(x, 1.0, 0.0),
++        Point3::new(x, 0.0, 1.0),
++    )])
++}
++
++#[test]
++fn world_verts_cached_does_not_reuse_stale_entry_after_source_release() {
++    let cache = FrameCache::default();
++    let pose = [0u64; 7];
++    let mut builds = 0usize;
++
++    let first = single_tri(10.0);
++    let v1 = cache.world_verts_cached(&first, pose, || {
++        builds += 1;
++        vec![[first[0].a.x as f32, 0.0, 0.0]]
++    });
++    assert_eq!(v1[0][0], 10.0);
++    assert_eq!(builds, 1);
++
++    let v1_hit = cache.world_verts_cached(&first, pose, || {
++        builds += 1;
++        vec![[999.0, 0.0, 0.0]]
++    });
++    assert_eq!(v1_hit[0][0], 10.0);
++    assert_eq!(builds, 1, "live source allocation must hit the cache");
++
++    drop(first);
++
++    for step in 0..64 {
++        let replacement = single_tri(20.0);
++        let v2 = cache.world_verts_cached(&replacement, pose, || {
++            builds += 1;
++            vec![[replacement[0].a.x as f32, 0.0, 0.0]]
++        });
++        assert_eq!(
++            v2[0][0], 20.0,
++            "step {step}: dropped source allocation must not return stale vertices"
++        );
++        assert_eq!(
++            lock_inner(&cache).world_verts.len(),
++            1,
++            "step {step}: dead source entries must be pruned"
++        );
++    }
++}
++
++#[test]
++fn world_collect_rebuilds_vertices_when_model_facets_are_replaced() {
++    let mut st = State::new();
++    let part = model::spawn(&st.world, "Part");
++    let first = cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 10.0)).facets;
++    let tri_count = first.len();
++    model::set_facets(&st.world, &part, first);
++    st.doc_version += 1;
++
++    let s1 = world::collect(&st);
++    assert_eq!(s1.parts.len(), 1);
++    let max_x1 = s1.parts[0]
++        .verts
++        .iter()
++        .map(|v| v[0])
++        .fold(f32::NEG_INFINITY, f32::max);
++    assert!((max_x1 - 10.0).abs() < 1e-4, "expected initial max_x 10.0, got {max_x1}");
++
++    for step in 0..16 {
++        let lo_x = 20.0 + f64::from(step) * 5.0;
++        let next = cube(Point3::new(lo_x, 0.0, 0.0), Point3::new(lo_x + 10.0, 10.0, 10.0)).facets;
++        assert_eq!(next.len(), tri_count);
++        model::set_facets(&st.world, &part, next);
++        st.doc_version += 1;
++
++        let s2 = world::collect(&st);
++        let min_x2 = s2.parts[0]
++            .verts
++            .iter()
++            .map(|v| v[0])
++            .fold(f32::INFINITY, f32::min);
++        assert!(
++            (min_x2 - lo_x as f32).abs() < 1e-4,
++            "step {step}: expected replaced min_x {lo_x}, got {min_x2}"
++        );
++    }
++}
+
+From 56fa6694bb956a40082c18f6da45296b03bd4f4e Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 18 Nov 2026 17:08:23 +0100
+Subject: [PATCH 3/3] test(ui): pin the pick-highlight screen-mesh cache with
+ build counters
+
+Each screen-mesh slot (selected, viewport hover, row hover) is now a
+MeshSlot with its own build counter. New tests in
+pick_highlight_mesh_tests.rs: a still frame tessellates once in each
+slot; an orbit, a pane resize and an ink change each tessellate again
+and the painted vertices move or change colour. The outline cache
+counts the viewport hover and the row hover apart, and the viewport
+hover gets its own pin.
+
+Review non-blockers: a cache hit sends a clone of the Arc<Mesh>, not a
+deep copy; toolpath_warning_count (no caller) is removed and
+toolpath_nonempty moves to model/toolpath.rs; pick_ink.rs keeps main's
+CRLF line ends and its doc names the real row-hover path; the decision
+file names the mesh cache pins.
+
+Refs #2201
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/model.rs                       |  21 +--
+ crates/app/src/model/toolpath.rs              |  17 ++
+ crates/ui/src/pick_highlight.rs               |  18 +-
+ crates/ui/src/pick_highlight_mesh.rs          |  33 +++-
+ crates/ui/src/pick_highlight_mesh_tests.rs    | 154 ++++++++++++++++++
+ crates/ui/src/pick_highlight_tests.rs         |  36 +++-
+ crates/ui/src/pick_ink.rs                     |   2 +-
+ docs/decisions/2201-highlighter-frame-perf.md |  40 ++++-
+ 8 files changed, 280 insertions(+), 41 deletions(-)
+ create mode 100644 crates/app/src/model/toolpath.rs
+ create mode 100644 crates/ui/src/pick_highlight_mesh_tests.rs
+
+diff --git a/crates/app/src/model.rs b/crates/app/src/model.rs
+index 51e150674..adb1c16a5 100644
+--- a/crates/app/src/model.rs
++++ b/crates/app/src/model.rs
+@@ -18,9 +18,11 @@ use crate::stock::StockShape;
+ mod chain_memo;
+ mod patch_memo;
+ mod geometry;
++mod toolpath;
+ 
+ pub use chain_memo::{chain_walks, resolve_chain};
+ pub use patch_memo::{patch_builds, patch_rings, patches};
++pub use toolpath::toolpath_nonempty;
+ pub use geometry::{feature_digests, features_of, features_of_local, features_of_shared, geometry_signature};
+ use crate::tools::Tool;
+ 
+@@ -282,25 +284,6 @@ pub fn has_toolpath(world: &World, entity: &Entity) -> bool {
+         .is_some()
+ }
+ 
+-/// True when the operation has a cached toolpath with at least one move
+-/// (without cloning the move vector).
+-#[must_use]
+-pub fn toolpath_nonempty(world: &World, entity: &Entity) -> bool {
+-    entity
+-        .entity_view(world)
+-        .try_get::<&Toolpath>(|t| !t.path.is_empty())
+-        .unwrap_or(false)
+-}
+-
+-/// Count of warnings on an operation's cached toolpath without cloning it.
+-#[must_use]
+-pub fn toolpath_warning_count(world: &World, entity: &Entity) -> usize {
+-    entity
+-        .entity_view(world)
+-        .try_get::<&Toolpath>(|t| t.warnings.len())
+-        .unwrap_or(0)
+-}
+-
+ /// Facets with the entity's rigid transform applied - the frame the
+ /// slicers, regions and generators work in.
+ #[must_use]
+diff --git a/crates/app/src/model/toolpath.rs b/crates/app/src/model/toolpath.rs
+new file mode 100644
+index 000000000..9ecf0b50f
+--- /dev/null
++++ b/crates/app/src/model/toolpath.rs
+@@ -0,0 +1,17 @@
++//! Reads of an operation's cached toolpath that do not clone it (#2201).
++//! Provenance: our own design notes; no vendor material consulted.
++
++use flecs_ecs::core::EntityViewGet; // not re-exported in prelude (0.2.2)
++use flecs_ecs::prelude::{Entity, World};
++
++use crate::schema::Toolpath;
++
++/// True when the operation has a cached toolpath with at least one move
++/// (without cloning the move vector).
++#[must_use]
++pub fn toolpath_nonempty(world: &World, entity: &Entity) -> bool {
++    entity
++        .entity_view(world)
++        .try_get::<&Toolpath>(|t| !t.path.is_empty())
++        .unwrap_or(false)
++}
+diff --git a/crates/ui/src/pick_highlight.rs b/crates/ui/src/pick_highlight.rs
+index 24cb90515..d052fbca2 100644
+--- a/crates/ui/src/pick_highlight.rs
++++ b/crates/ui/src/pick_highlight.rs
+@@ -96,12 +96,13 @@ pub(crate) struct HighlightInner {
+     pub(crate) next_id: u64,
+     pub(crate) selection_builds: u64,
+     pub(crate) hover_builds: u64,
++    pub(crate) row_hover_builds: u64,
+     selection: Option<(Key, Arc<ResolvedHighlights>)>,
+     hover: Option<(Key, Arc<ResolvedHighlights>)>,
+     row_hover: Option<(Key, Arc<ResolvedHighlights>)>,
+-    pub(crate) selected_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
+-    pub(crate) hover_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
+-    pub(crate) row_hover_mesh: Option<crate::pick_highlight_mesh::CachedMesh>,
++    pub(crate) selected_mesh: crate::pick_highlight_mesh::MeshSlot,
++    pub(crate) hover_mesh: crate::pick_highlight_mesh::MeshSlot,
++    pub(crate) row_hover_mesh: crate::pick_highlight_mesh::MeshSlot,
+ }
+ 
+ /// Per-`State` cache of resolved pick outlines and batched screen meshes.
+@@ -125,13 +126,20 @@ pub(crate) fn selection_builds(state: &State) -> u64 {
+     lock(state).selection_builds
+ }
+ 
+-/// Number of times a hover or row-hover outline was rebuilt for this state.
++/// Number of times the viewport hover outline was rebuilt for this state.
+ #[cfg(test)]
+ #[must_use]
+ pub(crate) fn hover_builds(state: &State) -> u64 {
+     lock(state).hover_builds
+ }
+ 
++/// Number of times the panel row-hover outline was rebuilt for this state.
++#[cfg(test)]
++#[must_use]
++pub(crate) fn row_hover_builds(state: &State) -> u64 {
++    lock(state).row_hover_builds
++}
++
+ fn append_feature(
+     state: &State,
+     item: &GeoSel,
+@@ -274,7 +282,7 @@ pub(crate) fn resolved_hover(state: &State) -> Arc<ResolvedHighlights> {
+ 
+ pub(crate) fn resolved_row_hover(state: &State) -> Arc<ResolvedHighlights> {
+     let key = Key::of(state, state.geo_hover_drawn.clone().into_iter().collect());
+-    resolve_cached(state, key, |i| &mut i.row_hover, |i| &mut i.hover_builds)
++    resolve_cached(state, key, |i| &mut i.row_hover, |i| &mut i.row_hover_builds)
+ }
+ 
+ /// Project cached world polylines (and optional vertex crosses) to viewport UV segments.
+diff --git a/crates/ui/src/pick_highlight_mesh.rs b/crates/ui/src/pick_highlight_mesh.rs
+index e98a1de7b..223b59ce8 100644
+--- a/crates/ui/src/pick_highlight_mesh.rs
++++ b/crates/ui/src/pick_highlight_mesh.rs
+@@ -8,6 +8,7 @@ use crate::pick_highlight::{
+     resolved_selected,
+ };
+ use crate::state::State;
++use std::sync::Arc;
+ 
+ #[derive(Clone, PartialEq, Eq)]
+ pub(crate) struct MeshKey {
+@@ -27,7 +28,18 @@ pub(crate) struct MeshKey {
+ 
+ pub(crate) struct CachedMesh {
+     key: MeshKey,
+-    mesh: Option<egui::Mesh>,
++    /// `Shape::Mesh` holds an `Arc<Mesh>`: a cache hit sends a clone of
++    /// the `Arc`, not a deep copy of the vertices.
++    mesh: Option<Arc<egui::Mesh>>,
++}
++
++/// One screen-mesh slot: the last mesh and its key, and the number of
++/// times this slot tessellated. The count pins the cache: a still frame
++/// adds nothing to it (crates/ui/AGENTS.md, "Frame cost").
++#[derive(Default)]
++pub(crate) struct MeshSlot {
++    cached: Option<CachedMesh>,
++    pub(crate) builds: u64,
+ }
+ 
+ fn push_screen_polyline_runs(
+@@ -158,7 +170,7 @@ fn paint_batched(
+     halo_px: f32,
+     ink: egui::Color32,
+     halo: egui::Color32,
+-    get_slot: impl Fn(&mut HighlightInner) -> &mut Option<CachedMesh>,
++    get_slot: impl Fn(&mut HighlightInner) -> &mut MeshSlot,
+ ) {
+     if !aspect.is_finite()
+         || aspect <= 0.0
+@@ -191,11 +203,11 @@ fn paint_batched(
+     };
+     {
+         let mut inner = lock(state);
+-        if let Some(cached) = get_slot(&mut inner)
++        if let Some(cached) = &get_slot(&mut inner).cached
+             && cached.key == key
+         {
+             if let Some(m) = &cached.mesh {
+-                painter.add(egui::Shape::mesh(m.clone()));
++                painter.add(egui::Shape::mesh(Arc::clone(m)));
+             }
+             return;
+         }
+@@ -211,12 +223,15 @@ fn paint_batched(
+         halo_px,
+         ink,
+         halo,
+-    );
++    )
++    .map(Arc::new);
+     if let Some(m) = &mesh {
+-        painter.add(egui::Shape::mesh(m.clone()));
++        painter.add(egui::Shape::mesh(Arc::clone(m)));
+     }
+     let mut inner = lock(state);
+-    *get_slot(&mut inner) = Some(CachedMesh { key, mesh });
++    let slot = get_slot(&mut inner);
++    slot.builds = slot.builds.saturating_add(1);
++    slot.cached = Some(CachedMesh { key, mesh });
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -299,3 +314,7 @@ pub(crate) fn paint_row_hover(
+         |inner| &mut inner.row_hover_mesh,
+     );
+ }
++
++#[cfg(test)]
++#[path = "pick_highlight_mesh_tests.rs"]
++mod tests;
+diff --git a/crates/ui/src/pick_highlight_mesh_tests.rs b/crates/ui/src/pick_highlight_mesh_tests.rs
+new file mode 100644
+index 000000000..81c14b9fa
+--- /dev/null
++++ b/crates/ui/src/pick_highlight_mesh_tests.rs
+@@ -0,0 +1,154 @@
++//! Pins for the screen-mesh cache of `pick_highlight_mesh` (#2201): each
++//! of the three slots (selected, viewport hover, row hover) has a build
++//! counter. A still frame tessellates nothing again; an orbit, a pane
++//! resize and an ink change each tessellate again, and the painted
++//! vertices move or change colour. crates/ui/AGENTS.md, "Frame cost".
++//! Provenance: our own unit tests; no vendor material consulted.
++
++use camcraft_app::geometry::{Point3, cube};
++use camcraft_app::model;
++use camcraft_app::operation::{FeatureSel, GeoSel};
++use egui::{Color32, Pos2, Rect, Shape, pos2};
++
++use super::{paint_hover, paint_row_hover, paint_selected};
++use crate::pick_highlight::lock;
++use crate::points_pick::PointsPick;
++use crate::state::{HoverHit, State};
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum Slot {
++    Selected,
++    Hover,
++    RowHover,
++}
++
++const SLOTS: [Slot; 3] = [Slot::Selected, Slot::Hover, Slot::RowHover];
++const INK: Color32 = Color32::from_rgb(40, 160, 255);
++const OTHER_INK: Color32 = Color32::from_rgb(255, 120, 20);
++const HALO: Color32 = Color32::from_rgb(10, 10, 10);
++const PANE: Rect = Rect { min: Pos2 { x: 0.0, y: 0.0 }, max: Pos2 { x: 800.0, y: 600.0 } };
++const SMALL_PANE: Rect = Rect { min: Pos2 { x: 100.0, y: 50.0 }, max: Pos2 { x: 500.0, y: 350.0 } };
++
++/// A state with one cube model "Part" and its first face in `slot`.
++fn picked_cube(slot: Slot) -> State {
++    let mut st = State::new();
++    let part = model::spawn(&st.world, "Part");
++    model::set_facets(&st.world, &part, cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 10.0)).facets);
++    let features = model::features_of(&st.world, &part).expect("cube features");
++    let fid = features.faces.first().expect("a face").id;
++    let sel = GeoSel { entity: "Part".into(), feature: FeatureSel::Face(fid) };
++    match slot {
++        Slot::Selected => st.points_pick = Some(PointsPick { setup: "Setup1".into(), picks: vec![sel] }),
++        Slot::Hover => st.hover = Some(HoverHit { entity: "Part".into(), facet: 0, feature: Some(sel.feature) }),
++        Slot::RowHover => st.geo_hover_drawn = Some(sel),
++    }
++    st
++}
++
++fn builds(st: &State, slot: Slot) -> u64 {
++    let inner = lock(st);
++    match slot {
++        Slot::Selected => inner.selected_mesh.builds,
++        Slot::Hover => inner.hover_mesh.builds,
++        Slot::RowHover => inner.row_hover_mesh.builds,
++    }
++}
++
++/// Run one egui frame that paints `slot` into `pane` with `ink`, and
++/// return the painted mesh vertices (position and colour).
++fn frame(ctx: &egui::Context, st: &State, slot: Slot, pane: Rect, ink: Color32) -> Vec<(Pos2, Color32)> {
++    let input = egui::RawInput {
++        screen_rect: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 800.0))),
++        ..Default::default()
++    };
++    let mut out = ctx.run_ui(input, |ui| {
++        let painter = ui.ctx().layer_painter(egui::LayerId::background());
++        let aspect = f64::from(pane.width() / pane.height());
++        let to_px = move |uv: [f32; 2]| {
++            pos2(
++                pane.min.x + (uv[0] + 1.0) * 0.5 * pane.width(),
++                pane.min.y + (1.0 - uv[1]) * 0.5 * pane.height(),
++            )
++        };
++        match slot {
++            Slot::Selected => paint_selected(&painter, st, aspect, &to_px, 2.0, 4.0, ink, HALO),
++            Slot::Hover => paint_hover(&painter, st, aspect, &to_px, 2.0, 4.0, ink, HALO),
++            Slot::RowHover => paint_row_hover(&painter, st, aspect, &to_px, 2.0, 4.0, ink, HALO),
++        }
++    });
++    out.textures_delta.clear();
++    fn walk(shape: &Shape, verts: &mut Vec<(Pos2, Color32)>) {
++        match shape {
++            Shape::Vec(v) => v.iter().for_each(|s| walk(s, verts)),
++            Shape::Mesh(m) => verts.extend(m.vertices.iter().map(|v| (v.pos, v.color))),
++            _ => {}
++        }
++    }
++    let mut verts = Vec::new();
++    for clipped in &out.shapes {
++        walk(&clipped.shape, &mut verts);
++    }
++    verts
++}
++
++#[test]
++fn highlight_mesh_still_frames_tessellate_once_in_each_slot() {
++    for slot in SLOTS {
++        let st = picked_cube(slot);
++        let ctx = egui::Context::default();
++        let first = frame(&ctx, &st, slot, PANE, INK);
++        assert!(!first.is_empty(), "{slot:?}: the pick paints a mesh");
++        for i in 0..8 {
++            let again = frame(&ctx, &st, slot, PANE, INK);
++            assert_eq!(again, first, "{slot:?}: frame {i} paints the same mesh");
++        }
++        assert_eq!(builds(&st, slot), 1, "{slot:?}: a still frame tessellates nothing again");
++        for other in SLOTS.into_iter().filter(|o| *o != slot) {
++            assert_eq!(builds(&st, other), 0, "{slot:?}: the {other:?} slot does not build");
++        }
++    }
++}
++
++#[test]
++fn highlight_mesh_rebuilds_after_an_orbit_and_the_vertices_move() {
++    for slot in SLOTS {
++        let mut st = picked_cube(slot);
++        let ctx = egui::Context::default();
++        let before = frame(&ctx, &st, slot, PANE, INK);
++        st.cam.orbit(12.0, -4.0);
++        let after = frame(&ctx, &st, slot, PANE, INK);
++        assert_eq!(builds(&st, slot), 2, "{slot:?}: an orbit tessellates again");
++        assert!(!after.is_empty(), "{slot:?}: the orbited pick still paints");
++        assert_ne!(after, before, "{slot:?}: the painted vertices follow the camera");
++        frame(&ctx, &st, slot, PANE, INK);
++        assert_eq!(builds(&st, slot), 2, "{slot:?}: the next still frame reads the cache");
++    }
++}
++
++#[test]
++fn highlight_mesh_rebuilds_after_a_pane_resize_and_the_vertices_move() {
++    for slot in SLOTS {
++        let st = picked_cube(slot);
++        let ctx = egui::Context::default();
++        let before = frame(&ctx, &st, slot, PANE, INK);
++        let after = frame(&ctx, &st, slot, SMALL_PANE, INK);
++        assert_eq!(builds(&st, slot), 2, "{slot:?}: a pane resize tessellates again");
++        assert!(!after.is_empty(), "{slot:?}: the resized pane still paints");
++        let max_x = |v: &[(Pos2, Color32)]| v.iter().map(|(p, _)| p.x).fold(f32::NEG_INFINITY, f32::max);
++        assert!(max_x(&after) < max_x(&before), "{slot:?}: the painted vertices shrink into the smaller pane");
++    }
++}
++
++#[test]
++fn highlight_mesh_rebuilds_after_an_ink_change_and_the_colour_changes() {
++    for slot in SLOTS {
++        let st = picked_cube(slot);
++        let ctx = egui::Context::default();
++        let before = frame(&ctx, &st, slot, PANE, INK);
++        assert!(before.iter().any(|(_, c)| *c == INK), "{slot:?}: the first frame paints the first ink");
++        let after = frame(&ctx, &st, slot, PANE, OTHER_INK);
++        assert_eq!(builds(&st, slot), 2, "{slot:?}: a theme (ink) change tessellates again");
++        assert!(after.iter().any(|(_, c)| *c == OTHER_INK), "{slot:?}: the new ink is painted");
++        assert!(after.iter().all(|(_, c)| *c != INK), "{slot:?}: the old ink is never served");
++    }
++}
+diff --git a/crates/ui/src/pick_highlight_tests.rs b/crates/ui/src/pick_highlight_tests.rs
+index 3f1f1ef88..68200b85e 100644
+--- a/crates/ui/src/pick_highlight_tests.rs
++++ b/crates/ui/src/pick_highlight_tests.rs
+@@ -10,7 +10,7 @@ use camcraft_app::model;
+ use camcraft_app::operation::{FeatureSel, GeoSel};
+ use camcraft_app::schema::Location;
+ 
+-use super::{hover_builds, resolved_row_hover};
++use super::{hover_builds, resolved_hover, resolved_row_hover, row_hover_builds};
+ use crate::state::State;
+ 
+ /// A state with one cube model "Part" and its first face row-hovered.
+@@ -37,7 +37,33 @@ fn highlight_still_frames_build_the_outline_once() {
+         let again = resolved_row_hover(&st);
+         assert!(Arc::ptr_eq(&first, &again), "a still frame reads the cached outline");
+     }
++    assert_eq!(row_hover_builds(&st), 1, "a still frame builds nothing");
++    assert_eq!(hover_builds(&st), 0, "the row hover does not count as a viewport hover");
++}
++
++/// The viewport hover slot (`state.hover`) has its own pin: a still
++/// frame builds once, a new hovered feature builds again, and the
++/// row-hover count does not move.
++#[test]
++fn viewport_hover_still_frames_build_once_and_a_new_feature_builds_again() {
++    let mut st = hovered_cube();
++    st.geo_hover_drawn = None;
++    let part = model::find_by_name(&st.world, "Part").expect("Part");
++    let features = model::features_of(&st.world, &part).expect("cube features");
++    let first = features.faces.first().expect("a face").id;
++    let second = features.faces.get(1).expect("a second face").id;
++    st.hover = Some(crate::state::HoverHit { entity: "Part".into(), facet: 0, feature: Some(FeatureSel::Face(first)) });
++    let a = resolved_hover(&st);
++    assert!(!a.polylines.is_empty(), "the hovered face draws an outline");
++    for _ in 0..16 {
++        assert!(Arc::ptr_eq(&a, &resolved_hover(&st)), "a still frame reads the cached outline");
++    }
+     assert_eq!(hover_builds(&st), 1, "a still frame builds nothing");
++    st.hover = Some(crate::state::HoverHit { entity: "Part".into(), facet: 1, feature: Some(FeatureSel::Face(second)) });
++    let b = resolved_hover(&st);
++    assert_eq!(hover_builds(&st), 2, "a new hovered feature builds again");
++    assert!(!Arc::ptr_eq(&a, &b));
++    assert_eq!(row_hover_builds(&st), 0, "the viewport hover does not count as a row hover");
+ }
+ 
+ #[test]
+@@ -48,7 +74,7 @@ fn highlight_rebuilds_when_the_pose_moves() {
+     let loc = Location { pos: Point3::new(50.0, 0.0, 0.0), ..Location::default() };
+     model::set_transform(&st.world, &part, loc);
+     let after = resolved_row_hover(&st);
+-    assert_eq!(hover_builds(&st), 2, "a moved body builds again");
++    assert_eq!(row_hover_builds(&st), 2, "a moved body builds again");
+     assert!((max_x(&after) - max_x(&before) - 50.0).abs() < 1e-9, "the outline moves with the body");
+ }
+ 
+@@ -60,7 +86,7 @@ fn highlight_rebuilds_when_the_facets_are_replaced() {
+     let part = model::find_by_name(&st.world, "Part").expect("Part");
+     model::set_facets(&st.world, &part, cube(Point3::new(0.0, 0.0, 0.0), Point3::new(30.0, 7.0, 3.0)).facets);
+     let after = resolved_row_hover(&st);
+-    assert_eq!(hover_builds(&st), 2, "a re-meshed body builds again");
++    assert_eq!(row_hover_builds(&st), 2, "a re-meshed body builds again");
+     assert!(!Arc::ptr_eq(&before, &after), "the old outline is never served for the new mesh");
+ }
+ 
+@@ -70,12 +96,12 @@ fn highlight_rebuilds_when_the_body_is_hidden_or_the_pick_changes() {
+     assert!(!resolved_row_hover(&st).polylines.is_empty());
+     st.hidden_models.push("Part".into());
+     assert!(resolved_row_hover(&st).polylines.is_empty(), "a hidden body draws nothing");
+-    assert_eq!(hover_builds(&st), 2);
++    assert_eq!(row_hover_builds(&st), 2);
+     st.hidden_models.clear();
+     let part = model::find_by_name(&st.world, "Part").expect("Part");
+     let features = model::features_of(&st.world, &part).expect("cube features");
+     let other = features.faces.get(1).expect("a second face").id;
+     st.geo_hover_drawn = Some(GeoSel { entity: "Part".into(), feature: FeatureSel::Face(other) });
+     assert!(!resolved_row_hover(&st).polylines.is_empty());
+-    assert_eq!(hover_builds(&st), 3, "a new pick builds again");
++    assert_eq!(row_hover_builds(&st), 3, "a new pick builds again");
+ }
+diff --git a/crates/ui/src/pick_ink.rs b/crates/ui/src/pick_ink.rs
+index 27f4a9fe0..a75f97858 100644
+--- a/crates/ui/src/pick_ink.rs
++++ b/crates/ui/src/pick_ink.rs
+@@ -1,7 +1,7 @@
+ //! The viewport's pick marks (#1505): one style for what an
+ //! operation's Geometry has selected and one, clearly different, for what
+ //! the pointer is over - the edge a click would take (the Geometry-list row
+-//! hover is main's `interact::row_hover_segments`, #1507). Both
++//! hover is `pick_highlight_mesh::paint_row_hover`, #1507). Both
+ //! are screen-space strokes drawn over the model with a dark halo, so they
+ //! read on the shaded and the wireframe model in either theme. Hover is
+ //! ephemeral view state: nothing here is a command.
+diff --git a/docs/decisions/2201-highlighter-frame-perf.md b/docs/decisions/2201-highlighter-frame-perf.md
+index 3b2fe365b..585e32f2c 100644
+--- a/docs/decisions/2201-highlighter-frame-perf.md
++++ b/docs/decisions/2201-highlighter-frame-perf.md
+@@ -12,11 +12,17 @@ caches whose key is the input itself (crates/ui/AGENTS.md, "Frame cost",
+   same as the key of `pick_line_memo`: the picks by value, and for each
+   picked body its display-off flag, its entity, its `Arc<Features>`
+   allocation and its view pose.
+-- `pick_highlight_mesh`: the batched screen meshes of these outlines.
++- `pick_highlight_mesh`: the batched screen meshes of these outlines,
++  in three slots (selected, viewport hover, row hover). The key is
++  `MeshKey`: the outline id, the camera matrix, the pane mapping, the
++  clip, the pixels per point, the widths and the colours. Each slot
++  (`MeshSlot`) has its own build counter. A hit sends a clone of the
++  `Arc<Mesh>`, not a deep copy.
+ - `geometry::feature`: the `[Option<Pos>; 3]` digest (the same hash as the
+   `Vec` form) and one `patch_lattice()` call for `patches` and
+   `patch_rings`.
+-- `model::toolpath_nonempty` and `model::toolpath_warning_count`.
++- `model::toolpath_nonempty`, in `model/toolpath.rs` (model.rs is past
++  400 lines). `toolpath_warning_count` had no caller and is removed.
+ 
+ **Why.** Main now has input-keyed memos for the same work:
+ `model::features_of` (Weak memo), `model::resolve_chain`, `model::patches`,
+@@ -44,6 +50,32 @@ by a document counter, and the review asked for counter and changed-input
+ tests for each. Main's memos cover the scene and the pick lines. A panel
+ cache comes back only with a measurement and an input key.
+ 
++**Hand-resolved hunk of the second refresh (main at `ed4a9940f`).**
++
++- `egui_app/tests.rs` module list: both sides added one module at the
++  same place (`highlight_perf` and main's `pocket_no_adaptive`). Both are
++  kept. #2484 (shared pick names) merged without a conflict: its
++  `geo_label` status lines in `interact.rs` and its chip names in
++  `state.rs` stay as main has them.
++
++**Counters split.** The outline cache counted the viewport hover and the
++row hover in one counter. Each now has its own (`hover_builds`,
++`row_hover_builds`), so each slot has its own pin.
++
+ **Cost to change later.** Low. Each kept cache is one module with a counter
+-test and changed-input tests (`pick_highlight_tests.rs`,
+-`frame_cache_tests.rs`).
++test and changed-input tests:
++
++- `frame_cache_tests.rs`: the world-vertex cache.
++- `pick_highlight_tests.rs`: the outline cache (row hover and viewport
++  hover, each with its own counter).
++- `pick_highlight_mesh_tests.rs`: the screen-mesh cache. For each of the
++  three slots, a still frame tessellates once, and an orbit, a pane
++  resize and an ink change each tessellate again with moved or recoloured
++  painted vertices.
++
++**Not done here (review non-blockers, left open).** The vertex cache keeps
++one entry for each pose of a live body (bounded at 32), the vertex cache
++hit still clones the vertex vector, and the law tests of
++`interact::hover_features` / `row_hover_segments` use
++`pick_highlight::project_segments`, not the production projection in
++`pick_highlight_mesh`.

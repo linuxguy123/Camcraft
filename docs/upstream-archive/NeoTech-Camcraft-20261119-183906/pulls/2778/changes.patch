@@ -1,0 +1,713 @@
+From 0a06cc451babb35d96781d46cb0a55e1da7da8c1 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 08:58:03 -0800
+Subject: [PATCH] fix(machine): expose pure limit checks in post
+
+Move the report and world-free limit checks into camcraft-post.
+Keep the ECS walk and document-specific checks in app.
+Preserve the existing app diagnostic text and order.
+
+Co-Authored-By: Codex <codex@openai.com>
+
+Fixes #2585
+---
+ crates/app/src/machine/mod.rs             | 160 ++-----------
+ crates/post/src/machine/check.rs          | 261 ++++++++++++++++++++++
+ crates/{app => post}/src/machine/judge.rs |   8 +-
+ crates/post/src/machine/mod.rs            |   7 +
+ crates/post/tests/machine_check.rs        | 105 +++++++++
+ docs/decisions/2585-machine-judgment.md   |  25 +++
+ 6 files changed, 416 insertions(+), 150 deletions(-)
+ create mode 100644 crates/post/src/machine/check.rs
+ rename crates/{app => post}/src/machine/judge.rs (97%)
+ create mode 100644 crates/post/tests/machine_check.rs
+ create mode 100644 docs/decisions/2585-machine-judgment.md
+
+diff --git a/crates/app/src/machine/mod.rs b/crates/app/src/machine/mod.rs
+index fe9ecef0e..8aaacb64b 100644
+--- a/crates/app/src/machine/mod.rs
++++ b/crates/app/src/machine/mod.rs
+@@ -57,13 +57,10 @@ pub use holders::{holder_lookup, parse_mch, tooling_refusal, tooling_refusals};
+ 
+ // #287: the Machines pane's catalogue, property sheet and validator.
+ pub mod library;
+-// #669: the machine check on a plasma table, and the per-move helpers
+-// it shares with the cutting check.
+-mod judge;
++// #669: the machine check on a plasma table.
+ mod plasma;
+ mod waterjet;
+ pub mod wire_edm;
+-use judge::{c_letter_problem, move_extremes, pose_problems, say, slowest_axis, tap_gate};
+ mod sheet;
+ pub mod validate;
+ // #383: the machine editor - property grid, draft, user folder and save.
+@@ -128,30 +125,6 @@ pub fn kind_of(world: &World) -> Kind {
+ 
+ pub use crate::setup_mount::kind_of_setup;
+ 
+-/// What a program asks that the machine cannot give. Located like the
+-/// deviation verdict - every line names its op - because a limit
+-/// violation without a WHERE is trivia, not a warning.
+-#[derive(Clone, Debug, Default, PartialEq)]
+-pub struct MachineCheck {
+-    pub problems: Vec<String>,
+-    /// How many more the reporter withheld (the walk caps its list;
+-    /// the count never lies).
+-    pub more: usize,
+-    /// What the machine's kind puts outside this check (#669 - a plasma
+-    /// table's Z depth and rpm), named so a skip is never silent. Notes
+-    /// never block: they say what was NOT judged, not what failed.
+-    pub notes: Vec<String>,
+-}
+-
+-impl MachineCheck {
+-    #[must_use]
+-    pub fn is_ok(&self) -> bool {
+-        self.problems.is_empty()
+-    }
+-}
+-
+-const REPORT_CAP: usize = 40;
+-
+ /// Check the WHOLE program - the same op walk the sim and the post
+ /// share, so the gate that stage D wires sees one machine judgment
+ /// over exactly what would post. Never re-plans: cached moves only.
+@@ -178,22 +151,10 @@ pub fn check_ops(world: &World, machine: &Machine, program: &[(String, flecs_ecs
+     // tools than the drum holds physically cannot run, however each
+     // tool passes on its own. Counted by name, the same identity the
+     // ops and the library agree on.
+-    if let Some(slots) = machine.tool_count {
+-        let mut names: Vec<String> = Vec::new();
+-        for (_, e) in &ops {
+-            if let Some(op) = model::operation_of(world, e)
+-                && !names.contains(&op.tool)
+-            {
+-                names.push(op.tool.clone());
+-            }
+-        }
+-        if names.len() > slots {
+-            say(
+-                &mut out,
+-                format!("program calls {} tools, the changer holds {slots}", names.len()),
+-            );
+-        }
+-    }
++    let names: Vec<String> = ops.iter()
++        .filter_map(|(_, e)| model::operation_of(world, e).map(|op| op.tool.clone()))
++        .collect();
++    out.check_tool_count(machine, &names.iter().map(String::as_str).collect::<Vec<_>>());
+ 
+     for (name, e) in &ops {
+         let op = model::operation_of(world, e).ok_or_else(|| format!("{name}: lost its operation"))?;
+@@ -212,25 +173,13 @@ pub fn check_ops(world: &World, machine: &Machine, program: &[(String, flecs_ecs
+         // what passes exactly as it shifts the G-code.
+         let (_, origin) = posting::wcs_context(world, op.setup.as_deref());
+         let flip = crate::setup_wcs_flip::of_setup(world, op.setup.as_deref());
+-        let lathe = kind(Some(machine)) == Kind::Lathe;
+ 
+         // Spindle: the speed the program commands for this op - the
+         // post's own answer (`posting::posted_rpm`), so a touch probe,
+         // which is never spun, is not judged against the spindle range
+         // (#565); every cutter is, by its own rpm.
+         let rpm = posting::posted_rpm(&tool);
+-        if rpm > 0.0 {
+-            if let Some(hi) = machine.spindle_max
+-                && rpm > hi
+-            {
+-                say(&mut out, format!("{name}: tool {} runs {rpm:.0} rpm, above the machine's {hi:.0}", op.tool));
+-            }
+-            if let Some(lo) = machine.spindle_min
+-                && rpm < lo
+-            {
+-                say(&mut out, format!("{name}: tool {} runs {rpm:.0} rpm, below the machine's {lo:.0}", op.tool));
+-            }
+-        }
++        out.check_spindle(machine, Some(SourceLocation::Operation(name)), &op.tool, rpm);
+         // Spindle power (M13.2): the estimate the cutting data makes
+         // of the op's own engagement against the stated motor. Every
+         // input must be stated - machine power, document material,
+@@ -256,17 +205,10 @@ pub fn check_ops(world: &World, machine: &Machine, program: &[(String, flecs_ecs
+         // "Tool length" is the whole protrusion from the spindle nose
+         // to the tip - what the magazine's clearance measures: cutter,
+         // shank, and the holder the setup assumes above them.
+-        if let Some(l) = machine.max_tool_length {
+-            let len = tool.flute_len + tool.shank_len + tool.holder_len;
+-            if len > l {
+-                say(&mut out, format!("{name}: tool {} is {len:.1} mm long, the machine takes {l:.1}", op.tool));
+-            }
+-        }
+-        if let Some(diam) = machine.max_tool_diameter
+-            && tool.diameter > diam
+-        {
+-            say(&mut out, format!("{name}: tool {} is {:.1} mm across, the machine takes {diam:.1}", op.tool, tool.diameter));
+-        }
++        out.check_tool_size(
++            machine, Some(SourceLocation::Operation(name)), &op.tool,
++            tool.flute_len + tool.shank_len + tool.holder_len, tool.diameter,
++        );
+         // The handoff step (M5.3 C): a parting op that asks for its
+         // part to move to a second spindle wants steel the machine
+         // may not have. Stated spindles check, unstated check
+@@ -293,84 +235,10 @@ pub fn check_ops(world: &World, machine: &Machine, program: &[(String, flecs_ecs
+         // meridian radius (`lathe_stroke`), not on the cache's world X.
+         let lathe_judged = lathe_stroke::judge(&mut out, name, &op.params, &op.tool, &tool, &cache.path, machine, origin);
+ 
+-        for (i, mv) in cache.path.moves.iter().enumerate() {
+-            // Pose (M5.1 stage A): a move that leans the tool asks
+-            // the machine to hold an angle, and the machine answers
+-            // with its rotaries - by name, never silently. Absence
+-            // is the ordinary case (prismatic), checked exact so no
+-            // float dust enters this branch from a normal path.
+-            // A C-axis live-tool move (issue #33) states the spindle's
+-            // angle; its pose is the fixed station's, so the letter it
+-            // asks for is C alone - read here, never re-derived from
+-            // the part-frame axis (whose A/B the machine does not have).
+-            if let Some(c) = mv.rotary {
+-                if let Some(msg) = c_letter_problem(machine, i, c) {
+-                    say(&mut out, format!("{name}: {msg}"));
+-                }
+-            } else if let Some(a) = mv.axis
+-                && !crate::cl::is_vertical(&a)
+-            {
+-                // The letters (or, on a 4th-axis table, the angle about
+-                // X, #797) name what the rotaries must hold (`judge`).
+-                for msg in pose_problems(machine, i, a) {
+-                    say(&mut out, format!("{name}: {msg}"));
+-                }
+-            }
+-            // Feed: only stated feeds check against stated ceilings.
+-            if let Some(feed) = mv.feed {
+-                let d = [
+-                    mv.to.x - mv.from.x,
+-                    mv.to.y - mv.from.y,
+-                    mv.to.z - mv.from.z,
+-                ];
+-                if let Some(ceil) = machine.feed_ceiling(d)
+-                    && feed > ceil
+-                {
+-                    say(&mut out, format!(
+-                        "{name}: move {i} feeds {feed:.0} mm/min, {} tops out at {ceil:.0}",
+-                        slowest_axis(&machine.axes, ceil)
+-                    ));
+-                }
+-            }
+-            if lathe_judged {
+-                continue; // its stroke was judged above, as posted (#647)
+-            }
+-            // Travel: endpoints and - for arcs - the quarter points
+-            // the sweep can bulge past. A straight move's extremes
+-            // ARE its endpoints. The stroke is the machine's own; an
+-            // inverted axis (#373) reads program `v` as `-v`, so the
+-            // band is judged in the machine's coordinates.
+-            // #631: on a lathe, an arc about the SPINDLE axis (a thread's
+-            // half-turn) is the spindle turning, not the slide: its far
+-            // side (negative X, and the quarter points) is the CL's
+-            // antipode, never a slide position. The slide reaches the
+-            // radius - judge |r| in X. Every other move keeps its signed X,
+-            // so a real move past centre is judged as before.
+-            let spindle_arc = lathe
+-                && mv.arc.is_some_and(|a| {
+-                    a.plane.is_xy() && (a.center.x - origin[0]).abs() < 1e-6 && (a.center.y - origin[1]).abs() < 1e-6
+-                });
+-            for p in move_extremes(mv) {
+-                for (k, w) in [p.x, p.y, p.z].iter().enumerate() {
+-                    let Some(ax) = machine.axis(k) else { continue };
+-                    let Some((lo, hi)) = ax.travel else { continue };
+-                    // #1649: a flipped WCS axis posts the other sign too.
+-                    let sign = ax.direction.sign() * if flip.get(k).copied().unwrap_or(false) { -1.0 } else { 1.0 };
+-                    let v = if spindle_arc && k == 0 {
+-                        (p.x - origin[0]).hypot(p.y - origin[1]) * sign
+-                    } else {
+-                        (w - origin[k]) * sign
+-                    };
+-                    if v < lo || v > hi {
+-                        let inv = if ax.direction.is_standard() { "" } else { " (inverted axis)" };
+-                        say(&mut out, format!(
+-                            "{name}: move {i} reaches {v:.3} in {}{inv}, the stroke is {lo:.3}..{hi:.3}",
+-                            ax.name
+-                        ));
+-                    }
+-                }
+-            }
+-        }
++        out.check_path(
++            machine, Some(SourceLocation::Operation(name)), &cache.path,
++            origin, flip, !lathe_judged,
++        );
+     }
+     Ok(out)
+ }
+diff --git a/crates/post/src/machine/check.rs b/crates/post/src/machine/check.rs
+new file mode 100644
+index 000000000..6b644e4f0
+--- /dev/null
++++ b/crates/post/src/machine/check.rs
+@@ -0,0 +1,261 @@
++//! Pure machine limit judgment over caller-provided program values (#2585).
++//! Provenance: general machine-tool practice; extracted from our app machine checks.
++
++use super::judge::{c_letter_problem, move_extremes, pose_problems, say, slowest_axis};
++use super::{Kind, Machine, kind};
++use crate::cl::Toolpath;
++
++/// The caller's source for a finding. NC callers can judge each line's moves.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SourceLocation<'a> {
++    Operation(&'a str),
++    NcLine(usize),
++}
++
++fn source_name(source: Option<SourceLocation<'_>>) -> String {
++    match source {
++        Some(SourceLocation::Operation(name)) => name.to_owned(),
++        Some(SourceLocation::NcLine(line)) => format!("line {line}"),
++        None => "program".into(),
++    }
++}
++
++/// What a program asks that the machine cannot give. Findings name the
++/// caller-provided source, so a limit violation identifies where it occurs.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct MachineCheck {
++    pub problems: Vec<String>,
++    /// How many more the reporter withheld (the walk caps its list;
++    /// the count never lies).
++    pub more: usize,
++    /// What the machine's kind puts outside this check (#669 - a plasma
++    /// table's Z depth and rpm), named so a skip is never silent. Notes
++    /// never block: they say what was NOT judged, not what failed.
++    pub notes: Vec<String>,
++}
++
++impl MachineCheck {
++    #[must_use]
++    pub fn is_ok(&self) -> bool {
++        self.problems.is_empty()
++    }
++}
++
++pub const REPORT_CAP: usize = 40;
++
++impl MachineCheck {
++    /// Count distinct tool identities across the whole program.
++    pub fn check_tool_count(&mut self, machine: &Machine, tools: &[&str]) {
++        if let Some(slots) = machine.tool_count {
++            let mut names = Vec::new();
++            for name in tools {
++                if !names.contains(name) {
++                    names.push(*name);
++                }
++            }
++            if names.len() > slots {
++                say(
++                    self,
++                    format!(
++                        "program calls {} tools, the changer holds {slots}",
++                        names.len()
++                    ),
++                );
++            }
++        }
++    }
++
++    /// Check posted RPM and whole protruding tool dimensions, in millimeters.
++    pub fn check_tool(
++        &mut self,
++        machine: &Machine,
++        source: Option<SourceLocation<'_>>,
++        tool_name: &str,
++        len: f64,
++        diameter: f64,
++        rpm: f64,
++    ) {
++        self.check_spindle(machine, source, tool_name, rpm);
++        self.check_tool_size(machine, source, tool_name, len, diameter);
++    }
++
++    /// A zero RPM represents an unspun tool, such as a probe.
++    pub fn check_spindle(
++        &mut self,
++        machine: &Machine,
++        source: Option<SourceLocation<'_>>,
++        tool_name: &str,
++        rpm: f64,
++    ) {
++        let name = source_name(source);
++        if rpm > 0.0 {
++            if let Some(hi) = machine.spindle_max
++                && rpm > hi
++            {
++                say(
++                    self,
++                    format!(
++                        "{name}: tool {} runs {rpm:.0} rpm, above the machine's {hi:.0}",
++                        tool_name
++                    ),
++                );
++            }
++            if let Some(lo) = machine.spindle_min
++                && rpm < lo
++            {
++                say(
++                    self,
++                    format!(
++                        "{name}: tool {} runs {rpm:.0} rpm, below the machine's {lo:.0}",
++                        tool_name
++                    ),
++                );
++            }
++        }
++    }
++
++    /// Check the full protrusion and cutter diameter against magazine limits.
++    pub fn check_tool_size(
++        &mut self,
++        machine: &Machine,
++        source: Option<SourceLocation<'_>>,
++        tool_name: &str,
++        len: f64,
++        diameter: f64,
++    ) {
++        let name = source_name(source);
++        if let Some(l) = machine.max_tool_length
++            && len > l
++        {
++            say(
++                self,
++                format!(
++                    "{name}: tool {} is {len:.1} mm long, the machine takes {l:.1}",
++                    tool_name
++                ),
++            );
++        }
++        if let Some(diam) = machine.max_tool_diameter
++            && diameter > diam
++        {
++            say(
++                self,
++                format!(
++                    "{name}: tool {} is {:.1} mm across, the machine takes {diam:.1}",
++                    tool_name, diameter
++                ),
++            );
++        }
++    }
++
++    /// Judge pose, feed and program-coordinate travel in millimeters.
++    /// Set `check_travel` false only when the caller separately judges the
++    /// posted lathe slide path. Pose and feed are still checked.
++    pub fn check_path(
++        &mut self,
++        machine: &Machine,
++        source: Option<SourceLocation<'_>>,
++        path: &Toolpath,
++        origin: [f64; 3],
++        flip: [bool; 3],
++        check_travel: bool,
++    ) {
++        let name = source_name(source);
++        let lathe = kind(Some(machine)) == Kind::Lathe;
++        for (i, mv) in path.moves.iter().enumerate() {
++            // Pose (M5.1 stage A): a move that leans the tool asks
++            // the machine to hold an angle, and the machine answers
++            // with its rotaries - by name, never silently. Absence
++            // is the ordinary case (prismatic), checked exact so no
++            // float dust enters this branch from a normal path.
++            // A C-axis live-tool move (issue #33) states the spindle's
++            // angle; its pose is the fixed station's, so the letter it
++            // asks for is C alone - read here, never re-derived from
++            // the part-frame axis (whose A/B the machine does not have).
++            if let Some(c) = mv.rotary {
++                if let Some(msg) = c_letter_problem(machine, i, c) {
++                    say(self, format!("{name}: {msg}"));
++                }
++            } else if let Some(a) = mv.axis
++                && !crate::cl::is_vertical(&a)
++            {
++                // The letters (or, on a 4th-axis table, the angle about
++                // X, #797) name what the rotaries must hold (`judge`).
++                for msg in pose_problems(machine, i, a) {
++                    say(self, format!("{name}: {msg}"));
++                }
++            }
++            // Feed: only stated feeds check against stated ceilings.
++            if let Some(feed) = mv.feed {
++                let d = [
++                    mv.to.x - mv.from.x,
++                    mv.to.y - mv.from.y,
++                    mv.to.z - mv.from.z,
++                ];
++                if let Some(ceil) = machine.feed_ceiling(d)
++                    && feed > ceil
++                {
++                    say(
++                        self,
++                        format!(
++                            "{name}: move {i} feeds {feed:.0} mm/min, {} tops out at {ceil:.0}",
++                            slowest_axis(&machine.axes, ceil)
++                        ),
++                    );
++                }
++            }
++            if !check_travel {
++                continue; // its stroke was judged above, as posted (#647)
++            }
++            // Travel: endpoints and - for arcs - the quarter points
++            // the sweep can bulge past. A straight move's extremes
++            // ARE its endpoints. The stroke is the machine's own; an
++            // inverted axis (#373) reads program `v` as `-v`, so the
++            // band is judged in the machine's coordinates.
++            // #631: on a lathe, an arc about the SPINDLE axis (a thread's
++            // half-turn) is the spindle turning, not the slide: its far
++            // side (negative X, and the quarter points) is the CL's
++            // antipode, never a slide position. The slide reaches the
++            // radius - judge |r| in X. Every other move keeps its signed X,
++            // so a real move past centre is judged as before.
++            let spindle_arc = lathe
++                && mv.arc.is_some_and(|a| {
++                    a.plane.is_xy()
++                        && (a.center.x - origin[0]).abs() < 1e-6
++                        && (a.center.y - origin[1]).abs() < 1e-6
++                });
++            for p in move_extremes(mv) {
++                for (k, w) in [p.x, p.y, p.z].iter().enumerate() {
++                    let Some(ax) = machine.axis(k) else { continue };
++                    let Some((lo, hi)) = ax.travel else { continue };
++                    // #1649: a flipped WCS axis posts the other sign too.
++                    let sign = ax.direction.sign()
++                        * if flip.get(k).copied().unwrap_or(false) {
++                            -1.0
++                        } else {
++                            1.0
++                        };
++                    let v = if spindle_arc && k == 0 {
++                        (p.x - origin[0]).hypot(p.y - origin[1]) * sign
++                    } else {
++                        (w - origin[k]) * sign
++                    };
++                    if v < lo || v > hi {
++                        let inv = if ax.direction.is_standard() {
++                            ""
++                        } else {
++                            " (inverted axis)"
++                        };
++                        say(
++                            self,
++                            format!(
++                                "{name}: move {i} reaches {v:.3} in {}{inv}, the stroke is {lo:.3}..{hi:.3}",
++                                ax.name
++                            ),
++                        );
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/app/src/machine/judge.rs b/crates/post/src/machine/judge.rs
+similarity index 97%
+rename from crates/app/src/machine/judge.rs
+rename to crates/post/src/machine/judge.rs
+index a5498329f..275482545 100644
+--- a/crates/app/src/machine/judge.rs
++++ b/crates/post/src/machine/judge.rs
+@@ -25,7 +25,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
+ /// be equal, and a control turns equal endpoints a whole circle), or
+ /// the arc is degenerate. The radius is the larger endpoint radius, so
+ /// a ramping arc is never under-read.
+-pub(super) fn move_extremes(mv: &crate::cl::Move) -> Vec<Point3> {
++pub fn move_extremes(mv: &crate::cl::Move) -> Vec<Point3> {
+     let mut v = vec![mv.from, mv.to];
+     let Some(arc) = &mv.arc else { return v };
+     let pl = arc.plane;
+@@ -58,14 +58,14 @@ const SAME_WORD: f64 = 0.01;
+ /// swept: float dust must never drop a point that the arc touches.
+ const ANGLE_SLACK: f64 = 1e-9;
+ 
+-pub(super) fn slowest_axis(axes: &[AxisLimits], ceil: f64) -> String {
++pub fn slowest_axis(axes: &[AxisLimits], ceil: f64) -> String {
+     axes.iter()
+         .find(|a| a.feed == Some(ceil))
+         .map(|a| a.name.clone())
+         .unwrap_or_else(|| "an axis".into())
+ }
+ 
+-pub(super) fn say(out: &mut MachineCheck, s: String) {
++pub fn say(out: &mut MachineCheck, s: String) {
+     if out.problems.len() < REPORT_CAP {
+         out.problems.push(s);
+     } else {
+@@ -209,7 +209,7 @@ pub(super) fn c_letter_problem(machine: &Machine, i: usize, c: f64) -> Option<St
+ /// (`spindle.rigid_tapping: false`), is refused by name - whatever post
+ /// is chosen, and never converted to another cycle. Unstated reads as
+ /// "not limited" (the unstated-limit law): nothing is said then.
+-pub(super) fn tap_gate(out: &mut MachineCheck, machine: &Machine, name: &str, path: &crate::cl::Toolpath) {
++pub fn tap_gate(out: &mut MachineCheck, machine: &Machine, name: &str, path: &crate::cl::Toolpath) {
+     if machine.rigid_tapping != Some(false) {
+         return;
+     }
+diff --git a/crates/post/src/machine/mod.rs b/crates/post/src/machine/mod.rs
+index 2d5edbd15..5e032c361 100644
+--- a/crates/post/src/machine/mod.rs
++++ b/crates/post/src/machine/mod.rs
+@@ -2,6 +2,7 @@
+ //! file's reader (`parse`) - the same facts `post::machine::mirror`
+ //! restates for scripts. Pure serde; no world, no units glue (that is
+ //! the app's `machine` module, which re-exports all of this).
++//! [`MachineCheck`] judges program values without a document or ECS world.
+ 
+ pub mod def;
+ mod direction;
+@@ -39,3 +40,9 @@ pub use plasma::plasma_refusals;
+ pub use tooling::{mount_check, tooling_refusals, HolderInfo, HolderLookup, SPINDLE_MOUNTS};
+ pub use tree::{parse_mch_tree, MachineTree, MovingSide, PartKind, SpindleBody, ToolStation, TreePart};
+ pub use trunnion::{trunnion_refusals, RotarySignConvention};
++
++mod check;
++mod judge;
++pub use check::{MachineCheck, SourceLocation, REPORT_CAP};
++// Shared with the app-specific plasma, waterjet, EDM and posted-lathe checks.
++pub use judge::{move_extremes, say, slowest_axis, tap_gate};
+diff --git a/crates/post/tests/machine_check.rs b/crates/post/tests/machine_check.rs
+new file mode 100644
+index 000000000..88f8380a3
+--- /dev/null
++++ b/crates/post/tests/machine_check.rs
+@@ -0,0 +1,105 @@
++//! Pure machine limits, available without an ECS document (#2585).
++//! Provenance: general machine-tool limits and the existing app machine checks.
++//! Gate map (M4.4): covers post::machine.
++
++use camcraft_post::cl::{Move, MoveKind, Toolpath};
++use camcraft_post::geometry::Point3;
++use camcraft_post::machine::{AxisLimits, Machine, MachineCheck, REPORT_CAP, SourceLocation};
++
++fn machine() -> Machine {
++    Machine {
++        model: "TestMill".into(),
++        axes: vec![AxisLimits {
++            name: "X".into(),
++            feed: Some(100.0),
++            travel: Some((-10.0, 10.0)),
++            ..Default::default()
++        }],
++        spindle_min: Some(50.0),
++        spindle_max: Some(1000.0),
++        max_tool_length: Some(100.0),
++        max_tool_diameter: Some(20.0),
++        tool_count: Some(1),
++        ..Default::default()
++    }
++}
++
++fn path(to_x: f64, feed: Option<f64>) -> Toolpath {
++    Toolpath::new(vec![Move::new(
++        MoveKind::Feed,
++        Point3::new(0.0, 0.0, 0.0),
++        Point3::new(to_x, 0.0, 0.0),
++        feed,
++    )])
++}
++
++#[test]
++fn pure_machine_checks_keep_operation_messages_and_nc_line_locations() {
++    let machine = machine();
++    let mut out = MachineCheck::default();
++    out.check_path(&machine, Some(SourceLocation::Operation("Face1")), &path(11.0, Some(200.0)), [0.0; 3], [false; 3], true);
++    assert_eq!(out.problems, [
++        "Face1: move 0 feeds 200 mm/min, X tops out at 100",
++        "Face1: move 0 reaches 11.000 in X, the stroke is -10.000..10.000",
++    ]);
++    let mut nc = MachineCheck::default();
++    nc.check_path(&machine, Some(SourceLocation::NcLine(17)), &path(11.0, None), [0.0; 3], [false; 3], true);
++    assert_eq!(nc.problems, ["line 17: move 0 reaches 11.000 in X, the stroke is -10.000..10.000"]);
++    assert!(!nc.is_ok());
++}
++
++#[test]
++fn pure_tool_checks_keep_rpm_sizes_and_distinct_tool_count() {
++    let machine = machine();
++    let mut out = MachineCheck::default();
++    out.check_tool_count(&machine, &["T1", "T1", "T2"]);
++    out.check_tool(&machine, Some(SourceLocation::Operation("Face1")), "T1", 101.0, 21.0, 1001.0);
++    out.check_tool(&machine, Some(SourceLocation::Operation("Face2")), "T2", 100.0, 20.0, 49.0);
++    assert_eq!(out.problems, [
++        "program calls 2 tools, the changer holds 1",
++        "Face1: tool T1 runs 1001 rpm, above the machine's 1000",
++        "Face1: tool T1 is 101.0 mm long, the machine takes 100.0",
++        "Face1: tool T1 is 21.0 mm across, the machine takes 20.0",
++        "Face2: tool T2 runs 49 rpm, below the machine's 50",
++    ]);
++}
++
++#[test]
++fn pure_checks_keep_unstated_limits_inclusive_edges_and_probe_rpm() {
++    let mut out = MachineCheck::default();
++    out.check_tool(&machine(), None, "probe", 100.0, 20.0, 0.0);
++    out.check_path(&machine(), None, &path(10.0, Some(100.0)), [0.0; 3], [false; 3], true);
++    let sparse = Machine::default();
++    out.check_tool(&sparse, None, "T1", 1000.0, 1000.0, 10000.0);
++    out.check_tool_count(&sparse, &["T1", "T2"]);
++    out.check_path(&sparse, None, &path(1000.0, Some(10000.0)), [0.0; 3], [false; 3], true);
++    assert!(out.is_ok(), "{:?}", out.problems);
++}
++
++#[test]
++fn pure_travel_uses_origin_flip_and_keeps_posted_lathe_override() {
++    let machine = machine();
++    let mut out = MachineCheck::default();
++    // Both endpoints shift inside the travel window.
++    let shifted = Toolpath::new(vec![Move::new(MoveKind::Rapid, Point3::new(20.0, 0.0, 0.0), Point3::new(21.0, 0.0, 0.0), None)]);
++    out.check_path(&machine, None, &shifted, [20.0, 0.0, 0.0], [false; 3], true);
++    assert!(out.is_ok());
++    let mut asymmetric = machine.clone();
++    asymmetric.axes[0].travel = Some((-20.0, 0.0));
++    out.check_path(&asymmetric, Some(SourceLocation::Operation("Face1")), &path(11.0, None), [0.0; 3], [true, false, false], true);
++    assert!(out.is_ok());
++    out.check_path(&machine, None, &path(100.0, Some(200.0)), [0.0; 3], [false; 3], false);
++    assert_eq!(out.problems.len(), 1);
++    assert!(out.problems[0].contains("feeds 200"));
++}
++
++#[test]
++fn pure_machine_report_caps_findings_and_counts_the_rest() {
++    let machine = machine();
++    let mut out = MachineCheck::default();
++    for _ in 0..REPORT_CAP + 3 {
++        out.check_tool(&machine, None, "T1", 100.0, 20.0, 1001.0);
++    }
++    assert_eq!(out.problems.len(), REPORT_CAP);
++    assert_eq!(out.more, 3);
++}
+diff --git a/docs/decisions/2585-machine-judgment.md b/docs/decisions/2585-machine-judgment.md
+new file mode 100644
+index 000000000..52590875d
+--- /dev/null
++++ b/docs/decisions/2585-machine-judgment.md
+@@ -0,0 +1,25 @@
++## #2585 - Share the machine limit judgment without the ECS world
++
++**What was decided:** Put the pure `MachineCheck` accumulator in
++`camcraft-post::machine`. It checks tool count, rpm, tool size, and paths.
++Each finding can use an optional `SourceLocation`, with an operation name
++or an NC line number. Pass tool length, diameter, and rpm as scalar values.
++Add no crate dependency.
++
++**Why:** A stand-alone simulator needs the same machine limit checks as
++the app. The post crate already owns the machine definition and move
++types. The app keeps the ECS walk, holder resolution, spindle power,
++part transfer, and the adaptation of the posted lathe path. It calls the
++pure checks in the existing order to preserve its diagnostic output.
++
++**Considered and dropped:** Adding a tools dependency would couple the
++checks to a full tool definition when three scalar values are sufficient.
++Moving world-specific code would bring document concerns into the post
++crate. Changing diagnostic text would make this extraction change app
++behavior and weaken comparison with the existing tests.
++
++**Cost to change later:** Additional source kinds require an API change
++and tests for their displayed locations. Additional tool properties can
++extend the pure input API without moving the ECS walk. Moving the retained
++app checks later requires plain inputs and tests that preserve diagnostic
++order and text.
