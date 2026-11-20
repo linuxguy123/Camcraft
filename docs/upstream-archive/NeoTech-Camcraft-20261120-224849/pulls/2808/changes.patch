@@ -1,0 +1,3677 @@
+From 1947b6b6c30d214baf3db2072f95ed51ccb2dae3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 12:18:48 -0800
+Subject: [PATCH 1/2] fix(geometry): add deterministic true-shape nesting
+ kernel
+
+Add exact NFP/IFP placement, cut clearance, hole nesting, multi-sheet reports,
+and named input refusals while preserving the existing raster API.
+Pin placement and clearance behavior with regression tests and mutation checks.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #2158
+---
+ crates/geometry/src/nesting.rs            | 343 ++++++++++++++++++-
+ crates/geometry/src/nesting/blf.rs        | 216 ++++++++++++
+ crates/geometry/src/nesting/candidates.rs | 380 +++++++++++++++++++++
+ crates/geometry/src/nesting/decompose.rs  | 361 ++++++++++++++++++++
+ crates/geometry/src/nesting/inflate.rs    | 341 +++++++++++++++++++
+ crates/geometry/src/nesting/nfp.rs        | 370 +++++++++++++++++++++
+ crates/geometry/src/nesting/types.rs      | 203 ++++++++++++
+ crates/geometry/src/nesting/validate.rs   | 209 ++++++++++++
+ crates/geometry/tests/nesting.rs          | 352 ++++++++++++++++++++
+ crates/geometry/tests/nesting_modes.rs    | 249 ++++++++++++++
+ crates/geometry/tests/nesting_refusals.rs | 382 ++++++++++++++++++++++
+ docs/decisions/2158-nesting-kernel.md     |  65 ++++
+ 12 files changed, 3464 insertions(+), 7 deletions(-)
+ create mode 100644 crates/geometry/src/nesting/blf.rs
+ create mode 100644 crates/geometry/src/nesting/candidates.rs
+ create mode 100644 crates/geometry/src/nesting/decompose.rs
+ create mode 100644 crates/geometry/src/nesting/inflate.rs
+ create mode 100644 crates/geometry/src/nesting/nfp.rs
+ create mode 100644 crates/geometry/src/nesting/types.rs
+ create mode 100644 crates/geometry/src/nesting/validate.rs
+ create mode 100644 crates/geometry/tests/nesting.rs
+ create mode 100644 crates/geometry/tests/nesting_modes.rs
+ create mode 100644 crates/geometry/tests/nesting_refusals.rs
+ create mode 100644 docs/decisions/2158-nesting-kernel.md
+
+diff --git a/crates/geometry/src/nesting.rs b/crates/geometry/src/nesting.rs
+index 0929a31db..c358c14e6 100644
+--- a/crates/geometry/src/nesting.rs
++++ b/crates/geometry/src/nesting.rs
+@@ -1,9 +1,338 @@
+-//! Nesting building blocks: the CPU raster filter of the raster nest (#2525).
+-//!
+-//! Provenance: the raster ("no-fit raster") method of the nesting literature -
+-//! Bennell and Oliveira, "The geometry of nesting problems: a tutorial", EJOR
+-//! 2008 - and the conservative-coverage rules of research comment 2 on #2525.
+-//! Nothing here reaches posted output or a verdict: a raster only filters
+-//! candidates, and the exact `geo2d` check decides.
++//! Deterministic 2D true-shape nesting kernel (NFP/IFP and bottom-left-fill, #2158).
++//! Provenance: Bennell & Oliveira (EJOR 2008); Burke, Hellier, Kendall & Whitwell (OR 2006, EJOR 2007).
+ 
+ pub mod raster;
++
++mod blf;
++mod candidates;
++mod decompose;
++mod inflate;
++mod nfp;
++pub mod types;
++mod validate;
++
++pub use types::*;
++
++use crate::geo2d::{Point2, Region};
++use blf::{NfpCache, PlacementHit, find_best_placement};
++use candidates::{ContainerKind, Obstacle, translate_loop, translate_region};
++use decompose::IPoint;
++use inflate::{PreparedOrientation, PreparedPart, prepare_part};
++use nfp::region_ibbox;
++use std::collections::{BTreeMap, BTreeSet};
++use validate::{SheetSpec, validate_sheet};
++
++struct HoleSlot {
++    host_id: String,
++    host_instance: usize,
++    region: Region,
++    obstacles: Vec<Obstacle>,
++}
++
++struct ActiveSheet {
++    usable_bbox: (IPoint, IPoint),
++    outer_obstacles: Vec<Obstacle>,
++    holes: Vec<HoleSlot>,
++    placements: Vec<PlacedPart>,
++    placed_counts: BTreeMap<String, usize>,
++    cut_footprints: Vec<Region>,
++    net_area_sum: f64,
++}
++
++impl ActiveSheet {
++    fn new(spec: &SheetSpec) -> Self {
++        ActiveSheet {
++            usable_bbox: spec.usable_bbox,
++            outer_obstacles: Vec::new(),
++            holes: Vec::new(),
++            placements: Vec::new(),
++            placed_counts: BTreeMap::new(),
++            cut_footprints: Vec::new(),
++            net_area_sum: 0.0,
++        }
++    }
++}
++
++fn record_placed(
++    sheet: &mut ActiveSheet,
++    part_id: &str,
++    instance_index: usize,
++    ori: &PreparedOrientation,
++    offset: IPoint,
++    container_part: Option<(String, usize)>,
++) -> Result<(), NestError> {
++    let shift = offset.to_point2();
++    let outer = ori
++        .outer
++        .as_ref()
++        .map(|l| translate_loop(l, offset))
++        .transpose()?;
++    let holes = ori
++        .holes
++        .iter()
++        .map(|h| translate_loop(h, offset))
++        .collect::<Result<Vec<_>, _>>()?;
++    let open_chains: Vec<Vec<Point2>> = ori
++        .open_chains
++        .iter()
++        .map(|c| {
++            c.iter()
++                .map(|p| Point2::new(p.x + shift.x, p.y + shift.y))
++                .collect()
++        })
++        .collect();
++    let cut_footprint = translate_region(&ori.cut_footprint, offset)?;
++    let inflated_footprint = translate_region(&ori.inflated_footprint, offset)?;
++
++    for hu in &ori.hole_usables {
++        let shifted_hu = translate_region(hu, offset)?;
++        if !shifted_hu.is_empty() {
++            sheet.holes.push(HoleSlot {
++                host_id: part_id.to_string(),
++                host_instance: instance_index,
++                region: shifted_hu,
++                obstacles: Vec::new(),
++            });
++        }
++    }
++
++    if !cut_footprint.is_empty() {
++        sheet.cut_footprints.push(cut_footprint.clone());
++    }
++    sheet.net_area_sum += ori.net_area;
++    *sheet.placed_counts.entry(part_id.to_string()).or_insert(0) += 1;
++    sheet.placements.push(PlacedPart {
++        part_id: part_id.to_string(),
++        instance_index,
++        tx: shift.x,
++        ty: shift.y,
++        angle_deg: ori.angle_deg,
++        mirrored: ori.mirrored,
++        container_part,
++        net_area: ori.net_area,
++        outer,
++        holes,
++        open_chains,
++        cut_footprint,
++        inflated_footprint,
++    });
++    Ok(())
++}
++
++fn make_obstacle(ori: &PreparedOrientation, offset: IPoint) -> Result<Obstacle, NestError> {
++    let base = &ori.obstacle_footprint;
++    let placed_region = translate_region(base, offset)?;
++    let placed_bbox = region_ibbox(&placed_region)?.unwrap_or((offset, offset));
++    Ok(Obstacle {
++        shape_key: ori.shape_key.clone(),
++        base_region: base.clone(),
++        placed_offset: offset,
++        placed_region,
++        placed_bbox,
++    })
++}
++
++fn fits_empty_sheet(
++    part: &PreparedPart,
++    spec: &SheetSpec,
++    cache: &mut NfpCache,
++) -> Result<Option<PlacementHit>, NestError> {
++    find_best_placement(
++        &part.orientations,
++        ContainerKind::RectSheet {
++            usable_bbox: spec.usable_bbox,
++        },
++        &[],
++        cache,
++    )
++}
++
++fn oversized_reason(part: &PreparedPart, spec: &SheetSpec) -> String {
++    let uw = (spec.usable_bbox.1.x - spec.usable_bbox.0.x) as f64 / crate::geo2d::SCALE;
++    let uh = (spec.usable_bbox.1.y - spec.usable_bbox.0.y) as f64 / crate::geo2d::SCALE;
++    if let Some(first) = part.orientations.first() {
++        let pw = (first.sheet_fit_bbox.1.x - first.sheet_fit_bbox.0.x) as f64 / crate::geo2d::SCALE;
++        let ph = (first.sheet_fit_bbox.1.y - first.sheet_fit_bbox.0.y) as f64 / crate::geo2d::SCALE;
++        format!(
++            "part '{}' ({pw:.3} x {ph:.3} mm with cut clearance) exceeds usable sheet ({uw:.3} x {uh:.3} mm) in all allowed orientations",
++            part.id
++        )
++    } else {
++        format!(
++            "part '{}' has no feasible orientation on usable sheet ({uw:.3} x {uh:.3} mm)",
++            part.id
++        )
++    }
++}
++
++fn union_all_cuts(cuts: &[Region]) -> Result<Region, NestError> {
++    match cuts.len() {
++        0 => Ok(Region::empty()),
++        1 => Ok(cuts[0].clone()),
++        n => {
++            let (l, r) = cuts.split_at(n / 2);
++            let ul = union_all_cuts(l)?;
++            let ur = union_all_cuts(r)?;
++            Ok(ul.union(&ur)?)
++        }
++    }
++}
++
++/// Nest 2D parts onto rectangular sheets using exact NFP/IFP and deterministic bottom-left-fill.
++/// Refuses requests above 10,000 total instances to bound placement work and report allocation.
++pub fn nest(sheet: &SheetInput, parts: &[PartInput]) -> Result<NestReport, NestError> {
++    let spec = validate_sheet(sheet)?;
++    let mut seen_ids = BTreeSet::new();
++    let mut prepared = Vec::with_capacity(parts.len());
++    let mut requested_counts = BTreeMap::new();
++    let mut total_requested = 0usize;
++
++    for p in parts {
++        if !seen_ids.insert(p.id.clone()) {
++            return Err(NestError::InvalidInput(format!(
++                "duplicate part id '{}'",
++                p.id
++            )));
++        }
++        total_requested = total_requested.checked_add(p.quantity).ok_or_else(|| {
++            NestError::InvalidInput(format!(
++                "part '{}' quantity overflows requested total",
++                p.id
++            ))
++        })?;
++        if total_requested > 10_000 {
++            return Err(NestError::InvalidInput(format!(
++                "part '{}' quantity exceeds the nesting limit of 10000 requested instances",
++                p.id
++            )));
++        }
++        let prep = prepare_part(p, sheet)?;
++        requested_counts.insert(prep.id.clone(), prep.quantity);
++        prepared.push(prep);
++    }
++
++    // Sort decreasing by outer footprint area, then by part id for deterministic ordering.
++    prepared.sort_by(|a, b| {
++        b.sort_area
++            .total_cmp(&a.sort_area)
++            .then_with(|| a.id.cmp(&b.id))
++    });
++
++    let mut cache = NfpCache::default();
++    let mut sheets: Vec<ActiveSheet> = Vec::new();
++    let mut placed_counts = BTreeMap::new();
++    let mut unplaced = Vec::new();
++    let mut total_placed = 0usize;
++
++    for part in &prepared {
++        if part.quantity == 0 {
++            continue;
++        }
++        let Some(empty_hit) = fits_empty_sheet(part, &spec, &mut cache)? else {
++            unplaced.push(UnplacedPart {
++                part_id: part.id.clone(),
++                quantity: part.quantity,
++                reason: oversized_reason(part, &spec),
++            });
++            continue;
++        };
++
++        for inst in 0..part.quantity {
++            let mut placed = false;
++
++            if sheet.allow_parts_in_holes {
++                'hole_search: for s in &mut sheets {
++                    for hole in &mut s.holes {
++                        if let Some(hit) = find_best_placement(
++                            &part.orientations,
++                            ContainerKind::Hole {
++                                region: &hole.region,
++                            },
++                            &hole.obstacles,
++                            &mut cache,
++                        )? {
++                            let ori = &part.orientations[hit.ori_index];
++                            hole.obstacles.push(make_obstacle(ori, hit.offset)?);
++                            let host = (hole.host_id.clone(), hole.host_instance);
++                            record_placed(s, &part.id, inst, ori, hit.offset, Some(host))?;
++                            placed = true;
++                            break 'hole_search;
++                        }
++                    }
++                }
++            }
++
++            if !placed {
++                for s in &mut sheets {
++                    if let Some(hit) = find_best_placement(
++                        &part.orientations,
++                        ContainerKind::RectSheet {
++                            usable_bbox: s.usable_bbox,
++                        },
++                        &s.outer_obstacles,
++                        &mut cache,
++                    )? {
++                        let ori = &part.orientations[hit.ori_index];
++                        s.outer_obstacles.push(make_obstacle(ori, hit.offset)?);
++                        record_placed(s, &part.id, inst, ori, hit.offset, None)?;
++                        placed = true;
++                        break;
++                    }
++                }
++            }
++
++            if !placed {
++                let mut s = ActiveSheet::new(&spec);
++                let ori = &part.orientations[empty_hit.ori_index];
++                s.outer_obstacles
++                    .push(make_obstacle(ori, empty_hit.offset)?);
++                record_placed(&mut s, &part.id, inst, ori, empty_hit.offset, None)?;
++                sheets.push(s);
++            }
++
++            *placed_counts.entry(part.id.clone()).or_insert(0) += 1;
++            total_placed += 1;
++        }
++    }
++
++    let mut out_sheets = Vec::with_capacity(sheets.len());
++    let mut total_net_area = 0.0f64;
++    for (idx, s) in sheets.into_iter().enumerate() {
++        let cut_union = union_all_cuts(&s.cut_footprints)?;
++        let used_bounds = cut_union.bounds();
++        let waste_region = if cut_union.is_empty() {
++            spec.sheet_region.clone()
++        } else {
++            spec.sheet_region.difference(&cut_union)?
++        };
++        let utilization_pct = (s.net_area_sum / spec.area) * 100.0;
++        total_net_area += s.net_area_sum;
++        out_sheets.push(SheetPlacement {
++            sheet_index: idx,
++            placements: s.placements,
++            placed_counts: s.placed_counts,
++            utilization_pct,
++            waste_region,
++            used_bounds,
++            usable_sheet: spec.usable_sheet.clone(),
++        });
++    }
++
++    let sheet_count = out_sheets.len();
++    let overall_utilization_pct = if sheet_count > 0 {
++        (total_net_area / (sheet_count as f64 * spec.area)) * 100.0
++    } else {
++        0.0
++    };
++
++    Ok(NestReport {
++        sheet_count,
++        sheets: out_sheets,
++        total_requested,
++        total_placed,
++        requested_counts,
++        placed_counts,
++        overall_utilization_pct,
++        unplaced,
++    })
++}
+diff --git a/crates/geometry/src/nesting/blf.rs b/crates/geometry/src/nesting/blf.rs
+new file mode 100644
+index 000000000..c95ec8b11
+--- /dev/null
++++ b/crates/geometry/src/nesting/blf.rs
+@@ -0,0 +1,216 @@
++//! Deterministic Bottom-Left-Fill (BLF) placement engine and NFP cache.
++//! Provenance: BLF placement heuristic over exact NFPs (Burke et al., Operations Research 2006).
++
++use super::candidates::{
++    ContainerKind, Obstacle, collect_candidates, translate_region, verify_with_nudge,
++};
++use super::decompose::IPoint;
++use super::inflate::{PreparedOrientation, ShapeKey};
++use super::nfp::{
++    IfpResult, NfpWithSeams, compute_ifp, compute_nfp, rect_region_from_ipoints, region_ibbox,
++};
++use super::types::NestError;
++use crate::geo2d::Region;
++use std::collections::BTreeMap;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub(crate) struct PlacementScore {
++    pub max_y: i64,
++    pub min_y: i64,
++    pub min_x: i64,
++    pub max_x: i64,
++    pub ori_index: usize,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct PlacementHit {
++    pub ori_index: usize,
++    pub offset: IPoint,
++    pub score: PlacementScore,
++}
++
++#[derive(Default)]
++pub(crate) struct NfpCache {
++    entries: BTreeMap<(ShapeKey, ShapeKey), NfpWithSeams>,
++}
++
++impl NfpCache {
++    fn get_translated(
++        &mut self,
++        obs: &Obstacle,
++        part_base: &Region,
++        part_key: &ShapeKey,
++    ) -> Result<NfpWithSeams, NestError> {
++        let Some((obs_lo, _)) = region_ibbox(&obs.base_region)? else {
++            return Ok(NfpWithSeams {
++                region: Region::empty(),
++                seam_points: Vec::new(),
++                seam_segments: Vec::new(),
++            });
++        };
++        let Some((part_lo, _)) = region_ibbox(part_base)? else {
++            return Ok(NfpWithSeams {
++                region: Region::empty(),
++                seam_points: Vec::new(),
++                seam_segments: Vec::new(),
++            });
++        };
++        let key = (obs.shape_key.clone(), part_key.clone());
++        let nfp_zero = if let Some(cached) = self.entries.get(&key) {
++            cached.clone()
++        } else {
++            let obs_zero = translate_region(
++                &obs.base_region,
++                IPoint {
++                    x: -obs_lo.x,
++                    y: -obs_lo.y,
++                },
++            )?;
++            let part_zero = translate_region(
++                part_base,
++                IPoint {
++                    x: -part_lo.x,
++                    y: -part_lo.y,
++                },
++            )?;
++            let computed = compute_nfp(&obs_zero, &part_zero)?;
++            self.entries.insert(key, computed.clone());
++            computed
++        };
++        let shift = IPoint {
++            x: obs.placed_offset.x + obs_lo.x - part_lo.x,
++            y: obs.placed_offset.y + obs_lo.y - part_lo.y,
++        };
++        let region = translate_region(&nfp_zero.region, shift)?;
++        let seam_points = nfp_zero
++            .seam_points
++            .iter()
++            .map(|p| p.add(shift))
++            .collect::<Result<Vec<_>, _>>()?;
++        let seam_segments = nfp_zero
++            .seam_segments
++            .iter()
++            .map(|&(a, b)| Ok((a.add(shift)?, b.add(shift)?)))
++            .collect::<Result<Vec<_>, NestError>>()?;
++        Ok(NfpWithSeams {
++            region,
++            seam_points,
++            seam_segments,
++        })
++    }
++}
++
++fn union_regions(regions: &[&Region]) -> Result<Region, NestError> {
++    match regions.len() {
++        0 => Ok(Region::empty()),
++        1 => Ok(regions[0].clone()),
++        n => {
++            let (left, right) = regions.split_at(n / 2);
++            let ul = union_regions(left)?;
++            let ur = union_regions(right)?;
++            if ul.is_empty() {
++                Ok(ur)
++            } else if ur.is_empty() {
++                Ok(ul)
++            } else {
++                Ok(ul.union(&ur)?)
++            }
++        }
++    }
++}
++
++/// Find the deterministic best BLF placement across all allowed orientations inside a container.
++pub(crate) fn find_best_placement(
++    orientations: &[PreparedOrientation],
++    container: ContainerKind<'_>,
++    obstacles: &[Obstacle],
++    cache: &mut NfpCache,
++) -> Result<Option<PlacementHit>, NestError> {
++    let (container_reg, is_rect) = match container {
++        ContainerKind::RectSheet { usable_bbox } => {
++            let r = rect_region_from_ipoints(usable_bbox.0, usable_bbox.1)?;
++            (r, true)
++        }
++        ContainerKind::Hole { region } => (region.clone(), false),
++    };
++
++    let mut best: Option<PlacementHit> = None;
++    for ori in orientations {
++        let ifp = if is_rect && ori.cut_footprint.is_empty() {
++            let (lo, hi) = match container {
++                ContainerKind::RectSheet { usable_bbox } => usable_bbox,
++                ContainerKind::Hole { .. } => continue,
++            };
++            let rx0 = lo.x - ori.sheet_fit_bbox.0.x;
++            let rx1 = hi.x - ori.sheet_fit_bbox.1.x;
++            let ry0 = lo.y - ori.sheet_fit_bbox.0.y;
++            let ry1 = hi.y - ori.sheet_fit_bbox.1.y;
++            if rx0 > rx1 || ry0 > ry1 {
++                continue;
++            }
++            let bbox = (IPoint { x: rx0, y: ry0 }, IPoint { x: rx1, y: ry1 });
++            let region = if rx0 < rx1 && ry0 < ry1 {
++                rect_region_from_ipoints(bbox.0, bbox.1)?
++            } else {
++                Region::empty()
++            };
++            IfpResult {
++                region,
++                bbox,
++                seam_points: Vec::new(),
++                seam_segments: Vec::new(),
++            }
++        } else {
++            let fit_fp = if is_rect {
++                &ori.cut_footprint
++            } else {
++                &ori.inflated_footprint
++            };
++            let Some(ifp) = compute_ifp(&container_reg, fit_fp, is_rect)? else {
++                continue;
++            };
++            ifp
++        };
++
++        let part_fp = &ori.obstacle_footprint;
++        let mut nfp_list = Vec::with_capacity(obstacles.len());
++        for obs in obstacles {
++            let nfp = cache.get_translated(obs, part_fp, &ori.shape_key)?;
++            if !nfp.region.is_empty() {
++                nfp_list.push(nfp);
++            }
++        }
++        let nfp_refs: Vec<&Region> = nfp_list.iter().map(|n| &n.region).collect();
++        let obs_union = union_regions(&nfp_refs)?;
++        let cands = collect_candidates(&ifp, &obs_union, &nfp_list, is_rect)?;
++        let part_box = ori.sheet_fit_bbox;
++
++        for cand in cands {
++            let cand_max_y = part_box.1.y + cand.y;
++            if let Some(ref b) = best
++                && cand_max_y > b.score.max_y + 1000
++            {
++                break;
++            }
++            let Some(offset) = verify_with_nudge(ori, cand, container, obstacles, false)? else {
++                continue;
++            };
++            let score = PlacementScore {
++                max_y: part_box.1.y + offset.y,
++                min_y: part_box.0.y + offset.y,
++                min_x: part_box.0.x + offset.x,
++                max_x: part_box.1.x + offset.x,
++                ori_index: ori.ori_index,
++            };
++            if best.as_ref().is_none_or(|b| score < b.score) {
++                best = Some(PlacementHit {
++                    ori_index: ori.ori_index,
++                    offset,
++                    score,
++                });
++            }
++            break;
++        }
++    }
++    Ok(best)
++}
+diff --git a/crates/geometry/src/nesting/candidates.rs b/crates/geometry/src/nesting/candidates.rs
+new file mode 100644
+index 000000000..d074058d4
+--- /dev/null
++++ b/crates/geometry/src/nesting/candidates.rs
+@@ -0,0 +1,380 @@
++//! Candidate point extraction and exact clearance verification for BLF placement.
++//! Provenance: boundary-intersection & exact-fit candidate scanning (Burke et al., OR 2006).
++
++use super::decompose::{IPoint, cross_i128};
++use super::inflate::PreparedOrientation;
++use super::nfp::{IfpResult, NfpWithSeams, region_ibbox, segment_intersections};
++use super::types::NestError;
++use crate::geo2d::{Loop, Point2, Region};
++
++const MAX_GRAZE_AREA: f64 = 0.05;
++
++#[derive(Clone, Debug)]
++pub(crate) struct Obstacle {
++    pub shape_key: super::inflate::ShapeKey,
++    pub base_region: Region,
++    pub placed_offset: IPoint,
++    pub placed_region: Region,
++    pub placed_bbox: (IPoint, IPoint),
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum ContainerKind<'a> {
++    RectSheet { usable_bbox: (IPoint, IPoint) },
++    Hole { region: &'a Region },
++}
++
++pub(crate) fn translate_loop(l: &Loop, delta: IPoint) -> Result<Loop, NestError> {
++    let shift = delta.to_point2();
++    let pts = l
++        .points()
++        .iter()
++        .map(|p| Point2::new(p.x + shift.x, p.y + shift.y))
++        .collect();
++    Ok(Loop::new(pts)?)
++}
++
++pub(crate) fn translate_region(region: &Region, delta: IPoint) -> Result<Region, NestError> {
++    if region.is_empty() || (delta.x == 0 && delta.y == 0) {
++        return Ok(region.clone());
++    }
++    let loops = region
++        .loops()
++        .iter()
++        .map(|l| translate_loop(l, delta))
++        .collect::<Result<Vec<_>, _>>()?;
++    Ok(Region::new(loops)?)
++}
++
++fn region_edges(region: &Region) -> Result<Vec<(IPoint, IPoint)>, NestError> {
++    let mut edges = Vec::new();
++    for l in region.loops() {
++        let pts = l.points();
++        let n = pts.len();
++        for i in 0..n {
++            let a = IPoint::from_point2(pts[i])?;
++            let b = IPoint::from_point2(pts[(i + 1) % n])?;
++            if a != b {
++                edges.push((a, b));
++            }
++        }
++    }
++    Ok(edges)
++}
++
++fn bbox_edges(lo: IPoint, hi: IPoint) -> Vec<(IPoint, IPoint)> {
++    let p0 = lo;
++    let p1 = IPoint { x: hi.x, y: lo.y };
++    let p2 = hi;
++    let p3 = IPoint { x: lo.x, y: hi.y };
++    [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]
++        .into_iter()
++        .filter(|(a, b)| a != b)
++        .collect()
++}
++
++fn near_boundary(edges: &[(IPoint, IPoint)], p: IPoint) -> bool {
++    for &(a, b) in edges {
++        if p.x < a.x.min(b.x) - 1
++            || p.x > a.x.max(b.x) + 1
++            || p.y < a.y.min(b.y) - 1
++            || p.y > a.y.max(b.y) + 1
++        {
++            continue;
++        }
++        let cross = cross_i128(a, b, p).abs() as f64;
++        let len = ((b.x - a.x) as f64).hypot((b.y - a.y) as f64);
++        if cross <= len * 1.5 {
++            return true;
++        }
++    }
++    false
++}
++
++fn in_bbox(p: IPoint, lo: IPoint, hi: IPoint) -> bool {
++    p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y
++}
++
++fn bbox_overlap(a: (IPoint, IPoint), b: (IPoint, IPoint)) -> bool {
++    a.1.x > b.0.x && b.1.x > a.0.x && a.1.y > b.0.y && b.1.y > a.0.y
++}
++
++pub(crate) fn collect_candidates(
++    ifp: &IfpResult,
++    obs_union: &Region,
++    obs_nfps: &[NfpWithSeams],
++    is_rect: bool,
++) -> Result<Vec<IPoint>, NestError> {
++    let feasible = if !ifp.region.is_empty() {
++        if obs_union.is_empty() {
++            ifp.region.clone()
++        } else {
++            ifp.region.difference(obs_union)?
++        }
++    } else {
++        Region::empty()
++    };
++
++    let mut cands: Vec<IPoint> = Vec::new();
++    for l in feasible.loops() {
++        for &p in l.points() {
++            cands.push(IPoint::from_point2(p)?);
++        }
++    }
++    if !ifp.region.is_empty() {
++        for l in ifp.region.loops() {
++            for &p in l.points() {
++                cands.push(IPoint::from_point2(p)?);
++            }
++        }
++    } else {
++        let (lo, hi) = ifp.bbox;
++        cands.extend([
++            lo,
++            IPoint { x: hi.x, y: lo.y },
++            hi,
++            IPoint { x: lo.x, y: hi.y },
++            IPoint {
++                x: lo.x + (hi.x - lo.x) / 2,
++                y: lo.y + (hi.y - lo.y) / 2,
++            },
++        ]);
++    }
++
++    let ifp_boundary_edges = if !ifp.region.is_empty() {
++        region_edges(&ifp.region)?
++    } else {
++        bbox_edges(ifp.bbox.0, ifp.bbox.1)
++    };
++
++    // Include zero-width pinch-seam points/intersections swallowed inside unioned NFP/IFP.
++    let mut seam_pts: Vec<IPoint> = ifp.seam_points.clone();
++    for &(s0, s1) in &ifp.seam_segments {
++        seam_pts.push(s0);
++        seam_pts.push(s1);
++    }
++    for nfp in obs_nfps {
++        seam_pts.extend(nfp.seam_points.iter().copied());
++        for &(s0, s1) in &nfp.seam_segments {
++            seam_pts.push(s0);
++            seam_pts.push(s1);
++            for &(a0, a1) in &ifp_boundary_edges {
++                segment_intersections(a0, a1, s0, s1, &mut seam_pts);
++            }
++        }
++    }
++    cands.extend(seam_pts.iter().copied());
++
++    let obs_edges = region_edges(obs_union)?;
++    if !obs_union.is_empty() {
++        for l in obs_union.loops() {
++            for &p in l.points() {
++                let ip = IPoint::from_point2(p)?;
++                if in_bbox(ip, ifp.bbox.0, ifp.bbox.1) {
++                    cands.push(ip);
++                }
++            }
++        }
++        for &(a0, a1) in &ifp_boundary_edges {
++            for &(b0, b1) in &obs_edges {
++                segment_intersections(a0, a1, b0, b1, &mut cands);
++            }
++        }
++    }
++
++    let ifp_edges = if !is_rect && !ifp.region.is_empty() {
++        region_edges(&ifp.region)?
++    } else {
++        Vec::new()
++    };
++
++    cands.sort_unstable();
++    cands.dedup();
++    cands.retain(|&ip| {
++        if !in_bbox(ip, ifp.bbox.0, ifp.bbox.1) {
++            return false;
++        }
++        let pt = ip.to_point2();
++        if !is_rect
++            && !ifp.region.is_empty()
++            && !ifp.region.contains(pt)
++            && !near_boundary(&ifp_edges, ip)
++        {
++            return false;
++        }
++        // Preserve zero-width seam points (handled by exact verification).
++        if seam_pts.contains(&ip) {
++            return true;
++        }
++        if !obs_union.is_empty() && obs_union.contains(pt) && !near_boundary(&obs_edges, ip) {
++            return false;
++        }
++        true
++    });
++    cands.sort_by_key(|p| (p.y, p.x));
++    Ok(cands)
++}
++
++fn check_candidate_exact(
++    ori: &PreparedOrientation,
++    offset: IPoint,
++    container: ContainerKind<'_>,
++    obstacles: &[Obstacle],
++    use_inflated: bool,
++) -> Result<bool, NestError> {
++    match container {
++        ContainerKind::RectSheet { usable_bbox } => {
++            let (lo, hi) = ori.sheet_fit_bbox;
++            if lo.x + offset.x < usable_bbox.0.x
++                || hi.x + offset.x > usable_bbox.1.x
++                || lo.y + offset.y < usable_bbox.0.y
++                || hi.y + offset.y > usable_bbox.1.y
++            {
++                return Ok(false);
++            }
++        }
++        ContainerKind::Hole { region } => {
++            let shifted_inf = translate_region(&ori.inflated_footprint, offset)?;
++            if !shifted_inf.difference(region)?.is_empty() {
++                return Ok(false);
++            }
++        }
++    }
++
++    let check_base = if use_inflated {
++        &ori.inflated_footprint
++    } else {
++        &ori.obstacle_footprint
++    };
++    let Some(base_box) = region_ibbox(check_base)? else {
++        return Ok(true);
++    };
++    let cand_box = (
++        IPoint {
++            x: base_box.0.x + offset.x,
++            y: base_box.0.y + offset.y,
++        },
++        IPoint {
++            x: base_box.1.x + offset.x,
++            y: base_box.1.y + offset.y,
++        },
++    );
++    let cand_shifted = translate_region(check_base, offset)?;
++    for obs in obstacles {
++        if !bbox_overlap(cand_box, obs.placed_bbox) {
++            continue;
++        }
++        if !cand_shifted.intersect(&obs.placed_region)?.is_empty() {
++            return Ok(false);
++        }
++    }
++    Ok(true)
++}
++
++pub(crate) fn verify_with_nudge(
++    ori: &PreparedOrientation,
++    cand: IPoint,
++    container: ContainerKind<'_>,
++    obstacles: &[Obstacle],
++    use_inflated: bool,
++) -> Result<Option<IPoint>, NestError> {
++    if check_candidate_exact(ori, cand, container, obstacles, use_inflated)? {
++        return Ok(Some(cand));
++    }
++    let check_base = if use_inflated {
++        &ori.inflated_footprint
++    } else {
++        &ori.obstacle_footprint
++    };
++    let cand_shifted = translate_region(check_base, cand)?;
++    let mut max_overlap = 0.0f64;
++    for obs in obstacles {
++        let area = cand_shifted.intersect(&obs.placed_region)?.area().abs();
++        max_overlap = max_overlap.max(area);
++    }
++    if max_overlap > MAX_GRAZE_AREA {
++        return Ok(None);
++    }
++    for step in [1i64, 10, 100, 1000] {
++        for (dx, dy) in [
++            (0, step),
++            (step, 0),
++            (step, step),
++            (-step, 0),
++            (0, -step),
++            (step, -step),
++            (-step, step),
++            (-step, -step),
++        ] {
++            let nudged = IPoint {
++                x: cand.x + dx,
++                y: cand.y + dy,
++            };
++            if check_candidate_exact(ori, nudged, container, obstacles, use_inflated)? {
++                return Ok(Some(nudged));
++            }
++        }
++    }
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::nesting::{PartInput, RotationMode, SheetInput};
++
++    fn rectangle(width: f64, height: f64) -> PreparedOrientation {
++        let outer = Loop::new(vec![
++            Point2::new(0.0, 0.0),
++            Point2::new(width, 0.0),
++            Point2::new(width, height),
++            Point2::new(0.0, height),
++        ])
++        .unwrap();
++        let part = PartInput::closed("tiny", 1, outer, vec![]).with_rotation(RotationMode::Locked);
++        super::super::inflate::prepare_part(&part, &SheetInput::default())
++            .unwrap()
++            .orientations
++            .remove(0)
++    }
++
++    #[test]
++    fn exact_check_refuses_micron_escape_from_hole() {
++        let ori = rectangle(1.0, 1.0);
++        let container = ContainerKind::Hole {
++            region: &ori.inflated_footprint,
++        };
++        assert!(!check_candidate_exact(&ori, IPoint { x: 1, y: 0 }, container, &[], true).unwrap());
++    }
++
++    #[test]
++    fn exact_check_refuses_sub_epsilon_overlap() {
++        let ori = rectangle(0.01, 0.01);
++        let obstacle = Obstacle {
++            shape_key: ori.shape_key.clone(),
++            base_region: ori.obstacle_footprint.clone(),
++            placed_offset: IPoint { x: 0, y: 0 },
++            placed_region: ori.obstacle_footprint.clone(),
++            placed_bbox: region_ibbox(&ori.obstacle_footprint).unwrap().unwrap(),
++        };
++        let container = ContainerKind::RectSheet {
++            usable_bbox: (
++                IPoint { x: 0, y: 0 },
++                IPoint {
++                    x: 100_000,
++                    y: 100_000,
++                },
++            ),
++        };
++        assert!(
++            !check_candidate_exact(
++                &ori,
++                IPoint { x: 9_999, y: 0 },
++                container,
++                &[obstacle],
++                true
++            )
++            .unwrap()
++        );
++    }
++}
+diff --git a/crates/geometry/src/nesting/decompose.rs b/crates/geometry/src/nesting/decompose.rs
+new file mode 100644
+index 000000000..d65f50d00
+--- /dev/null
++++ b/crates/geometry/src/nesting/decompose.rs
+@@ -0,0 +1,361 @@
++//! Integer grid primitives and Hertel-Mehlhorn convex polygon decomposition.
++//! Provenance: Hertel-Mehlhorn convex merging over triangulated regions (`Region::triangles`).
++
++use super::types::NestError;
++use crate::geo2d::{Point2, Region, SCALE};
++use std::cmp::Ordering;
++use std::collections::{BTreeMap, BTreeSet};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub(crate) struct IPoint {
++    pub x: i64,
++    pub y: i64,
++}
++
++impl IPoint {
++    pub fn from_point2(p: Point2) -> Result<Self, NestError> {
++        if !(p.x.is_finite() && p.y.is_finite()) {
++            return Err(NestError::InvalidInput("non-finite coordinate".into()));
++        }
++        let sx = (p.x * SCALE).round();
++        let sy = (p.y * SCALE).round();
++        if sx.abs() >= (i64::MAX / 4) as f64 || sy.abs() >= (i64::MAX / 4) as f64 {
++            return Err(NestError::OutOfRange(
++                "coordinate exceeds integer grid range".into(),
++            ));
++        }
++        Ok(IPoint {
++            x: sx as i64,
++            y: sy as i64,
++        })
++    }
++
++    pub fn to_point2(self) -> Point2 {
++        Point2::new(self.x as f64 / SCALE, self.y as f64 / SCALE)
++    }
++
++    pub fn add(self, o: Self) -> Result<Self, NestError> {
++        let x = self
++            .x
++            .checked_add(o.x)
++            .ok_or_else(|| NestError::OutOfRange("x overflow".into()))?;
++        let y = self
++            .y
++            .checked_add(o.y)
++            .ok_or_else(|| NestError::OutOfRange("y overflow".into()))?;
++        Ok(IPoint { x, y })
++    }
++
++    pub fn neg(self) -> Result<Self, NestError> {
++        let x = self
++            .x
++            .checked_neg()
++            .ok_or_else(|| NestError::OutOfRange("x overflow".into()))?;
++        let y = self
++            .y
++            .checked_neg()
++            .ok_or_else(|| NestError::OutOfRange("y overflow".into()))?;
++        Ok(IPoint { x, y })
++    }
++}
++
++pub(crate) fn cross_i128(o: IPoint, a: IPoint, b: IPoint) -> i128 {
++    let ax = (a.x as i128) - (o.x as i128);
++    let ay = (a.y as i128) - (o.y as i128);
++    let bx = (b.x as i128) - (o.x as i128);
++    let by = (b.y as i128) - (o.y as i128);
++    ax * by - ay * bx
++}
++
++fn upper_half(dx: i64, dy: i64) -> bool {
++    dy > 0 || (dy == 0 && dx > 0)
++}
++
++pub(crate) fn cmp_edge_angle(e1: (i64, i64), e2: (i64, i64)) -> Ordering {
++    let u1 = upper_half(e1.0, e1.1);
++    let u2 = upper_half(e2.0, e2.1);
++    if u1 != u2 {
++        return if u1 {
++            Ordering::Less
++        } else {
++            Ordering::Greater
++        };
++    }
++    let c = (e1.0 as i128) * (e2.1 as i128) - (e1.1 as i128) * (e2.0 as i128);
++    if c > 0 {
++        Ordering::Less
++    } else if c < 0 {
++        Ordering::Greater
++    } else {
++        Ordering::Equal
++    }
++}
++
++pub(crate) fn clean_ccw_ring(raw: &[IPoint]) -> Vec<IPoint> {
++    let mut pts: Vec<IPoint> = Vec::with_capacity(raw.len());
++    for &p in raw {
++        if pts.last() != Some(&p) {
++            pts.push(p);
++        }
++    }
++    if pts.len() > 1 && pts.first() == pts.last() {
++        pts.pop();
++    }
++    let mut changed = true;
++    while changed && pts.len() >= 3 {
++        changed = false;
++        let mut next_pts = Vec::with_capacity(pts.len());
++        let n = pts.len();
++        for i in 0..n {
++            let a = pts[(i + n - 1) % n];
++            let b = pts[i];
++            let c = pts[(i + 1) % n];
++            let dot = (b.x as i128 - a.x as i128) * (c.x as i128 - b.x as i128)
++                + (b.y as i128 - a.y as i128) * (c.y as i128 - b.y as i128);
++            if cross_i128(a, b, c) == 0 && dot >= 0 {
++                changed = true;
++            } else {
++                next_pts.push(b);
++            }
++        }
++        pts = next_pts;
++    }
++    if pts.len() < 3 {
++        return Vec::new();
++    }
++    let area2: i128 = (0..pts.len())
++        .map(|i| {
++            let a = pts[i];
++            let b = pts[(i + 1) % pts.len()];
++            (a.x as i128) * (b.y as i128) - (b.x as i128) * (a.y as i128)
++        })
++        .sum();
++    if area2 == 0 {
++        return Vec::new();
++    }
++    if area2 < 0 {
++        pts.reverse();
++    }
++    pts
++}
++
++fn is_simple_convex_ccw(pts: &[IPoint]) -> bool {
++    let n = pts.len();
++    if n < 3 {
++        return false;
++    }
++    let uniq: BTreeSet<IPoint> = pts.iter().copied().collect();
++    if uniq.len() != n {
++        return false;
++    }
++    let mut wraps = 0usize;
++    for i in 0..n {
++        let a = pts[i];
++        let b = pts[(i + 1) % n];
++        let c = pts[(i + 2) % n];
++        if cross_i128(a, b, c) < 0 {
++            return false;
++        }
++        let e1 = (b.x - a.x, b.y - a.y);
++        let e2 = (c.x - b.x, c.y - b.y);
++        if e1 == (0, 0) || e2 == (0, 0) {
++            return false;
++        }
++        if cmp_edge_angle(e1, e2) == Ordering::Greater {
++            wraps += 1;
++        }
++    }
++    wraps == 1
++}
++
++/// Decompose a `Region` into non-overlapping CCW convex polygons on the micron grid.
++pub(crate) fn convex_decompose(region: &Region) -> Result<Vec<Vec<IPoint>>, NestError> {
++    if region.is_empty() {
++        return Ok(Vec::new());
++    }
++    if region.loops().len() == 1 {
++        let raw: Vec<IPoint> = region.loops()[0]
++            .points()
++            .iter()
++            .map(|&p| IPoint::from_point2(p))
++            .collect::<Result<_, _>>()?;
++        let ring = clean_ccw_ring(&raw);
++        if is_simple_convex_ccw(&ring) {
++            return Ok(vec![ring]);
++        }
++    }
++
++    let tris = match region.triangles() {
++        Ok(tris) => {
++            let mut out = Vec::with_capacity(tris.len());
++            for tri in tris {
++                let raw = [
++                    IPoint::from_point2(tri[0])?,
++                    IPoint::from_point2(tri[1])?,
++                    IPoint::from_point2(tri[2])?,
++                ];
++                let cleaned = clean_ccw_ring(&raw);
++                if is_simple_convex_ccw(&cleaned) {
++                    out.push(Some(cleaned));
++                }
++            }
++            out
++        }
++        Err(_) => slab_decompose(region)?,
++    };
++    let mut polys: Vec<Option<Vec<IPoint>>> = tris;
++
++    let mut edge_owner: BTreeMap<(IPoint, IPoint), usize> = BTreeMap::new();
++    for (idx, poly) in polys.iter().enumerate() {
++        if let Some(pts) = poly {
++            for k in 0..pts.len() {
++                edge_owner.insert((pts[k], pts[(k + 1) % pts.len()]), idx);
++            }
++        }
++    }
++
++    let mut i = 0usize;
++    while i < polys.len() {
++        let Some(pi) = polys[i].clone() else {
++            i += 1;
++            continue;
++        };
++        let mut merged_any = false;
++        for k in 0..pi.len() {
++            let u = pi[k];
++            let v = pi[(k + 1) % pi.len()];
++            let Some(&j) = edge_owner.get(&(v, u)) else {
++                continue;
++            };
++            if j == i {
++                continue;
++            }
++            let Some(pj) = polys[j].as_ref() else {
++                continue;
++            };
++            let Some(pos_j) = pj
++                .windows(2)
++                .position(|w| w[0] == v && w[1] == u)
++                .or_else(|| {
++                    if pj.last() == Some(&v) && pj.first() == Some(&u) {
++                        Some(pj.len() - 1)
++                    } else {
++                        None
++                    }
++                })
++            else {
++                continue;
++            };
++            let mut combined = Vec::with_capacity(pi.len() + pj.len());
++            for step in 1..pi.len() {
++                combined.push(pi[(k + 1 + step) % pi.len()]);
++            }
++            for step in 1..pj.len() {
++                combined.push(pj[(pos_j + 1 + step) % pj.len()]);
++            }
++            let cleaned = clean_ccw_ring(&combined);
++            if !is_simple_convex_ccw(&cleaned) {
++                continue;
++            }
++            for e in 0..pi.len() {
++                edge_owner.remove(&(pi[e], pi[(e + 1) % pi.len()]));
++            }
++            for e in 0..pj.len() {
++                edge_owner.remove(&(pj[e], pj[(e + 1) % pj.len()]));
++            }
++            for e in 0..cleaned.len() {
++                edge_owner.insert((cleaned[e], cleaned[(e + 1) % cleaned.len()]), i);
++            }
++            polys[i] = Some(cleaned);
++            polys[j] = None;
++            merged_any = true;
++            break;
++        }
++        if !merged_any {
++            i += 1;
++        }
++    }
++
++    Ok(polys.into_iter().flatten().collect())
++}
++
++/// Robust horizontal-slab trapezoidation fallback for multi-hole or pinched regions
++/// where bridge ear-clipping cannot pick a bridge chord.
++fn slab_decompose(region: &Region) -> Result<Vec<Option<Vec<IPoint>>>, NestError> {
++    struct Edge {
++        lo: IPoint,
++        hi: IPoint,
++    }
++    let mut edges = Vec::new();
++    let mut ys = Vec::new();
++    for l in region.loops() {
++        let pts = l.points();
++        let n = pts.len();
++        for i in 0..n {
++            let a = IPoint::from_point2(pts[i])?;
++            let b = IPoint::from_point2(pts[(i + 1) % n])?;
++            ys.push(a.y);
++            if a.y < b.y {
++                edges.push(Edge { lo: a, hi: b });
++            } else if b.y < a.y {
++                edges.push(Edge { lo: b, hi: a });
++            }
++        }
++    }
++    ys.sort_unstable();
++    ys.dedup();
++    let x_at = |e: &Edge, y: f64| -> f64 {
++        let dy = (e.hi.y - e.lo.y) as f64;
++        (e.lo.x as f64) + ((y - (e.lo.y as f64)) / dy) * ((e.hi.x - e.lo.x) as f64)
++    };
++    let x_int = |e: &Edge, y: i64| -> i64 {
++        if y == e.lo.y {
++            e.lo.x
++        } else if y == e.hi.y {
++            e.hi.x
++        } else {
++            x_at(e, y as f64).round() as i64
++        }
++    };
++
++    let mut out = Vec::new();
++    for w in ys.windows(2) {
++        let (y0, y1) = (w[0], w[1]);
++        if y0 >= y1 {
++            continue;
++        }
++        let y_mid = (y0 as f64 + y1 as f64) * 0.5;
++        let mut active: Vec<&Edge> = edges
++            .iter()
++            .filter(|e| e.lo.y <= y0 && e.hi.y >= y1)
++            .collect();
++        active.sort_by(|a, b| x_at(a, y_mid).total_cmp(&x_at(b, y_mid)));
++        for &[left, right] in active.as_chunks::<2>().0 {
++            let mut bl_x = x_int(left, y0);
++            let mut br_x = x_int(right, y0);
++            let mut tl_x = x_int(left, y1);
++            let mut tr_x = x_int(right, y1);
++            if bl_x > br_x {
++                let mid = bl_x + (br_x - bl_x) / 2;
++                bl_x = mid;
++                br_x = mid;
++            }
++            if tl_x > tr_x {
++                let mid = tl_x + (tr_x - tl_x) / 2;
++                tl_x = mid;
++                tr_x = mid;
++            }
++            let quad = [
++                IPoint { x: bl_x, y: y0 },
++                IPoint { x: br_x, y: y0 },
++                IPoint { x: tr_x, y: y1 },
++                IPoint { x: tl_x, y: y1 },
++            ];
++            let cleaned = clean_ccw_ring(&quad);
++            if is_simple_convex_ccw(&cleaned) {
++                out.push(Some(cleaned));
++            }
++        }
++    }
++    Ok(out)
++}
+diff --git a/crates/geometry/src/nesting/inflate.rs b/crates/geometry/src/nesting/inflate.rs
+new file mode 100644
+index 000000000..c590f4795
+--- /dev/null
++++ b/crates/geometry/src/nesting/inflate.rs
+@@ -0,0 +1,341 @@
++//! Orientation transforms and kerf/gap inflation for 2D nesting parts.
++//! Provenance: kerf/gap inflation rules from CamCraft plasma/router geometry specs (#2156, #2158).
++
++use super::decompose::{IPoint, clean_ccw_ring};
++use super::nfp::region_ibbox;
++use super::types::{ClearanceMode, CutSide, NestError, PartInput, SheetInput};
++use super::validate::{
++    MIN_AREA, candidate_angles, part_err, validate_closed_loops, validate_open_chains,
++};
++use crate::geo2d::{Loop, Point2, Region};
++use std::collections::BTreeSet;
++use std::f64::consts::PI;
++
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub(crate) struct ShapeKey(Vec<Vec<IPoint>>);
++
++#[derive(Clone, Debug)]
++pub(crate) struct PreparedOrientation {
++    pub ori_index: usize,
++    pub angle_deg: f64,
++    pub mirrored: bool,
++    pub outer: Option<Loop>,
++    pub holes: Vec<Loop>,
++    pub open_chains: Vec<Vec<Point2>>,
++    pub net_area: f64,
++    pub cut_footprint: Region,
++    pub sheet_fit_bbox: (IPoint, IPoint),
++    pub inflated_footprint: Region,
++    pub obstacle_footprint: Region,
++    pub hole_usables: Vec<Region>,
++    pub shape_key: ShapeKey,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct PreparedPart {
++    pub id: String,
++    pub quantity: usize,
++    pub sort_area: f64,
++    pub orientations: Vec<PreparedOrientation>,
++}
++
++fn cos_sin_deg(angle_deg: f64) -> (f64, f64) {
++    let rem = angle_deg.rem_euclid(360.0);
++    if (rem - 0.0).abs() < 1e-12 || (rem - 360.0).abs() < 1e-12 {
++        (1.0, 0.0)
++    } else if (rem - 90.0).abs() < 1e-12 {
++        (0.0, 1.0)
++    } else if (rem - 180.0).abs() < 1e-12 {
++        (-1.0, 0.0)
++    } else if (rem - 270.0).abs() < 1e-12 {
++        (0.0, -1.0)
++    } else {
++        let rad = rem * PI / 180.0;
++        (rad.cos(), rad.sin())
++    }
++}
++
++pub(crate) fn transform_point(p: Point2, mirrored: bool, angle_deg: f64) -> Point2 {
++    let mx = if mirrored { -p.x } else { p.x };
++    let (c, s) = cos_sin_deg(angle_deg);
++    Point2::new(mx * c - p.y * s, mx * s + p.y * c)
++}
++
++fn transform_loop(l: &Loop, mirrored: bool, angle_deg: f64) -> Result<Loop, NestError> {
++    let mut pts: Vec<Point2> = l
++        .points()
++        .iter()
++        .map(|&p| transform_point(p, mirrored, angle_deg))
++        .collect();
++    if mirrored {
++        pts.reverse();
++    }
++    Ok(Loop::new(pts)?)
++}
++
++fn distances_for_mode(sheet: &SheetInput, cut_side: CutSide) -> (f64, f64, f64, f64, f64) {
++    let kw = sheet.cut_width;
++    let gap = sheet.part_gap;
++    let outer_cut = match cut_side {
++        CutSide::Outside => kw,
++        CutSide::OnLine => kw * 0.5,
++        CutSide::Inside => 0.0,
++    };
++    let open_cut = match cut_side {
++        CutSide::OnLine => kw * 0.5,
++        CutSide::Outside | CutSide::Inside => kw,
++    };
++    match sheet.clearance_mode {
++        ClearanceMode::SeparateCuts => {
++            let outer_inf = outer_cut + gap * 0.5;
++            let hole_inf = match cut_side {
++                CutSide::OnLine => kw * 0.5 + gap * 0.5,
++                CutSide::Outside | CutSide::Inside => kw + gap * 0.5,
++            };
++            let open_inf = open_cut + gap * 0.5;
++            (outer_cut, outer_inf, hole_inf, open_cut, open_inf)
++        }
++        ClearanceMode::RouterSingleSlot => {
++            let half_gap = gap * 0.5;
++            let open_inf = match cut_side {
++                CutSide::OnLine => half_gap,
++                CutSide::Outside | CutSide::Inside => kw.max(half_gap),
++            };
++            (outer_cut, half_gap, half_gap, open_cut, open_inf)
++        }
++    }
++}
++
++fn canonical_shape_key(region: &Region) -> Result<ShapeKey, NestError> {
++    let Some((lo, _)) = region_ibbox(region)? else {
++        return Ok(ShapeKey(Vec::new()));
++    };
++    let mut loops = Vec::with_capacity(region.loops().len());
++    for l in region.loops() {
++        let mut pts = Vec::with_capacity(l.points().len());
++        for &p in l.points() {
++            let ip = IPoint::from_point2(p)?;
++            pts.push(IPoint {
++                x: ip.x - lo.x,
++                y: ip.y - lo.y,
++            });
++        }
++        let ring = clean_ccw_ring(&pts);
++        if !ring.is_empty() {
++            let min_pos = ring
++                .iter()
++                .enumerate()
++                .min_by_key(|&(_, q)| *q)
++                .map_or(0, |(i, _)| i);
++            let mut rot = Vec::with_capacity(ring.len());
++            rot.extend_from_slice(&ring[min_pos..]);
++            rot.extend_from_slice(&ring[..min_pos]);
++            loops.push(rot);
++        }
++    }
++    loops.sort();
++    Ok(ShapeKey(loops))
++}
++
++fn open_chains_ibbox(chains: &[Vec<Point2>]) -> Result<Option<(IPoint, IPoint)>, NestError> {
++    let mut it = chains.iter().flat_map(|c| c.iter());
++    let Some(&first) = it.next() else {
++        return Ok(None);
++    };
++    let mut lo = IPoint::from_point2(first)?;
++    let mut hi = lo;
++    for &p in it {
++        let ip = IPoint::from_point2(p)?;
++        lo.x = lo.x.min(ip.x);
++        lo.y = lo.y.min(ip.y);
++        hi.x = hi.x.max(ip.x);
++        hi.y = hi.y.max(ip.y);
++    }
++    Ok(Some((lo, hi)))
++}
++
++pub(crate) fn prepare_part(
++    part: &PartInput,
++    sheet: &SheetInput,
++) -> Result<PreparedPart, NestError> {
++    if part.id.trim().is_empty() {
++        return Err(NestError::InvalidInput("part id cannot be empty".into()));
++    }
++    if part.outer.is_none() && part.open_chains.is_empty() {
++        return Err(part_err(
++            &part.id,
++            "part has neither an outer loop nor open chains",
++        ));
++    }
++    if part.outer.is_none() && !part.holes.is_empty() {
++        return Err(part_err(&part.id, "part has holes without an outer loop"));
++    }
++    let clean_chains = validate_open_chains(&part.id, &part.open_chains)?;
++    let (outer_cut, outer_inf, hole_inf, open_cut, open_inf) =
++        distances_for_mode(sheet, part.cut_side);
++    if !clean_chains.is_empty() && open_inf <= 0.0 {
++        return Err(part_err(
++            &part.id,
++            "open chains require positive cut_width or part_gap",
++        ));
++    }
++
++    let (base_outer_area, has_closed) = if part.outer.is_some() {
++        let (outer_reg, _) = validate_closed_loops(part)?;
++        (outer_reg.area().abs(), true)
++    } else {
++        (0.0, false)
++    };
++
++    let angles = candidate_angles(&part.id, part.rotation_mode)?;
++    let mirrors: &[bool] = if part.allow_mirror {
++        &[false, true]
++    } else {
++        &[false]
++    };
++    let mut seen_keys: BTreeSet<(ShapeKey, ShapeKey)> = BTreeSet::new();
++    let mut orientations = Vec::new();
++    let mut sort_area = base_outer_area;
++
++    for &mirrored in mirrors {
++        for &angle_deg in &angles {
++            let t_chains: Vec<Vec<Point2>> = clean_chains
++                .iter()
++                .map(|c| {
++                    c.iter()
++                        .map(|&p| transform_point(p, mirrored, angle_deg))
++                        .collect()
++                })
++                .collect();
++            let swept_cut = if !t_chains.is_empty() && open_cut > 0.0 {
++                Region::sweep(&t_chains, open_cut)?
++            } else {
++                Region::empty()
++            };
++            let swept_inf = if !t_chains.is_empty() {
++                Region::sweep(&t_chains, open_inf)?
++            } else {
++                Region::empty()
++            };
++
++            let (t_outer, t_holes, net_area, cut_fp, inf_fp, obs_fp, hole_usables) = if has_closed {
++                let outer_ref = part
++                    .outer
++                    .as_ref()
++                    .ok_or_else(|| part_err(&part.id, "missing outer"))?;
++                let lo = transform_loop(outer_ref, mirrored, angle_deg)?;
++                let lh: Vec<Loop> = part
++                    .holes
++                    .iter()
++                    .map(|h| transform_loop(h, mirrored, angle_deg))
++                    .collect::<Result<_, _>>()?;
++                let mut all_loops = Vec::with_capacity(1 + lh.len());
++                all_loops.push(lo.clone());
++                all_loops.extend(lh.iter().cloned());
++                let nominal = Region::new(all_loops)?;
++                let outer_only = Region::new(vec![lo.clone()])?;
++                let net_area = nominal.area().abs();
++
++                let closed_cut = if outer_cut > 0.0 {
++                    nominal.offset_sharp(outer_cut)?
++                } else {
++                    nominal.clone()
++                };
++                let cut_fp = if swept_cut.is_empty() {
++                    closed_cut
++                } else {
++                    closed_cut.union(&swept_cut)?
++                };
++
++                let outer_filled_inf = if outer_inf > 0.0 {
++                    outer_only.offset_sharp(outer_inf)?
++                } else {
++                    outer_only
++                };
++                let obs_fp = if swept_inf.is_empty() {
++                    outer_filled_inf.clone()
++                } else {
++                    outer_filled_inf.union(&swept_inf)?
++                };
++
++                let mut usable_holes = Vec::new();
++                let mut all_holes_usable = Region::empty();
++                for h in &lh {
++                    let hr = Region::new(vec![h.clone()])?;
++                    let shrunk = if hole_inf > 0.0 {
++                        hr.offset_sharp(-hole_inf)?
++                    } else {
++                        hr
++                    };
++                    let hu = if swept_inf.is_empty() || shrunk.is_empty() {
++                        shrunk
++                    } else {
++                        shrunk.difference(&swept_inf)?
++                    };
++                    if !hu.is_empty() && hu.area() > MIN_AREA {
++                        all_holes_usable = all_holes_usable.union(&hu)?;
++                        if sheet.allow_parts_in_holes {
++                            usable_holes.push(hu);
++                        }
++                    }
++                }
++                let closed_inf = if all_holes_usable.is_empty() {
++                    outer_filled_inf
++                } else {
++                    outer_filled_inf.difference(&all_holes_usable)?
++                };
++                let inf_fp = if swept_inf.is_empty() {
++                    closed_inf
++                } else {
++                    closed_inf.union(&swept_inf)?
++                };
++                (Some(lo), lh, net_area, cut_fp, inf_fp, obs_fp, usable_holes)
++            } else {
++                sort_area = sort_area.max(swept_inf.area());
++                (
++                    None,
++                    Vec::new(),
++                    0.0,
++                    swept_cut,
++                    swept_inf.clone(),
++                    swept_inf,
++                    Vec::new(),
++                )
++            };
++
++            let sheet_fit_bbox = if let Some(b) = region_ibbox(&cut_fp)? {
++                b
++            } else if let Some(b) = open_chains_ibbox(&t_chains)? {
++                b
++            } else {
++                (IPoint { x: 0, y: 0 }, IPoint { x: 0, y: 0 })
++            };
++            let key_pair = (canonical_shape_key(&obs_fp)?, canonical_shape_key(&cut_fp)?);
++            if !seen_keys.insert(key_pair.clone()) {
++                continue;
++            }
++            orientations.push(PreparedOrientation {
++                ori_index: orientations.len(),
++                angle_deg,
++                mirrored,
++                outer: t_outer,
++                holes: t_holes,
++                open_chains: t_chains,
++                net_area,
++                cut_footprint: cut_fp,
++                sheet_fit_bbox,
++                inflated_footprint: inf_fp,
++                obstacle_footprint: obs_fp,
++                hole_usables,
++                shape_key: key_pair.0,
++            });
++        }
++    }
++
++    Ok(PreparedPart {
++        id: part.id.clone(),
++        quantity: part.quantity,
++        sort_area,
++        orientations,
++    })
++}
+diff --git a/crates/geometry/src/nesting/nfp.rs b/crates/geometry/src/nesting/nfp.rs
+new file mode 100644
+index 000000000..7cbd3b363
+--- /dev/null
++++ b/crates/geometry/src/nesting/nfp.rs
+@@ -0,0 +1,370 @@
++//! Exact NFP/IFP computation on the geo2d::SCALE integer grid via convex Minkowski sums.
++//! Provenance: Minkowski sum over convex decompositions (Bennell & Oliveira, EJOR 2008; Burke et al., EJOR 2007).
++
++use super::decompose::{IPoint, clean_ccw_ring, cmp_edge_angle, convex_decompose, cross_i128};
++use super::types::NestError;
++use crate::geo2d::{Loop, Point2, Region};
++use std::cmp::Ordering;
++
++#[derive(Clone, Debug)]
++pub(crate) struct NfpWithSeams {
++    pub region: Region,
++    /// Exact zero-slack fit vertices/segments swallowed inside merged Minkowski pieces.
++    pub seam_points: Vec<IPoint>,
++    pub seam_segments: Vec<(IPoint, IPoint)>,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct IfpResult {
++    /// Positive-area feasible interior (empty when exact-fit collapses to 1D/0D).
++    pub region: Region,
++    /// Bounding-box IFP `[rx0..=rx1] x [ry0..=ry1]` on the micron grid.
++    pub bbox: (IPoint, IPoint),
++    pub seam_points: Vec<IPoint>,
++    pub seam_segments: Vec<(IPoint, IPoint)>,
++}
++
++fn rotate_min_yx(pts: &[IPoint]) -> Vec<IPoint> {
++    let min_idx = pts
++        .iter()
++        .enumerate()
++        .min_by_key(|&(_, p)| (p.y, p.x))
++        .map_or(0, |(idx, _)| idx);
++    let mut out = Vec::with_capacity(pts.len());
++    out.extend_from_slice(&pts[min_idx..]);
++    out.extend_from_slice(&pts[..min_idx]);
++    out
++}
++
++/// Exact Minkowski sum `P + Q` of two CCW convex integer polygons.
++fn minkowski_convex(p_raw: &[IPoint], q_raw: &[IPoint]) -> Result<Vec<IPoint>, NestError> {
++    let p = rotate_min_yx(p_raw);
++    let q = rotate_min_yx(q_raw);
++    let (m, n) = (p.len(), q.len());
++    let mut out = Vec::with_capacity(m + n);
++    let (mut i, mut j) = (0usize, 0usize);
++    while i < m || j < n {
++        out.push(p[i % m].add(q[j % n])?);
++        if i == m {
++            j += 1;
++        } else if j == n {
++            i += 1;
++        } else {
++            let ep = (p[(i + 1) % m].x - p[i % m].x, p[(i + 1) % m].y - p[i % m].y);
++            let eq = (q[(j + 1) % n].x - q[j % n].x, q[(j + 1) % n].y - q[j % n].y);
++            match cmp_edge_angle(ep, eq) {
++                Ordering::Less => i += 1,
++                Ordering::Greater => j += 1,
++                Ordering::Equal => {
++                    i += 1;
++                    j += 1;
++                }
++            }
++        }
++    }
++    Ok(clean_ccw_ring(&out))
++}
++
++fn ring_to_loop(ring: &[IPoint]) -> Result<Loop, NestError> {
++    Ok(Loop::new(ring.iter().map(|p| p.to_point2()).collect())?)
++}
++
++fn ring_bbox(ring: &[IPoint]) -> (IPoint, IPoint) {
++    let mut lo = ring[0];
++    let mut hi = lo;
++    for &p in &ring[1..] {
++        lo.x = lo.x.min(p.x);
++        lo.y = lo.y.min(p.y);
++        hi.x = hi.x.max(p.x);
++        hi.y = hi.y.max(p.y);
++    }
++    (lo, hi)
++}
++
++fn boxes_touch_or_overlap(a: (IPoint, IPoint), b: (IPoint, IPoint)) -> bool {
++    a.1.x >= b.0.x && b.1.x >= a.0.x && a.1.y >= b.0.y && b.1.y >= a.0.y
++}
++
++fn strictly_inside_convex_ccw(ring: &[IPoint], p: IPoint) -> bool {
++    let n = ring.len();
++    for i in 0..n {
++        if cross_i128(ring[i], ring[(i + 1) % n], p) <= 0 {
++            return false;
++        }
++    }
++    true
++}
++
++pub(crate) fn segment_intersections(
++    a0: IPoint,
++    a1: IPoint,
++    b0: IPoint,
++    b1: IPoint,
++    out: &mut Vec<IPoint>,
++) {
++    if a0.x.max(a1.x) < b0.x.min(b1.x)
++        || b0.x.max(b1.x) < a0.x.min(a1.x)
++        || a0.y.max(a1.y) < b0.y.min(b1.y)
++        || b0.y.max(b1.y) < a0.y.min(a1.y)
++    {
++        return;
++    }
++    let rx = (a1.x as i128) - (a0.x as i128);
++    let ry = (a1.y as i128) - (a0.y as i128);
++    let sx = (b1.x as i128) - (b0.x as i128);
++    let sy = (b1.y as i128) - (b0.y as i128);
++    let denom = rx * sy - ry * sx;
++    let qpx = (b0.x as i128) - (a0.x as i128);
++    let qpy = (b0.y as i128) - (a0.y as i128);
++    let t_num = qpx * sy - qpy * sx;
++    let u_num = qpx * ry - qpy * rx;
++
++    if denom == 0 {
++        if u_num != 0 {
++            return;
++        }
++        let on_box = |p: IPoint, u: IPoint, v: IPoint| {
++            p.x >= u.x.min(v.x) && p.x <= u.x.max(v.x) && p.y >= u.y.min(v.y) && p.y <= u.y.max(v.y)
++        };
++        for p in [a0, a1] {
++            if on_box(p, b0, b1) {
++                out.push(p);
++            }
++        }
++        for p in [b0, b1] {
++            if on_box(p, a0, a1) {
++                out.push(p);
++            }
++        }
++        return;
++    }
++
++    let in_01 = |num: i128| {
++        if denom > 0 {
++            num >= 0 && num <= denom
++        } else {
++            num <= 0 && num >= denom
++        }
++    };
++    if !in_01(t_num) || !in_01(u_num) {
++        return;
++    }
++    if t_num == 0 {
++        out.push(a0);
++    } else if t_num == denom {
++        out.push(a1);
++    } else if u_num == 0 {
++        out.push(b0);
++    } else if u_num == denom {
++        out.push(b1);
++    } else {
++        let t = (t_num as f64) / (denom as f64);
++        let x = a0.x + (t * (rx as f64)).round() as i64;
++        let y = a0.y + (t * (ry as f64)).round() as i64;
++        out.push(IPoint { x, y });
++    }
++}
++
++fn find_internal_seams(
++    rings: &[Vec<IPoint>],
++    nfp: &Region,
++) -> (Vec<IPoint>, Vec<(IPoint, IPoint)>) {
++    if rings.len() <= 1 || nfp.is_empty() {
++        return (Vec::new(), Vec::new());
++    }
++    let boxes: Vec<(IPoint, IPoint)> = rings.iter().map(|r| ring_bbox(r)).collect();
++    let mut raw_pts = Vec::new();
++    let mut seam_segs = Vec::new();
++
++    for i in 0..rings.len() {
++        for &p in &rings[i] {
++            raw_pts.push(p);
++        }
++        for j in (i + 1)..rings.len() {
++            if !boxes_touch_or_overlap(boxes[i], boxes[j]) {
++                continue;
++            }
++            let ri = &rings[i];
++            let rj = &rings[j];
++            for ei in 0..ri.len() {
++                let (a0, a1) = (ri[ei], ri[(ei + 1) % ri.len()]);
++                for ej in 0..rj.len() {
++                    let (b0, b1) = (rj[ej], rj[(ej + 1) % rj.len()]);
++                    let before = raw_pts.len();
++                    segment_intersections(a0, a1, b0, b1, &mut raw_pts);
++                    // Opposite-direction collinear overlap creates a potential zero-width seam.
++                    let ax = (a1.x as i128) - (a0.x as i128);
++                    let ay = (a1.y as i128) - (a0.y as i128);
++                    let bx = (b1.x as i128) - (b0.x as i128);
++                    let by = (b1.y as i128) - (b0.y as i128);
++                    if ax * by - ay * bx == 0
++                        && ax * bx + ay * by < 0
++                        && raw_pts.len() >= before + 2
++                    {
++                        let mut seg_pts = raw_pts[before..].to_vec();
++                        seg_pts.sort_unstable();
++                        seg_pts.dedup();
++                        if seg_pts.len() >= 2 {
++                            let p_lo = seg_pts[0];
++                            let p_hi = seg_pts[seg_pts.len() - 1];
++                            let mid = IPoint {
++                                x: p_lo.x + (p_hi.x - p_lo.x) / 2,
++                                y: p_lo.y + (p_hi.y - p_lo.y) / 2,
++                            };
++                            if !rings.iter().enumerate().any(|(k, r)| {
++                                boxes[k].0.x <= mid.x
++                                    && boxes[k].1.x >= mid.x
++                                    && boxes[k].0.y <= mid.y
++                                    && boxes[k].1.y >= mid.y
++                                    && strictly_inside_convex_ccw(r, mid)
++                            }) {
++                                seam_segs.push((p_lo, p_hi));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    raw_pts.sort_unstable();
++    raw_pts.dedup();
++    raw_pts.retain(|&p| {
++        if !nfp.contains(p.to_point2()) {
++            return false;
++        }
++        !rings.iter().enumerate().any(|(k, r)| {
++            boxes[k].0.x < p.x
++                && boxes[k].1.x > p.x
++                && boxes[k].0.y < p.y
++                && boxes[k].1.y > p.y
++                && strictly_inside_convex_ccw(r, p)
++        })
++    });
++    (raw_pts, seam_segs)
++}
++
++/// Exact No-Fit Polygon `NFP(A, B) = A + (-B)` on the micron grid, preserving zero-width seams.
++pub(crate) fn compute_nfp(a: &Region, b: &Region) -> Result<NfpWithSeams, NestError> {
++    if a.is_empty() || b.is_empty() {
++        return Ok(NfpWithSeams {
++            region: Region::empty(),
++            seam_points: Vec::new(),
++            seam_segments: Vec::new(),
++        });
++    }
++    let pa = convex_decompose(a)?;
++    let pb = convex_decompose(b)?;
++    let mut neg_b = Vec::with_capacity(pb.len());
++    for piece in &pb {
++        let mut neg = Vec::with_capacity(piece.len());
++        for &pt in piece {
++            neg.push(pt.neg()?);
++        }
++        neg_b.push(clean_ccw_ring(&neg));
++    }
++    let mut sum_rings = Vec::with_capacity(pa.len() * neg_b.len());
++    let mut loops = Vec::with_capacity(pa.len() * neg_b.len());
++    for ca in &pa {
++        for cb in &neg_b {
++            let sum = minkowski_convex(ca, cb)?;
++            if sum.len() >= 3 {
++                loops.push(ring_to_loop(&sum)?);
++                sum_rings.push(sum);
++            }
++        }
++    }
++    if loops.is_empty() {
++        return Ok(NfpWithSeams {
++            region: Region::empty(),
++            seam_points: Vec::new(),
++            seam_segments: Vec::new(),
++        });
++    }
++    let region = Region::union_all(loops)?;
++    let (seam_points, seam_segments) = find_internal_seams(&sum_rings, &region);
++    Ok(NfpWithSeams {
++        region,
++        seam_points,
++        seam_segments,
++    })
++}
++
++pub(crate) fn region_ibbox(r: &Region) -> Result<Option<(IPoint, IPoint)>, NestError> {
++    let Some((lo, hi)) = r.bounds() else {
++        return Ok(None);
++    };
++    Ok(Some((IPoint::from_point2(lo)?, IPoint::from_point2(hi)?)))
++}
++
++pub(crate) fn rect_region_from_ipoints(lo: IPoint, hi: IPoint) -> Result<Region, NestError> {
++    let (a, b) = (lo.to_point2(), hi.to_point2());
++    Ok(Region::new(vec![Loop::new(vec![
++        Point2::new(a.x, a.y),
++        Point2::new(b.x, a.y),
++        Point2::new(b.x, b.y),
++        Point2::new(a.x, b.y),
++    ])?])?)
++}
++
++/// Inner-Fit Polygon `IFP(container, part)` returning feasible reference positions.
++pub(crate) fn compute_ifp(
++    container: &Region,
++    part: &Region,
++    is_rect_container: bool,
++) -> Result<Option<IfpResult>, NestError> {
++    let Some((c0, c1)) = region_ibbox(container)? else {
++        return Ok(None);
++    };
++    let Some((p0, p1)) = region_ibbox(part)? else {
++        return Ok(None);
++    };
++    let rx0 = c0.x - p0.x;
++    let rx1 = c1.x - p1.x;
++    let ry0 = c0.y - p0.y;
++    let ry1 = c1.y - p1.y;
++    if rx0 > rx1 || ry0 > ry1 {
++        return Ok(None);
++    }
++    let bbox = (IPoint { x: rx0, y: ry0 }, IPoint { x: rx1, y: ry1 });
++    if is_rect_container {
++        let region = if rx0 < rx1 && ry0 < ry1 {
++            rect_region_from_ipoints(bbox.0, bbox.1)?
++        } else {
++            Region::empty()
++        };
++        return Ok(Some(IfpResult {
++            region,
++            bbox,
++            seam_points: Vec::new(),
++            seam_segments: Vec::new(),
++        }));
++    }
++
++    let pw = p1.x - p0.x;
++    let ph = p1.y - p0.y;
++    let pad = pw.max(ph).saturating_add(10_000_000);
++    let frame = rect_region_from_ipoints(
++        IPoint {
++            x: c0.x.saturating_sub(pad),
++            y: c0.y.saturating_sub(pad),
++        },
++        IPoint {
++            x: c1.x.saturating_add(pad),
++            y: c1.y.saturating_add(pad),
++        },
++    )?;
++    let comp = frame.difference(container)?;
++    let nfp_comp = compute_nfp(&comp, part)?;
++    let region = if rx0 < rx1 && ry0 < ry1 {
++        rect_region_from_ipoints(bbox.0, bbox.1)?.difference(&nfp_comp.region)?
++    } else {
++        Region::empty()
++    };
++    Ok(Some(IfpResult {
++        region,
++        bbox,
++        seam_points: nfp_comp.seam_points,
++        seam_segments: nfp_comp.seam_segments,
++    }))
++}
+diff --git a/crates/geometry/src/nesting/types.rs b/crates/geometry/src/nesting/types.rs
+new file mode 100644
+index 000000000..f9cc54f6b
+--- /dev/null
++++ b/crates/geometry/src/nesting/types.rs
+@@ -0,0 +1,203 @@
++//! Public input, error, and report types for 2D true-shape nesting.
++//! Provenance: our own domain types specced for #2158 from published nesting literature (Bennell & Oliveira 2008; Burke et al. 2006).
++
++use crate::geo2d::{GeoError, Loop, Point2, Region};
++use std::collections::BTreeMap;
++use thiserror::Error;
++
++/// Spacing rule between adjacent cuts on a sheet.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ClearanceMode {
++    /// Separate kerf per part: uncut material between adjacent cut edges is at least `part_gap`.
++    #[default]
++    SeparateCuts,
++    /// Router single-slot mode (`part_gap >= cut_width`): adjacent `Outside` profiles share a single cutter-width channel.
++    RouterSingleSlot,
++}
++
++/// Default side on which the cutter runs relative to a profile loop.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum CutSide {
++    #[default]
++    Outside,
++    OnLine,
++    Inside,
++}
++
++/// Allowed rotation angles for placing a part.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub enum RotationMode {
++    /// Keep 0 degrees only (e.g. grain direction or printed face).
++    Locked,
++    /// Allow 0, 90, 180, and 270 degree orientations.
++    #[default]
++    Orthogonal,
++    /// Allow increments of `deg` degrees in `[0, 360)`.
++    FixedStep(f64),
++}
++
++/// Rectangular sheet specification and cut-clearance parameters (millimetres).
++#[derive(Clone, Debug, PartialEq)]
++pub struct SheetInput {
++    pub width: f64,
++    pub height: f64,
++    pub edge_margin: f64,
++    /// Kerf width (waterjet/plasma/laser) or cutter diameter (router).
++    pub cut_width: f64,
++    pub part_gap: f64,
++    pub allow_parts_in_holes: bool,
++    pub clearance_mode: ClearanceMode,
++}
++
++impl Default for SheetInput {
++    fn default() -> Self {
++        SheetInput {
++            width: 0.0,
++            height: 0.0,
++            edge_margin: 0.0,
++            cut_width: 0.0,
++            part_gap: 0.0,
++            allow_parts_in_holes: true,
++            clearance_mode: ClearanceMode::SeparateCuts,
++        }
++    }
++}
++
++/// One 2D part definition with quantity, geometry, cut side, and orientation rules.
++#[derive(Clone, Debug, PartialEq)]
++pub struct PartInput {
++    pub id: String,
++    pub quantity: usize,
++    pub outer: Option<Loop>,
++    pub holes: Vec<Loop>,
++    pub open_chains: Vec<Vec<Point2>>,
++    pub cut_side: CutSide,
++    pub rotation_mode: RotationMode,
++    pub allow_mirror: bool,
++}
++
++impl PartInput {
++    /// Create a closed part with an outer loop and optional hole loops.
++    pub fn closed(id: impl Into<String>, quantity: usize, outer: Loop, holes: Vec<Loop>) -> Self {
++        PartInput {
++            id: id.into(),
++            quantity,
++            outer: Some(outer),
++            holes,
++            open_chains: Vec::new(),
++            cut_side: CutSide::Outside,
++            rotation_mode: RotationMode::Orthogonal,
++            allow_mirror: false,
++        }
++    }
++
++    /// Create a standalone open-chain part with no closed outer loop.
++    pub fn open(id: impl Into<String>, quantity: usize, open_chains: Vec<Vec<Point2>>) -> Self {
++        PartInput {
++            id: id.into(),
++            quantity,
++            outer: None,
++            holes: Vec::new(),
++            open_chains,
++            cut_side: CutSide::OnLine,
++            rotation_mode: RotationMode::Orthogonal,
++            allow_mirror: false,
++        }
++    }
++
++    pub fn with_cut_side(mut self, cut_side: CutSide) -> Self {
++        self.cut_side = cut_side;
++        self
++    }
++
++    pub fn with_rotation(mut self, rotation_mode: RotationMode) -> Self {
++        self.rotation_mode = rotation_mode;
++        self
++    }
++
++    pub fn with_mirror(mut self, allow_mirror: bool) -> Self {
++        self.allow_mirror = allow_mirror;
++        self
++    }
++
++    pub fn with_open_chains(mut self, open_chains: Vec<Vec<Point2>>) -> Self {
++        self.open_chains = open_chains;
++        self
++    }
++}
++
++#[derive(Clone, Error, Debug, PartialEq)]
++pub enum NestError {
++    #[error("invalid nesting input: {0}")]
++    InvalidInput(String),
++    #[error("nesting input out of machinable range: {0}")]
++    OutOfRange(String),
++    #[error("invalid part '{part_id}': {reason}")]
++    InvalidPart { part_id: String, reason: String },
++    #[error("nesting geometry error: {0}")]
++    Geometry(#[from] GeoError),
++    #[error("unplaced parts remain: {0}")]
++    Unplaced(String),
++}
++
++/// One placed instance on a sheet.
++#[derive(Clone, Debug, PartialEq)]
++pub struct PlacedPart {
++    pub part_id: String,
++    pub instance_index: usize,
++    pub tx: f64,
++    pub ty: f64,
++    pub angle_deg: f64,
++    pub mirrored: bool,
++    /// Set when placed inside a closed hole of another placed part `(host_id, host_instance)`.
++    pub container_part: Option<(String, usize)>,
++    pub net_area: f64,
++    pub outer: Option<Loop>,
++    pub holes: Vec<Loop>,
++    pub open_chains: Vec<Vec<Point2>>,
++    pub cut_footprint: Region,
++    pub inflated_footprint: Region,
++}
++
++/// Nesting output for one physical sheet.
++#[derive(Clone, Debug, PartialEq)]
++pub struct SheetPlacement {
++    pub sheet_index: usize,
++    pub placements: Vec<PlacedPart>,
++    pub placed_counts: BTreeMap<String, usize>,
++    pub utilization_pct: f64,
++    pub waste_region: Region,
++    pub used_bounds: Option<(Point2, Point2)>,
++    pub usable_sheet: Region,
++}
++
++/// Summary of parts that could not fit on any sheet, with named reasons.
++#[derive(Clone, Debug, PartialEq)]
++pub struct UnplacedPart {
++    pub part_id: String,
++    pub quantity: usize,
++    pub reason: String,
++}
++
++/// Full deterministic nesting report across all allocated sheets.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct NestReport {
++    pub sheet_count: usize,
++    pub sheets: Vec<SheetPlacement>,
++    pub total_requested: usize,
++    pub total_placed: usize,
++    pub requested_counts: BTreeMap<String, usize>,
++    pub placed_counts: BTreeMap<String, usize>,
++    pub overall_utilization_pct: f64,
++    pub unplaced: Vec<UnplacedPart>,
++}
++
++impl NestReport {
++    /// Return `Err(NestError::Unplaced)` naming the first unplaced part if any remain.
++    pub fn strict(self) -> Result<Self, NestError> {
++        if let Some(first) = self.unplaced.first() {
++            return Err(NestError::Unplaced(first.reason.clone()));
++        }
++        Ok(self)
++    }
++}
+diff --git a/crates/geometry/src/nesting/validate.rs b/crates/geometry/src/nesting/validate.rs
+new file mode 100644
+index 000000000..e499f0725
+--- /dev/null
++++ b/crates/geometry/src/nesting/validate.rs
+@@ -0,0 +1,209 @@
++//! Input validation helpers for sheet dimensions, cut parameters, loops, and open chains.
++//! Provenance: Prime Directive validation rules for CamCraft 2D nesting (#2158).
++
++use super::decompose::IPoint;
++use super::types::{ClearanceMode, NestError, PartInput, RotationMode, SheetInput};
++use crate::geo2d::{COORD_LIMIT, Loop, Point2, Region};
++
++pub(crate) const MIN_AREA: f64 = 1e-6;
++const MIN_OPEN_LEN: f64 = 1e-6;
++const MAX_ROTATION_STEPS: usize = 720;
++
++#[derive(Clone, Debug)]
++pub(crate) struct SheetSpec {
++    pub area: f64,
++    pub sheet_region: Region,
++    pub usable_sheet: Region,
++    pub usable_bbox: (IPoint, IPoint),
++}
++
++pub(crate) fn part_err(part_id: &str, reason: impl Into<String>) -> NestError {
++    NestError::InvalidPart {
++        part_id: part_id.to_string(),
++        reason: reason.into(),
++    }
++}
++
++fn check_non_negative(name: &str, val: f64, strictly_positive: bool) -> Result<(), NestError> {
++    if !val.is_finite() {
++        return Err(NestError::InvalidInput(format!("{name} must be finite")));
++    }
++    if val >= COORD_LIMIT {
++        return Err(NestError::OutOfRange(format!(
++            "{name} exceeds machinable range"
++        )));
++    }
++    if strictly_positive && val <= 0.0 {
++        return Err(NestError::InvalidInput(format!("{name} must be positive")));
++    }
++    if !strictly_positive && val < 0.0 {
++        return Err(NestError::InvalidInput(format!(
++            "{name} must be non-negative"
++        )));
++    }
++    Ok(())
++}
++
++pub(crate) fn validate_sheet(sheet: &SheetInput) -> Result<SheetSpec, NestError> {
++    check_non_negative("sheet width", sheet.width, true)?;
++    check_non_negative("sheet height", sheet.height, true)?;
++    check_non_negative("edge_margin", sheet.edge_margin, false)?;
++    check_non_negative("cut_width", sheet.cut_width, false)?;
++    check_non_negative("part_gap", sheet.part_gap, false)?;
++
++    if sheet.clearance_mode == ClearanceMode::RouterSingleSlot && sheet.part_gap < sheet.cut_width {
++        return Err(NestError::InvalidInput(format!(
++            "router single-slot clearance requires part_gap ({}) >= cut_width ({})",
++            sheet.part_gap, sheet.cut_width
++        )));
++    }
++    if sheet.edge_margin * 2.0 >= sheet.width || sheet.edge_margin * 2.0 >= sheet.height {
++        return Err(NestError::InvalidInput(
++            "usable sheet is empty after applying edge_margin".into(),
++        ));
++    }
++
++    let sheet_region = Region::new(vec![Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(sheet.width, 0.0),
++        Point2::new(sheet.width, sheet.height),
++        Point2::new(0.0, sheet.height),
++    ])?])?;
++    let usable_sheet = if sheet.edge_margin > 0.0 {
++        sheet_region.offset_sharp(-sheet.edge_margin)?
++    } else {
++        sheet_region.clone()
++    };
++    if usable_sheet.is_empty() || usable_sheet.area() <= MIN_AREA {
++        return Err(NestError::InvalidInput(
++            "usable sheet is empty after applying edge_margin".into(),
++        ));
++    }
++    let Some(usable_bbox) = super::nfp::region_ibbox(&usable_sheet)? else {
++        return Err(NestError::InvalidInput("usable sheet has no bounds".into()));
++    };
++    Ok(SheetSpec {
++        area: sheet.width * sheet.height,
++        sheet_region,
++        usable_sheet,
++        usable_bbox,
++    })
++}
++
++pub(crate) fn candidate_angles(part_id: &str, mode: RotationMode) -> Result<Vec<f64>, NestError> {
++    match mode {
++        RotationMode::Locked => Ok(vec![0.0]),
++        RotationMode::Orthogonal => Ok(vec![0.0, 90.0, 180.0, 270.0]),
++        RotationMode::FixedStep(deg) => {
++            if !(deg.is_finite() && deg > 0.0 && deg <= 360.0) {
++                return Err(part_err(
++                    part_id,
++                    format!("rotation step {deg} must be in (0, 360]"),
++                ));
++            }
++            let count = (360.0 / deg).ceil() as usize;
++            if count > MAX_ROTATION_STEPS {
++                return Err(part_err(
++                    part_id,
++                    format!(
++                        "rotation step {deg} exceeds {MAX_ROTATION_STEPS} candidate orientations"
++                    ),
++                ));
++            }
++            let mut angles = Vec::new();
++            let mut k = 0usize;
++            loop {
++                let a = (k as f64) * deg;
++                if a >= 360.0 - 1e-9 || angles.len() >= MAX_ROTATION_STEPS {
++                    break;
++                }
++                angles.push(a);
++                k += 1;
++            }
++            if angles.is_empty() {
++                angles.push(0.0);
++            }
++            Ok(angles)
++        }
++    }
++}
++
++pub(crate) fn validate_open_chains(
++    part_id: &str,
++    chains: &[Vec<Point2>],
++) -> Result<Vec<Vec<Point2>>, NestError> {
++    let mut cleaned = Vec::with_capacity(chains.len());
++    for (idx, chain) in chains.iter().enumerate() {
++        let mut pts: Vec<Point2> = Vec::with_capacity(chain.len());
++        for &p in chain {
++            if !(p.x.is_finite() && p.y.is_finite()) {
++                return Err(part_err(
++                    part_id,
++                    format!("open chain {idx} has non-finite point"),
++                ));
++            }
++            if p.x.abs() >= COORD_LIMIT || p.y.abs() >= COORD_LIMIT {
++                return Err(NestError::OutOfRange(format!(
++                    "part '{part_id}' open chain {idx} exceeds machinable range"
++                )));
++            }
++            if pts
++                .last()
++                .is_none_or(|q| (q.x - p.x).hypot(q.y - p.y) > 1e-9)
++            {
++                pts.push(p);
++            }
++        }
++        let len: f64 = pts
++            .windows(2)
++            .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
++            .sum();
++        if pts.len() < 2 || len <= MIN_OPEN_LEN {
++            return Err(part_err(
++                part_id,
++                format!("open chain {idx} has no usable length"),
++            ));
++        }
++        cleaned.push(pts);
++    }
++    Ok(cleaned)
++}
++
++pub(crate) fn validate_closed_loops(part: &PartInput) -> Result<(Region, Vec<Region>), NestError> {
++    let Some(outer) = &part.outer else {
++        return Err(part_err(&part.id, "missing outer loop"));
++    };
++    let outer_reg = Region::new(vec![outer.clone()])
++        .map_err(|e| part_err(&part.id, format!("invalid outer loop: {e}")))?;
++    if outer_reg.loops().len() != 1 || outer_reg.area().abs() <= MIN_AREA {
++        return Err(part_err(&part.id, "outer loop encloses no area"));
++    }
++    let mut hole_regs = Vec::with_capacity(part.holes.len());
++    for (idx, hole) in part.holes.iter().enumerate() {
++        let hr = Region::new(vec![hole.clone()])
++            .map_err(|e| part_err(&part.id, format!("invalid hole loop {idx}: {e}")))?;
++        if hr.loops().len() != 1 || hr.area().abs() <= MIN_AREA {
++            return Err(part_err(
++                &part.id,
++                format!("hole loop {idx} encloses no area"),
++            ));
++        }
++        let outside = hr.difference(&outer_reg)?.area().abs();
++        if outside > 1e-6 || hr.area().abs() >= outer_reg.area().abs() - MIN_AREA {
++            return Err(part_err(
++                &part.id,
++                format!("hole loop {idx} lies outside or intersects outer loop"),
++            ));
++        }
++        for (prev_idx, prev) in hole_regs.iter().enumerate() {
++            if hr.intersect(prev)?.area().abs() > 1e-6 {
++                return Err(part_err(
++                    &part.id,
++                    format!("hole loop {idx} overlaps hole loop {prev_idx}"),
++                ));
++            }
++        }
++        hole_regs.push(hr);
++    }
++    Ok((outer_reg, hole_regs))
++}
+diff --git a/crates/geometry/tests/nesting.rs b/crates/geometry/tests/nesting.rs
+new file mode 100644
+index 000000000..78d2d71bc
+--- /dev/null
++++ b/crates/geometry/tests/nesting.rs
+@@ -0,0 +1,352 @@
++//! Nesting kernel tests: 2D NFP/IFP and deterministic bottom-left-fill
++//! placement on the micron grid (issue 2158).
++//!
++//! Gate map (M4.4): covers camcraft_geometry::nesting.
++
++use camcraft_geometry::geo2d::{Loop, Point2, Region};
++use camcraft_geometry::nesting::{
++    ClearanceMode, CutSide, NestError, PartInput, RotationMode, SheetInput, nest,
++};
++
++fn rect_loop(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++    Loop::new(vec![
++        Point2::new(x0, y0),
++        Point2::new(x1, y0),
++        Point2::new(x1, y1),
++        Point2::new(x0, y1),
++    ])
++    .expect("valid rectangle loop")
++}
++
++fn l_shape_loop(w: f64, h: f64, arm: f64) -> Loop {
++    Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(w, 0.0),
++        Point2::new(w, arm),
++        Point2::new(arm, arm),
++        Point2::new(arm, h),
++        Point2::new(0.0, h),
++    ])
++    .expect("valid L-shape loop")
++}
++
++fn close(a: f64, b: f64, tol: f64) -> bool {
++    (a - b).abs() <= tol
++}
++
++fn assert_no_inflated_overlap(placements: &[camcraft_geometry::nesting::PlacedPart]) {
++    for i in 0..placements.len() {
++        for j in (i + 1)..placements.len() {
++            let inter = placements[i]
++                .inflated_footprint
++                .intersect(&placements[j].inflated_footprint)
++                .expect("intersect inflated footprints");
++            assert!(
++                inter.is_empty(),
++                "inflated footprints overlap between {}#{} and {}#{}: area={}",
++                placements[i].part_id,
++                placements[i].instance_index,
++                placements[j].part_id,
++                placements[j].instance_index,
++                inter.area()
++            );
++        }
++    }
++}
++
++#[test]
++fn deterministic_irregular_l_shapes_nest_without_overlap() {
++    let sheet = SheetInput {
++        width: 120.0,
++        height: 120.0,
++        edge_margin: 5.0,
++        cut_width: 1.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let l_part = PartInput::closed("l_bracket", 4, l_shape_loop(40.0, 40.0, 15.0), vec![])
++        .with_rotation(RotationMode::Orthogonal);
++    let spacer = PartInput::closed("spacer", 2, rect_loop(0.0, 0.0, 18.0, 18.0), vec![])
++        .with_rotation(RotationMode::Orthogonal);
++
++    let r1 = nest(&sheet, &[l_part.clone(), spacer.clone()]).expect("first nest run");
++    let r2 = nest(&sheet, &[l_part, spacer]).expect("second nest run");
++    assert_eq!(r1, r2, "nesting must be deterministic");
++    assert!(
++        r1.unplaced.is_empty(),
++        "unexpected unplaced: {:?}",
++        r1.unplaced
++    );
++    assert_eq!(r1.total_requested, 6);
++    assert_eq!(r1.total_placed, 6);
++    assert_eq!(r1.sheet_count, 1);
++
++    let s = &r1.sheets[0];
++    assert_eq!(s.placed_counts.get("l_bracket"), Some(&4));
++    assert_eq!(s.placed_counts.get("spacer"), Some(&2));
++    assert_no_inflated_overlap(&s.placements);
++
++    let l_area = 40.0 * 15.0 + 25.0 * 15.0; // 975.0
++    let spacer_area = 18.0 * 18.0; // 324.0
++    let expected_net = 4.0 * l_area + 2.0 * spacer_area;
++    let expected_pct = expected_net / (120.0 * 120.0) * 100.0;
++    assert!(
++        close(s.utilization_pct, expected_pct, 1e-3),
++        "got {} want {}",
++        s.utilization_pct,
++        expected_pct
++    );
++    assert!(close(r1.overall_utilization_pct, expected_pct, 1e-3));
++
++    // Verify waste_region excludes every cut footprint and sums to sheet area.
++    let mut cut_union = Region::empty();
++    for p in &s.placements {
++        assert!(
++            p.cut_footprint
++                .difference(&s.usable_sheet)
++                .expect("diff usable")
++                .area()
++                .abs()
++                < 1e-3,
++            "cut footprint escaped usable sheet for {}#{}",
++            p.part_id,
++            p.instance_index
++        );
++        cut_union = cut_union
++            .union(&p.cut_footprint)
++            .expect("union cut footprints");
++        let waste_hit = s
++            .waste_region
++            .intersect(&p.cut_footprint)
++            .expect("waste vs cut");
++        assert!(
++            waste_hit.area().abs() < 1e-4,
++            "waste region overlaps cut footprint: {}",
++            waste_hit.area()
++        );
++    }
++    assert!(
++        close(
++            s.waste_region.area() + cut_union.area(),
++            120.0 * 120.0,
++            1e-2
++        ),
++        "waste {} + cuts {} != sheet {}",
++        s.waste_region.area(),
++        cut_union.area(),
++        120.0 * 120.0
++    );
++    assert!(s.used_bounds.is_some());
++}
++
++#[test]
++fn places_small_part_inside_large_part_hole_with_full_clearance() {
++    let sheet = SheetInput {
++        width: 120.0,
++        height: 120.0,
++        edge_margin: 5.0,
++        cut_width: 2.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let frame = PartInput::closed(
++        "frame",
++        1,
++        rect_loop(0.0, 0.0, 100.0, 100.0),
++        vec![rect_loop(20.0, 20.0, 80.0, 80.0)],
++    )
++    .with_rotation(RotationMode::Locked);
++    // Hole is 60x60; hole_usable shrinks by cut_width + part_gap/2 = 3.0 per side -> 54x54.
++    // Core is 30x30; inflated by cut_width + part_gap/2 = 3.0 per side -> 36x36 <= 54x54.
++    let core = PartInput::closed("core", 1, rect_loop(0.0, 0.0, 30.0, 30.0), vec![])
++        .with_rotation(RotationMode::Locked);
++
++    let report = nest(&sheet, &[frame.clone(), core.clone()]).expect("nest with hole");
++    assert_eq!(report.sheet_count, 1, "core should fit inside frame hole");
++    assert_eq!(report.total_placed, 2);
++    assert_no_inflated_overlap(&report.sheets[0].placements);
++
++    let placed_core = report.sheets[0]
++        .placements
++        .iter()
++        .find(|p| p.part_id == "core")
++        .expect("core placed");
++    assert_eq!(
++        placed_core.container_part,
++        Some(("frame".to_string(), 0)),
++        "core must report frame#0 as container"
++    );
++
++    let expected_net = (100.0 * 100.0 - 60.0 * 60.0) + (30.0 * 30.0);
++    let expected_pct = expected_net / (120.0 * 120.0) * 100.0;
++    assert!(close(report.sheets[0].utilization_pct, expected_pct, 1e-3));
++
++    // When allow_parts_in_holes is false, core cannot fit inside frame and must open sheet 2.
++    let mut no_holes = sheet;
++    no_holes.allow_parts_in_holes = false;
++    let report_no_holes = nest(&no_holes, &[frame, core]).expect("nest without parts in holes");
++    assert_eq!(report_no_holes.sheet_count, 2);
++}
++
++#[test]
++fn swept_open_chains_and_cut_sides_nest_cleanly() {
++    let sheet = SheetInput {
++        width: 120.0,
++        height: 80.0,
++        edge_margin: 5.0,
++        cut_width: 2.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let slit_online = PartInput::open(
++        "slit_online",
++        2,
++        vec![vec![Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)]],
++    )
++    .with_cut_side(CutSide::OnLine);
++    let slit_side = PartInput::open(
++        "slit_side",
++        1,
++        vec![vec![Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)]],
++    )
++    .with_cut_side(CutSide::Outside);
++    let box_inside = PartInput::closed("box_in", 1, rect_loop(0.0, 0.0, 20.0, 20.0), vec![])
++        .with_cut_side(CutSide::Inside);
++    let box_outside = PartInput::closed("box_out", 1, rect_loop(0.0, 0.0, 20.0, 20.0), vec![])
++        .with_cut_side(CutSide::Outside);
++
++    let report = nest(&sheet, &[slit_online, slit_side, box_inside, box_outside])
++        .expect("nest open chains and cut sides");
++    assert!(report.unplaced.is_empty());
++    assert_eq!(report.total_placed, 5);
++    assert_eq!(report.sheet_count, 1);
++    assert_no_inflated_overlap(&report.sheets[0].placements);
++    // Open chain net area is 0, closed boxes contribute 20*20 * 2 = 800.
++    let expected_pct = 800.0 / (120.0 * 80.0) * 100.0;
++    assert!(close(report.sheets[0].utilization_pct, expected_pct, 1e-3));
++}
++
++#[test]
++fn multi_sheet_overflow_and_exact_per_sheet_counts() {
++    let sheet = SheetInput {
++        width: 100.0,
++        height: 100.0,
++        edge_margin: 5.0,
++        cut_width: 2.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    // Exact fit: 4 of 40x40 squares per 100x100 sheet:
++    // 5 (margin) + 2 (kerf) + 40 + 6 (2*kerf+gap) + 40 + 2 (kerf) + 5 (margin) = 100.0!
++    // Request 5 squares -> 4 on sheet 0, 1 on sheet 1.
++    let sq = PartInput::closed("tile", 5, rect_loop(0.0, 0.0, 40.0, 40.0), vec![])
++        .with_rotation(RotationMode::Locked);
++    let small = PartInput::closed("plug", 2, rect_loop(0.0, 0.0, 10.0, 10.0), vec![])
++        .with_rotation(RotationMode::Locked);
++
++    let report = nest(&sheet, &[sq, small]).expect("multi sheet nest");
++    assert!(report.unplaced.is_empty());
++    assert_eq!(report.sheet_count, 2);
++    assert_eq!(report.sheets[0].placed_counts.get("tile"), Some(&4));
++    assert_eq!(report.sheets[1].placed_counts.get("tile"), Some(&1));
++    assert_eq!(report.placed_counts.get("tile"), Some(&5));
++    assert_eq!(report.placed_counts.get("plug"), Some(&2));
++    for s in &report.sheets {
++        assert_no_inflated_overlap(&s.placements);
++    }
++    let overall_expected = (5.0 * 1600.0 + 2.0 * 100.0) / (2.0 * 10_000.0) * 100.0;
++    assert!(close(
++        report.overall_utilization_pct,
++        overall_expected,
++        1e-3
++    ));
++}
++
++#[test]
++fn refuses_non_finite_negative_and_oversized_inputs_by_name() {
++    let good_sheet = SheetInput {
++        width: 100.0,
++        height: 100.0,
++        edge_margin: 5.0,
++        cut_width: 1.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let good_part = PartInput::closed("ok", 1, rect_loop(0.0, 0.0, 10.0, 10.0), vec![]);
++
++    let mut bad = good_sheet.clone();
++    bad.width = -10.0;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::InvalidInput(msg)) if msg.contains("width")
++    ));
++
++    let mut bad = good_sheet.clone();
++    bad.height = f64::NAN;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::InvalidInput(msg)) if msg.contains("height")
++    ));
++
++    let mut bad = good_sheet.clone();
++    bad.edge_margin = -1.0;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::InvalidInput(msg)) if msg.contains("edge_margin")
++    ));
++
++    let mut bad = good_sheet.clone();
++    bad.cut_width = f64::INFINITY;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::InvalidInput(msg)) if msg.contains("cut_width")
++    ));
++
++    let mut bad = good_sheet.clone();
++    bad.part_gap = -0.1;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::InvalidInput(msg)) if msg.contains("part_gap")
++    ));
++
++    let mut bad = good_sheet.clone();
++    bad.width = 1e13;
++    assert!(matches!(
++        nest(&bad, std::slice::from_ref(&good_part)),
++        Err(NestError::OutOfRange(msg)) if msg.contains("width")
++    ));
++
++    // Bad rotation step
++    let bad_rot = good_part
++        .clone()
++        .with_rotation(RotationMode::FixedStep(0.0));
++    assert!(matches!(
++        nest(&good_sheet, &[bad_rot]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "ok"
++    ));
++
++    // Hole outside outer loop
++    let bad_hole = PartInput::closed(
++        "bad_hole",
++        1,
++        rect_loop(0.0, 0.0, 20.0, 20.0),
++        vec![rect_loop(30.0, 30.0, 40.0, 40.0)],
++    );
++    assert!(matches!(
++        nest(&good_sheet, &[bad_hole]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "bad_hole"
++    ));
++
++    // Oversized part vs sheet -> explicit unplaced refusal naming the part
++    let huge = PartInput::closed("huge_plate", 1, rect_loop(0.0, 0.0, 200.0, 50.0), vec![]);
++    let report = nest(&good_sheet, &[huge]).expect("oversized part recorded in unplaced");
++    assert_eq!(report.unplaced.len(), 1);
++    assert_eq!(report.unplaced[0].part_id, "huge_plate");
++    assert!(report.unplaced[0].reason.contains("huge_plate"));
++    assert!(report.strict().is_err());
++}
+diff --git a/crates/geometry/tests/nesting_modes.rs b/crates/geometry/tests/nesting_modes.rs
+new file mode 100644
+index 000000000..7a2e016b2
+--- /dev/null
++++ b/crates/geometry/tests/nesting_modes.rs
+@@ -0,0 +1,249 @@
++//! Rotation modes, mirroring, router single-slot mode, and multi-part batch tests (issue 2158).
++//!
++//! Gate map (M4.4): covers camcraft_geometry::nesting.
++
++use camcraft_geometry::geo2d::{Loop, Point2};
++use camcraft_geometry::nesting::{ClearanceMode, PartInput, RotationMode, SheetInput, nest};
++
++fn rect_loop(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++    Loop::new(vec![
++        Point2::new(x0, y0),
++        Point2::new(x1, y0),
++        Point2::new(x1, y1),
++        Point2::new(x0, y1),
++    ])
++    .expect("valid rectangle loop")
++}
++
++fn l_shape_loop(w: f64, h: f64, arm: f64) -> Loop {
++    Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(w, 0.0),
++        Point2::new(w, arm),
++        Point2::new(arm, arm),
++        Point2::new(arm, h),
++        Point2::new(0.0, h),
++    ])
++    .expect("valid L-shape loop")
++}
++
++fn assert_no_inflated_overlap(placements: &[camcraft_geometry::nesting::PlacedPart]) {
++    for i in 0..placements.len() {
++        for j in (i + 1)..placements.len() {
++            let inter = placements[i]
++                .inflated_footprint
++                .intersect(&placements[j].inflated_footprint)
++                .expect("intersect inflated footprints");
++            assert!(
++                inter.is_empty(),
++                "inflated footprints overlap between {}#{} and {}#{}: area={}",
++                placements[i].part_id,
++                placements[i].instance_index,
++                placements[j].part_id,
++                placements[j].instance_index,
++                inter.area()
++            );
++        }
++    }
++}
++
++#[test]
++fn router_single_slot_mode_fits_shared_channel_and_refuses_under_sized_gap() {
++    let mut sheet = SheetInput {
++        width: 128.0,
++        height: 72.0,
++        edge_margin: 5.0,
++        cut_width: 6.0,
++        part_gap: 6.0,
++        allow_parts_in_holes: false,
++        clearance_mode: ClearanceMode::RouterSingleSlot,
++    };
++    let sq = PartInput::closed("panel", 2, rect_loop(0.0, 0.0, 50.0, 50.0), vec![])
++        .with_rotation(RotationMode::Locked);
++
++    let single = nest(&sheet, std::slice::from_ref(&sq)).expect("single slot nest");
++    assert_eq!(single.sheet_count, 1);
++    assert_no_inflated_overlap(&single.sheets[0].placements);
++
++    sheet.clearance_mode = ClearanceMode::SeparateCuts;
++    let separate = nest(&sheet, std::slice::from_ref(&sq)).expect("separate cuts nest");
++    assert_eq!(separate.sheet_count, 2);
++
++    sheet.clearance_mode = ClearanceMode::RouterSingleSlot;
++    sheet.part_gap = 4.0;
++    let err = nest(&sheet, &[sq]).expect_err("must refuse part_gap < cut_width");
++    let msg = err.to_string();
++    assert!(
++        msg.contains("part_gap") && msg.contains("cut_width"),
++        "unexpected error: {msg}"
++    );
++}
++
++#[test]
++fn fixed_step_rotation_and_mirror_unlock_tight_placements() {
++    let sheet = SheetInput {
++        width: 70.0,
++        height: 70.0,
++        edge_margin: 5.0,
++        cut_width: 0.0,
++        part_gap: 0.0,
++        allow_parts_in_holes: false,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let bar = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(72.0, 0.0),
++        Point2::new(72.0, 6.0),
++        Point2::new(0.0, 6.0),
++    ])
++    .unwrap();
++    let locked =
++        PartInput::closed("bar", 1, bar.clone(), vec![]).with_rotation(RotationMode::Locked);
++    let r_locked = nest(&sheet, &[locked]).expect("oversized locked returns unplaced");
++    assert_eq!(r_locked.total_placed, 0);
++    assert_eq!(r_locked.unplaced.len(), 1);
++    assert!(r_locked.unplaced[0].reason.contains("bar"));
++    assert!(r_locked.strict().is_err());
++
++    let angled =
++        PartInput::closed("bar", 1, bar, vec![]).with_rotation(RotationMode::FixedStep(45.0));
++    let r_angled = nest(&sheet, &[angled]).expect("45 deg rotation fits");
++    assert_eq!(r_angled.total_placed, 1);
++}
++
++#[test]
++fn allow_mirror_places_chiral_part_in_cavity_and_circular_hole_accepts_inner_part() {
++    let sheet = SheetInput {
++        width: 50.0,
++        height: 35.0,
++        edge_margin: 0.0,
++        cut_width: 0.0,
++        part_gap: 0.0,
++        allow_parts_in_holes: false,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let host = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(50.0, 0.0),
++        Point2::new(50.0, 10.0),
++        Point2::new(40.0, 10.0),
++        Point2::new(40.0, 25.0),
++        Point2::new(30.0, 25.0),
++        Point2::new(30.0, 15.0),
++        Point2::new(20.0, 15.0),
++        Point2::new(20.0, 35.0),
++        Point2::new(0.0, 35.0),
++    ])
++    .unwrap();
++    let chiral = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(10.0, 0.0),
++        Point2::new(10.0, 15.0),
++        Point2::new(20.0, 15.0),
++        Point2::new(20.0, 5.0),
++        Point2::new(30.0, 5.0),
++        Point2::new(30.0, 25.0),
++        Point2::new(0.0, 25.0),
++    ])
++    .unwrap();
++    let host_part = PartInput::closed("host", 1, host, vec![]).with_rotation(RotationMode::Locked);
++    let chiral_no_mirror = PartInput::closed("chiral", 1, chiral.clone(), vec![])
++        .with_rotation(RotationMode::Orthogonal)
++        .with_mirror(false);
++    let r_no_mirror = nest(&sheet, &[host_part.clone(), chiral_no_mirror]).unwrap();
++    assert_eq!(
++        r_no_mirror.sheet_count, 2,
++        "unmirrored chiral part must spill to sheet 2"
++    );
++
++    let chiral_mirror = PartInput::closed("chiral", 1, chiral, vec![])
++        .with_rotation(RotationMode::Orthogonal)
++        .with_mirror(true);
++    let r_mirror = nest(&sheet, &[host_part, chiral_mirror]).unwrap();
++    assert_eq!(
++        r_mirror.sheet_count, 1,
++        "mirrored chiral part must fit on sheet 1"
++    );
++    assert_no_inflated_overlap(&r_mirror.sheets[0].placements);
++    let placed_chiral = r_mirror.sheets[0]
++        .placements
++        .iter()
++        .find(|p| p.part_id == "chiral")
++        .unwrap();
++    assert!(placed_chiral.mirrored);
++
++    let circle_sheet = SheetInput {
++        width: 140.0,
++        height: 140.0,
++        edge_margin: 5.0,
++        cut_width: 1.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let ring_pts = |r: f64, cx: f64, cy: f64| -> Loop {
++        let n = 16;
++        let pts = (0..n)
++            .map(|i| {
++                let a = std::f64::consts::TAU * (i as f64) / (n as f64);
++                Point2::new(cx + r * a.cos(), cy + r * a.sin())
++            })
++            .collect();
++        Loop::new(pts).unwrap()
++    };
++    let flange = PartInput::closed(
++        "flange",
++        1,
++        rect_loop(0.0, 0.0, 120.0, 120.0),
++        vec![ring_pts(40.0, 60.0, 60.0)],
++    )
++    .with_rotation(RotationMode::Locked);
++    let washer = PartInput::closed("washer", 1, ring_pts(15.0, 0.0, 0.0), vec![])
++        .with_rotation(RotationMode::Locked);
++    let r_circle = nest(&circle_sheet, &[flange, washer]).unwrap();
++    assert_eq!(r_circle.sheet_count, 1);
++    assert_no_inflated_overlap(&r_circle.sheets[0].placements);
++    let placed_washer = r_circle.sheets[0]
++        .placements
++        .iter()
++        .find(|p| p.part_id == "washer")
++        .unwrap();
++    assert_eq!(
++        placed_washer.container_part,
++        Some(("flange".to_string(), 0))
++    );
++}
++
++#[test]
++fn batch_30_irregular_parts_is_deterministic_and_zero_overlap() {
++    let sheet = SheetInput {
++        width: 200.0,
++        height: 150.0,
++        edge_margin: 5.0,
++        cut_width: 1.5,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let l_part = PartInput::closed("l_arm", 10, l_shape_loop(45.0, 45.0, 16.0), vec![])
++        .with_rotation(RotationMode::Orthogonal);
++    let frame = PartInput::closed(
++        "frame",
++        8,
++        rect_loop(0.0, 0.0, 50.0, 40.0),
++        vec![rect_loop(10.0, 10.0, 40.0, 30.0)],
++    )
++    .with_rotation(RotationMode::Orthogonal);
++    let plug = PartInput::closed("plug", 12, rect_loop(0.0, 0.0, 12.0, 12.0), vec![])
++        .with_rotation(RotationMode::Locked);
++
++    let r1 = nest(&sheet, &[l_part.clone(), frame.clone(), plug.clone()]).unwrap();
++    let r2 = nest(&sheet, &[l_part, frame, plug]).unwrap();
++    assert_eq!(r1, r2);
++    assert_eq!(r1.total_requested, 30);
++    assert_eq!(r1.total_placed, 30);
++    assert!(r1.unplaced.is_empty());
++    for s in &r1.sheets {
++        assert_no_inflated_overlap(&s.placements);
++    }
++}
+diff --git a/crates/geometry/tests/nesting_refusals.rs b/crates/geometry/tests/nesting_refusals.rs
+new file mode 100644
+index 000000000..e30968fcf
+--- /dev/null
++++ b/crates/geometry/tests/nesting_refusals.rs
+@@ -0,0 +1,382 @@
++//! Refusal, spacing, seam, and multi-level hole tests for 2D nesting (issue 2158).
++//!
++//! Gate map (M4.4): covers camcraft_geometry::nesting.
++
++use camcraft_geometry::geo2d::{Loop, Point2, Region};
++use camcraft_geometry::nesting::{
++    ClearanceMode, CutSide, NestError, PartInput, RotationMode, SheetInput, nest,
++};
++
++fn rect_loop(x0: f64, y0: f64, x1: f64, y1: f64) -> Loop {
++    Loop::new(vec![
++        Point2::new(x0, y0),
++        Point2::new(x1, y0),
++        Point2::new(x1, y1),
++        Point2::new(x0, y1),
++    ])
++    .expect("valid rectangle loop")
++}
++
++fn close(a: f64, b: f64, tol: f64) -> bool {
++    (a - b).abs() <= tol
++}
++
++fn nominal_gap_x(
++    a: &camcraft_geometry::nesting::PlacedPart,
++    b: &camcraft_geometry::nesting::PlacedPart,
++) -> f64 {
++    let ba = Region::new(vec![a.outer.clone().unwrap()])
++        .unwrap()
++        .bounds()
++        .unwrap();
++    let bb = Region::new(vec![b.outer.clone().unwrap()])
++        .unwrap()
++        .bounds()
++        .unwrap();
++    (bb.0.x - ba.1.x).max(ba.0.x - bb.1.x)
++}
++
++#[test]
++fn cut_side_inflations_leave_exact_uncut_gap() {
++    let sheet = SheetInput {
++        width: 100.0,
++        height: 40.0,
++        edge_margin: 5.0,
++        cut_width: 2.0,
++        part_gap: 4.0,
++        allow_parts_in_holes: false,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++
++    // Outside + Outside => 2*cut_width + part_gap = 8.0 mm nominal gap
++    let p_out = PartInput::closed("out", 2, rect_loop(0.0, 0.0, 20.0, 20.0), vec![])
++        .with_cut_side(CutSide::Outside)
++        .with_rotation(RotationMode::Locked);
++    let r_out = nest(&sheet, &[p_out]).unwrap();
++    assert!(close(
++        nominal_gap_x(
++            &r_out.sheets[0].placements[0],
++            &r_out.sheets[0].placements[1]
++        ),
++        8.0,
++        1e-4
++    ));
++
++    // OnLine + OnLine => cut_width + part_gap = 6.0 mm nominal gap
++    let p_on = PartInput::closed("on", 2, rect_loop(0.0, 0.0, 20.0, 20.0), vec![])
++        .with_cut_side(CutSide::OnLine)
++        .with_rotation(RotationMode::Locked);
++    let r_on = nest(&sheet, &[p_on]).unwrap();
++    assert!(close(
++        nominal_gap_x(&r_on.sheets[0].placements[0], &r_on.sheets[0].placements[1]),
++        6.0,
++        1e-4
++    ));
++
++    // Inside + Inside => part_gap = 4.0 mm nominal gap
++    let p_in = PartInput::closed("in", 2, rect_loop(0.0, 0.0, 20.0, 20.0), vec![])
++        .with_cut_side(CutSide::Inside)
++        .with_rotation(RotationMode::Locked);
++    let r_in = nest(&sheet, &[p_in]).unwrap();
++    assert!(close(
++        nominal_gap_x(&r_in.sheets[0].placements[0], &r_in.sheets[0].placements[1]),
++        4.0,
++        1e-4
++    ));
++
++    // Outside (larger) + Inside (smaller) => cut_width + part_gap = 6.0 mm nominal gap
++    let big_out = PartInput::closed("a_out", 1, rect_loop(0.0, 0.0, 22.0, 20.0), vec![])
++        .with_cut_side(CutSide::Outside)
++        .with_rotation(RotationMode::Locked);
++    let small_in = PartInput::closed("b_in", 1, rect_loop(0.0, 0.0, 18.0, 20.0), vec![])
++        .with_cut_side(CutSide::Inside)
++        .with_rotation(RotationMode::Locked);
++    let r_mix = nest(&sheet, &[big_out, small_in]).unwrap();
++    assert!(close(
++        nominal_gap_x(
++            &r_mix.sheets[0].placements[0],
++            &r_mix.sheets[0].placements[1]
++        ),
++        6.0,
++        1e-4
++    ));
++}
++
++#[test]
++fn chiral_cavity_on_larger_sheet_finds_zero_slack_seam() {
++    // 100x35 sheet: host sits at x=[0,50], leaving both an exact cavity at [20,50]x[10,35]
++    // AND free space at x=[50,100]. Note that placing at (tx=50, ty=10) inside the cavity
++    // keeps max_y=35 (if sheet is 35 high), whereas placing at (50, 0) also fits at y=0.
++    // On a 50x45 sheet (extra height at top!), (50, 10) is strictly interior to IFP ([30..50]x[0..20])
++    // and ONLY found via internal NFP seam tracking!
++    let sheet = SheetInput {
++        width: 50.0,
++        height: 45.0,
++        edge_margin: 0.0,
++        cut_width: 0.0,
++        part_gap: 0.0,
++        allow_parts_in_holes: false,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let host = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(50.0, 0.0),
++        Point2::new(50.0, 10.0),
++        Point2::new(40.0, 10.0),
++        Point2::new(40.0, 25.0),
++        Point2::new(30.0, 25.0),
++        Point2::new(30.0, 15.0),
++        Point2::new(20.0, 15.0),
++        Point2::new(20.0, 35.0),
++        Point2::new(0.0, 35.0),
++    ])
++    .unwrap();
++    let chiral = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(10.0, 0.0),
++        Point2::new(10.0, 15.0),
++        Point2::new(20.0, 15.0),
++        Point2::new(20.0, 5.0),
++        Point2::new(30.0, 5.0),
++        Point2::new(30.0, 25.0),
++        Point2::new(0.0, 25.0),
++    ])
++    .unwrap();
++    let p_host = PartInput::closed("host", 1, host, vec![]).with_rotation(RotationMode::Locked);
++    let p_chiral = PartInput::closed("chiral", 1, chiral, vec![])
++        .with_rotation(RotationMode::Locked)
++        .with_mirror(true);
++    let r = nest(&sheet, &[p_host, p_chiral]).unwrap();
++    assert_eq!(r.sheet_count, 1);
++    let placed_c = &r.sheets[0].placements[1];
++    // Inside the cavity max_y == 35.0; sitting above host would have max_y >= 40.0.
++    assert!(
++        close(placed_c.ty, 10.0, 1e-4) && placed_c.mirrored,
++        "expected chiral inside cavity at ty=10 (max_y=35), got tx={} ty={} mir={}",
++        placed_c.tx,
++        placed_c.ty,
++        placed_c.mirrored
++    );
++}
++
++#[test]
++fn multi_level_parts_in_holes_and_open_slit_clearance() {
++    let sheet = SheetInput {
++        width: 140.0,
++        height: 140.0,
++        edge_margin: 5.0,
++        cut_width: 1.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let big = PartInput::closed(
++        "big",
++        1,
++        rect_loop(0.0, 0.0, 120.0, 120.0),
++        vec![rect_loop(10.0, 10.0, 110.0, 110.0)],
++    )
++    .with_rotation(RotationMode::Locked);
++    let mid = PartInput::closed(
++        "mid",
++        1,
++        rect_loop(0.0, 0.0, 80.0, 80.0),
++        vec![rect_loop(10.0, 10.0, 70.0, 70.0)],
++    )
++    .with_rotation(RotationMode::Locked);
++    let tiny = PartInput::closed("tiny", 1, rect_loop(0.0, 0.0, 30.0, 30.0), vec![])
++        .with_rotation(RotationMode::Locked);
++
++    let report = nest(&sheet, &[big, mid, tiny]).unwrap();
++    assert_eq!(report.sheet_count, 1);
++    let p_mid = report.sheets[0]
++        .placements
++        .iter()
++        .find(|p| p.part_id == "mid")
++        .unwrap();
++    let p_tiny = report.sheets[0]
++        .placements
++        .iter()
++        .find(|p| p.part_id == "tiny")
++        .unwrap();
++    assert_eq!(p_mid.container_part, Some(("big".into(), 0)));
++    assert_eq!(p_tiny.container_part, Some(("mid".into(), 0)));
++
++    // An open chain bisecting a hole blocks placing a large square inside that hole.
++    let bisected = PartInput::closed(
++        "slit_host",
++        1,
++        rect_loop(0.0, 0.0, 120.0, 120.0),
++        vec![rect_loop(20.0, 20.0, 100.0, 100.0)],
++    )
++    .with_open_chains(vec![vec![
++        Point2::new(60.0, 20.0),
++        Point2::new(60.0, 100.0),
++    ]])
++    .with_rotation(RotationMode::Locked);
++    let blocker = PartInput::closed("blocker", 1, rect_loop(0.0, 0.0, 50.0, 50.0), vec![])
++        .with_rotation(RotationMode::Locked);
++    let r_bisected = nest(&sheet, &[bisected, blocker]).unwrap();
++    assert_eq!(
++        r_bisected.sheet_count, 2,
++        "open slit across hole must block 50x50 inner part"
++    );
++}
++
++#[test]
++fn refuses_malformed_parts_and_edge_cases_by_name() {
++    let sheet = SheetInput {
++        width: 100.0,
++        height: 100.0,
++        edge_margin: 5.0,
++        cut_width: 1.0,
++        part_gap: 2.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++
++    // Empty part id
++    let empty_id = PartInput::closed("  ", 1, rect_loop(0.0, 0.0, 10.0, 10.0), vec![]);
++    assert!(
++        matches!(nest(&sheet, &[empty_id]), Err(NestError::InvalidInput(m)) if m.contains("empty"))
++    );
++
++    // Duplicate part id
++    let p1 = PartInput::closed("dup", 1, rect_loop(0.0, 0.0, 10.0, 10.0), vec![]);
++    let p2 = PartInput::closed("dup", 1, rect_loop(0.0, 0.0, 15.0, 15.0), vec![]);
++    assert!(
++        matches!(nest(&sheet, &[p1, p2]), Err(NestError::InvalidInput(m)) if m.contains("dup"))
++    );
++
++    // Part with neither outer nor open chains
++    let empty_part = PartInput::open("nothing", 1, vec![]);
++    assert!(matches!(
++        nest(&sheet, &[empty_part]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "nothing"
++    ));
++
++    // Collinear zero-area outer loop
++    let col = Loop::new(vec![
++        Point2::new(0.0, 0.0),
++        Point2::new(5.0, 0.0),
++        Point2::new(10.0, 0.0),
++    ])
++    .unwrap();
++    let zero_area = PartInput::closed("flat", 1, col, vec![]);
++    assert!(matches!(
++        nest(&sheet, &[zero_area]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "flat"
++    ));
++
++    // Overlapping holes
++    let overlap_holes = PartInput::closed(
++        "olap",
++        1,
++        rect_loop(0.0, 0.0, 40.0, 40.0),
++        vec![
++            rect_loop(5.0, 5.0, 20.0, 20.0),
++            rect_loop(15.0, 15.0, 30.0, 30.0),
++        ],
++    );
++    assert!(matches!(
++        nest(&sheet, &[overlap_holes]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "olap"
++    ));
++
++    // Empty usable sheet from edge_margin
++    let mut bad_margin = sheet.clone();
++    bad_margin.edge_margin = 50.0;
++    let ok = PartInput::closed("ok", 1, rect_loop(0.0, 0.0, 10.0, 10.0), vec![]);
++    assert!(matches!(
++        nest(&bad_margin, std::slice::from_ref(&ok)),
++        Err(NestError::InvalidInput(m)) if m.contains("edge_margin")
++    ));
++
++    // Open chain with zero cut_width + zero part_gap
++    let mut zero_clear = sheet.clone();
++    zero_clear.cut_width = 0.0;
++    zero_clear.part_gap = 0.0;
++    let open = PartInput::open(
++        "slit",
++        1,
++        vec![vec![Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)]],
++    );
++    assert!(matches!(
++        nest(&zero_clear, &[open]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "slit"
++    ));
++
++    // Open chain with coordinate out of range
++    let oob = PartInput::open(
++        "far",
++        1,
++        vec![vec![Point2::new(0.0, 0.0), Point2::new(1e13, 0.0)]],
++    );
++    assert!(matches!(nest(&sheet, &[oob]), Err(NestError::OutOfRange(m)) if m.contains("far")));
++
++    // Too-fine rotation step
++    let tiny_step = ok.clone().with_rotation(RotationMode::FixedStep(0.01));
++    assert!(matches!(
++        nest(&sheet, &[tiny_step]),
++        Err(NestError::InvalidPart { part_id, .. }) if part_id == "ok"
++    ));
++
++    // Empty parts & zero quantity
++    let empty_report = nest(&sheet, &[]).unwrap();
++    assert_eq!(empty_report.sheet_count, 0);
++    assert_eq!(empty_report.total_placed, 0);
++    let zero_qty = nest(
++        &sheet,
++        &[PartInput::closed(
++            "q0",
++            0,
++            rect_loop(0.0, 0.0, 10.0, 10.0),
++            vec![],
++        )],
++    )
++    .unwrap();
++    assert_eq!(zero_qty.sheet_count, 0);
++}
++
++#[test]
++fn refuses_unbounded_and_overflowing_requested_quantities() {
++    let sheet = SheetInput {
++        width: 100.0,
++        height: 100.0,
++        ..SheetInput::default()
++    };
++    // Oversized parts never enter the per-instance placement loop, even without the guard.
++    let huge = PartInput::closed(
++        "huge",
++        usize::MAX,
++        rect_loop(0.0, 0.0, 200.0, 200.0),
++        vec![],
++    );
++    let one = PartInput::closed("one", 1, rect_loop(0.0, 0.0, 200.0, 200.0), vec![]);
++    for parts in [vec![huge.clone()], vec![huge, one]] {
++        let err = nest(&sheet, &parts).expect_err("unbounded quantity must be refused");
++        assert!(err.to_string().contains("quantity"), "{err}");
++    }
++}
++
++#[test]
++fn refuses_requested_quantity_sum_overflow() {
++    let sheet = SheetInput {
++        width: 100.0,
++        height: 100.0,
++        ..SheetInput::default()
++    };
++    let first = PartInput::closed("first", 10_000, rect_loop(0.0, 0.0, 200.0, 200.0), vec![]);
++    let second = PartInput::closed(
++        "second",
++        usize::MAX,
++        rect_loop(0.0, 0.0, 200.0, 200.0),
++        vec![],
++    );
++    let err = nest(&sheet, &[first, second]).expect_err("quantity sum must not overflow");
++    let msg = err.to_string();
++    assert!(
++        msg.contains("second") && msg.contains("quantity") && msg.contains("overflows"),
++        "{msg}"
++    );
++}
+diff --git a/docs/decisions/2158-nesting-kernel.md b/docs/decisions/2158-nesting-kernel.md
+new file mode 100644
+index 000000000..f5cb90c5d
+--- /dev/null
++++ b/docs/decisions/2158-nesting-kernel.md
+@@ -0,0 +1,65 @@
++## #2158 - Deterministic true-shape nesting in camcraft-geometry
++
++**Decided.** Integrate the held CamCraft nesting kernel from
++`origin/issue/2158-nesting-kernel` into the current geometry crate. Keep the
++existing `nesting.rs` entry point and its public raster module. Add no ECS,
++world access, or crate dependencies. The algorithm follows Bennell and
++Oliveira (EJOR 2008) and Burke, Hellier, Kendall, and Whitwell (OR 2006,
++EJOR 2007); no third-party nesting implementation supplied code.
++
++- Compute NFPs from convex decomposition and Minkowski sums on the existing
++  `geo2d::SCALE` integer grid. Preserve zero-width seams swallowed by polygon
++  unions so exact-fit cavities remain candidates. Compute rectangular IFPs
++  from bounds and closed-hole IFPs from the container complement's NFP.
++  Keep triangulation and its slab fallback local to nesting.
++- Place parts with deterministic bottom-left-fill. Sort by decreasing outer
++  area, then stable part id, then instance index. Try permitted rotations
++  and mirrors, deduplicate equivalent footprints, and cache local NFPs.
++  Outer-area ordering places a hollow frame before parts that can use its
++  holes even when the frame's net material area is smaller.
++- Apply separate-cut inflation by cut side: `cut_width + part_gap / 2`
++  outside, `cut_width / 2 + part_gap / 2` on line, and `part_gap / 2`
++  inside. Buffer open chains with `Region::sweep`. Offer an explicit router
++  single-slot mode and refuse it when `part_gap < cut_width`.
++- Reduce the sheet by `edge_margin` with `Region::offset_sharp`, then keep
++  each cut footprint inside that usable sheet. The footprint already
++  includes outer cutter clearance, avoiding double-counting at the edge.
++- Search usable holes before allocating a new sheet. Treat placed hole
++  occupants as filled outer obstacles within their parent's hole. Expose
++  their own holes separately and report the immediate containing part.
++  Require empty intersection and outside-difference regions during exact
++  verification; a small positive overlap is not accepted as a tolerance.
++- Check requested-quantity addition and refuse totals above 10,000
++  instances by name. This bounds placement work and report allocation.
++  Report counts, net-area utilization, used bounds, waste regions, and
++  named unplaced quantities without producing toolpaths or G-code.
++
++**Why.** Reusing the held clean-room work preserves its existing geometry
++coverage while adapting only the entry point and refusal checks to current
++main. Convex decomposition makes concavities and swept-chain polygons use
++the same geometry operations. Explicit seams retain exact fits, while the
++final region checks enforce clearance independently of candidate generation.
++
++**Dropped.** Orbital NFP sliding needs more state around collinear edges and
++pinched cavities. Net-area sorting can place a small solid before its
++larger hollow host. Raster-only placement cannot establish exact vector
++clearance. Changing `geo2d::Region::triangles()` would broaden this issue;
++the fallback remains local. Unbounded quantities risk impractical loops or
++allocation, and positive-area overlap tolerances weaken the zero-overlap
++contract.
++
++**Validation.** The unchanged upstream API failed the pinning build. The
++restored kernel passed 66 focused tests. Nine runtime mutations each failed
++their pin and passed after restoration: hole containment, tiny overlap,
++router gap, negative input, quantity overflow, quantity cap, kerf inflation,
++NFP seams, and filled-hole obstacles. Restoring upstream `nesting.rs` also
++failed the API pins and passed after restoration. The quick gate passed all
++936 steps, and geometry all-targets clippy passed with warnings denied.
++No G-code or CL goldens changed. App and motion heavy lanes were planned
++but not run; the PR remains a draft.
++
++**Cost to change.** NFP, IFP, and placement search stay behind internal
++functions. Another search heuristic or a configurable quantity budget can
++replace those policies without changing the geometry primitives. Raising
++the quantity cap requires performance and memory measurements. Changing the
++public input or report structs requires updating downstream nesting users.
+
+From 828342f011d9eed65d534eddbd78a0d9cf7471fc Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 15:06:20 -0800
+Subject: [PATCH 2/2] fix(geometry): reject non-empty invalid hole regions
+
+Reject any hole region outside its outer loop or overlapping another hole. Pin both micron-scale cases with named InvalidPart refusals.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #2158
+---
+ crates/geometry/src/nesting/validate.rs   |  6 +--
+ crates/geometry/tests/nesting_refusals.rs | 47 +++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/crates/geometry/src/nesting/validate.rs b/crates/geometry/src/nesting/validate.rs
+index e499f0725..34428aaa5 100644
+--- a/crates/geometry/src/nesting/validate.rs
++++ b/crates/geometry/src/nesting/validate.rs
+@@ -188,15 +188,15 @@ pub(crate) fn validate_closed_loops(part: &PartInput) -> Result<(Region, Vec<Reg
+                 format!("hole loop {idx} encloses no area"),
+             ));
+         }
+-        let outside = hr.difference(&outer_reg)?.area().abs();
+-        if outside > 1e-6 || hr.area().abs() >= outer_reg.area().abs() - MIN_AREA {
++        let outside = hr.difference(&outer_reg)?;
++        if !outside.is_empty() || hr.area().abs() >= outer_reg.area().abs() - MIN_AREA {
+             return Err(part_err(
+                 &part.id,
+                 format!("hole loop {idx} lies outside or intersects outer loop"),
+             ));
+         }
+         for (prev_idx, prev) in hole_regs.iter().enumerate() {
+-            if hr.intersect(prev)?.area().abs() > 1e-6 {
++            if !hr.intersect(prev)?.is_empty() {
+                 return Err(part_err(
+                     &part.id,
+                     format!("hole loop {idx} overlaps hole loop {prev_idx}"),
+diff --git a/crates/geometry/tests/nesting_refusals.rs b/crates/geometry/tests/nesting_refusals.rs
+index e30968fcf..23c00179c 100644
+--- a/crates/geometry/tests/nesting_refusals.rs
++++ b/crates/geometry/tests/nesting_refusals.rs
+@@ -380,3 +380,50 @@ fn refuses_requested_quantity_sum_overflow() {
+         "{msg}"
+     );
+ }
++
++#[test]
++fn refuses_micron_hole_escape_by_name() {
++    let sheet = SheetInput {
++        width: 10.0,
++        height: 10.0,
++        edge_margin: 0.0,
++        cut_width: 0.0,
++        part_gap: 0.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let part = PartInput::closed(
++        "micron_escape",
++        1,
++        rect_loop(0.0, 0.0, 1.0, 1.0),
++        vec![rect_loop(0.5, 0.2, 1.000001, 0.8)],
++    );
++    let err = nest(&sheet, &[part]).expect_err("a non-empty escape must be refused");
++    assert!(matches!(err, NestError::InvalidPart { part_id, reason }
++            if part_id == "micron_escape" && reason == "hole loop 0 lies outside or intersects outer loop"));
++}
++
++#[test]
++fn refuses_sub_epsilon_hole_overlap_by_name() {
++    let sheet = SheetInput {
++        width: 10.0,
++        height: 10.0,
++        edge_margin: 0.0,
++        cut_width: 0.0,
++        part_gap: 0.0,
++        allow_parts_in_holes: true,
++        clearance_mode: ClearanceMode::SeparateCuts,
++    };
++    let part = PartInput::closed(
++        "micron_overlap",
++        1,
++        rect_loop(0.0, 0.0, 1.0, 1.0),
++        vec![
++            rect_loop(0.1, 0.2, 0.5, 0.8),
++            rect_loop(0.499999, 0.2, 0.9, 0.8),
++        ],
++    );
++    let err = nest(&sheet, &[part]).expect_err("a non-empty hole overlap must be refused");
++    assert!(matches!(err, NestError::InvalidPart { part_id, reason }
++            if part_id == "micron_overlap" && reason == "hole loop 1 overlaps hole loop 0"));
++}
