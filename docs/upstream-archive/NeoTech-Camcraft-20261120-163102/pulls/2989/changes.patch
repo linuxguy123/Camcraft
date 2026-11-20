@@ -1,0 +1,2347 @@
+From 0cd1a634f0fb8c642041ef3a929f0611c3de24d6 Mon Sep 17 00:00:00 2001
+From: Viljo Marrandi <30616+vilts@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:59:51 +0200
+Subject: [PATCH] feat(ui): draw the viewport overlay as wide anti-aliased
+ lines, with MSAA
+
+The overlay (toolpaths, height planes, outlines, triads, grid) was drawn
+as wgpu lines: one hardware pixel wide, never smoothed. Each segment is
+now one 32-byte instance drawn as a screen-facing quad with a one-pixel
+coverage fade at the sides and the ends.
+
+- Line width: 1, 1.5, 2 or 3 pt (default 1.5), scaled by the display's
+  pixels per point.
+- The ends reach half the width past their points, so two lines that
+  meet close the corner and do not overlap past it.
+- Each vertex is lifted toward the eye by three line widths, so a line
+  that lies on a face keeps its full width in the depth test.
+- Anti-aliasing: Off, 2x or 4x (default 4x). The viewport pipelines and
+  the traced-stock composite rebuild for the new sample count. Only the
+  counts the device offers are built; 2x needs the adapter-specific
+  format feature, which bring-up now requests when the adapter has it.
+- Both settings are per-user view settings (view.json), picked from the
+  Theme door's new "Line width" and "Anti-aliasing" groups. They are not
+  on the undo history.
+
+The viewport pipelines and targets move to viewport/pipes.rs and the
+wide line stage to viewport/wide.rs (viewport.rs: 1543 -> 1265 lines).
+
+Fixes #2958
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/view.rs                        | 128 ++++-
+ crates/app/tests/view_file.rs                 |  38 +-
+ crates/ui/src/egui_app/gpu_init.rs            |   8 +-
+ crates/ui/src/egui_app/shell_web.rs           |   2 +-
+ crates/ui/src/egui_app/shell_window.rs        |   3 +
+ crates/ui/src/egui_app/shell_window/frame.rs  |   2 +-
+ crates/ui/src/egui_app/tests.rs               |   2 +
+ .../src/egui_app/tests/theme_door_quality.rs  | 104 ++++
+ crates/ui/src/egui_app/tests/view_names.rs    |   2 +-
+ crates/ui/src/egui_app/theme_drop.rs          |  56 +-
+ crates/ui/src/egui_app/view_pass.rs           |  32 ++
+ crates/ui/src/state.rs                        |  19 +
+ crates/ui/src/state_view.rs                   |  42 +-
+ crates/ui/src/trace/composite.rs              | 100 ++--
+ crates/ui/src/trace/eye.rs                    |   5 +
+ crates/ui/src/viewport.rs                     | 486 ++++--------------
+ crates/ui/src/viewport/pipes.rs               | 223 ++++++++
+ crates/ui/src/viewport/wide.rs                | 188 +++++++
+ crates/ui/src/viewport/wide_tests.rs          |  61 +++
+ crates/ui/tests/gpu_render.rs                 |   4 +
+ crates/ui/tests/gpu_render/wide_lines.rs      | 140 +++++
+ crates/ui/tests/trace_composite.rs            |  25 +
+ docs/decisions/2958-wide-overlay-lines.md     |  37 ++
+ .../guide/getting-started/first-run.md        |   8 +
+ 24 files changed, 1283 insertions(+), 432 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/tests/theme_door_quality.rs
+ create mode 100644 crates/ui/src/viewport/pipes.rs
+ create mode 100644 crates/ui/src/viewport/wide.rs
+ create mode 100644 crates/ui/src/viewport/wide_tests.rs
+ create mode 100644 crates/ui/tests/gpu_render/wide_lines.rs
+ create mode 100644 docs/decisions/2958-wide-overlay-lines.md
+
+diff --git a/crates/app/src/view.rs b/crates/app/src/view.rs
+index e2d687ecf..3298d4ace 100644
+--- a/crates/app/src/view.rs
++++ b/crates/app/src/view.rs
+@@ -11,6 +11,11 @@
+ //! the defaults - names ON, the #727 decision - and says why, never a
+ //! crash.
+ //!
++//! #2958 adds how the viewport draws its overlay lines: their width in
++//! screen points and the multisample anti-aliasing. A word this build
++//! does not know reads as that setting's default (a newer build's file
++//! keeps the rest of its choices).
++//!
+ //! Provenance: our own design, specced from #645's review ask (a
+ //! toggle in the view settings, persisted, default on); the folder
+ //! resolver is `recent`'s (#662) and the atomic write
+@@ -18,7 +23,7 @@
+ 
+ use std::path::{Path, PathBuf};
+ 
+-use serde::{Deserialize, Serialize};
++use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ 
+ use super::recent::config_dir_for;
+ 
+@@ -39,11 +44,130 @@ pub struct ViewPrefs {
+     /// a user already has.
+     #[serde(default = "default_names_on")]
+     pub show_gizmo_names: bool,
++    /// #2958: the overlay line width. Default 1.5 pt.
++    #[serde(default)]
++    pub line_width: LineWidth,
++    /// #2958: the multisample anti-aliasing. Default 4x.
++    #[serde(default)]
++    pub antialias: Antialias,
+ }
+ 
+ impl Default for ViewPrefs {
+     fn default() -> Self {
+-        Self { show_gizmo_names: true }
++        Self { show_gizmo_names: true, line_width: LineWidth::default(), antialias: Antialias::default() }
++    }
++}
++
++/// The viewport overlay line width (#2958) in screen points; the shell
++/// multiplies it by the display's pixels per point. 2 pt and more turn a
++/// dense path into one solid area when the view is far, thus 1.5 pt is
++/// the default.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum LineWidth {
++    Thin,
++    #[default]
++    Normal,
++    Bold,
++    Heavy,
++}
++
++impl LineWidth {
++    pub const ALL: [Self; 4] = [Self::Thin, Self::Normal, Self::Bold, Self::Heavy];
++
++    #[must_use]
++    pub const fn points(self) -> f32 {
++        match self {
++            Self::Thin => 1.0,
++            Self::Normal => 1.5,
++            Self::Bold => 2.0,
++            Self::Heavy => 3.0,
++        }
++    }
++
++    /// The file word; the menu shows it with "pt".
++    #[must_use]
++    pub const fn word(self) -> &'static str {
++        match self {
++            Self::Thin => "1",
++            Self::Normal => "1.5",
++            Self::Bold => "2",
++            Self::Heavy => "3",
++        }
++    }
++}
++
++/// The viewport's multisample anti-aliasing (#2958). The shell builds
++/// only a sample count that the graphics device offers; for any other it
++/// falls back and says so.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub enum Antialias {
++    Off,
++    X2,
++    #[default]
++    X4,
++}
++
++impl Antialias {
++    pub const ALL: [Self; 3] = [Self::Off, Self::X2, Self::X4];
++
++    /// Samples per pixel.
++    #[must_use]
++    pub const fn samples(self) -> u32 {
++        match self {
++            Self::Off => 1,
++            Self::X2 => 2,
++            Self::X4 => 4,
++        }
++    }
++
++    /// The file word and the menu text in one.
++    #[must_use]
++    pub const fn word(self) -> &'static str {
++        match self {
++            Self::Off => "Off",
++            Self::X2 => "2x",
++            Self::X4 => "4x",
++        }
++    }
++}
++
++/// Write a setting as its file word.
++fn put<S: Serializer>(word: &str, s: S) -> Result<S::Ok, S::Error> {
++    s.serialize_str(word)
++}
++
++/// Read a file word back; a word (or a type) this build does not know is
++/// the default, never a refusal of the whole file.
++fn take<'de, D: Deserializer<'de>, T: Copy + Default>(d: D, all: &[T], word: fn(T) -> &'static str) -> Result<T, D::Error> {
++    let v = serde_json::Value::deserialize(d)?;
++    let found = v.as_str().and_then(|w| all.iter().copied().find(|x| word(*x) == w));
++    if found.is_none() {
++        tracing::warn!("view settings: '{v}' is not known - using {}", word(T::default()));
++    }
++    Ok(found.unwrap_or_default())
++}
++
++impl Serialize for LineWidth {
++    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        put(self.word(), s)
++    }
++}
++
++impl<'de> Deserialize<'de> for LineWidth {
++    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
++        take(d, &Self::ALL, Self::word)
++    }
++}
++
++impl Serialize for Antialias {
++    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        put(self.word(), s)
++    }
++}
++
++impl<'de> Deserialize<'de> for Antialias {
++    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
++        take(d, &Self::ALL, Self::word)
+     }
+ }
+ 
+diff --git a/crates/app/tests/view_file.rs b/crates/app/tests/view_file.rs
+index 5d7f9bdf7..b74c962c1 100644
+--- a/crates/app/tests/view_file.rs
++++ b/crates/app/tests/view_file.rs
+@@ -8,12 +8,14 @@
+ //!
+ //! Provenance: our own tests, specced from #645's review ask.
+ //!
++//! #2958: the line width and the anti-aliasing ride the same file.
++//!
+ //! Gate map (M4.4): covers app::view.
+ 
+ use std::path::{Path, PathBuf};
+ 
+ use camcraft_app::recent;
+-use camcraft_app::view::{self, ViewPrefs, FILE_NAME, FORMAT};
++use camcraft_app::view::{self, Antialias, LineWidth, ViewPrefs, FILE_NAME, FORMAT};
+ 
+ /// A fresh, empty folder for one test.
+ fn dir(tag: &str) -> PathBuf {
+@@ -34,11 +36,11 @@ fn a_flipped_choice_round_trips_through_the_file() {
+     let d = dir("roundtrip");
+     let file = file_in(&d);
+     assert_eq!(view::load(&file), (ViewPrefs::default(), None), "no file yet: quiet defaults");
+-    view::save(&file, &ViewPrefs { show_gizmo_names: false }).expect("save creates the file");
++    view::save(&file, &ViewPrefs { show_gizmo_names: false, ..ViewPrefs::default() }).expect("save creates the file");
+     let (prefs, note) = view::load(&file);
+     assert!(!prefs.show_gizmo_names, "the restart reads the choice back");
+     assert_eq!(note, None, "a good file says nothing");
+-    view::save(&file, &ViewPrefs { show_gizmo_names: true }).expect("flip back");
++    view::save(&file, &ViewPrefs { show_gizmo_names: true, ..ViewPrefs::default() }).expect("flip back");
+     assert!(view::load(&file).0.show_gizmo_names, "and back on survives too");
+ }
+ 
+@@ -100,6 +102,34 @@ fn the_config_dir_override_houses_the_view_file() {
+         .expect("the override names a folder on every platform");
+     assert_eq!(folder, d, "the absolute override wins over any home folder");
+     let file = file_in(&folder);
+-    view::save(&file, &ViewPrefs { show_gizmo_names: false }).expect("save under the override");
++    view::save(&file, &ViewPrefs { show_gizmo_names: false, ..ViewPrefs::default() }).expect("save under the override");
+     assert!(!view::load(&file).0.show_gizmo_names, "the restart reads it back from there");
+ }
++
++/// #2958: the line width and the anti-aliasing round-trip through the
++/// file. The defaults are 1.5 pt and 4x, a file from before #2958 reads
++/// as those defaults, and a word this build does not know is that one
++/// setting's default - the other choices in the file survive.
++#[test]
++fn the_line_width_and_the_antialias_round_trip() {
++    let d = ViewPrefs::default();
++    assert_eq!((d.line_width, d.antialias), (LineWidth::Normal, Antialias::X4));
++    assert!((LineWidth::Normal.points() - 1.5).abs() < f32::EPSILON);
++    let file = file_in(&dir("lines"));
++    for (w, a) in [(LineWidth::Thin, Antialias::Off), (LineWidth::Bold, Antialias::X2), (LineWidth::Heavy, Antialias::X4)] {
++        let chosen = ViewPrefs { line_width: w, antialias: a, ..ViewPrefs::default() };
++        view::save(&file, &chosen).expect("save");
++        assert_eq!(view::load(&file), (chosen, None), "{w:?} / {a:?} survive");
++    }
++    let older = format!(r#"{{"format":"{FORMAT}","view":{{"show_gizmo_names":false}}}}"#);
++    std::fs::write(&file, older).expect("write an older file");
++    let (p, note) = view::load(&file);
++    assert_eq!(note, None);
++    assert_eq!(p, ViewPrefs { show_gizmo_names: false, ..ViewPrefs::default() }, "an older file reads the defaults");
++    let odd = format!(r#"{{"format":"{FORMAT}","view":{{"show_gizmo_names":false,"line_width":"7","antialias":16}}}}"#);
++    std::fs::write(&file, odd).expect("write a newer file");
++    let (p, note) = view::load(&file);
++    assert_eq!(note, None, "an unknown word does not refuse the file");
++    assert!(!p.show_gizmo_names, "the other choice survives");
++    assert_eq!((p.line_width, p.antialias), (LineWidth::Normal, Antialias::X4));
++}
+diff --git a/crates/ui/src/egui_app/gpu_init.rs b/crates/ui/src/egui_app/gpu_init.rs
+index 3ef776cec..ca08f535f 100644
+--- a/crates/ui/src/egui_app/gpu_init.rs
++++ b/crates/ui/src/egui_app/gpu_init.rs
+@@ -148,7 +148,13 @@ fn try_adapter<T, F>(
+ where
+     F: FnMut(&wgpu::Device, &wgpu::Queue, &wgpu::SurfaceConfiguration) -> Result<T, String>,
+ {
+-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
++    // #2958: the adapter's own sample counts (2x) need this feature; an
++    // adapter without it keeps WebGPU's guaranteed counts.
++    let desc = wgpu::DeviceDescriptor {
++        required_features: adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
++        ..wgpu::DeviceDescriptor::default()
++    };
++    let (device, queue) = pollster::block_on(adapter.request_device(&desc))
+         .map_err(|e| format!("device request refused ({e})"))?;
+     let lost = Arc::new(AtomicBool::new(false));
+     {
+diff --git a/crates/ui/src/egui_app/shell_web.rs b/crates/ui/src/egui_app/shell_web.rs
+index 49c8b33c9..b35f5db0d 100644
+--- a/crates/ui/src/egui_app/shell_web.rs
++++ b/crates/ui/src/egui_app/shell_web.rs
+@@ -250,7 +250,7 @@ impl eframe::App for WebShell {
+         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+             label: Some("egui-shell-web-frame"),
+         });
+-        view_pass::encode(&mut self.state, &mut self.view, &mut self.stock_eye, device, queue, &mut encoder);
++        view_pass::encode(&mut self.state, &mut self.view, &mut self.stock_eye, device, queue, &mut encoder, scale);
+         queue.submit([encoder.finish()]);
+         if self.stock_eye.as_ref().is_some_and(StockEye::cpu_pending) {
+             ui.ctx().request_repaint();
+diff --git a/crates/ui/src/egui_app/shell_window.rs b/crates/ui/src/egui_app/shell_window.rs
+index 7fd1a965e..a36c0fbe8 100644
+--- a/crates/ui/src/egui_app/shell_window.rs
++++ b/crates/ui/src/egui_app/shell_window.rs
+@@ -254,6 +254,9 @@ impl Shell {
+         let gpu_line = gpu::describe(&adapter).log_line();
+         diag_info!("{gpu_line}");
+         self.state.gpu_line = Some(gpu_line);
++        // #2958: the anti-aliasing the Theme door offers on this device.
++        self.state.samples_offered = crate::viewport::offered_samples(&adapter, device.features(), VIEW3D_FORMAT);
++        diag_info!("viewport: sample counts offered {:?}", self.state.samples_offered);
+ 
+         let mut renderer = Renderer::new(&device, config.format, RendererOptions::default());
+         let scene = world::collect(&self.state);
+diff --git a/crates/ui/src/egui_app/shell_window/frame.rs b/crates/ui/src/egui_app/shell_window/frame.rs
+index 7fa3712b8..c2213f71b 100644
+--- a/crates/ui/src/egui_app/shell_window/frame.rs
++++ b/crates/ui/src/egui_app/shell_window/frame.rs
+@@ -189,7 +189,7 @@ impl Shell {
+         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+             label: Some("egui-shell-frame"),
+         });
+-        view_pass::encode(state, view, stock_eye, device, queue, &mut encoder);
++        view_pass::encode(state, view, stock_eye, device, queue, &mut encoder, scale);
+ 
+         // Pass 2: egui over the surface.
+         let sd = ScreenDescriptor {
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 40e492339..ebd98c183 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -192,6 +192,8 @@ mod tool_cutter_params;
+ mod tool_shape_window;
+ // #441: the Theme ribbon door; the Stock page shows stock only.
+ mod theme_door;
++// #2958: the Theme door's line width and anti-aliasing groups.
++mod theme_door_quality;
+ mod recent_door;
+ // #1431: the browser build's Save, Save As and Post as downloads; the rest refused by name.
+ mod browser_files;
+diff --git a/crates/ui/src/egui_app/tests/theme_door_quality.rs b/crates/ui/src/egui_app/tests/theme_door_quality.rs
+new file mode 100644
+index 000000000..231f15e17
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/theme_door_quality.rs
+@@ -0,0 +1,104 @@
++//! #2958: the Theme door's "Line width" and "Anti-aliasing" groups. A
++//! pick is a per-user view setting: it goes out to the view file at once,
++//! survives a restart, and Ctrl+Z does not take it back. A choice of the
++//! gizmo names never resets it. An anti-aliasing count that the graphics
++//! device does not offer is a disabled row, and a queued pick of it is
++//! refused by name and not kept.
++//! Provenance: our own tests over our own shell; no HSMWorks material.
++//!
++//! Gate map (M4.4): covers ui::egui_app::theme_drop (the quality rows),
++//! ui::state (state_view), app::view through the State handoff.
++
++use std::path::PathBuf;
++
++use camcraft_app::view::{self, Antialias, FILE_NAME, LineWidth};
++use egui::accesskit::Role;
++use egui_kittest::kittest::NodeT;
++
++use super::*;
++
++fn temp_dir(tag: &str) -> PathBuf {
++    let d = std::env::temp_dir().join(format!("camcraft-quality-ui-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).expect("make the test folder");
++    std::fs::canonicalize(&d).expect("canonical folder")
++}
++
++fn open_theme_door(h: &mut egui_kittest::Harness<'_, ShellUi>) {
++    h.get_by_role_and_label(Role::Button, "Theme").click();
++    h.run_steps(2);
++    assert!(h.state().state.ribbon_theme_open, "pressing the door opens its list");
++}
++
++#[test]
++fn the_defaults_are_one_and_a_half_points_and_four_samples() {
++    let state = State::new();
++    assert_eq!((state.line_width, state.antialias), (LineWidth::Normal, Antialias::X4));
++    assert_eq!(state.samples_offered, vec![1, 4], "headless keeps the WebGPU guaranteed counts");
++}
++
++#[test]
++fn a_line_width_pick_is_kept_survives_a_restart_and_undo_leaves_it() {
++    let file = temp_dir("width").join(FILE_NAME);
++    let mut h = shell_harness();
++    h.state_mut().state.view_store = Some(file.clone());
++    h.run();
++    open_theme_door(&mut h);
++    for caption in ["Line width", "Anti-aliasing"] {
++        assert!(h.query_by_label(caption).is_some(), "the door shows the '{caption}' group");
++    }
++    // The seed document is already unsaved; the pick must not change that.
++    let dirty = h.state().state.history.is_dirty();
++    h.get_by_role_and_label(Role::MenuItem, "2 pt").click();
++    h.run_steps(2);
++    assert!(!h.state().state.ribbon_theme_open, "a choice closes the list");
++    assert_eq!(h.state().state.line_width, LineWidth::Bold);
++    assert_eq!(view::load(&file).0.line_width, LineWidth::Bold, "the pick goes out to the file at once");
++    assert_eq!(h.state().state.history.is_dirty(), dirty, "a view setting is not an unsaved change");
++    h.state_mut().state.pending.push_back(CommandKind::Undo);
++    h.run_steps(3);
++    assert_eq!(h.state().state.line_width, LineWidth::Bold, "undo leaves the width");
++    // The gizmo-name switch writes the same file: it keeps the width.
++    h.state_mut().state.set_gizmo_names(false);
++    assert_eq!(view::load(&file).0.line_width, LineWidth::Bold, "another view setting never resets it");
++    let mut restarted = State::new();
++    restarted.load_view_from(&file);
++    assert_eq!(restarted.line_width, LineWidth::Bold, "the width survives a restart");
++}
++
++#[test]
++fn an_offered_antialias_pick_is_kept_and_an_unoffered_one_is_a_disabled_row() {
++    let file = temp_dir("aa").join(FILE_NAME);
++    let mut h = shell_harness();
++    h.state_mut().state.view_store = Some(file.clone());
++    h.run();
++    open_theme_door(&mut h);
++    let two = h.get_by_role_and_label(Role::MenuItem, "2x");
++    assert!(two.accesskit_node().is_disabled(), "2x is not offered on WebGPU's guaranteed counts");
++    assert!(!h.get_by_role_and_label(Role::MenuItem, "Off").accesskit_node().is_disabled());
++    h.get_by_role_and_label(Role::MenuItem, "Off").click();
++    h.run_steps(2);
++    assert_eq!(h.state().state.antialias, Antialias::Off);
++    assert_eq!(view::load(&file).0.antialias, Antialias::Off, "kept at once");
++    // A device that offers 2x enables the row.
++    h.state_mut().state.samples_offered = vec![1, 2, 4];
++    open_theme_door(&mut h);
++    assert!(!h.get_by_role_and_label(Role::MenuItem, "2x").accesskit_node().is_disabled(), "an offered 2x is live");
++}
++
++#[test]
++fn a_queued_pick_of_an_unoffered_count_is_refused_by_name_and_not_kept() {
++    let file = temp_dir("refuse").join(FILE_NAME);
++    let mut state = State::new();
++    state.view_store = Some(file.clone());
++    state.pending.push_back(CommandKind::SelectAntialias(Antialias::X2));
++    state.drain_actions();
++    assert_eq!(state.antialias, Antialias::X4, "the refused pick is not worn");
++    assert!(state.status.contains("anti-aliasing 2x not selected"), "refused by name: {}", state.status);
++    assert!(!file.exists(), "nothing is written for a refusal");
++    state.samples_offered = vec![1, 2, 4];
++    state.pending.push_back(CommandKind::SelectAntialias(Antialias::X2));
++    state.drain_actions();
++    assert_eq!(state.antialias, Antialias::X2, "an offered count is kept");
++    assert_eq!(view::load(&file).0.antialias, Antialias::X2);
++}
+diff --git a/crates/ui/src/egui_app/tests/view_names.rs b/crates/ui/src/egui_app/tests/view_names.rs
+index a09bc94cb..50beccd6f 100644
+--- a/crates/ui/src/egui_app/tests/view_names.rs
++++ b/crates/ui/src/egui_app/tests/view_names.rs
+@@ -48,7 +48,7 @@ fn the_names_checkbox_flips_view_state_not_a_command_and_persists() {
+ fn the_choice_survives_a_restart_and_a_corrupt_file_starts_with_names_on() {
+     let d = temp_dir("restart");
+     let file = d.join(FILE_NAME);
+-    view::save(&file, &ViewPrefs { show_gizmo_names: false }).expect("write an off choice");
++    view::save(&file, &ViewPrefs { show_gizmo_names: false, ..ViewPrefs::default() }).expect("write an off choice");
+     let mut second = State::new();
+     second.load_view_from(&file);
+     assert!(!second.show_gizmo_names, "the next run starts the way the last left it");
+diff --git a/crates/ui/src/egui_app/theme_drop.rs b/crates/ui/src/egui_app/theme_drop.rs
+index b18d749af..e069b4714 100644
+--- a/crates/ui/src/egui_app/theme_drop.rs
++++ b/crates/ui/src/egui_app/theme_drop.rs
+@@ -7,11 +7,17 @@
+ //! the same actions the old page combo queued. The pick is a user
+ //! preference (#877): kept per user across restarts, never on the undo
+ //! history; opening and closing the list is view state.
++//! #2958 adds two groups under the colour-vision rows: the viewport's
++//! overlay line width and its anti-aliasing (`SelectLineWidth` /
++//! `SelectAntialias`, kept in the per-user view file). An anti-aliasing
++//! count the graphics device does not offer is a disabled row that says
++//! why on hover.
+ //! Provenance: our own code, the hand-drawn dropdown law of the View
+ //! and machine doors (panes.rs, layout/mod.rs); no HSMWorks material.
+ 
+ use camcraft_app::commands::{color_vision_of, theme_of};
+ use camcraft_app::schema::{ColorVision, ThemeRef};
++use camcraft_app::view::{Antialias, LineWidth};
+ use egui::{Rect, Sense, Ui, Vec2};
+ 
+ use super::theme::Tokens;
+@@ -27,6 +33,32 @@ pub(super) enum ThemeRow {
+     VisionCaption,
+     /// One colour-vision mode.
+     Vision(ColorVision),
++    /// #2958: the inert caption over the line-width rows.
++    LineCaption,
++    /// #2958: one overlay line width.
++    Line(LineWidth),
++    /// #2958: the inert caption over the anti-aliasing rows.
++    SmoothCaption,
++    /// #2958: one anti-aliasing choice.
++    Smooth(Antialias),
++}
++
++impl ThemeRow {
++    const fn is_caption(&self) -> bool {
++        matches!(self, Self::VisionCaption | Self::LineCaption | Self::SmoothCaption)
++    }
++}
++
++/// The menu text of a line width.
++#[must_use]
++pub(super) fn line_label(w: LineWidth) -> String {
++    format!("{} pt", w.word())
++}
++
++/// Why an anti-aliasing row cannot be picked on this device, if it cannot.
++pub(super) fn smooth_refusal(state: &State, a: Antialias) -> Option<String> {
++    (!state.samples_offered.contains(&a.samples()))
++        .then(|| format!("this graphics device does not offer {} anti-aliasing", a.word()))
+ }
+ 
+ /// The command a theme row queues.
+@@ -52,6 +84,10 @@ pub(super) fn rows_of(state: &State, button: Rect, strip: Rect, pal: &Tokens) ->
+         .collect();
+     rows.push(ThemeRow::VisionCaption);
+     rows.extend(ColorVision::ALL.into_iter().map(ThemeRow::Vision));
++    rows.push(ThemeRow::LineCaption);
++    rows.extend(LineWidth::ALL.into_iter().map(ThemeRow::Line));
++    rows.push(ThemeRow::SmoothCaption);
++    rows.extend(Antialias::ALL.into_iter().map(ThemeRow::Smooth));
+     let g = pal.dropdown();
+     let w = g.fit_width(g.menu_width, strip.width());
+     let left = g.fit_left(button.left(), strip, w);
+@@ -104,29 +140,37 @@ pub(super) fn show(
+                     ThemeRow::Theme(label, pick) => (label.clone(), pick.as_ref() == Some(&theme), true),
+                     ThemeRow::VisionCaption => ("Colour vision".to_owned(), false, false),
+                     ThemeRow::Vision(mode) => (format!("  {}", mode.label()), *mode == vision, true),
++                    ThemeRow::LineCaption => ("Line width".to_owned(), false, false),
++                    ThemeRow::Line(w) => (format!("  {}", line_label(*w)), *w == state.line_width, true),
++                    ThemeRow::SmoothCaption => ("Anti-aliasing".to_owned(), false, false),
++                    ThemeRow::Smooth(a) => (format!("  {}", a.word()), *a == state.antialias, true),
+                 };
+                 let why = match row {
+                     ThemeRow::Theme(_, pick) if state.browser_build =>
+-                        crate::browser_files::refusal(&command_of(pick.as_ref()), false),
++                        crate::browser_files::refusal(&command_of(pick.as_ref()), false).map(str::to_owned),
++                    ThemeRow::Smooth(a) => smooth_refusal(state, *a),
+                     _ => None,
+                 };
+                 let live = live && why.is_none();
+                 let resp = ui.add_enabled_ui(live, |ui| {
+                     ui.interact(*r, id.with(("theme-row", k)), Sense::click())
+                 }).inner;
+-                if !matches!(row, ThemeRow::VisionCaption) {
++                if !row.is_caption() {
+                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, live, &label));
+                 }
+                 let resp = if let Some(why) = why { resp.on_disabled_hover_text(why) } else { resp };
+                 if resp.hovered() && live {
+                     p.rect_filled(*r, 0.0, pal.field_hover);
+                 }
+-                if matches!(row, ThemeRow::VisionCaption) {
++                if row.is_caption() {
+                     p.hline(r.x_range(), r.top(), egui::Stroke::new(1.0, pal.border));
+                 }
+                 let text = if current { format!("{label}  (current)") } else { label };
+-                let checked = matches!(row, ThemeRow::Theme(_, Some(_)) | ThemeRow::Vision(_))
+-                    .then_some(current);
++                let checked = matches!(
++                    row,
++                    ThemeRow::Theme(_, Some(_)) | ThemeRow::Vision(_) | ThemeRow::Line(_) | ThemeRow::Smooth(_)
++                )
++                .then_some(current);
+                 super::painted::menu_item(&resp, text.trim(), live, checked);
+                 p.text(
+                     r.left_center() + Vec2::new(g.pad_x, 0.0),
+@@ -141,6 +185,8 @@ pub(super) fn show(
+                     chose = Some(match row {
+                         ThemeRow::Theme(_, pick) if !current => Some(command_of(pick.as_ref())),
+                         ThemeRow::Vision(mode) if !current => Some(CommandKind::SelectColorVision(*mode)),
++                        ThemeRow::Line(w) if !current => Some(CommandKind::SelectLineWidth(*w)),
++                        ThemeRow::Smooth(a) if !current => Some(CommandKind::SelectAntialias(*a)),
+                         _ => None,
+                     });
+                 }
+diff --git a/crates/ui/src/egui_app/view_pass.rs b/crates/ui/src/egui_app/view_pass.rs
+index 10450ffa7..8fef1b9ee 100644
+--- a/crates/ui/src/egui_app/view_pass.rs
++++ b/crates/ui/src/egui_app/view_pass.rs
+@@ -60,6 +60,36 @@ pub(crate) fn fit_target(view: &mut View3D, device: &wgpu::Device, want: (u32, u
+     true
+ }
+ 
++/// #2958: wear the viewer's line width and anti-aliasing. The width is a
++/// uniform (nothing re-uploads); a new sample count rebuilds the pass's
++/// pipelines and multisample targets once, the composite's with them. A
++/// kept count that this device does not offer falls back to the highest
++/// offered count below it, said once on the status line.
++pub(crate) fn apply_quality(
++    state: &mut State,
++    view: &mut View3D,
++    stock_eye: &mut Option<StockEye>,
++    device: &wgpu::Device,
++    scale: f64,
++) {
++    view.set_line_px(crate::viewport::line_px(state.line_width.points(), target_scale(scale)));
++    let want = state.antialias.samples();
++    let samples = crate::viewport::effective_samples(want, &state.samples_offered);
++    if samples != want {
++        state.say_once(&format!(
++            "anti-aliasing {} is not offered by this graphics device - {} samples per pixel are used",
++            state.antialias.word(),
++            samples
++        ));
++    }
++    if view.set_samples(device, samples) {
++        diag_info!("viewport: {samples} samples per pixel");
++    }
++    if let Some(se) = stock_eye.as_mut() {
++        se.set_samples(device, samples);
++    }
++}
++
+ /// Pass 1 of a frame: the 3D offscreen target (its own bind group, mvp
+ /// from the camera the panels' FrameAll and the orbit gestures just moved).
+ pub(crate) fn encode(
+@@ -69,7 +99,9 @@ pub(crate) fn encode(
+     device: &wgpu::Device,
+     queue: &wgpu::Queue,
+     encoder: &mut wgpu::CommandEncoder,
++    scale: f64,
+ ) {
++    apply_quality(state, view, stock_eye, device, scale);
+     let (ew, eh) = view.extent();
+     let mvp = state.cam.mvp(f64::from(ew.max(1)) / f64::from(eh.max(1)));
+     let eye = state.cam.eye_f32();
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index ab4940f13..cfc64476e 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -283,6 +283,12 @@ pub enum CommandKind {
+     /// gated (separation + readability through the simulated eye)
+     /// before it is set, so a failing mode is never worn or stored.
+     SelectColorVision(ColorVision),
++    /// #2958: the viewport overlay line width, a per-user view setting
++    /// (not on the history, not a document change).
++    SelectLineWidth(camcraft_app::view::LineWidth),
++    /// #2958: the viewport anti-aliasing; a sample count the device does
++    /// not offer is refused by name.
++    SelectAntialias(camcraft_app::view::Antialias),
+     /// The active setup's WCS (#342: one per setup): origin plus full
+     /// orientation as yaw-pitch-roll degrees (R = Rz ⊗ Ry ⊗ Rx). The world
+     /// stores a unit quaternion; pure-yaw setups use roll = pitch = 0.
+@@ -1726,6 +1732,14 @@ pub struct State {
+     /// depend on it - only the names (`World`, each offset's entity
+     /// name) do.
+     pub show_gizmo_names: bool,
++    /// #2958: the viewport overlay line width and multisample
++    /// anti-aliasing, kept in the same per-user view file.
++    pub line_width: camcraft_app::view::LineWidth,
++    pub antialias: camcraft_app::view::Antialias,
++    /// #2958: the sample counts the graphics device offers for the 3D
++    /// targets, set by the windowed shell at bring-up. Headless and the
++    /// browser keep WebGPU's guaranteed pair, 1 and 4.
++    pub samples_offered: Vec<u32>,
+     /// Show cached toolpaths beyond the selected operation's: with this on,
+     /// every generated path draws (dimmed where unselected) instead of only
+     /// the one the tree highlights. View state like the camera - not
+@@ -2269,6 +2283,9 @@ impl State {
+             body_turn: None,
+             handle_bar: crate::egui_app::viewport_bar::HandleBarState::default(),
+             show_gizmo_names: true,
++            line_width: camcraft_app::view::LineWidth::default(),
++            antialias: camcraft_app::view::Antialias::default(),
++            samples_offered: crate::viewport::GUARANTEED_SAMPLES.to_vec(),
+             show_all_paths: false,
+             display: DisplayMode::default(),
+             sim: None,
+@@ -3495,6 +3512,8 @@ impl State {
+             }
+             CommandKind::SelectTheme(next) => self.select_theme(next),
+             CommandKind::SelectColorVision(next) => self.select_color_vision(next),
++            CommandKind::SelectLineWidth(next) => self.select_line_width(next),
++            CommandKind::SelectAntialias(next) => self.select_antialias(next),
+             CommandKind::SelectThemeDialog => {
+                 if let Some(path) = pick_theme_file() {
+                     self.select_theme(ThemeRef::File(path.display().to_string()));
+diff --git a/crates/ui/src/state_view.rs b/crates/ui/src/state_view.rs
+index cd743e731..c9eed22a0 100644
+--- a/crates/ui/src/state_view.rs
++++ b/crates/ui/src/state_view.rs
+@@ -5,6 +5,8 @@
+ //! state like the camera (never a command, never on the history); what
+ //! persists is the user's choice, so the next run starts the way this
+ //! one ended.
++//! #2958: the line width and the anti-aliasing are kept the same way;
++//! every write takes all the view settings, so one never resets another.
+ //! Provenance: our own wiring over our own app::view; no HSMWorks material.
+ 
+ use std::path::Path;
+@@ -30,6 +32,8 @@ impl State {
+     pub fn load_view_from(&mut self, path: &Path) {
+         let (prefs, note) = view::load(path);
+         self.show_gizmo_names = prefs.show_gizmo_names;
++        self.line_width = prefs.line_width;
++        self.antialias = prefs.antialias;
+         self.view_store = Some(path.to_path_buf());
+         if let Some(why) = note {
+             self.status = why;
+@@ -43,9 +47,41 @@ impl State {
+     /// way.
+     pub(crate) fn set_gizmo_names(&mut self, on: bool) {
+         self.show_gizmo_names = on;
+-        let Some(path) = self.view_store.clone() else { return };
+-        let prefs = view::ViewPrefs { show_gizmo_names: on };
+-        let _ = view::save(&path, &prefs);
++        self.persist_view();
++    }
++
++    /// Write every view setting back to the per-user file (a failed
++    /// write is logged by `view::save`; the choice stays for this run).
++    fn persist_view(&self) {
++        let Some(path) = &self.view_store else { return };
++        let prefs = view::ViewPrefs {
++            show_gizmo_names: self.show_gizmo_names,
++            line_width: self.line_width,
++            antialias: self.antialias,
++        };
++        let _ = view::save(path, &prefs);
++    }
++
++    /// #2958: choose the overlay line width; kept at once.
++    pub(super) fn select_line_width(&mut self, next: view::LineWidth) {
++        self.line_width = next;
++        self.persist_view();
++        self.status = format!("line width: {} pt", next.word());
++    }
++
++    /// #2958: choose the anti-aliasing. A sample count that this graphics
++    /// device does not offer is refused by name and never kept.
++    pub(super) fn select_antialias(&mut self, next: view::Antialias) {
++        if !self.samples_offered.contains(&next.samples()) {
++            self.refuse(
++                super::ErrorScope::Setup,
++                format!("anti-aliasing {} not selected: this graphics device does not offer it", next.word()),
++            );
++            return;
++        }
++        self.antialias = next;
++        self.persist_view();
++        self.status = format!("anti-aliasing: {}", next.word());
+     }
+ 
+     /// #2177: add `line` to the status line once - a refusal that every
+diff --git a/crates/ui/src/trace/composite.rs b/crates/ui/src/trace/composite.rs
+index c66760b67..586cc1e4c 100644
+--- a/crates/ui/src/trace/composite.rs
++++ b/crates/ui/src/trace/composite.rs
+@@ -16,6 +16,10 @@
+ //! - **Refuse, never black-screen.** A device that cannot read storage
+ //!   from a fragment refuses at construction by name, and the shell
+ //!   keeps the stock sheet.
++//! - **One sample count with the pass.** The composite draws into the
++//!   viewport's pass, so its pipeline follows the pass's anti-aliasing
++//!   (#2958, `set_samples`). It writes one depth for each pixel, so the
++//!   traced stock's own edges are not smoothed; its cost does not change.
+ 
+ use egui_wgpu::wgpu;
+ 
+@@ -55,6 +59,11 @@ pub struct Composite {
+     pipeline: wgpu::RenderPipeline,
+     bgl: wgpu::BindGroupLayout,
+     uniform: wgpu::Buffer,
++    /// Kept to rebuild the pipeline for a new sample count (#2958).
++    module: wgpu::ShaderModule,
++    layout: wgpu::PipelineLayout,
++    format: wgpu::TextureFormat,
++    samples: u32,
+ }
+ 
+ impl Composite {
+@@ -106,37 +115,7 @@ impl Composite {
+             bind_group_layouts: &[Some(&bgl)],
+             immediate_size: 0,
+         });
+-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("trace-composite-pipe"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &module,
+-                entry_point: Some("vs_full"),
+-                compilation_options: Default::default(),
+-                buffers: &[],
+-            },
+-            primitive: wgpu::PrimitiveState::default(),
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(true),
+-                depth_compare: Some(wgpu::CompareFunction::Less),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &module,
+-                entry_point: Some("fs_composite"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: None,
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
++        let pipeline = pipeline_for(device, &module, &layout, format, 1);
+         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+             label: Some("trace-composite-uniform"),
+             size: UNIFORM_SIZE,
+@@ -146,7 +125,23 @@ impl Composite {
+         if let Some(err) = scope.pop().await {
+             return Err(format!("the device refused the composite pipeline ({err})"));
+         }
+-        Ok(Composite { pipeline, bgl, uniform })
++        Ok(Composite { pipeline, bgl, uniform, module, layout, format, samples: 1 })
++    }
++
++    /// #2958: rebuild the pipeline for the viewport pass's sample count.
++    /// The caller passes only a count the device offers (the viewport's
++    /// `effective_samples`); the same count builds the viewport's own.
++    pub fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
++        let samples = samples.max(1);
++        if samples != self.samples {
++            self.pipeline = pipeline_for(device, &self.module, &self.layout, self.format, samples);
++            self.samples = samples;
++        }
++    }
++
++    #[must_use]
++    pub const fn samples(&self) -> u32 {
++        self.samples
+     }
+ 
+     /// Bind a trace frame (one vec4 per trace pixel, STORAGE usage).
+@@ -175,6 +170,47 @@ impl Composite {
+     }
+ }
+ 
++/// The composite pipeline for `samples` per pixel.
++fn pipeline_for(
++    device: &wgpu::Device,
++    module: &wgpu::ShaderModule,
++    layout: &wgpu::PipelineLayout,
++    format: wgpu::TextureFormat,
++    samples: u32,
++) -> wgpu::RenderPipeline {
++    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: Some("trace-composite-pipe"),
++        layout: Some(layout),
++        vertex: wgpu::VertexState {
++            module,
++            entry_point: Some("vs_full"),
++            compilation_options: Default::default(),
++            buffers: &[],
++        },
++        primitive: wgpu::PrimitiveState::default(),
++        depth_stencil: Some(wgpu::DepthStencilState {
++            format: DEPTH_FORMAT,
++            depth_write_enabled: Some(true),
++            depth_compare: Some(wgpu::CompareFunction::Less),
++            stencil: wgpu::StencilState::default(),
++            bias: wgpu::DepthBiasState::default(),
++        }),
++        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
++        fragment: Some(wgpu::FragmentState {
++            module,
++            entry_point: Some("fs_composite"),
++            compilation_options: Default::default(),
++            targets: &[Some(wgpu::ColorTargetState {
++                format,
++                blend: None,
++                write_mask: wgpu::ColorWrites::ALL,
++            })],
++        }),
++        multiview_mask: None,
++        cache: None,
++    })
++}
++
+ /// `struct C`, field by field.
+ #[must_use]
+ pub fn uniform_bytes(mvp: &[[f32; 4]; 4], g: &FrameGeom) -> Vec<u8> {
+diff --git a/crates/ui/src/trace/eye.rs b/crates/ui/src/trace/eye.rs
+index 6699ab3bd..82f16816b 100644
+--- a/crates/ui/src/trace/eye.rs
++++ b/crates/ui/src/trace/eye.rs
+@@ -145,6 +145,11 @@ impl StockEye {
+         self.verdict = Self::verdict_of(p);
+     }
+ 
++    /// #2958: the composite follows the viewport pass's sample count.
++    pub fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
++        self.composite.set_samples(device, samples);
++    }
++
+     /// The same eye with its GPU march dropped: the CPU fallback a
+     /// refusing device lands on, reachable on purpose for the tests.
+     #[must_use]
+diff --git a/crates/ui/src/viewport.rs b/crates/ui/src/viewport.rs
+index c78a49b6f..ebbe58e58 100644
+--- a/crates/ui/src/viewport.rs
++++ b/crates/ui/src/viewport.rs
+@@ -13,6 +13,14 @@
+ 
+ use egui_wgpu::wgpu;
+ 
++mod pipes;
++mod wide;
++
++pub use wide::{
++    GUARANTEED_SAMPLES, LIFT_WIDTHS, MAX_LINE_PX, MIN_LINE_PX, SEGMENT_BYTES, effective_samples, line_px,
++    offered_samples, segment_bytes,
++};
++
+ /// vec3 position + f32 selection flag + f32 deviation class. Like `sel`,
+ /// the class rides baked in the vertex stream (same submit-time law as
+ /// above) and every `vs_main` pipeline reads all three attributes - the
+@@ -42,11 +50,12 @@ const VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayou
+     ],
+ };
+ 
+-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
++pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+ 
+-/// `struct U`: mvp + eye + wire (80 bytes), six palette vec4s, then the
+-/// wireframe edge ink of the live ground (#698).
+-const UNIFORM_SIZE: u64 = 80 + 7 * 16;
++/// `struct U`: mvp + eye + wire (80 bytes), six palette vec4s, the
++/// wireframe edge ink of the live ground (#698), then the overlay line
++/// geometry `vp` (#2958: target size, half width, half width + 1 px).
++const UNIFORM_SIZE: u64 = 80 + 8 * 16;
+ 
+ const SHADER: &str = "
+ // The verdict / selection palette rides the uniform (M13.4's
+@@ -54,7 +63,7 @@ const SHADER: &str = "
+ struct U { mvp: mat4x4<f32>, eye: vec3<f32>, wire: f32,
+            clean: vec4<f32>, rest: vec4<f32>, gouge: vec4<f32>,
+            unjudged: vec4<f32>, hot: vec4<f32>, warm: vec4<f32>,
+-           wire_ink: vec4<f32> };
++           wire_ink: vec4<f32>, vp: vec4<f32> };
+ @group(0) @binding(0) var<uniform> u: U;
+ 
+ struct VSOut {
+@@ -159,30 +168,8 @@ fn fs_region(in: VSOut) -> @location(0) vec4<f32> {
+     return vec4<f32>(0.95, 0.58, 0.15, 0.22);
+ }
+ 
+-// Overlay lines (WCS triads, world axes): position + explicit color, no
+-// lighting - reference geometry must stay legible at any zoom.
+-struct LineOut {
+-    @builtin(position) clip: vec4<f32>,
+-    @location(0) rgb: vec3<f32>,
+-};
+-
+-@vertex
+-fn vs_line(@location(0) pos: vec3<f32>, @location(1) rgb: vec3<f32>) -> LineOut {
+-    var out: LineOut;
+-    out.clip = u.mvp * vec4<f32>(pos, 1.0);
+-    out.rgb = rgb;
+-    return out;
+-}
+-
+-@fragment
+-fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
+-    return vec4<f32>(in.rgb, 1.0);
+-}
+ ";
+ 
+-/// Overlay line vertex: vec3 position + vec3 color.
+-const OVERLAY_STRIDE: u64 = 24;
+-
+ /// One triangle-soup part for the GPU: world-space vertices (transform
+ /// applied by the caller), plus selection and kind flags. Stock parts are
+ /// drawn blended after the models; region-fill parts after those (see
+@@ -207,14 +194,16 @@ pub struct GpuPart {
+ }
+ 
+ pub struct View3D {
+-    pipeline: wgpu::RenderPipeline,
+-    /// Faces that only write depth - the wireframe mode's hidden-line
+-    /// prepass (same vertex stage and culling as `pipeline`, no color).
+-    depth_pipeline: wgpu::RenderPipeline,
+-    line_pipeline: wgpu::RenderPipeline,
+-    stock_pipeline: wgpu::RenderPipeline,
+-    region_pipeline: wgpu::RenderPipeline,
+-    overlay_pipeline: wgpu::RenderPipeline,
++    /// Every pipeline of the pass, built for `samples` (#2958).
++    pipes: pipes::Pipes,
++    shader: wgpu::ShaderModule,
++    layout: wgpu::PipelineLayout,
++    format: wgpu::TextureFormat,
++    /// Samples per pixel of the pass targets: 1 draws straight into
++    /// `color_view`; more renders into `msaa_view` and resolves there.
++    samples: u32,
++    /// The overlay line width in target pixels (#2958).
++    line_px: f32,
+     bind_group: wgpu::BindGroup,
+     uniform: wgpu::Buffer,
+     /// The verdict/selection palette the next render uploads (M13.4;
+@@ -241,7 +230,10 @@ pub struct View3D {
+     edge_count: u32,
+     model_edge_count: u32,
+     overlay_buf: wgpu::Buffer,
++    /// Overlay segments (instances), not vertices (#2958).
+     overlay_count: u32,
++    _msaa_tex: Option<wgpu::Texture>,
++    msaa_view: Option<wgpu::TextureView>,
+     _color_tex: wgpu::Texture,
+     color_view: wgpu::TextureView,
+     _depth_tex: wgpu::Texture,
+@@ -259,7 +251,7 @@ impl View3D {
+     ) -> Self {
+         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("viewport3d"),
+-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
++            source: wgpu::ShaderSource::Wgsl(format!("{SHADER}{}", wide::WIDE_SHADER).into()),
+         });
+ 
+         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+@@ -298,278 +290,7 @@ impl View3D {
+             }],
+         });
+ 
+-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-pipe"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_main"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(VERTEX_LAYOUT)],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::TriangleList,
+-                front_face: wgpu::FrontFace::Ccw,
+-                cull_mode: Some(wgpu::Face::Back),
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(true),
+-                depth_compare: Some(wgpu::CompareFunction::Less),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_main"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: None,
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
+-
+-        // Depth-only pass for wireframe mode: the same solid geometry,
+-        // rasterized with color writes off. Faces occlude the far wire
+-        // exactly as they occlude it when lit - the hidden-line law is
+-        // then one branch in `render`, not a second geometry.
+-        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-depth"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_main"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(VERTEX_LAYOUT)],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::TriangleList,
+-                front_face: wgpu::FrontFace::Ccw,
+-                cull_mode: Some(wgpu::Face::Back),
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(true),
+-                depth_compare: Some(wgpu::CompareFunction::Less),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_edge"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: None,
+-                    write_mask: wgpu::ColorWrites::empty(),
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
+-
+-        // Facet edges over the shaded pass. No culling (back-face wire is
+-        // hidden by depth anyway) and a negative slope bias so the lines
+-        // win the depth test against the faces they lie on.
+-        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-lines"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_main"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(VERTEX_LAYOUT)],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::LineList,
+-                cull_mode: None,
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                // Lines may not carry a depth bias in wgpu 30, so edges win
+-                // ties against the faces they lie on via LessEqual instead.
+-                depth_write_enabled: Some(false),
+-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_edge"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: None,
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
+-
+-        // Translucent stock: blended over whatever the opaque pass left,
+-        // never writing depth (models stay pickable-and-visible through it).
+-        let stock_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-stock"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_main"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(VERTEX_LAYOUT)],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::TriangleList,
+-                front_face: wgpu::FrontFace::Ccw,
+-                cull_mode: Some(wgpu::Face::Back),
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(false),
+-                depth_compare: Some(wgpu::CompareFunction::Less),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_stock"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: Some(wgpu::BlendState {
+-                        color: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::SrcAlpha,
+-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                        alpha: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::Zero,
+-                            dst_factor: wgpu::BlendFactor::One,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                    }),
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
+-
+-        // Cut-region fill: the stock blend's shape (last, translucent, no
+-        // depth write) with a constant color - cloned, not shared, so a
+-        // future stock-material change cannot silently retint the fill.
+-        let region_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-region"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_main"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(VERTEX_LAYOUT)],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::TriangleList,
+-                front_face: wgpu::FrontFace::Ccw,
+-                cull_mode: Some(wgpu::Face::Back),
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(false),
+-                depth_compare: Some(wgpu::CompareFunction::Less),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_region"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: Some(wgpu::BlendState {
+-                        color: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::SrcAlpha,
+-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                        alpha: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::Zero,
+-                            dst_factor: wgpu::BlendFactor::One,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                    }),
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
+-
+-        // Non-indexed lines for the WCS triads and world axes: their own
+-        // vertex layout (pos + rgb), no lighting, depth-tested but never
+-        // occluded-by-write.
+-        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("viewport3d-overlay"),
+-            layout: Some(&layout),
+-            vertex: wgpu::VertexState {
+-                module: &shader,
+-                entry_point: Some("vs_line"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(wgpu::VertexBufferLayout {
+-                    array_stride: OVERLAY_STRIDE,
+-                    step_mode: wgpu::VertexStepMode::Vertex,
+-                    attributes: &[
+-                        wgpu::VertexAttribute {
+-                            format: wgpu::VertexFormat::Float32x3,
+-                            offset: 0,
+-                            shader_location: 0,
+-                        },
+-                        wgpu::VertexAttribute {
+-                            format: wgpu::VertexFormat::Float32x3,
+-                            offset: 12,
+-                            shader_location: 1,
+-                        },
+-                    ],
+-                })],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                topology: wgpu::PrimitiveTopology::LineList,
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: DEPTH_FORMAT,
+-                depth_write_enabled: Some(false),
+-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+-                stencil: wgpu::StencilState::default(),
+-                bias: wgpu::DepthBiasState::default(),
+-            }),
+-            multisample: wgpu::MultisampleState::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &shader,
+-                entry_point: Some("fs_line"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format,
+-                    blend: None,
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
++        let pipes = pipes::build(device, &shader, &layout, format, 1);
+ 
+         // 4-byte placeholders keep the empty-document path simple.
+         let dummy = |label, usage| {
+@@ -585,15 +306,15 @@ impl View3D {
+         let edge_buf = dummy("viewport3d-ebuf", wgpu::BufferUsages::INDEX);
+         let overlay_buf = dummy("viewport3d-obuf", wgpu::BufferUsages::VERTEX);
+ 
+-        let targets = make_targets(device, format, width, height);
++        let targets = pipes::make_targets(device, format, width, height, 1);
+ 
+         View3D {
+-            pipeline,
+-            depth_pipeline,
+-            line_pipeline,
+-            stock_pipeline,
+-            region_pipeline,
+-            overlay_pipeline,
++            pipes,
++            shader,
++            layout,
++            format,
++            samples: 1,
++            line_px: line_px(1.5, 1.0),
+             bind_group,
+             uniform,
+             palette: crate::egui_app::colorvision::Semantic::OFF,
+@@ -608,6 +329,8 @@ impl View3D {
+             model_edge_count: 0,
+             overlay_buf,
+             overlay_count: 0,
++            _msaa_tex: targets.msaa,
++            msaa_view: targets.msaa_view,
+             _color_tex: targets.color,
+             color_view: targets.color_view,
+             _depth_tex: targets.depth,
+@@ -633,11 +356,13 @@ impl View3D {
+         if width == self.width && height == self.height {
+             return;
+         }
+-        let targets = make_targets(device, format, width, height);
++        let targets = pipes::make_targets(device, format, width, height, self.samples);
+         self._color_tex = targets.color;
+         self.color_view = targets.color_view;
+         self._depth_tex = targets.depth;
+         self.depth_view = targets.depth_view;
++        self._msaa_tex = targets.msaa;
++        self.msaa_view = targets.msaa_view;
+         self.width = width;
+         self.height = height;
+     }
+@@ -739,16 +464,12 @@ impl View3D {
+     /// drawn non-indexed after every solid - the WCS triads, world axes and
+     /// cached toolpaths (the producers cap the list before it gets here).
+     pub fn set_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lines: &[[f32; 6]]) {
+-        if lines.is_empty() {
++        // #2958: one 32-byte instance per segment, drawn as a wide quad.
++        let data = segment_bytes(lines);
++        if data.is_empty() {
+             self.overlay_count = 0; // render() then skips the draw entirely
+             return;
+         }
+-        let mut data = Vec::with_capacity(lines.len() * 24);
+-        for v in lines {
+-            for c in v {
+-                data.extend_from_slice(&c.to_le_bytes());
+-            }
+-        }
+         let buf = device.create_buffer(&wgpu::BufferDescriptor {
+             label: Some("viewport3d-obuf"),
+             size: data.len() as u64,
+@@ -757,7 +478,48 @@ impl View3D {
+         });
+         queue.write_buffer(&buf, 0, &data);
+         self.overlay_buf = buf;
+-        self.overlay_count = lines.len() as u32;
++        self.overlay_count = u32::try_from(lines.len() / 2).unwrap_or(u32::MAX);
++    }
++
++    /// The overlay segment count of the last upload.
++    #[must_use]
++    pub const fn overlay_segments(&self) -> u32 {
++        self.overlay_count
++    }
++
++    /// #2958: the overlay line width in target pixels (`line_px` holds it
++    /// to `MIN_LINE_PX..=MAX_LINE_PX`). A uniform: nothing re-uploads.
++    pub fn set_line_px(&mut self, px: f32) {
++        self.line_px = if px.is_finite() { px.clamp(MIN_LINE_PX, MAX_LINE_PX) } else { MIN_LINE_PX };
++    }
++
++    #[must_use]
++    pub const fn line_width_px(&self) -> f32 {
++        self.line_px
++    }
++
++    #[must_use]
++    pub const fn samples(&self) -> u32 {
++        self.samples
++    }
++
++    /// #2958: rebuild the pipelines and the multisample targets for
++    /// `samples` per pixel. The resolved colour target is kept, so the
++    /// shell's egui texture stays bound. The caller passes only a count
++    /// the device offers (`effective_samples`). True when it changed.
++    pub fn set_samples(&mut self, device: &wgpu::Device, samples: u32) -> bool {
++        let samples = samples.max(1);
++        if samples == self.samples {
++            return false;
++        }
++        self.pipes = pipes::build(device, &self.shader, &self.layout, self.format, samples);
++        let (msaa, depth) = pipes::make_sample_targets(device, self.format, self.width, self.height, samples);
++        self.msaa_view = msaa.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
++        self._msaa_tex = msaa;
++        self.depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
++        self._depth_tex = depth;
++        self.samples = samples;
++        true
+     }
+ 
+     /// The verdict/selection palette the next `render` uploads (M13.4's
+@@ -825,13 +587,20 @@ impl View3D {
+             data[o..o + 4].copy_from_slice(&v.to_le_bytes());
+             o += 4;
+         }
++        // #2958: the overlay geometry - target size, half width, and the
++        // quad's reach (half width plus the one-pixel fade).
++        let hw = self.line_px * 0.5;
++        for v in [self.width as f32, self.height as f32, hw, hw + 1.0] {
++            data[o..o + 4].copy_from_slice(&v.to_le_bytes());
++            o += 4;
++        }
+         queue.write_buffer(&self.uniform, 0, &data);
+ 
+         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+             label: Some("viewport3d-pass"),
+             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                view: &self.color_view,
+-                resolve_target: None,
++                view: self.msaa_view.as_ref().unwrap_or(&self.color_view),
++                resolve_target: self.msaa_view.as_ref().map(|_| &self.color_view),
+                 ops: wgpu::Operations {
+                     load: wgpu::LoadOp::Clear(wgpu::Color {
+                         r: f64::from(ground.r()) / 255.0,
+@@ -871,16 +640,16 @@ impl View3D {
+             pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+             if wireframe {
+                 if self.model_index_count > 0 {
+-                    pass.set_pipeline(&self.depth_pipeline);
++                    pass.set_pipeline(&self.pipes.depth_pipeline);
+                     pass.draw_indexed(0..self.model_index_count, 0, 0..1);
+                 }
+             } else {
+-                pass.set_pipeline(&self.pipeline);
++                pass.set_pipeline(&self.pipes.pipeline);
+                 pass.draw_indexed(0..self.model_index_count, 0, 0..1);
+             }
+             if self.model_edge_count > 0 {
+                 pass.set_index_buffer(self.edge_buf.slice(..), wgpu::IndexFormat::Uint32);
+-                pass.set_pipeline(&self.line_pipeline);
++                pass.set_pipeline(&self.pipes.line_pipeline);
+                 pass.draw_indexed(0..self.model_edge_count, 0, 0..1);
+             }
+             let traced = stock.filter(|_| !wireframe);
+@@ -891,29 +660,29 @@ impl View3D {
+                 // traced stock's to replace: it still draws.
+                 if self.overlay_index_start < self.stock_index_end {
+                     pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+-                    pass.set_pipeline(&self.stock_pipeline);
++                    pass.set_pipeline(&self.pipes.stock_pipeline);
+                     pass.draw_indexed(self.overlay_index_start..self.stock_index_end, 0, 0..1);
+                 }
+             } else if self.model_index_count < self.stock_index_end && !wireframe {
+                 pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+-                pass.set_pipeline(&self.stock_pipeline);
++                pass.set_pipeline(&self.pipes.stock_pipeline);
+                 pass.draw_indexed(self.model_index_count..self.stock_index_end, 0, 0..1);
+             }
+             if traced.is_none() && self.model_edge_count < self.edge_count {
+                 pass.set_index_buffer(self.edge_buf.slice(..), wgpu::IndexFormat::Uint32);
+-                pass.set_pipeline(&self.line_pipeline);
++                pass.set_pipeline(&self.pipes.line_pipeline);
+                 pass.draw_indexed(self.model_edge_count..self.edge_count, 0, 0..1);
+             }
+             if self.stock_index_end < self.index_count {
+                 pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+-                pass.set_pipeline(&self.region_pipeline);
++                pass.set_pipeline(&self.pipes.region_pipeline);
+                 pass.draw_indexed(self.stock_index_end..self.index_count, 0, 0..1);
+             }
+         }
+         if self.overlay_count > 0 {
+-            pass.set_pipeline(&self.overlay_pipeline);
++            pass.set_pipeline(&self.pipes.wide_pipeline);
+             pass.set_vertex_buffer(0, self.overlay_buf.slice(..));
+-            pass.draw(0..self.overlay_count, 0..1);
++            pass.draw(0..6, 0..self.overlay_count);
+         }
+     }
+ 
+@@ -987,53 +756,6 @@ impl View3D {
+     }
+ }
+ 
+-struct Targets {
+-    color: wgpu::Texture,
+-    color_view: wgpu::TextureView,
+-    depth: wgpu::Texture,
+-    depth_view: wgpu::TextureView,
+-}
+-
+-fn make_targets(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Targets {
+-    let size = wgpu::Extent3d {
+-        width: width.max(1),
+-        height: height.max(1),
+-        depth_or_array_layers: 1,
+-    };
+-    let color = device.create_texture(&wgpu::TextureDescriptor {
+-        label: Some("viewport3d-color"),
+-        size,
+-        mip_level_count: 1,
+-        sample_count: 1,
+-        dimension: wgpu::TextureDimension::D2,
+-        format,
+-        // COPY_SRC lets tests read the frame back (View3D::snapshot_rgba);
+-        // for the app the flag costs nothing at runtime.
+-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+-            | wgpu::TextureUsages::TEXTURE_BINDING
+-            | wgpu::TextureUsages::COPY_SRC,
+-        view_formats: &[],
+-    });
+-    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+-    let depth = device.create_texture(&wgpu::TextureDescriptor {
+-        label: Some("viewport3d-depth"),
+-        size,
+-        mip_level_count: 1,
+-        sample_count: 1,
+-        dimension: wgpu::TextureDimension::D2,
+-        format: DEPTH_FORMAT,
+-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+-        view_formats: &[],
+-    });
+-    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+-    Targets {
+-        color,
+-        color_view,
+-        depth,
+-        depth_view,
+-    }
+-}
+-
+ /// A world direction spelled as its three components - what `normalize`,
+ /// `fwd`, `basis_right` and `basis_up` all produce, so the orthonormal
+ /// basis `view_basis` returns is three of these.
+diff --git a/crates/ui/src/viewport/pipes.rs b/crates/ui/src/viewport/pipes.rs
+new file mode 100644
+index 000000000..07622a44b
+--- /dev/null
++++ b/crates/ui/src/viewport/pipes.rs
+@@ -0,0 +1,223 @@
++//! The viewport's render pipelines, built for one sample count (#2958):
++//! every pipeline of the 3D pass must match the pass's targets, so a new
++//! anti-aliasing choice rebuilds this whole set (and the traced-stock
++//! composite, `trace::composite`) and nothing else.
++//! Provenance: our own code, moved out of `viewport.rs` (the descriptors
++//! are unchanged apart from the sample count and the wide overlay lines);
++//! specced from the wgpu documentation.
++
++use egui_wgpu::wgpu;
++
++use super::wide::SEGMENT_LAYOUT;
++use super::{DEPTH_FORMAT, VERTEX_LAYOUT};
++
++pub(super) struct Pipes {
++    pub pipeline: wgpu::RenderPipeline,
++    /// Faces that only write depth - the wireframe mode's hidden-line
++    /// prepass (same vertex stage and culling as `pipeline`, no color).
++    pub depth_pipeline: wgpu::RenderPipeline,
++    pub line_pipeline: wgpu::RenderPipeline,
++    pub stock_pipeline: wgpu::RenderPipeline,
++    pub region_pipeline: wgpu::RenderPipeline,
++    /// #2958: the overlay as wide anti-aliased quads, one instance per
++    /// segment (`viewport::wide`).
++    pub wide_pipeline: wgpu::RenderPipeline,
++}
++
++/// Translucent over what is there; the target's alpha stays as it is (the
++/// egui texture keeps an opaque viewport).
++const OVER: wgpu::BlendState = wgpu::BlendState {
++    color: wgpu::BlendComponent {
++        src_factor: wgpu::BlendFactor::SrcAlpha,
++        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
++        operation: wgpu::BlendOperation::Add,
++    },
++    alpha: wgpu::BlendComponent {
++        src_factor: wgpu::BlendFactor::Zero,
++        dst_factor: wgpu::BlendFactor::One,
++        operation: wgpu::BlendOperation::Add,
++    },
++};
++
++/// What differs between the viewport's pipelines.
++struct Spec {
++    label: &'static str,
++    vs: &'static str,
++    fs: &'static str,
++    buffer: wgpu::VertexBufferLayout<'static>,
++    topology: wgpu::PrimitiveTopology,
++    cull: Option<wgpu::Face>,
++    depth_write: bool,
++    compare: wgpu::CompareFunction,
++    blend: Option<wgpu::BlendState>,
++    writes: wgpu::ColorWrites,
++}
++
++pub(super) fn build(
++    device: &wgpu::Device,
++    shader: &wgpu::ShaderModule,
++    layout: &wgpu::PipelineLayout,
++    format: wgpu::TextureFormat,
++    samples: u32,
++) -> Pipes {
++    let make = |s: Spec| {
++        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some(s.label),
++            layout: Some(layout),
++            vertex: wgpu::VertexState {
++                module: shader,
++                entry_point: Some(s.vs),
++                compilation_options: Default::default(),
++                buffers: &[Some(s.buffer)],
++            },
++            primitive: wgpu::PrimitiveState {
++                topology: s.topology,
++                front_face: wgpu::FrontFace::Ccw,
++                cull_mode: s.cull,
++                ..Default::default()
++            },
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: DEPTH_FORMAT,
++                depth_write_enabled: Some(s.depth_write),
++                depth_compare: Some(s.compare),
++                stencil: wgpu::StencilState::default(),
++                bias: wgpu::DepthBiasState::default(),
++            }),
++            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
++            fragment: Some(wgpu::FragmentState {
++                module: shader,
++                entry_point: Some(s.fs),
++                compilation_options: Default::default(),
++                targets: &[Some(wgpu::ColorTargetState { format, blend: s.blend, write_mask: s.writes })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        })
++    };
++    let tri = wgpu::PrimitiveTopology::TriangleList;
++    let back = Some(wgpu::Face::Back);
++    let (less, less_eq) = (wgpu::CompareFunction::Less, wgpu::CompareFunction::LessEqual);
++    let all = wgpu::ColorWrites::ALL;
++    let solid = |label, fs, depth_write, blend, writes| Spec {
++        label,
++        vs: "vs_main",
++        fs,
++        buffer: VERTEX_LAYOUT,
++        topology: tri,
++        cull: back,
++        depth_write,
++        compare: less,
++        blend,
++        writes,
++    };
++    Pipes {
++        pipeline: make(solid("viewport3d-pipe", "fs_main", true, None, all)),
++        // Depth-only pass for wireframe mode: the same solid geometry,
++        // rasterized with color writes off. Faces occlude the far wire
++        // exactly as they occlude it when lit - the hidden-line law is
++        // then one branch in `render`, not a second geometry.
++        depth_pipeline: make(solid("viewport3d-depth", "fs_edge", true, None, wgpu::ColorWrites::empty())),
++        // Facet edges over the shaded pass. No culling (back-face wire is
++        // hidden by depth anyway). Lines may not carry a depth bias in
++        // wgpu, so edges win ties against the faces they lie on via
++        // LessEqual instead.
++        line_pipeline: make(Spec {
++            label: "viewport3d-lines",
++            topology: wgpu::PrimitiveTopology::LineList,
++            cull: None,
++            depth_write: false,
++            compare: less_eq,
++            ..solid("", "fs_edge", false, None, all)
++        }),
++        // Translucent stock: blended over whatever the opaque pass left,
++        // never writing depth (models stay pickable-and-visible through it).
++        stock_pipeline: make(solid("viewport3d-stock", "fs_stock", false, Some(OVER), all)),
++        // Cut-region fill: the stock blend's shape (last, translucent, no
++        // depth write) with a constant color.
++        region_pipeline: make(solid("viewport3d-region", "fs_region", false, Some(OVER), all)),
++        // The overlay (toolpaths, height planes, outlines, triads, grid):
++        // depth-tested, never writing depth, blended by its coverage.
++        wide_pipeline: make(Spec {
++            label: "viewport3d-wide",
++            vs: "vs_wide",
++            fs: "fs_wide",
++            buffer: SEGMENT_LAYOUT,
++            topology: tri,
++            cull: None,
++            depth_write: false,
++            compare: less_eq,
++            blend: Some(OVER),
++            writes: all,
++        }),
++    }
++}
++
++/// The pass's targets for one sample count.
++pub(super) struct Targets {
++    /// The multisample colour target (`None` at 1 sample per pixel).
++    pub msaa: Option<wgpu::Texture>,
++    pub msaa_view: Option<wgpu::TextureView>,
++    /// The single-sample colour the shell shows and tests read back.
++    pub color: wgpu::Texture,
++    pub color_view: wgpu::TextureView,
++    pub depth: wgpu::Texture,
++    pub depth_view: wgpu::TextureView,
++}
++
++fn extent(width: u32, height: u32) -> wgpu::Extent3d {
++    wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 }
++}
++
++pub(super) fn make_targets(
++    device: &wgpu::Device,
++    format: wgpu::TextureFormat,
++    width: u32,
++    height: u32,
++    samples: u32,
++) -> Targets {
++    let color = device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("viewport3d-color"),
++        size: extent(width, height),
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format,
++        // COPY_SRC lets tests read the frame back (View3D::snapshot_rgba);
++        // for the app the flag costs nothing at runtime.
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++            | wgpu::TextureUsages::TEXTURE_BINDING
++            | wgpu::TextureUsages::COPY_SRC,
++        view_formats: &[],
++    });
++    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
++    let (msaa, depth) = make_sample_targets(device, format, width, height, samples);
++    let msaa_view = msaa.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
++    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
++    Targets { msaa, msaa_view, color, color_view, depth, depth_view }
++}
++
++/// The targets whose sample count follows the anti-aliasing: the
++/// multisample colour (none at 1) and the depth.
++pub(super) fn make_sample_targets(
++    device: &wgpu::Device,
++    format: wgpu::TextureFormat,
++    width: u32,
++    height: u32,
++    samples: u32,
++) -> (Option<wgpu::Texture>, wgpu::Texture) {
++    let target = |label, format, usage| {
++        device.create_texture(&wgpu::TextureDescriptor {
++            label: Some(label),
++            size: extent(width, height),
++            mip_level_count: 1,
++            sample_count: samples,
++            dimension: wgpu::TextureDimension::D2,
++            format,
++            usage,
++            view_formats: &[],
++        })
++    };
++    let msaa = (samples > 1).then(|| target("viewport3d-msaa", format, wgpu::TextureUsages::RENDER_ATTACHMENT));
++    let depth = target("viewport3d-depth", DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
++    (msaa, depth)
++}
+diff --git a/crates/ui/src/viewport/wide.rs b/crates/ui/src/viewport/wide.rs
+new file mode 100644
+index 000000000..5e86f76b2
+--- /dev/null
++++ b/crates/ui/src/viewport/wide.rs
+@@ -0,0 +1,188 @@
++//! Wide anti-aliased overlay lines and the viewport's sample count (#2958).
++//! A `wgpu` line is always one hardware pixel and is never smoothed, so
++//! each overlay segment is drawn as a screen-facing quad: one 32-byte
++//! instance per segment, the six corners made in the vertex shader. The
++//! fragment shader fades the sides and the ends over one pixel, an end
++//! reaches half the width past its point (two segments that meet close
++//! the corner and do not overshoot it), and each vertex is lifted toward
++//! the eye by a few line widths, so a line that lies on a face is not
++//! half buried in that face by the depth test.
++//! Provenance: the screen-space line quad and coverage fade are standard
++//! real-time rendering practice (public graphics literature); the sample
++//! counts follow the WebGPU and wgpu documentation. Our own code.
++
++use egui_wgpu::wgpu;
++
++/// One overlay segment on the GPU: two f32x3 points, two RGBA8 colours.
++pub const SEGMENT_BYTES: u64 = 32;
++
++/// The instance layout `vs_wide` reads.
++pub(super) const SEGMENT_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
++    array_stride: SEGMENT_BYTES,
++    step_mode: wgpu::VertexStepMode::Instance,
++    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4, 3 => Unorm8x4],
++};
++
++/// How far the lift pulls a vertex toward the eye, in line widths. Three
++/// widths keep the full band over a face tilted up to about 79 degrees
++/// from the screen; a line that is really behind a face by less than this
++/// (a few pixels of depth on the screen) shows through.
++pub const LIFT_WIDTHS: f32 = 3.0;
++
++/// The narrowest and widest line the shader draws, in pixels.
++pub const MIN_LINE_PX: f32 = 1.0;
++pub const MAX_LINE_PX: f32 = 16.0;
++
++/// The sample counts WebGPU guarantees for the viewport formats.
++pub const GUARANTEED_SAMPLES: [u32; 2] = [1, 4];
++
++/// Appended to the viewport shader: it shares `struct U` and reads
++/// `u.vp` = (target width, target height, half width, half width + 1) px.
++pub(super) const WIDE_SHADER: &str = "
++struct WideOut {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) rgb: vec3<f32>,
++    @location(1) @interpolate(linear) dist: f32,
++    @location(2) @interpolate(linear) along: f32,
++    @location(3) @interpolate(flat) len: f32,
++};
++
++// The world distance one pixel spans at clip depth w: the y row of the
++// projection scales world units to clip units (perspective and ortho).
++fn world_px(w: f32) -> f32 {
++    let p11 = length(vec3<f32>(u.mvp[0].y, u.mvp[1].y, u.mvp[2].y));
++    return max(w, 1e-6) / max(u.vp.y * 0.5 * p11, 1e-9);
++}
++
++// Toward the eye: along the eye ray in perspective (the point stays on
++// its pixel), against the depth gradient in ortho (no w row).
++fn to_eye(p: vec3<f32>) -> vec3<f32> {
++    let wrow = vec3<f32>(u.mvp[0].w, u.mvp[1].w, u.mvp[2].w);
++    let zrow = vec3<f32>(u.mvp[0].z, u.mvp[1].z, u.mvp[2].z);
++    let ortho = length(wrow) < 1e-12;
++    let toward = select(u.eye - p, -zrow, ortho);
++    let len = length(toward);
++    return select(vec3<f32>(0.0), toward / len, len > 1e-12);
++}
++
++fn lifted(p: vec3<f32>) -> vec4<f32> {
++    let c = u.mvp * vec4<f32>(p, 1.0);
++    let lift = to_eye(p) * world_px(c.w) * u.vp.w * 3.0;
++    return u.mvp * vec4<f32>(p + lift, 1.0);
++}
++
++@vertex
++fn vs_wide(@builtin(vertex_index) vi: u32,
++           @location(0) a: vec3<f32>, @location(1) b: vec3<f32>,
++           @location(2) rgb_a: vec4<f32>, @location(3) rgb_b: vec4<f32>) -> WideOut {
++    var out: WideOut;
++    // Corners 0..5 of two triangles: side -1/+1 across, end a/b along.
++    let side = select(-1.0, 1.0, vi == 1u || vi == 2u || vi == 4u);
++    let at_b = vi == 2u || vi == 4u || vi == 5u;
++    var qa = lifted(a);
++    var qb = lifted(b);
++    // Clip to the near plane (wgpu clip z >= 0) before the screen
++    // direction is taken: an end behind the eye must not flip the quad.
++    if (qa.z < 0.0 && qb.z < 0.0) {
++        out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0);
++        out.rgb = vec3<f32>(0.0);
++        out.dist = 0.0;
++        out.along = 0.0;
++        out.len = 0.0;
++        return out;
++    }
++    if (qa.z < 0.0) { qa = mix(qa, qb, qa.z / (qa.z - qb.z)); }
++    if (qb.z < 0.0) { qb = mix(qb, qa, qb.z / (qb.z - qa.z)); }
++    let half_vp = u.vp.xy * 0.5;
++    let sa = qa.xy / qa.w * half_vp;
++    let sb = qb.xy / qb.w * half_vp;
++    var d = sb - sa;
++    let len = length(d);
++    if (len < 1e-6) { d = vec2<f32>(1.0, 0.0); } else { d = d / len; }
++    let n = vec2<f32>(-d.y, d.x);
++    let ext = u.vp.w;
++    let me = select(qa, qb, at_b);
++    let along = select(-d, d, at_b) * ext;
++    let off = (n * side * ext + along) / half_vp * me.w;
++    out.clip = me + vec4<f32>(off, 0.0, 0.0);
++    out.rgb = select(rgb_a.rgb, rgb_b.rgb, at_b);
++    out.dist = side * ext;
++    out.along = select(-ext, len + ext, at_b);
++    out.len = len;
++    return out;
++}
++
++// Coverage: one pixel of fade at the sides and past each end; the end
++// reaches half the width past its point.
++@fragment
++fn fs_wide(in: WideOut) -> @location(0) vec4<f32> {
++    let hw = u.vp.z;
++    let side = clamp(hw + 0.5 - abs(in.dist), 0.0, 1.0);
++    let beyond = max(-in.along, in.along - in.len);
++    let cap = clamp(hw + 0.5 - beyond, 0.0, 1.0);
++    return vec4<f32>(in.rgb, side * cap);
++}
++";
++
++/// The overlay vertex pairs (`[x, y, z, r, g, b]`, two per segment) as
++/// instance bytes: the points as f32, each end's colour as RGBA8. A
++/// trailing odd vertex is dropped (never half a line).
++#[must_use]
++pub fn segment_bytes(lines: &[[f32; 6]]) -> Vec<u8> {
++    let rgba = |v: &[f32; 6]| -> [u8; 4] {
++        // `as u8` saturates and maps NaN to 0.
++        let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
++        [c(v[3]), c(v[4]), c(v[5]), 255]
++    };
++    let mut out = Vec::with_capacity(lines.len() / 2 * SEGMENT_BYTES as usize);
++    let (segments, _odd) = lines.as_chunks::<2>();
++    for [a, b] in segments {
++        for x in a[..3].iter().chain(&b[..3]) {
++            out.extend_from_slice(&x.to_le_bytes());
++        }
++        out.extend_from_slice(&rgba(a));
++        out.extend_from_slice(&rgba(b));
++    }
++    out
++}
++
++/// The line width in target pixels for `points` at `scale` pixels per
++/// point, held to `MIN_LINE_PX..=MAX_LINE_PX` (a bad scale draws 1 px).
++#[must_use]
++pub fn line_px(points: f32, scale: f64) -> f32 {
++    let px = f64::from(points) * scale;
++    if px.is_finite() { (px as f32).clamp(MIN_LINE_PX, MAX_LINE_PX) } else { MIN_LINE_PX }
++}
++
++/// The sample count to build: `want` when the device offers it, else the
++/// highest offered count below it (never more memory than was asked for),
++/// else 1.
++#[must_use]
++pub fn effective_samples(want: u32, offered: &[u32]) -> u32 {
++    offered.iter().copied().filter(|n| *n <= want).max().unwrap_or(1)
++}
++
++/// The sample counts `adapter` offers for the colour `format` and the
++/// depth target together. Without the adapter-specific format feature on
++/// the device, only WebGPU's guaranteed pair is valid.
++#[must_use]
++pub fn offered_samples(adapter: &wgpu::Adapter, device_features: wgpu::Features, format: wgpu::TextureFormat) -> Vec<u32> {
++    if !device_features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
++        return GUARANTEED_SAMPLES.to_vec();
++    }
++    let both = |n: u32| {
++        [format, super::DEPTH_FORMAT]
++            .iter()
++            .all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(n))
++    };
++    let mut out: Vec<u32> = [1, 2, 4].into_iter().filter(|n| *n == 1 || both(*n)).collect();
++    if !out.contains(&4) {
++        // WebGPU guarantees 4 for these formats; keep it offered.
++        out.push(4);
++    }
++    out
++}
++
++#[cfg(test)]
++#[path = "wide_tests.rs"]
++mod tests;
+diff --git a/crates/ui/src/viewport/wide_tests.rs b/crates/ui/src/viewport/wide_tests.rs
+new file mode 100644
+index 000000000..1fe06f262
+--- /dev/null
++++ b/crates/ui/src/viewport/wide_tests.rs
+@@ -0,0 +1,61 @@
++//! #2958: the wide overlay lines' CPU half - the instance bytes, the
++//! pixel width and the sample-count fallback. The GPU half (full width on
++//! a face, closed corners, MSAA) is in `tests/gpu_render.rs`.
++//! Provenance: our own tests, specced from the issue's "Done means".
++//!
++//! Gate map (M4.4): covers ui::viewport (wide).
++
++use super::*;
++
++#[test]
++fn each_segment_is_one_32_byte_instance() {
++    let v = |x: f32, rgb: [f32; 3]| [x, 2.0, 3.0, rgb[0], rgb[1], rgb[2]];
++    let lines = [v(1.0, [1.0, 0.0, 0.5]), v(4.0, [0.0, 1.0, 0.0]), v(7.0, [0.2, 0.2, 0.2]), v(8.0, [0.2, 0.2, 0.2])];
++    let bytes = segment_bytes(&lines);
++    assert_eq!(bytes.len() as u64, 2 * SEGMENT_BYTES, "two segments, 32 bytes each");
++    let f = |o: usize| f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
++    assert_eq!([f(0), f(4), f(8), f(12), f(16), f(20)], [1.0, 2.0, 3.0, 4.0, 2.0, 3.0], "both points as f32");
++    assert_eq!(bytes[24..28], [255, 0, 128, 255], "the start colour as RGBA8");
++    assert_eq!(bytes[28..32], [0, 255, 0, 255], "the end keeps its own colour (the grid fades along a line)");
++    // The 512k-segment overlay ceiling fits in 16 MiB (the old 1 px
++    // vertex pairs used 24 MiB).
++    assert_eq!(crate::interact::MAX_OVERLAY_VERTICES as u64 / 2 * SEGMENT_BYTES, 16 * 1024 * 1024);
++}
++
++#[test]
++fn an_odd_vertex_and_bad_colours_never_reach_the_gpu_as_garbage() {
++    let odd = [[0.0; 6], [1.0; 6], [2.0; 6]];
++    assert_eq!(segment_bytes(&odd).len() as u64, SEGMENT_BYTES, "the trailing half line is dropped");
++    assert!(segment_bytes(&[]).is_empty());
++    let bad = [[0.0, 0.0, 0.0, f32::NAN, 2.0, -1.0], [0.0, 0.0, 0.0, f32::INFINITY, 0.0, 0.0]];
++    let b = segment_bytes(&bad);
++    assert_eq!(b[24..28], [0, 255, 0, 255], "NaN reads 0, out of range clamps");
++    assert_eq!(b[28..32], [255, 0, 0, 255]);
++}
++
++#[test]
++fn the_line_width_scales_with_the_display_and_stays_in_range() {
++    assert!((line_px(1.5, 1.0) - 1.5).abs() < 1e-6);
++    assert!((line_px(1.5, 1.5) - 2.25).abs() < 1e-6, "a 150 % display widens the line");
++    assert!((line_px(1.0, 0.5) - MIN_LINE_PX).abs() < 1e-6, "never under one pixel");
++    assert!((line_px(3.0, 100.0) - MAX_LINE_PX).abs() < 1e-6, "never past the cap");
++    assert!((line_px(1.5, f64::NAN) - MIN_LINE_PX).abs() < 1e-6, "a bad scale draws one pixel");
++    assert!((line_px(f32::INFINITY, 1.0) - MIN_LINE_PX).abs() < 1e-6);
++}
++
++#[test]
++fn an_unoffered_sample_count_falls_back_to_the_highest_offered_below_it() {
++    let guaranteed = GUARANTEED_SAMPLES.to_vec();
++    assert_eq!(effective_samples(4, &guaranteed), 4);
++    assert_eq!(effective_samples(1, &guaranteed), 1);
++    assert_eq!(effective_samples(2, &guaranteed), 1, "2x is not guaranteed: never more memory than asked");
++    assert_eq!(effective_samples(2, &[1, 2, 4]), 2, "a device that offers 2x gets it");
++    assert_eq!(effective_samples(4, &[]), 1, "nothing offered: one sample");
++    assert_eq!(effective_samples(0, &guaranteed), 1);
++}
++
++#[test]
++fn the_shader_lifts_by_the_documented_widths() {
++    let lift = format!("u.vp.w * {LIFT_WIDTHS:.1}");
++    assert!(WIDE_SHADER.contains(&lift), "the shader's lift is LIFT_WIDTHS ({lift})");
++}
+diff --git a/crates/ui/tests/gpu_render.rs b/crates/ui/tests/gpu_render.rs
+index 24842b8df..f79ef1da5 100644
+--- a/crates/ui/tests/gpu_render.rs
++++ b/crates/ui/tests/gpu_render.rs
+@@ -31,6 +31,10 @@ use camcraft_ui::interact;
+ use camcraft_ui::state::{CommandKind, DisplayMode, State};
+ use camcraft_ui::viewport::{Camera, GpuPart, ProjectionMode, View3D};
+ 
++/// #2958: the wide overlay lines and MSAA, on this binary's device.
++#[path = "gpu_render/wide_lines.rs"]
++mod wide_lines;
++
+ const SIDE: u32 = 256;
+ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+ // Concurrent fallback-device creation and teardown can crash in software
+diff --git a/crates/ui/tests/gpu_render/wide_lines.rs b/crates/ui/tests/gpu_render/wide_lines.rs
+new file mode 100644
+index 000000000..f1e9a0dac
+--- /dev/null
++++ b/crates/ui/tests/gpu_render/wide_lines.rs
+@@ -0,0 +1,140 @@
++//! #2958: the overlay draws as wide anti-aliased lines. On a real device
++//! frame: a line that lies on a face keeps its full width (the depth
++//! lift), two lines that meet close the corner and do not reach past it,
++//! the width follows `set_line_px`, and 4x MSAA smooths the edges that
++//! 1x leaves hard. Same device, lock and skip policy as the rest of
++//! `gpu_render` (one GPU process for the binary).
++//! Provenance: our own tests, specced from the issue's "Done means".
++
++use super::{GPU_TEST_LOCK, SIDE, distinct_colors, model_part, shared_device, test_cam};
++use camcraft_ui::state::DisplayMode;
++use egui_wgpu::wgpu;
++use camcraft_ui::viewport::{Camera, GpuPart, ProjectionMode, View3D};
++
++const RED: [f32; 3] = [1.0, 0.0, 0.0];
++
++/// A flat opaque sheet at z = 0, counter-clockwise from above.
++fn floor(h: f32) -> GpuPart {
++    let q = [[-h, -h, 0.0], [h, -h, 0.0], [h, h, 0.0], [-h, -h, 0.0], [h, h, 0.0], [-h, h, 0.0]];
++    GpuPart { verts: q.to_vec(), selected: false, stock: false, fill: false, classes: Vec::new() }
++}
++
++fn seg(a: [f32; 3], b: [f32; 3]) -> [[f32; 6]; 2] {
++    [[a[0], a[1], a[2], RED[0], RED[1], RED[2]], [b[0], b[1], b[2], RED[0], RED[1], RED[2]]]
++}
++
++/// One SIDE x SIDE frame of `parts` and `lines`; `None` without a device.
++fn frame(parts: &[GpuPart], lines: &[[f32; 6]], cam: &Camera, px: f32, samples: u32) -> Option<Vec<u8>> {
++    let _gpu_guard = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let Some((device, queue)) = shared_device() else {
++        eprintln!("gpu_render wide_lines: no adapter - SKIP");
++        return None;
++    };
++    let mut view = View3D::new(&device, super::FORMAT, SIDE, SIDE);
++    assert!(view.set_samples(&device, samples) == (samples != 1), "a new count rebuilds; the same count does not");
++    assert_eq!(view.samples(), samples);
++    view.set_line_px(px);
++    view.set_document(&device, &queue, parts);
++    view.set_overlay(&device, &queue, lines);
++    assert_eq!(view.overlay_segments() as usize, lines.len() / 2, "one instance per segment");
++    let mvp = cam.mvp(1.0);
++    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wide-lines") });
++    view.render(&queue, &mut enc, &mvp, cam.eye_f32(), DisplayMode::ShadedEdges);
++    queue.submit([enc.finish()]);
++    let (rgba, w, h) = view.snapshot_rgba(&device, &queue)?;
++    assert_eq!((w, h), (SIDE, SIDE));
++    Some(rgba)
++}
++
++fn is_red(img: &[u8], x: i32, y: i32) -> bool {
++    if x < 0 || y < 0 || x >= SIDE as i32 || y >= SIDE as i32 {
++        return false;
++    }
++    let i = ((y as u32 * SIDE + x as u32) * 4) as usize;
++    let (r, g, b) = (i32::from(img[i]), i32::from(img[i + 1]), i32::from(img[i + 2]));
++    r > g + 100 && r > b + 100
++}
++
++fn red_count(img: &[u8]) -> usize {
++    (0..SIDE as i32).flat_map(|y| (0..SIDE as i32).map(move |x| (x, y))).filter(|(x, y)| is_red(img, *x, *y)).count()
++}
++
++/// Where `p` lands in the frame, in pixels (the mvp is column-major).
++fn pixel(cam: &Camera, p: [f32; 3]) -> [f32; 2] {
++    let m = cam.mvp(1.0);
++    let c: [f32; 4] = std::array::from_fn(|r| m[0][r] * p[0] + m[1][r] * p[1] + m[2][r] * p[2] + m[3][r]);
++    let s = SIDE as f32;
++    [(c[0] / c[3] * 0.5 + 0.5) * s, (0.5 - c[1] / c[3] * 0.5) * s]
++}
++
++fn red_at(img: &[u8], at: [f32; 2]) -> bool {
++    is_red(img, at[0].floor() as i32, at[1].floor() as i32)
++}
++
++fn tilted() -> Camera {
++    Camera { target: [0.0, 0.0, 0.0], yaw: 0.9, pitch: 0.5, dist: 80.0, ..Camera::default() }
++}
++
++#[test]
++fn a_line_on_a_face_keeps_its_full_width() {
++    let line = seg([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0]);
++    let cam = tilted();
++    let Some(free) = frame(&[], &line, &cam, 6.0, 1) else { return };
++    let Some(on_face) = frame(&[floor(30.0)], &line, &cam, 6.0, 1) else { return };
++    let (free, on_face) = (red_count(&free), red_count(&on_face));
++    assert!(free > 300, "a 6 px line over ~100 px paints a band: {free}");
++    // Without the lift the face's depth hid about half the band.
++    assert!(on_face * 10 >= free * 9, "the band on the face ({on_face} px) is the free band ({free} px)");
++}
++
++#[test]
++fn the_line_width_setting_widens_the_band() {
++    let line = seg([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0]);
++    let cam = tilted();
++    let Some(thin) = frame(&[], &line, &cam, 2.0, 1) else { return };
++    let Some(wide) = frame(&[], &line, &cam, 6.0, 1) else { return };
++    let (thin, wide) = (red_count(&thin), red_count(&wide));
++    assert!(thin > 0 && wide >= thin * 2, "6 px paints at least twice 2 px: {thin} vs {wide}");
++}
++
++#[test]
++fn two_lines_that_meet_close_the_corner_and_do_not_reach_past_it() {
++    // Straight down, orthographic: the screen is the XY plane.
++    let cam = Camera {
++        target: [10.0, 10.0, 0.0],
++        yaw: 0.0,
++        pitch: std::f64::consts::FRAC_PI_2 - 1e-3,
++        dist: 60.0,
++        projection: ProjectionMode::Orthographic,
++        ..Camera::default()
++    };
++    let (a, b, c) = ([0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0, 20.0, 0.0]);
++    let mut lines = seg(a, b).to_vec();
++    lines.extend(seg(a, c));
++    let Some(img) = frame(&[], &lines, &cam, 6.0, 1) else { return };
++    let (pa, pb, pc) = (pixel(&cam, a), pixel(&cam, b), pixel(&cam, c));
++    let unit = |from: [f32; 2], to: [f32; 2]| {
++        let d = [to[0] - from[0], to[1] - from[1]];
++        let l = d[0].hypot(d[1]);
++        [d[0] / l, d[1] / l]
++    };
++    let (ab, ac) = (unit(pa, pb), unit(pa, pc));
++    let out = unit([0.0, 0.0], [-(ab[0] + ac[0]), -(ab[1] + ac[1])]);
++    let at = |p: [f32; 2], d: [f32; 2], k: f32| [p[0] + d[0] * k, p[1] + d[1] * k];
++    // Half width 3 px: the square end of each line fills the corner...
++    assert!(red_at(&img, at(pa, out, 2.0)), "the outer corner is closed");
++    // ...and stops there: nothing past the corner square or an end.
++    assert!(!red_at(&img, at(pa, out, 3.0 * std::f32::consts::SQRT_2 + 2.0)), "no overshoot past the corner");
++    assert!(red_at(&img, at(pb, ab, 1.5)), "an end reaches half the width past its point");
++    assert!(!red_at(&img, at(pb, ab, 5.5)), "and no further");
++}
++
++#[test]
++fn msaa_smooths_the_edges_that_one_sample_leaves_hard() {
++    let parts = [model_part(40.0)];
++    let cam = test_cam();
++    let Some(one) = frame(&parts, &[], &cam, 1.5, 1) else { return };
++    let Some(four) = frame(&parts, &[], &cam, 1.5, 4) else { return };
++    let (one, four) = (distinct_colors(&one), distinct_colors(&four));
++    assert!(four > one, "4x blends edge pixels into new shades: {one} colours at 1x, {four} at 4x");
++}
+diff --git a/crates/ui/tests/trace_composite.rs b/crates/ui/tests/trace_composite.rs
+index 843bb5b51..a6e781c51 100644
+--- a/crates/ui/tests/trace_composite.rs
++++ b/crates/ui/tests/trace_composite.rs
+@@ -8,6 +8,7 @@
+ //!
+ //! Gate map (M4.4): covers ui::trace::{eye, composite} and
+ //! viewport::View3D::render_with.
++//! #2958: the composite follows the pass's MSAA sample count.
+ 
+ use std::sync::Arc;
+ 
+@@ -69,7 +70,14 @@ fn centre(dev: &wgpu::Device, q: &wgpu::Queue, parts: &[GpuPart], traced: bool)
+ }
+ 
+ fn centre_with(dev: &wgpu::Device, q: &wgpu::Queue, parts: &[GpuPart], traced: bool, cpu: bool) -> [u8; 4] {
++    centre_at(dev, q, parts, traced, cpu, 1)
++}
++
++/// `centre_with` at `samples` per pixel (#2958): the viewport and the
++/// composite build their pipelines for the same count.
++fn centre_at(dev: &wgpu::Device, q: &wgpu::Queue, parts: &[GpuPart], traced: bool, cpu: bool, samples: u32) -> [u8; 4] {
+     let mut view = View3D::new(dev, FORMAT, W, H);
++    view.set_samples(dev, samples);
+     view.set_document(dev, q, parts);
+     let cam = Camera { target: [5.0, 5.0, 2.5], yaw: 0.9, pitch: 0.9, dist: 30.0, ..Camera::default() };
+     let mvp = cam.mvp(f64::from(W) / f64::from(H));
+@@ -77,6 +85,7 @@ fn centre_with(dev: &wgpu::Device, q: &wgpu::Queue, parts: &[GpuPart], traced: b
+     if cpu {
+         eye = eye.cpu_only();
+     }
++    eye.set_samples(dev, samples);
+     let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+     let fv = field_view();
+     if traced {
+@@ -182,3 +191,19 @@ fn the_cpu_fallback_paints_what_the_gpu_eye_paints() {
+     // lost, never a different picture.
+     assert!(gpu.iter().zip(cpu).all(|(a, b)| a.abs_diff(b) <= 8), "{gpu:?} vs {cpu:?}");
+ }
++
++/// #2958: with 4x anti-aliasing the composite draws into the multisample
++/// pass (its pipeline is built for the same count), and the traced stock
++/// paints as it does at one sample.
++#[test]
++fn the_traced_stock_paints_the_same_with_msaa() {
++    let Some((dev, q)) = device_and_queue() else {
++        eprintln!("trace_composite: no adapter - skipped");
++        return;
++    };
++    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
++    let one = centre_at(&dev, &q, &[stock_part()], true, false, 1);
++    let four = centre_at(&dev, &q, &[stock_part()], true, false, 4);
++    assert!(pollster::block_on(scope.pop()).is_none(), "the 4x pass validates");
++    assert!(close(one, four), "the traced stock paints the same at 4x: {one:?} vs {four:?}");
++}
+diff --git a/docs/decisions/2958-wide-overlay-lines.md b/docs/decisions/2958-wide-overlay-lines.md
+new file mode 100644
+index 000000000..368eb6108
+--- /dev/null
++++ b/docs/decisions/2958-wide-overlay-lines.md
+@@ -0,0 +1,37 @@
++## #2958 - Viewport overlay as wide anti-aliased lines, with MSAA
++
++**What was decided.**
++
++- The viewport overlay draws as screen-facing quads, one 32-byte instance for each segment (two f32x3 points and two RGBA8 colours). The vertex shader makes the six corners. The fragment shader fades the sides and the ends over one pixel. The old 1 px `LineList` overlay pipeline is removed.
++- The overlay includes toolpaths, height planes, region outlines, triads, the ground grid and the other overlay lines. All of these use the one width.
++- The default width is 1.5 pt, multiplied by the display's pixels per point. The choices are 1, 1.5, 2 and 3 pt.
++- Each wide-line vertex moves toward the eye by `LIFT_WIDTHS` = 3 line widths of world distance. The world size of one pixel comes from the `mvp` matrix, so the lift is correct in perspective and in orthographic projection.
++- Each end of a line extends half the line width past its point. Two lines that meet thus close the corner and do not overlap past it.
++- MSAA is a setting: Off, 2x or 4x. The default is 4x. All the viewport pipelines and the traced-stock composite use the same sample count. A change rebuilds the pipelines and the multisample and depth targets. The resolved colour target stays, so the egui texture stays bound.
++- The windowed shell requests `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` when the adapter has it, and reads the adapter's sample counts for the colour and depth formats. Without the feature, only WebGPU's guaranteed counts (1 and 4) are offered. The browser build always offers only 1 and 4.
++- An anti-aliasing row for a count that the device does not offer is disabled, and its hover text gives the reason. A queued pick of such a count is refused by name.
++- A kept count that the device does not offer falls back to the highest offered count below it. The status line says so once.
++- The two settings are per-user view settings in `view.json` (`app::view`), with the origin-name switch. They are not in `prefs.json`. They are not on the undo history and do not make the document unsaved, the same as the theme.
++- The rows are in the Theme door, under "Colour vision", as the groups "Line width" and "Anti-aliasing".
++
++**Why.**
++
++- A `wgpu` line is always one hardware pixel wide and has no anti-aliasing. Toolpaths were hard to see next to the 3 px egui triad (#195).
++- 2 pt and more made the dense paths into one solid area when the camera is far. Thus the default is 1.5 pt.
++- Without the lift, half of a wide line that lies on a face failed the depth test. In the pinning test, 292 px were visible on the face against 628 px for the same line in the air.
++- An instanced segment uses 32 bytes against 48 for the old vertex pair. At the overlay limit (512k segments) this is 16 MiB against 24 MiB.
++- For the fallback, a lower count never uses more memory than the user asked for.
++- `view.json` already holds the viewport's look (the origin names). `prefs.json` was already past the 400-line file limit.
++
++**Considered and dropped.**
++
++- Draw the paths with the egui painter, as the triad is drawn. This loses the depth test and is slow on large toolpaths.
++- Six full vertices for each segment (the trial). This needed approximately 135 MB at the overlay limit.
++- A per-line width class for the ground grid. The grid already fades at its rim, so it uses the one width. This can be added later with a byte in the instance colour.
++- A fallback to a higher sample count. This uses more memory than the user asked for.
++
++**Cost to change later.**
++
++- The width and the lift are uniforms and constants in `viewport/wide.rs`.
++- A new sample count is one row in `Antialias` and one check in `offered_samples`.
++- The file words are `"1"`, `"1.5"`, `"2"`, `"3"` and `"Off"`, `"2x"`, `"4x"`. A word that the build does not know reads as the default.
+diff --git a/site/content/guide/getting-started/first-run.md b/site/content/guide/getting-started/first-run.md
+index 7c6ddf4f1..23cb2f212 100644
+--- a/site/content/guide/getting-started/first-run.md
++++ b/site/content/guide/getting-started/first-run.md
+@@ -83,6 +83,14 @@ clearly in both Horizon Day and Teal Night. Browser rows, their eye
+ toggles and context-menu rows carry accessibility labels, so a screen
+ reader or an automated test can name them.
+ 
++The **Theme** list also sets how the viewport draws its lines.
++**Line width** (1, 1.5, 2 or 3 pt; 1.5 is the default) sets the width of
++toolpaths, height planes, outlines and axes. **Anti-aliasing** (Off, 2x
++or 4x; 4x is the default) smooths the edges of lines and models. 4x uses
++more graphics memory; turn it down on a slow integrated graphics chip.
++A count that the graphics device does not offer shows as unavailable.
++Both choices are kept for the next start.
++
+ ## A first toolpath
+ 
+ 1. **Import a model.** Click {{ <icon name="folder-open" /> }} **Model** and pick an STL, OBJ or STEP file. If
