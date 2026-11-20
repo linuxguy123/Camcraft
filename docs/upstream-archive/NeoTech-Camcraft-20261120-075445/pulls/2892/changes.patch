@@ -1,0 +1,1596 @@
+From cf336a22511a789bdcc84fc5d6299a575655fae8 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Fri, 20 Nov 2026 08:01:33 +0100
+Subject: [PATCH] fix(post): refuse Fanuc G76 when the start point is above
+ material
+
+Carry `start_in_air` on `cl::ThreadCycle`, serialize it as optional
+`AIR 1` on `THREAD` records (absent reads false), and expose it to post
+scripts as `StartInAir`.
+
+Compute `start_in_air` across the full rapid-infeed axial band against
+the revolved part, stock and prior turning, grooving, facing and
+drilling operations. Refuse G76 by name in `assets/posts/fanuc-lathe.cps`
+when `StartInAir !== true` so the control never moves the insert into
+material at rapid traverse.
+
+Allow `turning::thread` to start a pass in free air in front of a free
+end face and stop `revolve::lattice` from re-adding out-of-domain window
+endpoints after `retain`.
+
+Fixes #2878
+---
+ assets/posts/fanuc-lathe.cps                  |  13 +-
+ crates/app/src/operation/g76_start.rs         | 339 ++++++++++++++++++
+ crates/app/src/operation/generate.rs          |   7 +-
+ crates/app/src/operation/mod.rs               |   1 +
+ .../app/src/operation/turning_rapids_tests.rs |   2 +-
+ crates/app/src/project/thread_dto.rs          |   6 +
+ crates/app/src/rest/ahead.rs                  |  14 +
+ crates/app/src/rest/pilots.rs                 |   4 +-
+ crates/app/tests/common/g76.rs                |  14 +-
+ crates/app/tests/fanuc_lathe_inch/mod.rs      |  22 +-
+ .../tests/golden/nc/fanuc-lathe/thread_g76.nc |   2 +-
+ .../golden/nc/fanuc-lathe/thread_g76_area.nc  |   2 +-
+ .../golden/nc/inch/fanuc-lathe/thread_g76.nc  |   2 +-
+ crates/app/tests/lathe_post_g76.rs            |  41 +--
+ crates/app/tests/lathe_post_g76_schedule.rs   |   4 +-
+ crates/app/tests/lathe_post_g76_start.rs      | 336 +++++++++++++++++
+ crates/app/tests/lathe_post_inch.rs           |   4 +-
+ crates/app/tests/lathe_post_tormach_thread.rs |   5 +-
+ crates/cl/src/cl/thread.rs                    |   7 +
+ crates/motion/src/turning/mod.rs              |   1 +
+ crates/motion/src/turning/revolve.rs          |   4 -
+ crates/motion/src/turning/thread.rs           |  11 +-
+ crates/motion/src/turning/thread_cycle.rs     |  61 +++-
+ crates/motion/tests/turning_thread_cycle.rs   |  48 +++
+ crates/post/src/post/cnc_thread.rs            |  15 +-
+ crates/post/tests/inverted_post.rs            |   1 +
+ crates/post/tests/recorded_streams.rs         |   1 +
+ docs/decisions/2878-fanuc-g76-start-in-air.md |  20 ++
+ 28 files changed, 930 insertions(+), 57 deletions(-)
+ create mode 100644 crates/app/src/operation/g76_start.rs
+ create mode 100644 crates/app/tests/lathe_post_g76_start.rs
+ create mode 100644 docs/decisions/2878-fanuc-g76-start-in-air.md
+
+diff --git a/assets/posts/fanuc-lathe.cps b/assets/posts/fanuc-lathe.cps
+index 4852bfbff..32c4f728a 100644
+--- a/assets/posts/fanuc-lathe.cps
++++ b/assets/posts/fanuc-lathe.cps
+@@ -155,7 +155,11 @@ explainBlockMax = 80;
+ //    verified), and a record the cycle cannot state - alternating
+ //    flank infeed, a one-pass thread, every roughing depth cut twice
+ //    (issue #418: the cycle cuts each depth once), chip-break dips
+-//    (issue #419: a cycle states no dip) - is refused by name.
++//    (issue #419: a cycle states no dip), or a start point above
++//    material (issue #2878: the control rapids to each pass's depth
++//    at the start Z, so the start must stand in free air in front of
++//    the end face or in a relief groove wider than the insert) - is
++//    refused by name.
+ //    The control reads the ROUNDED words, so d is derived from their own
+ //    ladder (g76Allowance): the allowance that makes the rounded Q, Q, P
+ //    cut the record's rough pass count, nearest the record's allowance
+@@ -947,6 +951,13 @@ function g76Why(p, r0, r1) {
+   if (rev !== spinRev) {
+     return "a " + p.Hand + "-hand thread cut " + (p.EndZ < p.Z ? "toward" : "away from") + " the chuck needs " + (rev ? "M04" : "M03") + ", the section's spindle runs " + (spinRev ? "M04" : "M03");
+   }
++  // #2878: a Fanuc-type G76 rapids from the start point to each pass's
++  // depth. If the start point stands above material (not in free air
++  // in front of the end face or in a relief groove wider than the
++  // insert), refuse the cycle by name and never write it.
++  if (p.StartInAir !== true) {
++    return "the start point is above material (G76 moves the insert to pass depth at rapid traverse) - start the thread in free air in front of the end face or in a relief groove wider than the insert, regenerate the operation, or choose G32 passes";
++  }
+   return null;
+ }
+ 
+diff --git a/crates/app/src/operation/g76_start.rs b/crates/app/src/operation/g76_start.rs
+new file mode 100644
+index 000000000..2ad13f60b
+--- /dev/null
++++ b/crates/app/src/operation/g76_start.rs
+@@ -0,0 +1,339 @@
++//! Issue #2878: Fanuc G76 free-air start check in the meridian plane against the revolved part, remaining stock and prior turning ops - the rapid-infeed behaviour from public Fanuc lathe programming manuals read onto our own meridian outline; no vendor material consulted.
++
++use crate::cl::{MoveKind, ThreadCycle, Toolpath};
++use crate::turning::profile::Frame;
++use crate::turning::{cycle_infeed_band, part_band_clear};
++
++use super::drill_prior::PriorCell;
++use super::turning_credit::{pilots, Pilot};
++use super::turning_outline::Revolved;
++use super::turning_rapids::{faced_end, kerf_of, seg_dist, Meridian, SignedMeridian};
++use super::OpParams;
++
++/// Step cap for sampling the rapid-infeed band against remaining stock (mm).
++const SAMPLE_STEP: f64 = 0.1;
++/// Hard ceiling on samples per axis so degenerate spans never hang.
++const MAX_STEPS: usize = 2000;
++/// Grazing tolerance matching `revolve::HAIR`.
++const HAIR: f64 = 1e-9;
++
++/// One prior turning feed move in the meridian, carrying either a nose
++/// circle (turning / boring insert) or a blade band (grooving blade).
++struct AheadCut {
++    p: (f64, f64),
++    q: (f64, f64),
++    nose: f64,
++    band: f64,
++}
++
++impl AheadCut {
++    /// Whether this prior cut removed material at `(s, r)` (`r >= 0`).
++    fn removed(&self, s: f64, r: f64, margin: f64) -> bool {
++        if self.band > 0.0 {
++            let (s_lo, s_hi) = (self.p.0.min(self.q.0), self.p.0.max(self.q.0));
++            let r_tip = self.p.1.abs().min(self.q.1.abs());
++            return s >= s_lo - self.band - HAIR
++                && s <= s_hi + self.band + HAIR
++                && r >= r_tip - margin;
++        }
++        if self.nose > 0.0 {
++            let reach = self.nose + margin;
++            return seg_dist((s, r), self.p, self.q) <= reach
++                || seg_dist((s, -r), self.p, self.q) <= reach;
++        }
++        false
++    }
++}
++
++/// Refine every [`ThreadCycle::start_in_air`] flag on a generated Threading
++/// path against the revolved part, the setup's stock and every prior op's
++/// cut (Facing, Grooving, Turning, Drilling). Non-threading operations and
++/// paths without thread records are left untouched.
++pub(super) fn judge(
++    params: &OpParams,
++    path: &mut Toolpath,
++    cx: &Meridian,
++    prior: &mut PriorCell,
++) {
++    let OpParams::Threading { tolerance, .. } = params else {
++        return;
++    };
++    if path.threads.is_empty() {
++        return;
++    }
++    let insert_width = cx.band * 2.0;
++    let Ok(frame) = Frame::about(cx.part) else {
++        for rec in &mut path.threads {
++            rec.start_in_air = false;
++        }
++        return;
++    };
++    let sm = SignedMeridian::of(&frame, path);
++    let stock = match cx.stock {
++        Some(facets) => match Revolved::of(facets, &frame) {
++            Some(rev) => Some(rev),
++            // Unreadable stock is treated as solid (Prime Directive).
++            None => {
++                for rec in &mut path.threads {
++                    rec.start_in_air = false;
++                }
++                return;
++            }
++        },
++        None => None,
++    };
++    let mut cap_cell: Option<Option<f64>> = None;
++    let pilot_cuts = pilots(cx.drills, &sm);
++    for rec in &mut path.threads {
++        rec.start_in_air = record_in_air(
++            rec,
++            insert_width,
++            *tolerance,
++            &frame,
++            &sm,
++            stock.as_ref(),
++            &pilot_cuts,
++            &mut cap_cell,
++            prior,
++            cx,
++        );
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn record_in_air(
++    rec: &ThreadCycle,
++    insert_width: f64,
++    tol: f64,
++    frame: &Frame,
++    sm: &SignedMeridian,
++    stock: Option<&Revolved>,
++    pilot_cuts: &[Pilot],
++    cap_cell: &mut Option<Option<f64>>,
++    prior: &mut PriorCell,
++    cx: &Meridian,
++) -> bool {
++    let Some((band_lo, band_hi)) = cycle_infeed_band(frame, rec, insert_width) else {
++        return false;
++    };
++    let root = rec.minor_diameter * 0.5;
++    if !(root.is_finite() && root >= 0.0) {
++        return false;
++    }
++    // 1. The finished part itself must have no material above `root`
++    //    anywhere in the rapid-infeed band.
++    if !part_band_clear(cx.part, frame, tol, band_lo, band_hi, root) {
++        return false;
++    }
++    // 2. When stock is present, every point of the stock standing above
++    //    `root` inside `[band_lo, band_hi]` must have been cleared by a
++    //    prior Facing, Grooving, Turning or Drilling operation.
++    let Some(stock) = stock else {
++        return true;
++    };
++    let ahead_cuts: Vec<AheadCut> = cx
++        .ahead
++        .iter()
++        .flat_map(|a| {
++            a.moves.iter().filter(|m| m.kind != MoveKind::Rapid).filter_map(move |m| {
++                let (p, q) = kerf_of(m, sm, cx.z_tol)?;
++                let reach = a.band.max(a.nose) + cx.margin;
++                let (lo, hi) = (p.0.min(q.0) - reach, p.0.max(q.0) + reach);
++                (hi >= band_lo && lo <= band_hi).then_some(AheadCut { p, q, nose: a.nose, band: a.band })
++            })
++        })
++        .collect();
++    let s_span = (band_hi - band_lo).max(0.0);
++    let sn = ((s_span / SAMPLE_STEP).ceil() as usize).clamp(4, MAX_STEPS);
++    for i in 0..=sn {
++        let s = band_lo + s_span * (i as f64) / (sn as f64);
++        let (_, outer) = stock.annulus(s);
++        if outer <= root + HAIR {
++            continue;
++        }
++        // Only simulate prior ops if raw stock stands in the band.
++        let cap = *cap_cell.get_or_insert_with(|| faced_end(prior, frame, sm, cx));
++        if cap.is_some_and(|c| s >= c + cx.margin) {
++            continue;
++        }
++        let r_span = (outer - root).max(0.0);
++        let rn = ((r_span / SAMPLE_STEP).ceil() as usize).clamp(4, MAX_STEPS);
++        for j in 0..=rn {
++            let r = root + r_span * (j as f64) / (rn as f64);
++            if !stock.solid(s, r, 0.0) {
++                continue;
++            }
++            if pilot_cuts.iter().any(|p| p.removed(s, r)) {
++                continue;
++            }
++            if ahead_cuts.iter().any(|c| c.removed(s, r, cx.margin)) {
++                continue;
++            }
++            return false;
++        }
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::cl::{Move, ThreadHand};
++    use crate::geometry::{Point3, Triangle};
++    use crate::rest::TurnedAhead;
++
++    fn revolve(m: &[(f64, f64)]) -> Vec<Triangle> {
++        let v = |j: usize, r: f64, z: f64| {
++            let th = std::f64::consts::TAU * j as f64 / 16.0;
++            Point3::new(r * th.cos(), r * th.sin(), z)
++        };
++        let mut t = Vec::new();
++        for w in m.windows(2) {
++            let ((ra, za), (rb, zb)) = (w[0], w[1]);
++            for j in 0..16 {
++                let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++                if ra <= 1e-12 {
++                    t.push(Triangle::new(a1, b2, b1));
++                } else if rb <= 1e-12 {
++                    t.push(Triangle::new(a1, a2, b2));
++                } else {
++                    t.push(Triangle::new(a1, a2, b2));
++                    t.push(Triangle::new(a1, b2, b1));
++                }
++            }
++        }
++        t
++    }
++
++    fn cycle_at(start_z: f64, end_z: f64, infeed_angle: f64) -> ThreadCycle {
++        ThreadCycle {
++            start: Point3::new(6.05, 0.0, start_z),
++            end: Point3::new(4.8, 0.0, end_z),
++            major_diameter: 12.0,
++            minor_diameter: 9.6,
++            lead: 2.0,
++            height: 1.2,
++            first_depth: 0.4,
++            min_depth: 0.4,
++            finish_allowance: 0.4,
++            infeed_angle,
++            spring_passes: 0,
++            pull_out: 0.0,
++            alternating: false,
++            repeat_each_depth: false,
++            chip_break_dips: false,
++            first: 0,
++            last: 0,
++            hand: ThreadHand::Right,
++            start_in_air: false,
++        }
++    }
++
++    fn eval(part: &[Triangle], stock: Option<&[Triangle]>, ahead: &[TurnedAhead], rec: ThreadCycle, width: f64) -> bool {
++        let mut path = Toolpath::new(vec![Move {
++            kind: MoveKind::Rapid,
++            from: Point3::new(6.05, 0.0, 24.0),
++            to: rec.start,
++            feed: None,
++            arc: None,
++            axis: None,
++            rotary: None,
++        }]);
++        path.threads.push(rec);
++        let cx = Meridian {
++            part,
++            stock,
++            nose: 0.0,
++            margin: 0.02,
++            z_tol: 1e-3,
++            drills: &[],
++            band: width * 0.5,
++            body: None,
++            ahead,
++            outward: Some((30.0_f64).to_radians().tan()),
++        };
++        let params = OpParams::Threading {
++            tolerance: 0.05,
++            clearance_z: crate::operation::Height::fixed(24.0),
++            top_z: crate::operation::Height::fixed(16.0),
++            bottom_z: crate::operation::Height::fixed(8.0),
++            pitch: 2.0,
++            depth: 1.2,
++            infeed: 0.4,
++            feed: 120.0,
++            plunge_feed: 40.0,
++            infeed_plan: Default::default(),
++            hand: ThreadHand::Right,
++        };
++        let mut prior = PriorCell::new(None);
++        judge(&params, &mut path, &cx, &mut prior);
++        path.threads[0].start_in_air
++    }
++
++    #[test]
++    fn relief_groove_wider_than_insert_passes_when_grooved_and_refuses_when_uncut_or_narrow() {
++        // Bar Ø12 from -26..40 with a relief groove [12.5, 15.5] (3 mm wide)
++        // down to R=4.5 (<= root 4.8); insert is 1.732 mm wide centered at Z=14.0
++        // (band [13.134, 14.866]).
++        let wide_groove = revolve(&[
++            (0.0, -26.0), (6.0, -26.0), (6.0, 12.5), (4.5, 12.5),
++            (4.5, 15.5), (6.0, 15.5), (6.0, 40.0), (0.0, 40.0),
++        ]);
++        let raw_stock = revolve(&[(0.0, -26.0), (6.0, -26.0), (6.0, 40.0), (0.0, 40.0)]);
++        let rec = cycle_at(14.0, 8.0, 0.0);
++
++        // No stock: part relief groove alone is wider than insert and <= root -> clear.
++        assert!(eval(&wide_groove, None, &[], rec, 1.732), "wide relief groove in part is clear");
++
++        // Raw Ø12 stock without prior Groove op -> uncut stock stands in the groove -> refused.
++        assert!(!eval(&wide_groove, Some(&raw_stock), &[], rec, 1.732), "uncut stock in relief groove must refuse");
++
++        // Prior GrooveFinish op with 3.0 mm blade (band 1.5) plunging to R=4.5 at Z=14.0 -> clear.
++        let groove_cut = [TurnedAhead {
++            nose: 0.0,
++            band: 1.5,
++            moves: vec![Move {
++                kind: MoveKind::Feed,
++                from: Point3::new(6.05, 0.0, 14.0),
++                to: Point3::new(4.5, 0.0, 14.0),
++                feed: Some(60.0),
++                arc: None,
++                axis: None,
++                rotary: None,
++            }],
++        }];
++        assert!(
++            eval(&wide_groove, Some(&raw_stock), &groove_cut, rec, 1.732),
++            "wide relief groove cleared by prior Groove op must pass"
++        );
++
++        // Narrow relief groove [13.5, 14.5] (1 mm wide < 1.732 mm insert) -> refused.
++        let narrow_groove = revolve(&[
++            (0.0, -26.0), (6.0, -26.0), (6.0, 13.5), (4.5, 13.5),
++            (4.5, 14.5), (6.0, 14.5), (6.0, 40.0), (0.0, 40.0),
++        ]);
++        assert!(!eval(&narrow_groove, None, &[], rec, 1.732), "relief groove narrower than insert must refuse");
++
++        // Shallow relief groove [12.5, 15.5] at R=5.2 (> root 4.8) -> refused.
++        let shallow_groove = revolve(&[
++            (0.0, -26.0), (6.0, -26.0), (6.0, 12.5), (5.2, 12.5),
++            (5.2, 15.5), (6.0, 15.5), (6.0, 40.0), (0.0, 40.0),
++        ]);
++        assert!(!eval(&shallow_groove, None, &[], rec, 1.732), "relief groove shallower than root must refuse");
++    }
++
++    #[test]
++    fn flank_infeed_refuses_when_deep_pass_overlaps_end_face() {
++        // Bar ends at Z=14.693. With 55-degree flank angle, height=1.2 shifts
++        // the deepest pass by 1.2 * tan(27.5 deg) = 0.625 mm toward -Z.
++        let bar = revolve(&[(0.0, -26.0), (6.0, -26.0), (6.0, 14.693), (0.0, 14.693)]);
++        // Start A at Z=15.8 (itself clear of 14.693 with half=0.866 -> 14.934),
++        // but deepest pass enters at 15.8 - 0.625 = 15.175 -> band_lo = 14.309 < 14.693!
++        let overlaps = cycle_at(15.8, 8.0, 55.0);
++        assert!(!eval(&bar, Some(&bar), &[], overlaps, 1.732), "flank pass overlapping end face must refuse");
++
++        // Start A at Z=16.625 -> deepest pass enters at 16.0 -> band_lo = 15.134 > 14.693!
++        let clear = cycle_at(16.625, 8.0, 55.0);
++        assert!(eval(&bar, Some(&bar), &[], clear, 1.732), "flank pass clear of end face must pass");
++    }
++}
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index fbff32a96..314359cdf 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -3101,7 +3101,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     // #339 slice 5: an upright mill's links are planned over the steel -
+     // a struck link rises over it, an unclearable one refuses by name.
+     // Posed and rotary paths keep the report-only verdict below.
+-    let path = if frame.is_none() && rotary_axis.is_none() && is_mill && !lathe_tool {
++    let mut path = if frame.is_none() && rotary_axis.is_none() && is_mill && !lathe_tool {
+         let named: Vec<_> = fixture_names.into_iter().zip(fixture_boxes.iter().copied()).collect();
+         let stack = verify::steel_stack(&geom, &holder, spindle);
+         let steel = super::fixture_route::LinkSteel { boxes: &named, stack: &stack, ceiling: z_ceiling };
+@@ -3308,6 +3308,11 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                 }),
+             };
+             super::turning_rapids::judge_axial_rapids(&params, &path, &meridian, &mut verify_prior, &mut warns);
++            // #2878: a Fanuc-type G76 moves to each pass's depth at rapid
++            // traverse, so record whether the start band stands in free air
++            // (in front of the end face or in a relief groove wider than
++            // the insert) against the part, stock and prior cuts.
++            super::g76_start::judge(&params, &mut path, &meridian, &mut verify_prior);
+             // ...and a boring bar's head and shank on its FEEDS (#146),
+             // against the same revolved material at each instant.
+             super::turning_feeds::judge_bar_feeds(&params, &path, &meridian, &mut verify_prior, &mut warns);
+diff --git a/crates/app/src/operation/mod.rs b/crates/app/src/operation/mod.rs
+index da93c922d..1970f83df 100644
+--- a/crates/app/src/operation/mod.rs
++++ b/crates/app/src/operation/mod.rs
+@@ -244,6 +244,7 @@ mod tap_core;
+ pub use clearance_stock::{CLEARANCE_STOCK_WARNING, creation_advice as clearance_in_stock_advice};
+ pub use top_stock::{CARRIED_STOCK_NOTE, TOP_STOCK_WARNING};
+ mod turning_credit;
++mod g76_start;
+ mod turning_axis;
+ mod turning_feeds;
+ mod turning_holder;
+diff --git a/crates/app/src/operation/turning_rapids_tests.rs b/crates/app/src/operation/turning_rapids_tests.rs
+index 9f2f52632..50efaedbf 100644
+--- a/crates/app/src/operation/turning_rapids_tests.rs
++++ b/crates/app/src/operation/turning_rapids_tests.rs
+@@ -271,7 +271,7 @@ fn a_banded_rapid_just_under_an_earlier_face_cut_is_convicted() {
+     };
+     let p = Point3::new;
+     let (part, stock) = (cylinder(6.0, -60.0, 10.0), cylinder(10.0, -60.0, 16.0));
+-    let ahead = [crate::rest::TurnedAhead { nose: 0.8, moves: vec![mv(MoveKind::Feed, p(11.0, 0.0, 15.8), p(0.0, 0.0, 15.8))] }];
++    let ahead = [crate::rest::TurnedAhead { nose: 0.8, band: 0.0, moves: vec![mv(MoveKind::Feed, p(11.0, 0.0, 15.8), p(0.0, 0.0, 15.8))] }];
+     let judge = |c: f64| {
+         let path = Toolpath {
+             moves: vec![mv(MoveKind::Rapid, p(8.0, 0.0, 25.0), p(8.0, 0.0, c))],
+diff --git a/crates/app/src/project/thread_dto.rs b/crates/app/src/project/thread_dto.rs
+index b6929e7f0..59fc104b2 100644
+--- a/crates/app/src/project/thread_dto.rs
++++ b/crates/app/src/project/thread_dto.rs
+@@ -63,6 +63,10 @@ pub struct ThreadCycleDto {
+     /// #419: absent (and written only when set) is no chip-break dips.
+     #[serde(default, skip_serializing_if = "is_false")]
+     pub chip_break_dips: bool,
++    /// #2878: absent (and written only when set) is not proven clear for
++    /// a Fanuc G76 rapid infeed - older caches refuse G76 until regenerated.
++    #[serde(default, skip_serializing_if = "is_false")]
++    pub start_in_air: bool,
+     pub first: u64,
+     pub last: u64,
+     /// The hand the passes cut (#629); absent reads right.
+@@ -91,6 +95,7 @@ impl ThreadCycleDto {
+             alternating: t.alternating,
+             repeat_each_depth: t.repeat_each_depth,
+             chip_break_dips: t.chip_break_dips,
++            start_in_air: t.start_in_air,
+             first: t.first as u64,
+             last: t.last as u64,
+             hand: t.hand.into(),
+@@ -117,6 +122,7 @@ impl ThreadCycleDto {
+             alternating: self.alternating,
+             repeat_each_depth: self.repeat_each_depth,
+             chip_break_dips: self.chip_break_dips,
++            start_in_air: self.start_in_air,
+             first: usize::try_from(self.first).unwrap_or(usize::MAX),
+             last: usize::try_from(self.last).unwrap_or(usize::MAX),
+             hand: self.hand.into(),
+diff --git a/crates/app/src/rest/ahead.rs b/crates/app/src/rest/ahead.rs
+index e75ded7a7..997ff3a4e 100644
+--- a/crates/app/src/rest/ahead.rs
++++ b/crates/app/src/rest/ahead.rs
+@@ -39,6 +39,9 @@ pub(super) struct Ahead {
+     /// (tip = centre - nose) - the insert's real cutting edge, never
+     /// the flat disc of its whole size. Only [`super::PriorPlan`] reads it.
+     pub(super) nose: Option<f64>,
++    /// Half-width of a grooving blade ahead (#2878): credits the relief
++    /// groove a prior Groove op cut out of stock.
++    pub(super) band: f64,
+     pub(super) cut: bool,
+     pub(super) moves: Vec<Move>,
+     /// The operation's effective setup (#318: the chain across setups
+@@ -152,6 +155,12 @@ fn collect(world: &World, name: &str, with_moves: bool, keep: impl Fn(&Option<St
+                 .filter(|t| matches!(t.kind, crate::tools::ToolKind::Turning | crate::tools::ToolKind::Bore))
+                 .map(|t| t.nose_radius)
+                 .filter(|n| n.is_finite() && *n > 0.0),
++            band: tool
++                .as_ref()
++                .filter(|t| t.kind == crate::tools::ToolKind::Groove)
++                .map(|t| t.width * 0.5)
++                .filter(|b| b.is_finite() && *b > 0.0)
++                .unwrap_or(0.0),
+             cut,
+             moves,
+             setup,
+@@ -199,6 +208,11 @@ pub(super) fn digest_of(ahead: &[Ahead]) -> u64 {
+                 h.write_u8(3);
+                 h.write(&n.to_bits().to_le_bytes());
+             }
++            // A grooving blade's width is atom too (#2878).
++            if a.band > 0.0 {
++                h.write_u8(4);
++                h.write(&a.band.to_bits().to_le_bytes());
++            }
+         } else {
+             h.write_u8(0);
+         }
+diff --git a/crates/app/src/rest/pilots.rs b/crates/app/src/rest/pilots.rs
+index 3481a4f79..84d344fb0 100644
+--- a/crates/app/src/rest/pilots.rs
++++ b/crates/app/src/rest/pilots.rs
+@@ -26,6 +26,8 @@ pub struct DrillAhead {
+ /// alone (less removed, never more).
+ pub struct TurnedAhead {
+     pub nose: f64,
++    /// Half-width of a grooving blade (#2878); 0 for non-blade tools.
++    pub band: f64,
+     pub moves: Vec<Move>,
+ }
+ 
+@@ -37,7 +39,7 @@ pub fn turned_ahead(world: &World, name: &str, setup: Option<&str>) -> Vec<Turne
+     ahead_of(world, name, setup, true)
+         .into_iter()
+         .filter(|a| a.cut && a.kind.info().family() == crate::operation::Family::Turn)
+-        .map(|a| TurnedAhead { nose: a.nose.unwrap_or(0.0), moves: a.moves })
++        .map(|a| TurnedAhead { nose: a.nose.unwrap_or(0.0), band: a.band, moves: a.moves })
+         .collect()
+ }
+ 
+diff --git a/crates/app/tests/common/g76.rs b/crates/app/tests/common/g76.rs
+index af0478661..09d756178 100644
+--- a/crates/app/tests/common/g76.rs
++++ b/crates/app/tests/common/g76.rs
+@@ -55,11 +55,12 @@ pub fn revolve(meridian: &[(f64, f64)]) -> Mesh {
+     Mesh::from_facets(facets)
+ }
+ 
+-/// Wall r 6, a 60-degree V every 2.0 from z 8 to z 14, 1.2 deep.
++/// Wall r 6, a 60-degree V every 2.0 from z 8 to z 14, 1.2 deep, ending
++/// at the free face z 14 + half so G76 starts at z 16 in free air (#2878).
+ pub fn threaded() -> Mesh {
+     let half = DEPTH * (30.0_f64).to_radians().tan();
+     let root = MAJOR - DEPTH;
+-    let mut m = vec![(0.0, -16.0), (MAJOR, -16.0), (MAJOR, 8.0 - half)];
++    let mut m = vec![(0.0, -26.0), (MAJOR, -26.0), (MAJOR, 8.0 - half)];
+     let mut c = 8.0;
+     while c <= 14.0 + 1e-9 {
+         m.push((root, c));
+@@ -69,7 +70,7 @@ pub fn threaded() -> Mesh {
+         }
+         c += PITCH;
+     }
+-    m.extend([(MAJOR, 14.0 + half), (MAJOR, 40.0), (0.0, 40.0)]);
++    m.push((0.0, 14.0 + half));
+     revolve(&m)
+ }
+ 
+@@ -78,8 +79,9 @@ pub fn threaded() -> Mesh {
+ pub fn g76_world(infeed: f64, plan: ThreadInfeed) -> World {
+     let world = new_world();
+     let mut history = History::default();
+-    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
+-    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: 56.0 }, at);
++    let end_z = 14.0 + DEPTH * (30.0_f64).to_radians().tan();
++    let at = Location { pos: Point3::new(0.0, 0.0, -26.0), ..Location::default() };
++    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: end_z + 26.0 }, at);
+     history.execute(&world, cmd.expect("bar stock"));
+     let lathe = Machine {
+         model: "TestBench lathe".into(),
+@@ -97,7 +99,7 @@ pub fn g76_world(infeed: f64, plan: ThreadInfeed) -> World {
+     let params = OpParams::Threading {
+         tolerance: 0.05,
+         clearance_z: Height::fixed(24.0),
+-        top_z: Height::fixed(14.3),
++        top_z: Height::fixed(16.3),
+         bottom_z: Height::fixed(7.7),
+         pitch: PITCH,
+         depth: DEPTH,
+diff --git a/crates/app/tests/fanuc_lathe_inch/mod.rs b/crates/app/tests/fanuc_lathe_inch/mod.rs
+index 0f9292211..44465534f 100644
+--- a/crates/app/tests/fanuc_lathe_inch/mod.rs
++++ b/crates/app/tests/fanuc_lathe_inch/mod.rs
+@@ -193,7 +193,8 @@ fn thread(g76: bool, dips: bool) -> (World, PostOptions) {
+     let (major, pitch, depth) = (6.0, 2.0, 1.2);
+     let end: f64 = if dips { 24.0 } else { 14.0 };
+     let half = depth * (30.0_f64).to_radians().tan();
+-    let mut m = vec![(0.0, -16.0), (major, -16.0), (major, 8.0 - half)];
++    let z0 = if g76 { -26.0 } else { -16.0 };
++    let mut m = vec![(0.0, z0), (major, z0), (major, 8.0 - half)];
+     let mut c = 8.0;
+     while c <= end + 1e-9 {
+         m.push((major - depth, c));
+@@ -203,18 +204,25 @@ fn thread(g76: bool, dips: bool) -> (World, PostOptions) {
+         }
+         c += pitch;
+     }
+-    m.push((major, end + half));
+-    m.push((major, 40.0));
+-    m.push((0.0, 40.0));
+-    let stock = StockShape::Cylinder { diameter: 12.0, height: 56.0 };
+-    let (w, mut hi) = world(stock, -16.0, revolve(&m, 16), &["TD-1732-60"]);
++    let bar_top = if g76 {
++        // #2878: G76 starts in free air in front of the free end face.
++        end + half
++    } else {
++        m.push((major, end + half));
++        m.push((major, 40.0));
++        40.0
++    };
++    m.push((0.0, bar_top));
++    let stock = StockShape::Cylinder { diameter: 12.0, height: bar_top - z0 };
++    let (w, mut hi) = world(stock, z0, revolve(&m, 16), &["TD-1732-60"]);
+     let infeed_plan = if dips {
+         ThreadInfeed { dips: ThreadDips { interval: 4.0, height: 0.3, length: 0.0 }, ..ThreadInfeed::default() }
+     } else {
+         ThreadInfeed::default()
+     };
++    let top_z = if g76 { end + pitch + 0.3 } else { end + 0.3 };
+     let p = OpParams::Threading {
+-        tolerance: 0.05, clearance_z: h(end + 10.0), top_z: h(end + 0.3), bottom_z: h(7.7), pitch, depth,
++        tolerance: 0.05, clearance_z: h(end + 10.0), top_z: h(top_z), bottom_z: h(7.7), pitch, depth,
+         infeed: 0.4, feed: 120.0, plunge_feed: 40.0, hand: ThreadHand::Right, infeed_plan,
+     };
+     create(&w, &mut hi, "TH1", "TD-1732-60", p);
+diff --git a/crates/app/tests/golden/nc/fanuc-lathe/thread_g76.nc b/crates/app/tests/golden/nc/fanuc-lathe/thread_g76.nc
+index dd203ebfc..753daf881 100644
+--- a/crates/app/tests/golden/nc/fanuc-lathe/thread_g76.nc
++++ b/crates/app/tests/golden/nc/fanuc-lathe/thread_g76.nc
+@@ -8,7 +8,7 @@ T0101
+ G50 S12000
+ G97 S800 M03
+ M8
+-G00 X12.1 Z14.
++G00 X12.1 Z16.
+ G76 P010000 Q400 R0.4
+ G76 X9.6 Z8. P1200 Q400 F2.
+ G00 X12.1 Z24.
+diff --git a/crates/app/tests/golden/nc/fanuc-lathe/thread_g76_area.nc b/crates/app/tests/golden/nc/fanuc-lathe/thread_g76_area.nc
+index 362118fdd..93eafa804 100644
+--- a/crates/app/tests/golden/nc/fanuc-lathe/thread_g76_area.nc
++++ b/crates/app/tests/golden/nc/fanuc-lathe/thread_g76_area.nc
+@@ -8,7 +8,7 @@ T0101
+ G50 S12000
+ G97 S800 M03
+ M8
+-G00 X12.1 Z14.625
++G00 X12.1 Z16.625
+ G76 P020055 Q100 R0.05
+ G76 X9.6 Z8. P1200 Q400 F2.
+ G00 X12.1 Z24.
+diff --git a/crates/app/tests/golden/nc/inch/fanuc-lathe/thread_g76.nc b/crates/app/tests/golden/nc/inch/fanuc-lathe/thread_g76.nc
+index ab5e1ef2e..8a4778a8b 100644
+--- a/crates/app/tests/golden/nc/inch/fanuc-lathe/thread_g76.nc
++++ b/crates/app/tests/golden/nc/inch/fanuc-lathe/thread_g76.nc
+@@ -8,7 +8,7 @@ T0101
+ G50 S12000
+ G97 S800 M03
+ M8
+-G00 X0.4764 Z0.5512
++G00 X0.4764 Z0.6299
+ G76 P010000 Q157 R0.0158
+ G76 X0.378 Z0.315 P472 Q157 F0.07874
+ G00 X0.4764 Z0.9449
+diff --git a/crates/app/tests/lathe_post_g76.rs b/crates/app/tests/lathe_post_g76.rs
+index 2c8f5f30a..c03ad6663 100644
+--- a/crates/app/tests/lathe_post_g76.rs
++++ b/crates/app/tests/lathe_post_g76.rs
+@@ -66,11 +66,12 @@ fn revolve(meridian: &[(f64, f64)]) -> Mesh {
+ }
+ 
+ /// The app threading suite's bar: wall r 6, a 60-degree V every 2.0
+-/// from z 8 to z 14, 1.2 deep.
++/// from z 8 to z 14, 1.2 deep, ending at the free face z 14 + half so a
++/// G76 cycle starting at z 16 starts in free air (#2878).
+ fn threaded() -> Mesh {
+     let half = DEPTH * (30.0_f64).to_radians().tan();
+     let root = MAJOR - DEPTH;
+-    let mut m = vec![(0.0, -16.0), (MAJOR, -16.0), (MAJOR, 8.0 - half)];
++    let mut m = vec![(0.0, -26.0), (MAJOR, -26.0), (MAJOR, 8.0 - half)];
+     let mut c = 8.0;
+     while c <= 14.0 + 1e-9 {
+         m.push((root, c));
+@@ -80,9 +81,7 @@ fn threaded() -> Mesh {
+         }
+         c += PITCH;
+     }
+-    m.push((MAJOR, 14.0 + half));
+-    m.push((MAJOR, 40.0));
+-    m.push((0.0, 40.0));
++    m.push((0.0, 14.0 + half));
+     revolve(&m)
+ }
+ 
+@@ -95,8 +94,9 @@ fn thread_world() -> (World, History) {
+ fn thread_world_hand(hand: ThreadHand) -> (World, History) {
+     let world = new_world();
+     let mut history = History::default();
+-    let at = Location { pos: Point3::new(0.0, 0.0, -16.0), ..Location::default() };
+-    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: 56.0 }, at);
++    let end_z = 14.0 + DEPTH * (30.0_f64).to_radians().tan();
++    let at = Location { pos: Point3::new(0.0, 0.0, -26.0), ..Location::default() };
++    let cmd = SetStock::new(&world, camcraft_app::stock::StockShape::Cylinder { diameter: 12.0, height: end_z + 26.0 }, at);
+     history.execute(&world, cmd.expect("bar stock"));
+     let lathe = Machine {
+         model: "TestBench lathe".into(),
+@@ -114,7 +114,7 @@ fn thread_world_hand(hand: ThreadHand) -> (World, History) {
+     let params = OpParams::Threading {
+         tolerance: 0.05,
+         clearance_z: Height::fixed(24.0),
+-        top_z: Height::fixed(14.3),
++        top_z: Height::fixed(16.3),
+         bottom_z: Height::fixed(7.7),
+         pitch: PITCH,
+         depth: DEPTH,
+@@ -189,7 +189,7 @@ fn a_g76_thread_posts_to_the_lathe_golden() {
+     // the three passes verified. R0 had it rough to 1.2 and cut the
+     // root once more.
+     assert!(text.contains("M03\n") && !text.contains("M04"), "{text}");
+-    assert!(text.contains("G00 X12.1 Z14.\nG76 P010000 Q400 R0.4\n"), "{text}");
++    assert!(text.contains("G00 X12.1 Z16.\nG76 P010000 Q400 R0.4\n"), "{text}");
+     assert!(text.contains("G76 X9.6 Z8. P1200 Q400 F2.\n"), "{text}");
+     assert_eq!(text.matches("G76").count(), 2, "one two-block cycle: {text}");
+     assert!(!text.contains("G32"), "the passes are the control's now: {text}");
+@@ -236,8 +236,9 @@ fn the_thread_record_survives_the_round_trip() {
+     assert!((t.major_diameter - 12.0).abs() < 1e-6 && (t.minor_diameter - 9.6).abs() < 1e-6, "{t:?}");
+     assert!((t.lead - PITCH).abs() < 1e-12 && (t.height - DEPTH).abs() < 1e-6, "{t:?}");
+     assert!((t.first_depth - 0.4).abs() < 1e-6 && (t.min_depth - 0.4).abs() < 1e-6, "{t:?}");
+-    assert!((t.start.z - 14.0).abs() < 1e-6 && (t.end.z - 8.0).abs() < 1e-6, "{t:?}");
++    assert!((t.start.z - 16.0).abs() < 1e-6 && (t.end.z - 8.0).abs() < 1e-6, "{t:?}");
+     assert_eq!(t.hand, ThreadHand::Right);
++    assert!(t.start_in_air, "free-end start clears the face");
+     assert_eq!(path.moves[t.first].to, t.start);
+     assert!(t.last + 1 < path.moves.len(), "the out-rapid stays outside the span");
+     // The stream text: write, read, write again - identical, and the
+@@ -249,8 +250,8 @@ fn the_thread_record_survives_the_round_trip() {
+     let (a, b) = (thread_rec(&records), thread_rec(&back));
+     assert!((a.lead - b.lead).abs() < 1e-9 && (a.height - b.height).abs() < 1e-6, "{a:?} vs {b:?}");
+     assert!((a.end[2] - b.end[2]).abs() < 1e-6 && a.spring_passes == b.spring_passes);
+-    assert!(text.contains(" HAND right\n"), "the stream states the hand: {text}");
+-    assert_eq!((a.hand, b.hand), (ThreadHand::Right, ThreadHand::Right));
++    assert!(text.contains(" HAND right AIR 1\n"), "the stream states hand and air: {text}");
++    assert_eq!((a.hand, b.hand, a.start_in_air, b.start_in_air), (ThreadHand::Right, ThreadHand::Right, true, true));
+     // The project file: the cached record and the option both survive.
+     history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
+     let file = std::env::temp_dir().join(format!("camcraft-g76-{}.json", std::process::id()));
+@@ -262,7 +263,7 @@ fn the_thread_record_survives_the_round_trip() {
+     let loaded = camcraft_app::model::toolpath_of(&other, &e2).expect("cache").path;
+     assert_eq!(loaded.threads.len(), 1, "the record survives the file");
+     let l = loaded.threads[0];
+-    assert_eq!((l.first, l.last, l.spring_passes, l.hand), (t.first, t.last, t.spring_passes, t.hand));
++    assert_eq!((l.first, l.last, l.spring_passes, l.hand, l.start_in_air), (t.first, t.last, t.spring_passes, t.hand, t.start_in_air));
+     assert_eq!(loaded.moves[l.first].to, l.start, "still opens on its move");
+     for (x, y) in [(l.lead, t.lead), (l.height, t.height), (l.minor_diameter, t.minor_diameter), (l.end.z, t.end.z)] {
+         assert!((x - y).abs() < 1e-6, "{l:?} vs {t:?}");
+@@ -341,14 +342,14 @@ fn a_right_hand_thread_posts_toward_the_chuck_under_m03() {
+     assert!(refused.is_empty(), "{refused:?}");
+     assert!(text.contains("G97 S800 M03\n") && !text.contains("M04"), "{text}");
+     let zs = g32_zs(&text);
+-    assert_eq!(zs.len(), 18, "three passes of six half-turns: {text}");
+-    for pass in zs.chunks(6) {
++    assert_eq!(zs.len(), 24, "three passes of eight half-turns (Z16..Z8): {text}");
++    for pass in zs.chunks(8) {
+         assert!(pass.windows(2).all(|w| w[1] < w[0]), "every G32 pass descends: {pass:?}");
+-        assert_eq!((pass[0], pass[5]), (13.0, 8.0), "{pass:?}");
++        assert_eq!((pass[0], pass[7]), (15.0, 8.0), "{pass:?}");
+     }
+     let (g76, refused) = post(&world, &records, g76());
+     assert!(refused.is_empty(), "{refused:?}");
+-    assert!(g76.contains("M03") && g76.contains("G00 X12.1 Z14.\n") && g76.contains("G76 X9.6 Z8. "), "{g76}");
++    assert!(g76.contains("M03") && g76.contains("G00 X12.1 Z16.\n") && g76.contains("G76 X9.6 Z8. "), "{g76}");
+ }
+ 
+ #[test]
+@@ -368,8 +369,8 @@ fn a_left_hand_thread_posts_toward_the_chuck_under_m04() {
+     assert!(text.contains("G97 S800 M04\n") && !text.contains("M03"), "{text}");
+     assert!(text.contains("MOUNT THE INSERT FOR M04"), "{text}");
+     let zs = g32_zs(&text);
+-    assert_eq!(zs.len(), 18, "{text}");
+-    assert!(zs.chunks(6).all(|p| p.windows(2).all(|w| w[1] < w[0])), "toward the chuck: {zs:?}");
++    assert_eq!(zs.len(), 24, "{text}");
++    assert!(zs.chunks(8).all(|p| p.windows(2).all(|w| w[1] < w[0])), "toward the chuck: {zs:?}");
+     let (g76, refused) = post(&world, &records, g76());
+     assert!(refused.is_empty(), "{refused:?}");
+     assert!(g76.contains("M04") && g76.contains("G76 X9.6 Z8. "), "{g76}");
+@@ -413,7 +414,7 @@ fn the_hand_is_never_dropped() {
+     assert!(out.warnings.iter().any(|w| w.contains("does not declare threadHands")), "{:?}", out.warnings);
+     // The stream text states the hand, and a record without it is refused.
+     let line = cnc::serialize(&records);
+-    assert!(line.contains(" HAND right\n"), "{line}");
++    assert!(line.contains(" HAND right AIR 1\n"), "{line}");
+     let bare = line.replace(" HAND right", "");
+     assert!(cnc::parse(&bare).is_err_and(|e| e.to_string().contains("HAND")), "a THREAD record without its hand parses");
+ }
+diff --git a/crates/app/tests/lathe_post_g76_schedule.rs b/crates/app/tests/lathe_post_g76_schedule.rs
+index 312679547..b07438cf4 100644
+--- a/crates/app/tests/lathe_post_g76_schedule.rs
++++ b/crates/app/tests/lathe_post_g76_schedule.rs
+@@ -162,7 +162,7 @@ fn the_alternating_flag_rides_the_stream_and_the_file() {
+     let world = g76_world(0.4, alt);
+     let records = posting::stream_records(&world).expect("generated");
+     let text = camcraft_app::post::cnc::serialize(&records);
+-    assert!(text.lines().any(|l| l.starts_with("THREAD X") && l.ends_with(" ALT 1")), "{text}");
++    assert!(text.lines().any(|l| l.starts_with("THREAD X") && l.contains(" ALT 1")), "{text}");
+     let back = camcraft_app::post::cnc::parse(&text).expect("parses");
+     assert_eq!(camcraft_app::post::cnc::serialize(&back), text, "write-parse-write is a fixed point");
+     let file = std::env::temp_dir().join(format!("camcraft-g76-alt-{}.json", std::process::id()));
+@@ -185,7 +185,7 @@ fn a_repeated_depth_posts_as_g32_and_its_flag_rides_the_stream() {
+     let world = g76_world(0.4, repeat);
+     let records = posting::stream_records(&world).expect("generated");
+     let text = camcraft_app::post::cnc::serialize(&records);
+-    assert!(text.lines().any(|l| l.starts_with("THREAD X") && l.ends_with(" REP 1")), "{text}");
++    assert!(text.lines().any(|l| l.starts_with("THREAD X") && l.contains(" REP 1")), "{text}");
+     let back = camcraft_app::post::cnc::parse(&text).expect("parses");
+     assert_eq!(camcraft_app::post::cnc::serialize(&back), text, "write-parse-write is a fixed point");
+     // With G32 output the same passes post: five plunges, each a G32 run.
+diff --git a/crates/app/tests/lathe_post_g76_start.rs b/crates/app/tests/lathe_post_g76_start.rs
+new file mode 100644
+index 000000000..2bd1b9744
+--- /dev/null
++++ b/crates/app/tests/lathe_post_g76_start.rs
+@@ -0,0 +1,336 @@
++//! Fanuc lathe G76 free-air start law (issue #2878): a Fanuc-type G76
++//! cycle moves the insert from the start point to each pass's depth at
++//! rapid traverse, so the start point must stand in free air - in front
++//! of the end face, or in a relief groove wider than the insert, clear
++//! of both part and remaining stock. When the start point stands above
++//! material, the post refuses the G76 cycle by name and writes no G76;
++//! G32 passes (which plunge at G01 feed) still post cleanly.
++//!
++//! Provenance: our own fixtures; Fanuc G76 rapid-infeed behaviour from
++//! public Fanuc lathe programming manuals (behaviour only).
++//!
++//! Gate map (M4.4): covers camcraft_motion::turning (thread, thread_cycle,
++//! revolve), camcraft_cl::cl::ThreadCycle, camcraft_post::post (cnc_thread,
++//! assets/posts/fanuc-lathe.cps), app::operation (generate, g76_start),
++//! app::posting (post_setup).
++//! Lane shape (M4.4): all tests here run in seconds.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::cl::ThreadHand;
++use camcraft_app::commands::{
++    AddTool, CreateOperation, GenerateOperation, History, ImportModel, LoadMachine, SelectPost, SetPostOptions,
++    SetStock,
++};
++use camcraft_app::geometry::{Mesh, Point3, Triangle};
++use camcraft_app::machine::{Coolant, Machine};
++use camcraft_app::operation::{Height, OpParams, SrcRef};
++use camcraft_app::post::{cnc, engine};
++use camcraft_app::posting;
++use camcraft_app::schema::{Location, PostOptions, PostRef, ThreadingOutput};
++use camcraft_app::stock::StockShape;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++
++const TAU: f64 = std::f64::consts::TAU;
++const LATHE_CPS: &str = include_str!("../../../assets/posts/fanuc-lathe.cps");
++const MAJOR: f64 = 6.0;
++const PITCH: f64 = 2.0;
++const DEPTH: f64 = 1.2;
++
++fn revolve(meridian: &[(f64, f64)]) -> Mesh {
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / 16.0;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut facets = Vec::new();
++    for seg in meridian.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..16 {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                facets.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                facets.push(Triangle::new(a1, a2, b2));
++            } else {
++                facets.push(Triangle::new(a1, a2, b2));
++                facets.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    Mesh::from_facets(facets)
++}
++
++/// Ø12 bar with 60-degree V grooves at Z=8, 10, 12, 14, continuing solid
++/// to `end_z` (when `end_z == 40.0`, the pre-#2878 solid-bar fixture;
++/// when `end_z == 14.0 + half`, the free end face stands right after the
++/// last groove).
++fn bar_to(end_z: f64) -> Mesh {
++    let half = DEPTH * (30.0_f64).to_radians().tan();
++    let root = MAJOR - DEPTH;
++    let mut m = vec![(0.0, -26.0), (MAJOR, -26.0), (MAJOR, 8.0 - half)];
++    let mut c = 8.0;
++    while c <= 14.0 + 1e-9 {
++        m.push((root, c));
++        m.push((MAJOR, c + half));
++        if c + PITCH <= 14.0 + 1e-9 {
++            m.push((MAJOR, c + PITCH - half));
++        }
++        c += PITCH;
++    }
++    if end_z > 14.0 + half + 1e-6 {
++        m.push((MAJOR, end_z));
++    }
++    m.push((0.0, end_z.max(14.0 + half)));
++    revolve(&m)
++}
++
++fn lathe() -> Machine {
++    Machine {
++        model: "TestBench lathe".into(),
++        vendor: "Camcraft Testbench".into(),
++        kind: Some("lathe".into()),
++        spindle_min: Some(25.0),
++        spindle_max: Some(12000.0),
++        coolants: vec![Coolant { name: "Flood".into(), m_code: "M8".into() }],
++        ..Default::default()
++    }
++}
++
++fn g76() -> PostOptions {
++    PostOptions { threading: ThreadingOutput::G76Cycle, ..PostOptions::default() }
++}
++
++fn run_cps(world: &World, records: &[cnc::Record], options: PostOptions) -> (String, Vec<String>) {
++    let out = engine::run_with(
++        LATHE_CPS,
++        &posting::machine_value(world),
++        &cnc::serialize(records),
++        &posting::options_value(options),
++    )
++    .expect("the lathe script runs");
++    let stream_warns = records.iter().filter(|r| matches!(r, cnc::Record::Warn { .. })).count();
++    (out.program, out.warnings[stream_warns.min(out.warnings.len())..].to_vec())
++}
++
++fn build_world(bar: Mesh, stock_dia: f64, stock_z0: f64, stock_z1: f64, top_z: f64) -> (World, History) {
++    let world = new_world();
++    let mut history = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, stock_z0), ..Location::default() };
++    let stock = StockShape::Cylinder { diameter: stock_dia, height: stock_z1 - stock_z0 };
++    history.execute(&world, SetStock::new(&world, stock, at).expect("bar stock"));
++    history.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe())).expect("lathe"));
++    let tool = catalog().into_iter().find(|(n, _)| *n == "TD-1732-60").map(|(_, t)| t).expect("insert");
++    history.execute(&world, AddTool::new(&world, "TD-1732-60", tool).expect("tool"));
++    history.execute(&world, ImportModel::from_mesh("bar", bar));
++    let params = OpParams::Threading {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(24.0),
++        top_z: Height::fixed(top_z),
++        bottom_z: Height::fixed(7.7),
++        pitch: PITCH,
++        depth: DEPTH,
++        infeed: 0.4,
++        feed: 120.0,
++        plunge_feed: 40.0,
++        infeed_plan: Default::default(),
++        hand: ThreadHand::Right,
++    };
++    history.execute(&world, CreateOperation::new(&world, "TH1", "TD-1732-60", SrcRef::Entity("bar".into()), params).expect("create"));
++    history.execute(&world, GenerateOperation::new(&world, "TH1").expect("generate"));
++    history.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("lathe post"));
++    (world, history)
++}
++
++#[test]
++fn g76_refuses_when_start_point_is_inside_a_solid_bar() {
++    // Bar continues at Ø12 to Z=40; the thread starts at Z=14 inside
++    // solid material. G76 would rapid into the bar on every pass.
++    let (world, mut history) = build_world(bar_to(40.0), 12.0, -26.0, 40.0, 14.3);
++    // G32 plunges at G01 feed and still posts cleanly.
++    let path_g32 = std::env::temp_dir().join(format!("camcraft-2878-g32-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&path_g32);
++    posting::post_setup(&world, &path_g32).expect("G32 passes post cleanly");
++    let _ = std::fs::remove_file(&path_g32);
++
++    // G76 refuses by name and writes no cycle.
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++    let records = posting::stream_records(&world).expect("generated");
++    let (text, refused) = run_cps(&world, &records, g76());
++    assert!(
++        refused.iter().any(|w| w.contains("G76 threading cycle refused") && w.contains("above material")),
++        "expected G76 above-material refusal, got: {refused:?}\n{text}"
++    );
++    assert!(!text.contains("G76 X"), "a refused G76 cycle was written:\n{text}");
++    let path_g76 = std::env::temp_dir().join(format!("camcraft-2878-g76-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&path_g76);
++    let err = posting::post_setup(&world, &path_g76).expect_err("gated post must block unsafe G76");
++    assert!(err.contains("G76") && err.contains("above material"), "unexpected gate error: {err}");
++    assert!(!path_g76.exists(), "a refused post must write no file");
++}
++
++#[test]
++fn g76_refuses_on_cone_thread_start_inside_end_face() {
++    // Issue #2878 example (from #2394 turning/cone-thread): end face at
++    // Z=78, Ø10 thread from Z=63 to Z=78 (pitch 1.5, depth 0.92, 1.2 mm
++    // wide 60-degree insert), last groove at Z=77.4 so the insert band
++    // [76.8, 78.0] stands above solid material.
++    let pitch = 1.5;
++    let depth = 0.92;
++    let major = 5.0;
++    let root = major - depth;
++    let half_v = depth * (30.0_f64).to_radians().tan();
++    let mut m = vec![(0.0, 0.0), (15.0, 0.0), (15.0, 23.0), (10.0, 23.0), (5.0, 63.0), (major, 63.9 - half_v)];
++    let mut c = 63.9;
++    while c <= 77.4 + 1e-9 {
++        m.push((root, c));
++        m.push((major, c + half_v));
++        if c + pitch <= 77.4 + 1e-9 {
++            m.push((major, c + pitch - half_v));
++        }
++        c += pitch;
++    }
++    m.push((major, 78.0));
++    m.push((0.0, 78.0));
++
++    let world = new_world();
++    let mut history = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, 0.0), ..Location::default() };
++    let stock = StockShape::Cylinder { diameter: 30.0, height: 78.0 };
++    history.execute(&world, SetStock::new(&world, stock, at).expect("stock"));
++    history.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe())).expect("lathe"));
++    let mut insert = catalog().into_iter().find(|(n, _)| *n == "TD-1732-60").map(|(_, t)| t).expect("insert");
++    insert.width = 1.2;
++    insert.tip_angle = 60.0;
++    insert.rpm = 800.0;
++    history.execute(&world, AddTool::new(&world, "TD-1200-60", insert).expect("tool"));
++    history.execute(&world, ImportModel::from_mesh("cone", revolve(&m)));
++    let params = OpParams::Threading {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(82.0),
++        top_z: Height::fixed(78.0),
++        bottom_z: Height::fixed(63.4),
++        pitch,
++        depth,
++        infeed: 0.25,
++        feed: 120.0,
++        plunge_feed: 40.0,
++        infeed_plan: Default::default(),
++        hand: ThreadHand::Right,
++    };
++    history.execute(&world, CreateOperation::new(&world, "TH1", "TD-1200-60", SrcRef::Entity("cone".into()), params).expect("create"));
++    history.execute(&world, GenerateOperation::new(&world, "TH1").expect("generate"));
++    history.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("lathe post"));
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++
++    let records = posting::stream_records(&world).expect("generated");
++    let (text, refused) = run_cps(&world, &records, g76());
++    assert!(
++        refused.iter().any(|w| w.contains("G76 threading cycle refused") && w.contains("above material")),
++        "expected G76 above-material refusal on cone-thread, got: {refused:?}\n{text}"
++    );
++    assert!(!text.contains("G76 X"), "a refused G76 cycle was written:\n{text}");
++}
++
++#[test]
++fn g76_posts_when_start_point_is_in_free_air_in_front_of_end_face() {
++    let half = DEPTH * (30.0_f64).to_radians().tan();
++    let end_z = 14.0 + half;
++    // Start lattice at Z=16.0: insert band [15.134, 16.866] stands
++    // completely past the end face (14.693) in free air.
++    let (world, mut history) = build_world(bar_to(end_z), 12.0, -26.0, end_z, 16.3);
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++    let path = std::env::temp_dir().join(format!("camcraft-2878-air-{}.nc", std::process::id()));
++    let _ = std::fs::remove_file(&path);
++    let posted = posting::post_setup(&world, &path).expect("free-air G76 posts cleanly");
++    let _ = std::fs::remove_file(&path);
++    assert!(posted.program.contains("G00 X12.1 Z16.\nG76 P010000 Q400 R0.4\n"), "{}", posted.program);
++    assert!(posted.program.contains("G76 X9.6 Z8. P1200 Q400 F2.\n"), "{}", posted.program);
++}
++
++#[test]
++fn g76_refuses_uncut_stock_in_front_of_end_face_and_posts_after_facing() {
++    let end_z = 15.0;
++    // Part ends at 15.0 (past last groove flank 14.693, clear of insert
++    // band [15.134, 16.866] at Z=16.0), but raw stock extends to Z=17.0:
++    // at Z=16.0 the insert stands above uncut stock, so G76 must refuse.
++    let (world, mut history) = build_world(bar_to(end_z), 12.0, -26.0, 17.0, 16.3);
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++    let records = posting::stream_records(&world).expect("generated");
++    let (text, refused) = run_cps(&world, &records, g76());
++    assert!(
++        refused.iter().any(|w| w.contains("G76 threading cycle refused") && w.contains("above material")),
++        "uncut stock at start Z must refuse G76: {refused:?}\n{text}"
++    );
++    assert!(!text.contains("G76 X"), "{text}");
++
++    // Add a Facing op ahead of TH1 that faces the stock down to the
++    // part's end face: now Z=16.0 is in free air and G76 posts cleanly.
++    let world = new_world();
++    let mut history = History::default();
++    let at = Location { pos: Point3::new(0.0, 0.0, -26.0), ..Location::default() };
++    let stock = StockShape::Cylinder { diameter: 12.0, height: 17.0 - (-26.0) };
++    history.execute(&world, SetStock::new(&world, stock, at).expect("stock"));
++    history.execute(&world, LoadMachine::new(&world, "lathe.mch".into(), Some(lathe())).expect("lathe"));
++    for name in ["TN-1600-0R8", "TD-1732-60"] {
++        let tool = catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("tool");
++        history.execute(&world, AddTool::new(&world, name, tool).expect("add tool"));
++    }
++    history.execute(&world, ImportModel::from_mesh("bar", bar_to(end_z)));
++    let face = OpParams::Facing {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(24.0),
++        top_z: Height::fixed(17.0),
++        bottom_z: Height::fixed(end_z),
++        stepdown: 0.5,
++        feed: 150.0,
++        plunge_feed: 80.0,
++    };
++    history.execute(&world, CreateOperation::new(&world, "F1", "TN-1600-0R8", SrcRef::Entity("bar".into()), face).expect("face"));
++    history.execute(&world, GenerateOperation::new(&world, "F1").expect("gen face"));
++    let th = OpParams::Threading {
++        tolerance: 0.05,
++        clearance_z: Height::fixed(24.0),
++        top_z: Height::fixed(16.3),
++        bottom_z: Height::fixed(7.7),
++        pitch: PITCH,
++        depth: DEPTH,
++        infeed: 0.4,
++        feed: 120.0,
++        plunge_feed: 40.0,
++        infeed_plan: Default::default(),
++        hand: ThreadHand::Right,
++    };
++    history.execute(&world, CreateOperation::new(&world, "TH1", "TD-1732-60", SrcRef::Entity("bar".into()), th).expect("thread"));
++    history.execute(&world, GenerateOperation::new(&world, "TH1").expect("gen thread"));
++    history.execute(&world, SelectPost::new(&world, PostRef::Named("Fanuc Lathe".into())).expect("post"));
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++    let records = posting::stream_records(&world).expect("generated");
++    let (text, refused) = run_cps(&world, &records, g76());
++    assert!(refused.is_empty(), "faced free-air G76 must not refuse: {refused:?}\n{text}");
++    assert!(text.contains("G00 X12.1 Z16.\nG76 P010000 Q400 R0.4\n"), "{text}");
++    let th_e = camcraft_app::model::find_by_name(&world, "TH1").expect("TH1");
++    let th_tp = camcraft_app::model::toolpath_of(&world, &th_e).expect("TH1 cache");
++    assert!(th_tp.warnings.is_empty(), "TH1 warnings: {:?}", th_tp.warnings);
++    assert!(th_tp.path.threads[0].start_in_air, "TH1 start_in_air after facing");
++}
++
++#[test]
++fn g76_refuses_legacy_stream_without_air_flag() {
++    let half = DEPTH * (30.0_f64).to_radians().tan();
++    let end_z = 14.0 + half;
++    let (world, mut history) = build_world(bar_to(end_z), 12.0, -26.0, end_z, 16.3);
++    history.execute(&world, SetPostOptions::new(&world, g76()).expect("G76"));
++    let records = posting::stream_records(&world).expect("generated");
++    let stream = cnc::serialize(&records);
++    assert!(stream.contains(" AIR 1\n"), "free-air stream carries AIR 1:\n{stream}");
++    let legacy = stream.replace(" AIR 1\n", "\n");
++    let out = engine::run_with(LATHE_CPS, &posting::machine_value(&world), &legacy, &posting::options_value(g76()))
++        .expect("runs");
++    assert!(
++        out.warnings.iter().any(|w| w.contains("G76 threading cycle refused") && w.contains("above material")),
++        "legacy stream without AIR 1 must refuse G76: {:?}",
++        out.warnings
++    );
++    assert!(!out.program.contains("G76 X"), "{}", out.program);
++}
+diff --git a/crates/app/tests/lathe_post_inch.rs b/crates/app/tests/lathe_post_inch.rs
+index e0bbd49d5..5e3e8e4e2 100644
+--- a/crates/app/tests/lathe_post_inch.rs
++++ b/crates/app/tests/lathe_post_inch.rs
+@@ -142,12 +142,12 @@ fn the_inch_thread_words_are_pinned() {
+     let mch = posting::machine_value(&world);
+     let out = engine::run_with(CPS, &mch, &cnc::serialize(&records), &units(options, "inch")).expect("posts");
+     let p = &out.program;
+-    // mm: G00 X12.1 Z14 / G76 P010000 Q400 R0.4 / G76 X9.6 Z8 P1200 Q400 F2.
++    // mm: G00 X12.1 Z16. / G76 P010000 Q400 R0.4 / G76 X9.6 Z8. P1200 Q400 F2.
+     // 0.4 mm = 157 ten-thousandths, 1.2 mm = 472, lead 2 mm = 0.07874 in.
+     // R is 0.0158, not 0.4 mm's 0.0157: the control reads the rounded
+     // words, and 472 - 157 = 315 would sit one past the second rung 314
+     // and cut a fourth pass (PR #517 review; lathe_post_g76_schedule).
+-    assert!(p.contains("G00 X0.4764 Z0.5512\nG76 P010000 Q157 R0.0158\n"), "{p}");
++    assert!(p.contains("G00 X0.4764 Z0.6299\nG76 P010000 Q157 R0.0158\n"), "{p}");
+     assert!(p.contains("G76 X0.378 Z0.315 P472 Q157 F0.07874\n"), "{p}");
+     assert!(p.contains("G20 G18 G40 G80 G99\n"), "{p}");
+     // The G32 passes carry the lead at six decimals.
+diff --git a/crates/app/tests/lathe_post_tormach_thread.rs b/crates/app/tests/lathe_post_tormach_thread.rs
+index e9926de2d..07f3c2c59 100644
+--- a/crates/app/tests/lathe_post_tormach_thread.rs
++++ b/crates/app/tests/lathe_post_tormach_thread.rs
+@@ -279,7 +279,10 @@ fn cached_zero_finish_allowance_keeps_fanuc_g76_output() {
+     for inch in [false, true] {
+         let (world, _history) = thread_world(inch);
+         let records = posting::stream_records(&world).expect("generated");
+-        let cached = with_rec(&records, |t| t.finish_allowance = 0.0);
++        let cached = with_rec(&records, |t| {
++            t.finish_allowance = 0.0;
++            t.start_in_air = true;
++        });
+         let mut options = posting::options_value(g76());
+         options["Units"] = json!(posting::unit_word(camcraft_app::units::of(&world)));
+         let fanuc = include_str!("../../../assets/posts/fanuc-lathe.cps");
+diff --git a/crates/cl/src/cl/thread.rs b/crates/cl/src/cl/thread.rs
+index eb7369447..830b4376c 100644
+--- a/crates/cl/src/cl/thread.rs
++++ b/crates/cl/src/cl/thread.rs
+@@ -145,6 +145,13 @@ pub struct ThreadCycle {
+     /// in the span lays it ([`Self::is_sane`] holds them to it), so a
+     /// post never has to infer it.
+     pub hand: ThreadHand,
++    /// Whether the cycle's rapid infeed stands completely in free air
++    /// (issue #2878): in front of the end face, or in a relief groove
++    /// wider than the insert, clear of both part and remaining stock.
++    /// A Fanuc-type G76 moves the insert to pass depth at rapid
++    /// traverse, so a post that writes G76 refuses a record when this
++    /// is false.
++    pub start_in_air: bool,
+ }
+ 
+ impl ThreadCycle {
+diff --git a/crates/motion/src/turning/mod.rs b/crates/motion/src/turning/mod.rs
+index 81b5d1cd7..ffca268b3 100644
+--- a/crates/motion/src/turning/mod.rs
++++ b/crates/motion/src/turning/mod.rs
+@@ -71,4 +71,5 @@ pub use stock::StockEnv;
+ pub use infeed::{DepthSchedule, InfeedMethod, ThreadInfeed};
+ pub use thread_dips::{ThreadDips, MIN_DIP_HEIGHT};
+ pub use thread::{thread, thread_in, thread_planned_in, ThreadParams};
++pub use thread_cycle::{cycle_infeed_band, part_band_clear};
+ pub use thread_law::{thread_hand_warnings, thread_warnings, thread_warnings_excess};
+diff --git a/crates/motion/src/turning/revolve.rs b/crates/motion/src/turning/revolve.rs
+index d23ae2b7d..bee256eb3 100644
+--- a/crates/motion/src/turning/revolve.rs
++++ b/crates/motion/src/turning/revolve.rs
+@@ -224,10 +224,6 @@ pub fn lattice(pts: &[SR], moves: &[BandMove]) -> (Option<(f64, f64)>, Vec<f64>)
+         lat.push(sv);
+     }
+     lat.retain(|s| (d_lo..=d_hi).contains(s));
+-    if let Some((w0, w1)) = window {
+-        lat.push(w0);
+-        lat.push(w1);
+-    }
+     lat.sort_unstable_by(f64::total_cmp);
+     lat.dedup();
+     (window, lat)
+diff --git a/crates/motion/src/turning/thread.rs b/crates/motion/src/turning/thread.rs
+index adc54c637..c7f3cc7ec 100644
+--- a/crates/motion/src/turning/thread.rs
++++ b/crates/motion/src/turning/thread.rs
+@@ -238,10 +238,13 @@ pub fn thread_planned_in(
+     };
+     let c0 = (v_lo + v_hi) * 0.5;
+     // The lattice whose footprints reach the window: every center
+-    // whose band (center +- half) overlaps it. The valley itself is
+-    // such a center, so the run never comes up empty.
++    // whose band (center +- half) overlaps it. When `top_z` extends
++    // past the bar's free end, the pass may start in free air in front
++    // of the end face (issue #2878). The valley itself is in the
++    // window, so the run never comes up empty.
++    let s_hi_pass = f.station_of(p.top_z).max(s_hi);
+     let k_lo = ((s_lo - half - c0) / p.pitch).ceil();
+-    let k_hi = ((s_hi + half - c0) / p.pitch).floor();
++    let k_hi = ((s_hi_pass + half - c0) / p.pitch).floor();
+     if k_hi - k_lo > blade::MAX_RUNGS {
+         return Err(GenError::Invalid(format!(
+             "the thread would run more than {:.0} turns - the pitch is far too fine for \
+@@ -297,7 +300,7 @@ pub fn thread_planned_in(
+     let last = b.moves_len().saturating_sub(1);
+     b.push(MoveKind::Rapid, f.point(rho_clear, s_out), None);
+     let mut path = b.finish();
+-    thread_cycle::attach_cycle(&mut path, first, last, ref_top, root, p, plan, &passes);
++    thread_cycle::attach_cycle(&mut path, first, last, ref_top, root, p, plan, &passes, &f, &sg, stock);
+     thread_dips::require_record(&plan.dips, &path)?;
+     Ok(path)
+ }
+diff --git a/crates/motion/src/turning/thread_cycle.rs b/crates/motion/src/turning/thread_cycle.rs
+index 1e7b28c96..09a0b926e 100644
+--- a/crates/motion/src/turning/thread_cycle.rs
++++ b/crates/motion/src/turning/thread_cycle.rs
+@@ -11,10 +11,55 @@
+ //! only; our own mapping from our pass plan.
+ 
+ use crate::cl::{MoveKind, ThreadCycle, Toolpath};
++use crate::geometry::Triangle;
+ 
+ use super::infeed::{DepthSchedule, InfeedMethod, Pass, ThreadInfeed};
++use super::profile::{silhouette, Frame};
++use super::revolve;
++use super::stock::StockEnv;
+ use super::thread::ThreadParams;
+ 
++/// The axial station span `[lo, hi]` that a G76 rapid infeed sweeps across
++/// (issue #2878): every pass rapids from `rec.start` to its depth along the
++/// infeed flank line, carrying an insert of width `insert_width` centered on
++/// the tip. Returns `None` if any input is non-finite or non-positive.
++#[must_use]
++pub fn cycle_infeed_band(f: &Frame, rec: &ThreadCycle, insert_width: f64) -> Option<(f64, f64)> {
++    if !(insert_width.is_finite() && insert_width > 0.0 && rec.height.is_finite() && rec.height > 0.0) {
++        return None;
++    }
++    let start_s = f.sr(rec.start).0;
++    let end_s = f.sr(rec.end).0;
++    if !(start_s.is_finite() && end_s.is_finite() && rec.infeed_angle.is_finite()) {
++        return None;
++    }
++    let dir = if end_s < start_s { -1.0 } else { 1.0 };
++    let shift = rec.height * (rec.infeed_angle * 0.5).to_radians().tan();
++    if !shift.is_finite() {
++        return None;
++    }
++    let s_deep = start_s + dir * shift;
++    let half = insert_width * 0.5;
++    Some((start_s.min(s_deep) - half, start_s.max(s_deep) + half))
++}
++
++/// Whether the part's silhouette stays at or below `root` across the whole
++/// axial band `[band_lo, band_hi]` (issue #2878): true in front of the end
++/// face (radius 0) or inside a relief groove wider than the insert whose
++/// floor does not stand above `root`; false whenever solid part material
++/// stands inside the band above `root`.
++#[must_use]
++pub fn part_band_clear(facets: &[Triangle], f: &Frame, tol: f64, band_lo: f64, band_hi: f64, root: f64) -> bool {
++    if facets.is_empty() || !(tol.is_finite() && tol > 0.0 && root.is_finite()) {
++        return false;
++    }
++    let Ok(pts) = silhouette(facets, f, tol * 0.25) else {
++        return false;
++    };
++    let sg = revolve::segs(&pts);
++    revolve::span_max(&sg, band_lo, band_hi) <= root + revolve::HAIR
++}
++
+ /// Attach the record over `moves[first..=last]`, stating the very
+ /// passes laid (issue #417) in a lathe cycle's own terms, so a control
+ /// running the cycle cuts what was verified:
+@@ -33,6 +78,8 @@ use super::thread::ThreadParams;
+ /// - a plan that repeats every roughing depth (#418) sets
+ ///   `repeat_each_depth` - no single cycle states it; likewise a plan
+ ///   with chip-break dips (#419) sets `chip_break_dips`.
++/// - `start_in_air` (#2878): true only when the rapid-infeed band is
++///   clear of both the part silhouette and the raw stock envelope.
+ ///
+ /// A span the builder did not lay as planned gets no record; the
+ /// passes still post.
+@@ -46,6 +93,9 @@ pub(super) fn attach_cycle(
+     p: &ThreadParams,
+     plan: &ThreadInfeed,
+     passes: &[Pass],
++    f: &Frame,
++    sg: &revolve::Segs,
++    stock: Option<StockEnv>,
+ ) {
+     const NONE: &str = "threading: the passes did not lay as planned - no thread cycle record";
+     let infeed_angle = match plan.method {
+@@ -71,7 +121,7 @@ pub(super) fn attach_cycle(
+         DepthSchedule::ConstantDepth => p.infeed.min(height),
+         DepthSchedule::ConstantArea => plan.min_depth,
+     };
+-    let rec = ThreadCycle {
++    let mut rec = ThreadCycle {
+         start: m0.to,
+         end: end.to,
+         major_diameter: 2.0 * ref_top,
+@@ -90,7 +140,16 @@ pub(super) fn attach_cycle(
+         first,
+         last,
+         hand: p.hand,
++        start_in_air: false,
+     };
++    if let Some((band_lo, band_hi)) = cycle_infeed_band(f, &rec, p.insert_width) {
++        let part_clear = revolve::span_max(sg, band_lo, band_hi) <= root + revolve::HAIR;
++        let stock_clear = match stock {
++            None => true,
++            Some(s) => s.s_top.is_finite() && rec.toward_minus_z() && s.s_top <= band_lo + revolve::HAIR,
++        };
++        rec.start_in_air = part_clear && stock_clear;
++    }
+     if m0.kind == MoveKind::Rapid && rec.is_sane(&path.moves) {
+         path.threads.push(rec);
+     } else {
+diff --git a/crates/motion/tests/turning_thread_cycle.rs b/crates/motion/tests/turning_thread_cycle.rs
+index b2cd649eb..dc07a69f5 100644
+--- a/crates/motion/tests/turning_thread_cycle.rs
++++ b/crates/motion/tests/turning_thread_cycle.rs
+@@ -152,3 +152,51 @@ fn the_hand_of_a_turn_is_the_screw_law() {
+         assert_eq!(ThreadHand::of_turn(h.ccw_for(false), 1.0), Some(h));
+     }
+ }
++
++#[test]
++fn start_in_air_distinguishes_solid_bar_from_free_end_start() {
++    // #2878: on the bar continuing to Z=40, the start point at Z=14
++    // stands above solid material.
++    let solid_path = thread(&threaded(), &params(ThreadHand::Right)).expect("solid bar threads");
++    assert!(!solid_path.threads[0].start_in_air, "start inside solid bar must not be marked in air");
++
++    // On a free-end bar ending right after the last groove (14 + half),
++    // starting at Z=16 puts the entire insert band [15.134, 16.866] in
++    // free air in front of the end face.
++    let half = DEPTH * (30.0_f64).to_radians().tan();
++    let mut m = vec![(0.0, -26.0), (MAJOR, -26.0), (MAJOR, 8.0 - half)];
++    let mut c = 8.0;
++    while c <= 14.0 + 1e-9 {
++        m.push((MAJOR - DEPTH, c));
++        m.push((MAJOR, c + half));
++        if c + 2.0 <= 14.0 + 1e-9 {
++            m.push((MAJOR, c + 2.0 - half));
++        }
++        c += 2.0;
++    }
++    m.push((0.0, 14.0 + half));
++    let v = |j: usize, r: f64, z: f64| {
++        let th = TAU * j as f64 / 16.0;
++        Point3::new(r * th.cos(), r * th.sin(), z)
++    };
++    let mut free_end = Vec::new();
++    for seg in m.windows(2) {
++        let ((ra, za), (rb, zb)) = (seg[0], seg[1]);
++        for j in 0..16 {
++            let (a1, a2, b1, b2) = (v(j, ra, za), v(j + 1, ra, za), v(j, rb, zb), v(j + 1, rb, zb));
++            if ra <= 1e-12 {
++                free_end.push(Triangle::new(a1, b2, b1));
++            } else if rb <= 1e-12 {
++                free_end.push(Triangle::new(a1, a2, b2));
++            } else {
++                free_end.push(Triangle::new(a1, a2, b2));
++                free_end.push(Triangle::new(a1, b2, b1));
++            }
++        }
++    }
++    let mut p = params(ThreadHand::Right);
++    p.top_z = 16.3;
++    let air_path = thread(&free_end, &p).expect("free-end bar threads");
++    assert!((air_path.threads[0].start.z - 16.0).abs() < 1e-9, "{:?}", air_path.threads[0]);
++    assert!(air_path.threads[0].start_in_air, "free-end start in front of face must be marked in air");
++}
+diff --git a/crates/post/src/post/cnc_thread.rs b/crates/post/src/post/cnc_thread.rs
+index 397a8df70..fa3947287 100644
+--- a/crates/post/src/post/cnc_thread.rs
++++ b/crates/post/src/post/cnc_thread.rs
+@@ -44,6 +44,10 @@ pub struct ThreadRec {
+     /// The passes carry chip-break dips (issue #419): written `DIP 1`
+     /// only when set, the `ALT` precedent.
+     pub chip_break_dips: bool,
++    /// The cycle's rapid infeed stands completely in free air (issue
++    /// #2878): written `AIR 1` only when set, so older streams without
++    /// it read false and refuse G76 by name.
++    pub start_in_air: bool,
+ }
+ 
+ /// µm-integer text, the stream's length law.
+@@ -75,6 +79,7 @@ impl ThreadRec {
+             alternating: t.alternating,
+             repeat_each_depth: t.repeat_each_depth,
+             chip_break_dips: t.chip_break_dips,
++            start_in_air: t.start_in_air,
+         }
+     }
+ 
+@@ -103,6 +108,7 @@ impl ThreadRec {
+         m.insert("Alternating".into(), json!(self.alternating));
+         m.insert("RepeatEachDepth".into(), json!(self.repeat_each_depth));
+         m.insert("ChipBreakDips".into(), json!(self.chip_break_dips));
++        m.insert("StartInAir".into(), json!(self.start_in_air));
+         m
+     }
+ 
+@@ -111,7 +117,7 @@ impl ThreadRec {
+     pub fn line(&self) -> String {
+         format!(
+             "THREAD X {} Y {} Z {} EX {} EY {} EZ {} MAJOR {} MINOR {} LEAD {:.6} HEIGHT {} \
+-             FIRST {} MIN {} FINISH {} ANGLE {:.6} SPRING {} PULLOUT {} HAND {}{}{}{}\n",
++             FIRST {} MIN {} FINISH {} ANGLE {:.6} SPRING {} PULLOUT {} HAND {}{}{}{}{}\n",
+             q(self.start[0]),
+             q(self.start[1]),
+             q(self.start[2]),
+@@ -132,6 +138,7 @@ impl ThreadRec {
+             if self.alternating { " ALT 1" } else { "" },
+             if self.repeat_each_depth { " REP 1" } else { "" },
+             if self.chip_break_dips { " DIP 1" } else { "" },
++            if self.start_in_air { " AIR 1" } else { "" },
+         )
+     }
+ 
+@@ -152,9 +159,9 @@ impl ThreadRec {
+ /// missing, repeated, unknown or non-finite word is refused by name - a cycle the parser guessed at
+ /// is a thread cut to the wrong depth.
+ pub fn parse<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<Option<ThreadRec>, String> {
+-    const KEYS: [&str; 19] = [
++    const KEYS: [&str; 20] = [
+         "X", "Y", "Z", "EX", "EY", "EZ", "MAJOR", "MINOR", "LEAD", "HEIGHT", "FIRST", "MIN", "FINISH", "ANGLE",
+-        "SPRING", "PULLOUT", "ALT", "REP", "DIP",
++        "SPRING", "PULLOUT", "ALT", "REP", "DIP", "AIR",
+     ];
+     let mut seen: BTreeMap<&str, f64> = BTreeMap::new();
+     let mut hand: Option<ThreadHand> = None;
+@@ -206,6 +213,7 @@ pub fn parse<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<Option<ThreadR
+     let alternating = flag("ALT")?;
+     let repeat_each_depth = flag("REP")?;
+     let chip_break_dips = flag("DIP")?;
++    let start_in_air = flag("AIR")?;
+     Ok(Some(ThreadRec {
+         start: [um("X")?, um("Y")?, um("Z")?],
+         end: [um("EX")?, um("EY")?, um("EZ")?],
+@@ -223,6 +231,7 @@ pub fn parse<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<Option<ThreadR
+         alternating,
+         repeat_each_depth,
+         chip_break_dips,
++        start_in_air,
+     }))
+ }
+ 
+diff --git a/crates/post/tests/inverted_post.rs b/crates/post/tests/inverted_post.rs
+index 190207d5f..d4d34c821 100644
+--- a/crates/post/tests/inverted_post.rs
++++ b/crates/post/tests/inverted_post.rs
+@@ -192,6 +192,7 @@ fn a_threading_cycle_refuses_by_name() {
+         repeat_each_depth: false,
+         hand: camcraft_post::cl::ThreadHand::Right,
+         chip_break_dips: false,
++        start_in_air: false,
+     }));
+     let e = refused("fanuc", &["X"], &with(vec![t, Record::Thread(None)]));
+     assert!(e.contains("a threading cycle is not supported for an inverted axis"), "{e}");
+diff --git a/crates/post/tests/recorded_streams.rs b/crates/post/tests/recorded_streams.rs
+index 4f44caf0d..119ad8f69 100644
+--- a/crates/post/tests/recorded_streams.rs
++++ b/crates/post/tests/recorded_streams.rs
+@@ -124,6 +124,7 @@ fn tool_change() -> String {
+         alternating: false,
+         chip_break_dips: false,
+         repeat_each_depth: false,
++        start_in_air: false,
+     });
+     assert!(thread.threads[0].is_sane(&thread.moves), "the thread record sits on its passes");
+     assert!(thread.threads[0].reverse_spindle(), "a left-hand thread toward -Z needs M04");
+diff --git a/docs/decisions/2878-fanuc-g76-start-in-air.md b/docs/decisions/2878-fanuc-g76-start-in-air.md
+new file mode 100644
+index 000000000..fa95f7c53
+--- /dev/null
++++ b/docs/decisions/2878-fanuc-g76-start-in-air.md
+@@ -0,0 +1,20 @@
++## #2878 - Fanuc lathe G76 free-air start law (`start_in_air` on `ThreadCycle` and `AIR 1` in `THREAD`)
++
++- **What was decided**:
++  1. Carry `start_in_air: bool` on `cl::ThreadCycle`, serialize it as optional `AIR 1` on the intermediate `THREAD` record (absent = `false`) and `#[serde(default, skip_serializing_if = "is_false")]` in `ThreadCycleDto`, and expose it to post scripts as `properties.StartInAir`.
++  2. Refuse G76 by name in `assets/posts/fanuc-lathe.cps` (`g76Why`) whenever `p.StartInAir !== true`, so a start point above material (or a cached pre-#2878 record or legacy stream without `AIR 1`) never writes a G76 cycle.
++  3. Compute `start_in_air` from the revolved meridian across the full rapid-infeed axial band `[min(start_s, s_deep) - insert_width/2, max(start_s, s_deep) + insert_width/2]` (where `s_deep = start_s + dir * height * tan(infeed_angle/2)`): true only when the part silhouette stays at or below `root` across the band (in front of the end face or in a relief groove wider than the insert) AND no remaining stock stands above `root` there after prior Facing, Grooving, Turning or Drilling operations (`operation::g76_start`).
++  4. Allow `turning::thread` to extend `k_hi` up to `top_z` past the bar's free end face and fix `revolve::lattice` not to re-push out-of-domain window endpoints after `lat.retain`, so a G76 thread can start in free air in front of the end face.
++  5. Update the three Fanuc G76 golden fixtures (`thread_g76.nc`, `thread_g76_area.nc`, `inch/fanuc-lathe/thread_g76.nc`) to use a free-end bar starting at `Z16.` (`Z16.625` flank, `Z0.6299` inch) in free air instead of `Z14.` inside a solid Z=40 bar.
++
++- **Why**:
++  - A Fanuc-type G76 moves the insert from the start point to each pass's depth at rapid traverse. Checking `StockZTop` alone in `.cps` cannot distinguish a faced end or a machined relief groove from uncut stock, nor does the post script know the insert width or part silhouette. Computing `start_in_air` from the revolved part, stock and prior cuts in the generator/verifier and requiring `StartInAir === true` in `fanuc-lathe.cps` is fail-safe by default: older caches and hand-written streams without `AIR 1` refuse G76 rather than silently rapiding into steel, while G32 passes (which plunge with `G01`) stay unchanged.
++  - Putting the `StartInAir` check at the end of `g76Why` preserves more specific plan/range/hand refusals (such as chip-break dips or alternating flank infeed).
++
++- **What was considered and dropped**:
++  - **Checking only `StockZTop` inside `fanuc-lathe.cps`**: dropped because it rejects valid relief grooves and faced bars (where `start.z < StockZTop`) and misses narrow end-face overlaps where `start.z > StockZTop` but `start.z - insert_width/2 < StockZTop`, as well as flank-infeed shifts.
++  - **Auto-shifting the G76 start point inside `fanuc-lathe.cps`**: dropped because the post never shifts verified points (`fanuc-lathe.cps` law) and shifting past a solid bar would cut unmodeled length.
++  - **Changing `tormach-lathe.cps` in the same PR**: dropped to stay scoped to #2878 (Fanuc lathe G76); LinuxCNC G76 can adopt the same `StartInAir` property in a follow-up without changing the stream format.
++
++- **Cost to change later**:
++  - Low: `AIR 1` is an additive optional flag on `THREAD` and `ThreadCycleDto`, and `tormach-lathe.cps` can read the exact same `properties.StartInAir` field whenever its G76 fixtures are updated.
