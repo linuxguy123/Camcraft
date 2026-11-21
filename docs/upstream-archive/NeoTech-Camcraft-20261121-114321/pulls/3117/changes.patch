@@ -1,0 +1,674 @@
+From 6e7b0d4321f37b04f032db98a90c695c41a9191f Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 21 Nov 2026 00:38:51 -0800
+Subject: [PATCH 1/2] fix(xtask): seed a new worktree's target/ so solidcore is
+ not compiled again
+
+sccache hashes OUT_DIR and the cwd of a Rust compile. Both name the
+worktree, so each build-script crate and each crate above it (solidcore,
+flecs) missed the cache in a new worktree. Cargo's fingerprints do not
+name the worktree.
+
+Before its first step, the gate now copies the dependency units of the
+checkout with the most units (registry and git packages only; never a
+workspace member or a path dependency). It replaces units that cargo
+xtask built just before, keeps the file times, takes cargo's locks
+without a wait and passes over a busy checkout. CAMCRAFT_NO_SEED=1 turns
+it off.
+
+Fixes #2575
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/decisions/2575-seed-worktree-target.md |  34 ++++
+ xtask/src/main.rs                           |   4 +
+ xtask/src/seed.rs                           | 215 ++++++++++++++++++++
+ xtask/src/seed_tests.rs                     | 203 ++++++++++++++++++
+ 4 files changed, 456 insertions(+)
+ create mode 100644 docs/decisions/2575-seed-worktree-target.md
+ create mode 100644 xtask/src/seed.rs
+ create mode 100644 xtask/src/seed_tests.rs
+
+diff --git a/docs/decisions/2575-seed-worktree-target.md b/docs/decisions/2575-seed-worktree-target.md
+new file mode 100644
+index 000000000..d52d93ee6
+--- /dev/null
++++ b/docs/decisions/2575-seed-worktree-target.md
+@@ -0,0 +1,34 @@
++## #2575 - A new worktree seeds its target/ from another checkout
++
++**Decided.** Before its first step, `cargo xtask gate` copies the dependency units
++(`target/debug/{build,deps,.fingerprint}`) of the checkout with the most units into a new
++worktree. Cargo then finds `solidcore`, `flecs` and the build-script crates Fresh. The copy:
++
++- skips each package without a `source` in `cargo metadata` (workspace members and path
++  dependencies): their sources are in the checkout, and an older copy can read as Fresh
++  with other code;
++- replaces a unit that is there already (`cargo xtask` builds its own dependencies first),
++  else its newer time makes each copied unit above it dirty;
++- keeps the modification times, copies outputs before fingerprints, and renames each unit
++  into place, so a stopped copy only causes a compile;
++- takes cargo's locks of the two directories without a wait, and passes over a checkout
++  where a build runs;
++- writes `target/debug/.camcraft-seeded` once. `CAMCRAFT_NO_SEED=1` turns it off.
++
++**Why.** sccache 0.19 hashes the `OUT_DIR` value of each env dependency, the cwd and the
++raw arguments of a Rust compile. `OUT_DIR` names the worktree, so each build-script crate
++misses, and each crate above it misses too. `SCCACHE_BASEDIRS` applies only to C and C++.
++Cargo's fingerprints do not name the worktree, so a copied unit is reused. Measured on an
++18-core Mac (APFS clones, sccache warm): the first app test took 107 s without the seed
++and 42 s with it (9 s seed, 24 s step). 231 units compiled without it, 14 with it.
++
++**Dropped.**
++- A `--remap-path-prefix` in RUSTFLAGS: sccache hashes the raw argument, which names the
++  worktree, so all keys would change in each worktree.
++- A shared `CARGO_TARGET_DIR` or `build-dir`: AGENTS.md forbids the first, and the two lock
++  out parallel gates of other worktrees.
++- A change to sccache (normalize `OUT_DIR`): outside this repository.
++- Copy only the units that the gate needs: cargo has no stable unit graph to name them.
++
++**Cost to change.** One module (`xtask/src/seed.rs`) and one call in `gate`. Removing it
++returns the gate to the sccache-only behaviour.
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 05d5576ce..4b515c922 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -82,6 +82,9 @@ mod release_pack;
+ #[cfg(test)]
+ mod release_tests;
+ mod scan;
++mod seed;
++#[cfg(test)]
++mod seed_tests;
+ mod select;
+ #[cfg(test)]
+ mod select_tests;
+@@ -278,6 +281,7 @@ fn gate(root: &Path, g: &GateArgs) -> Result<i32, String> {
+         None => None,
+     };
+     let mut run = exec::Run::new(root, &g.tier, g.dry)?;
++    seed::before_gate(root, g.dry);
+     if let Some(name) = &g.filter {
+         let f = single::Filter {
+             name,
+diff --git a/xtask/src/seed.rs b/xtask/src/seed.rs
+new file mode 100644
+index 000000000..3600424fa
+--- /dev/null
++++ b/xtask/src/seed.rs
+@@ -0,0 +1,215 @@
++//! Seeds a new worktree's `target/debug` from another checkout of the same repository (#2575), so cargo
++//! finds the dependency units (solidcore, the build-script crates) Fresh instead of compiling them again.
++//! Provenance: our own build tooling (#900, #2575); Cargo's documented target layout (deps/, build/, .fingerprint/).
++//!
++//! Why not sccache: its Rust key hashes the `OUT_DIR` value and the cwd, and both name the worktree, so a
++//! build-script crate misses in each new worktree and every crate above it misses too. Cargo's own
++//! fingerprints do not name the worktree, so a copied unit reads as Fresh. Only units of packages with a
++//! registry or git source are copied: a local package (a workspace member or a path dependency) has its
++//! sources in the checkout, and an older copy of them could read as Fresh with other code.
++
++use std::fs::{self, File, TryLockError};
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++use crate::json::Json;
++
++/// The marker in `target/debug` of a seeded worktree: it is seeded once, never again.
++pub const MARKER: &str = ".camcraft-seeded";
++/// The unit directories, in copy order: the outputs first, the fingerprints last, so that a copy that
++/// stops half way leaves outputs without a fingerprint (cargo builds them again), never the reverse.
++const PARTS: [&str; 3] = ["build", "deps", ".fingerprint"];
++/// Cargo's locks of a target profile directory; a build in progress holds them.
++const LOCKS: [&str; 2] = [".cargo-lock", ".cargo-build-lock"];
++
++/// The names of the packages that have no `source` in `cargo metadata` (workspace members and path
++/// dependencies). Their sources differ between checkouts, so their units are never copied.
++pub fn local_packages(metadata: &Json) -> Vec<String> {
++    let Some(packages) = metadata.get("packages") else { return Vec::new() };
++    packages
++        .items()
++        .iter()
++        .filter(|p| matches!(p.get("source"), None | Some(Json::Null)))
++        .filter_map(|p| p.text("name").map(str::to_string))
++        .collect()
++}
++
++/// True when the unit entry `entry` (`<name>-<hash>`, `lib<crate>-<hash>.rlib`, ...) can belong to a
++/// local package. It matches by prefix and may match too much: that only costs a compile.
++pub fn is_local(entry: &str, local: &[String]) -> bool {
++    let bare = entry.strip_prefix("lib");
++    local.iter().any(|name| {
++        let snake = name.replace('-', "_");
++        [name.as_str(), snake.as_str()].iter().any(|n| {
++            let head = format!("{n}-");
++            entry.starts_with(&head) || bare.is_some_and(|b| b.starts_with(&head))
++        })
++    })
++}
++
++/// The number of units in `<checkout>/target/debug/.fingerprint`; 0 when there is none.
++fn units(checkout: &Path) -> usize {
++    fs::read_dir(checkout.join("target").join("debug").join(".fingerprint")).map(|d| d.count()).unwrap_or(0)
++}
++
++/// Takes cargo's locks of `dir` without a wait. `Ok(None)` when a lock is held (a build runs there).
++fn lock(dir: &Path, create: bool) -> Result<Option<Vec<File>>, String> {
++    let mut held = Vec::new();
++    for name in LOCKS {
++        let path = dir.join(name);
++        if !create && !path.is_file() {
++            continue;
++        }
++        let file = File::options().read(true).write(true).create(create).truncate(false).open(&path);
++        let file = file.map_err(|e| format!("open {}: {e}", path.display()))?;
++        match file.try_lock() {
++            Ok(()) => held.push(file),
++            Err(TryLockError::WouldBlock) => return Ok(None),
++            Err(TryLockError::Error(e)) => return Err(format!("lock {}: {e}", path.display())),
++        }
++    }
++    Ok(Some(held))
++}
++
++/// Removes the file or tree at `path`, if there is one.
++fn remove(path: &Path) {
++    if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
++        let _ = fs::remove_dir_all(path);
++    } else {
++        let _ = fs::remove_file(path);
++    }
++}
++
++/// Copies `from` to `to` (a file or a tree) with the modification times of `from`: cargo compares them.
++/// `fs::copy` clones the data where the file system can (APFS, btrfs, XFS, ReFS). Symbolic links are skipped.
++fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
++    let meta = fs::symlink_metadata(from).map_err(|e| format!("read {}: {e}", from.display()))?;
++    if meta.is_dir() {
++        fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
++        let list = fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
++        for item in list {
++            let item = item.map_err(|e| format!("read {}: {e}", from.display()))?;
++            copy_tree(&item.path(), &to.join(item.file_name()))?;
++        }
++    } else if meta.is_file() {
++        fs::copy(from, to).map_err(|e| format!("copy {}: {e}", from.display()))?;
++        let modified = meta.modified().map_err(|e| format!("mtime {}: {e}", from.display()))?;
++        let file = File::options().write(true).open(to).map_err(|e| format!("open {}: {e}", to.display()))?;
++        file.set_modified(modified).map_err(|e| format!("mtime {}: {e}", to.display()))?;
++    }
++    Ok(())
++}
++
++/// Copies the units of the checkout in `sources` with the most units into `dest_root/target/debug`. `Ok(None)` when the worktree was seeded before; `Ok(Some(note))` says what was seeded or why not.
++pub fn seed(dest_root: &Path, sources: &[PathBuf], local: &[String]) -> Result<Option<String>, String> {
++    let dest = dest_root.join("target").join("debug");
++    if dest.join(MARKER).exists() {
++        return Ok(None);
++    }
++    let me = fs::canonicalize(dest_root).unwrap_or_else(|_| dest_root.to_path_buf());
++    let mut found: Vec<(usize, &PathBuf)> = sources
++        .iter()
++        .filter(|s| fs::canonicalize(s).unwrap_or_else(|_| s.to_path_buf()) != me)
++        .map(|s| (units(s), s))
++        .filter(|(n, _)| *n > 0)
++        .collect();
++    if found.is_empty() {
++        return Ok(Some("target seed: no other checkout has built units; this worktree builds them".into()));
++    }
++    found.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
++    fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
++    let Some(_mine) = lock(&dest, true)? else {
++        return Ok(Some("target seed: a build runs in this worktree; not seeded".into()));
++    };
++    // The checkout with the most units first; one where a build runs now is passed over.
++    for (_, source) in found {
++        let src = source.join("target").join("debug");
++        let Some(_theirs) = lock(&src, false)? else { continue };
++        let t0 = std::time::Instant::now();
++        let copied = copy_units(&src, &dest, local)?;
++        let secs = t0.elapsed().as_secs();
++        let note = format!("target seed: seeded {copied} unit entries from {} in {secs}s", source.display());
++        fs::write(dest.join(MARKER), format!("{note}\n")).map_err(|e| format!("write {MARKER}: {e}"))?;
++        return Ok(Some(note));
++    }
++    Ok(Some("target seed: a build runs in each other checkout; not seeded this time".into()))
++}
++
++/// Copies each unit entry of `src` that is not of a local package into `dest`; the number copied. The
++/// entries of one part are copied on several threads; a part starts when the part before it is complete.
++fn copy_units(src: &Path, dest: &Path, local: &[String]) -> Result<usize, String> {
++    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 16);
++    let mut copied = 0usize;
++    for part in PARTS {
++        let (from, to) = (src.join(part), dest.join(part));
++        let Ok(list) = fs::read_dir(&from) else { continue };
++        fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
++        let mut names = Vec::new();
++        for item in list {
++            let item = item.map_err(|e| format!("read {}: {e}", from.display()))?;
++            let name = item.file_name().to_string_lossy().into_owned();
++            if !name.starts_with(".seed-") && !is_local(&name, local) {
++                names.push(name);
++            }
++        }
++        let next = std::sync::atomic::AtomicUsize::new(0);
++        let results: Vec<Result<(), String>> = std::thread::scope(|s| {
++            let jobs: Vec<_> = (0..workers)
++                .map(|_| {
++                    s.spawn(|| loop {
++                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                        let Some(name) = names.get(i) else { return Ok(()) };
++                        copy_unit(&from.join(name), &to, name)?;
++                    })
++                })
++                .collect();
++            jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err("a copy thread stopped".into()))).collect()
++        });
++        results.into_iter().collect::<Result<Vec<()>, String>>()?;
++        copied += names.len();
++    }
++    Ok(copied)
++}
++
++/// Copies one unit entry `from` into the directory `to` as `name`.
++fn copy_unit(from: &Path, to: &Path, name: &str) -> Result<(), String> {
++    // A copy under a temporary name, then one rename: a unit is complete or absent, never half there.
++    let tmp = to.join(format!(".seed-{name}"));
++    remove(&tmp);
++    copy_tree(from, &tmp)?;
++    // A unit that is here already (`cargo xtask` built its own dependencies just now) has the same hash,
++    // so the same inputs; it is replaced, else its newer time makes each copied unit above it dirty.
++    remove(&to.join(name));
++    fs::rename(&tmp, to.join(name)).map_err(|e| format!("rename {}: {e}", tmp.display()))
++}
++
++/// The checkouts of this repository (`git worktree list`): the main checkout and its worktrees.
++fn checkouts(root: &Path) -> Vec<PathBuf> {
++    let list = crate::exec::git(root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
++    list.lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from).collect()
++}
++
++/// Seeds the gate's worktree before its first cargo step. Never fails the gate: a problem is a note.
++/// `CAMCRAFT_NO_SEED=1` opts out; a dry run seeds nothing.
++pub fn before_gate(root: &Path, dry: bool) {
++    if dry || std::env::var_os("CAMCRAFT_NO_SEED").is_some_and(|v| v == "1") {
++        return;
++    }
++    if root.join("target").join("debug").join(MARKER).exists() {
++        return;
++    }
++    let out = Command::new(crate::exec::cargo()).args(["metadata", "--format-version", "1"]).current_dir(root).output();
++    let metadata = match out {
++        Ok(o) if o.status.success() => crate::json::parse(&String::from_utf8_lossy(&o.stdout)),
++        _ => None,
++    };
++    let Some(metadata) = metadata else {
++        println!("target seed: cargo metadata failed; not seeded");
++        return;
++    };
++    match seed(root, &checkouts(root), &local_packages(&metadata)) {
++        Ok(Some(note)) => println!("{note}"),
++        Ok(None) => {}
++        Err(e) => println!("target seed: {e}; not seeded"),
++    }
++}
+diff --git a/xtask/src/seed_tests.rs b/xtask/src/seed_tests.rs
+new file mode 100644
+index 000000000..2eaa92a35
+--- /dev/null
++++ b/xtask/src/seed_tests.rs
+@@ -0,0 +1,203 @@
++//! Pins of the worktree target seed (#2575): a fresh checkout finds a build-script dependency Fresh, and
++//! never takes a local package's stale unit. Provenance: our own tests.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++use std::time::{Duration, SystemTime};
++
++use crate::seed;
++
++/// A scratch directory of its own for each test.
++fn scratch(tag: &str) -> PathBuf {
++    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
++    let dir = std::env::temp_dir().join(format!("camcraft-seed-{tag}-{}-{nanos}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("scratch dir");
++    dir
++}
++
++fn write(path: &Path, text: &str) {
++    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
++    std::fs::write(path, text).expect("write");
++}
++
++/// Cargo in `dir` with its own CARGO_HOME and no wrapper or shared target dir; (ok, stderr).
++fn cargo(dir: &Path, home: &Path, args: &[&str]) -> (bool, String) {
++    let out = Command::new(crate::exec::cargo())
++        .args(args)
++        .current_dir(dir)
++        .env("CARGO_HOME", home)
++        .env_remove("RUSTC_WRAPPER")
++        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
++        .env_remove("CARGO_TARGET_DIR")
++        .env_remove("CARGO_BUILD_TARGET_DIR")
++        .env_remove("CARGO_ENCODED_RUSTFLAGS")
++        .env_remove("RUSTFLAGS")
++        .output()
++        .expect("cargo runs");
++    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
++}
++
++fn git(dir: &Path, args: &[&str]) {
++    let ok = Command::new("git")
++        .args(["-c", "user.name=seed", "-c", "user.email=seed@example.invalid", "-c", "commit.gpgsign=false"])
++        .args(args)
++        .current_dir(dir)
++        .output()
++        .expect("git runs")
++        .status
++        .success();
++    assert!(ok, "git {args:?}");
++}
++
++/// A git dependency with a build script that writes the source the library includes from OUT_DIR, as
++/// serde and the solidcore crates do; and one checkout `a` of a package that uses it, built once.
++fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
++    let root = scratch(tag);
++    let (home, base, dep, a) = (root.join("home"), root.join("base"), root.join("dep"), root.join("a"));
++    let repo = |dir: &Path| {
++        git(dir, &["init", "-q"]);
++        git(dir, &["add", "."]);
++        git(dir, &["commit", "-q", "-m", "fixture"]);
++        let path = dir.display().to_string().replace('\\', "/");
++        format!("file://{}{path}", if path.starts_with('/') { "" } else { "/" })
++    };
++    write(&base.join("Cargo.toml"), "[package]\nname = \"seedbase\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
++    write(&base.join("src/lib.rs"), "pub const B: u32 = 3;\n");
++    let base_url = repo(&base);
++    let dep_manifest = format!(
++        "[package]\nname = \"seeddep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
++         [dependencies]\nseedbase = {{ git = \"{base_url}\" }}\n"
++    );
++    write(&dep.join("Cargo.toml"), &dep_manifest);
++    write(
++        &dep.join("build.rs"),
++        "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    \
++         std::fs::write(format!(\"{out}/gen.rs\"), \"pub const N: u32 = 7 + seedbase::B;\").unwrap();\n}\n",
++    );
++    write(&dep.join("src/lib.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
++    let url = repo(&dep);
++    let manifest = format!(
++        "[package]\nname = \"seedapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n\n\
++         [dependencies]\nseeddep = {{ git = \"{url}\" }}\n"
++    );
++    write(&a.join("Cargo.toml"), &manifest);
++    write(&a.join("src/lib.rs"), "pub const LOCAL: u32 = 1;\npub fn n() -> u32 { seeddep::N + LOCAL }\n");
++    let (ok, err) = cargo(&a, &home, &["build"]);
++    assert!(ok, "checkout a builds: {err}");
++    (home, a, root)
++}
++
++/// A second checkout `b` of the same package, with `LOCAL = 2`, its source older than a's build.
++fn second_checkout(root: &Path, a: &Path) -> PathBuf {
++    let b = root.join("b");
++    write(&b.join("Cargo.toml"), &std::fs::read_to_string(a.join("Cargo.toml")).expect("manifest"));
++    std::fs::copy(a.join("Cargo.lock"), b.join("Cargo.lock")).expect("lock");
++    let lib = b.join("src/lib.rs");
++    write(&lib, "pub const LOCAL: u32 = 2;\npub fn n() -> u32 { seeddep::N + LOCAL }\n");
++    let old = SystemTime::now() - Duration::from_secs(3600);
++    std::fs::File::options().write(true).open(&lib).expect("open").set_modified(old).expect("mtime");
++    // `cargo xtask` builds its own dependencies in b before the seed: b has seedbase's units already, newer.
++    for part in ["deps", ".fingerprint"] {
++        let (from, to) = (a.join("target/debug").join(part), b.join("target/debug").join(part));
++        for item in std::fs::read_dir(&from).expect("units").flatten() {
++            let name = item.file_name().to_string_lossy().into_owned();
++            if name.starts_with("seedbase-") || name.starts_with("libseedbase-") {
++                touched_copy(&item.path(), &to.join(name));
++            }
++        }
++    }
++    b
++}
++
++/// Copies a file or tree with the time of now on each file.
++fn touched_copy(from: &Path, to: &Path) {
++    if from.is_dir() {
++        std::fs::create_dir_all(to).expect("mkdir");
++        for item in std::fs::read_dir(from).expect("read").flatten() {
++            touched_copy(&item.path(), &to.join(item.file_name()));
++        }
++    } else {
++        std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
++        std::fs::copy(from, to).expect("copy");
++        std::fs::File::options().write(true).open(to).expect("open").set_modified(SystemTime::now()).expect("mtime");
++    }
++}
++
++fn local_packages(dir: &Path, home: &Path) -> Vec<String> {
++    let out = Command::new(crate::exec::cargo())
++        .args(["metadata", "--format-version", "1"])
++        .current_dir(dir)
++        .env("CARGO_HOME", home)
++        .output()
++        .expect("cargo metadata");
++    let json = crate::json::parse(&String::from_utf8_lossy(&out.stdout)).expect("metadata json");
++    seed::local_packages(&json)
++}
++
++#[test]
++fn a_seeded_checkout_finds_a_build_script_dependency_fresh() {
++    let (home, a, root) = fixture("fresh");
++    let b = second_checkout(&root, &a);
++    let local = local_packages(&b, &home);
++    assert_eq!(local, ["seedapp"]);
++    let note = seed::seed(&b, std::slice::from_ref(&a), &local).expect("seed");
++    let (ok, err) = cargo(&b, &home, &["build", "-v"]);
++    assert!(ok, "checkout b builds: {err}");
++    assert!(
++        !err.contains("Compiling seeddep"),
++        "fresh-worktree build-script dependency must not compile again:\n{err}"
++    );
++    assert!(err.contains("Fresh seeddep"), "seeddep is Fresh:\n{err}");
++    // The local package is never taken from a: its older source would read as Fresh and hide LOCAL = 2.
++    assert!(err.contains("Compiling seedapp"), "the local package compiles in b:\n{err}");
++    assert!(note.is_some_and(|n| n.contains("seeded")), "the seed says what it did");
++    assert!(b.join("target/debug").join(seed::MARKER).is_file(), "the marker is written");
++    let again = seed::seed(&b, &[a], &local).expect("second seed");
++    assert!(again.is_none(), "a seeded worktree is not seeded again");
++    let _ = std::fs::remove_dir_all(&root);
++}
++
++#[test]
++fn a_checkout_where_a_build_runs_is_passed_over() {
++    let root = scratch("busy");
++    let (big, small, dest) = (root.join("big"), root.join("small"), root.join("dest"));
++    for (checkout, units) in [(&big, 2), (&small, 1)] {
++        for n in 0..units {
++            write(&checkout.join(format!("target/debug/.fingerprint/dep{n}-00/hash")), "x");
++        }
++        write(&checkout.join(format!("target/debug/deps/libonly_{}-00.rlib", units)), "rlib");
++    }
++    write(&big.join("target/debug/.cargo-lock"), "");
++    let held = std::fs::File::options().write(true).open(big.join("target/debug/.cargo-lock")).expect("open");
++    held.try_lock().expect("the test holds big's build lock");
++    let note = seed::seed(&dest, &[big.clone(), small.clone()], &[]).expect("seed").expect("a note");
++    assert!(note.contains(&small.display().to_string()), "the free checkout seeds: {note}");
++    assert!(dest.join("target/debug/deps/libonly_1-00.rlib").is_file(), "small's unit is here");
++    assert!(!dest.join("target/debug/deps/libonly_2-00.rlib").exists(), "nothing is read from the busy checkout");
++    let dest2 = root.join("dest2");
++    let note = seed::seed(&dest2, &[big], &[]).expect("seed").expect("a note");
++    assert!(note.contains("a build runs"), "all sources busy: {note}");
++    assert!(!dest2.join("target/debug").join(seed::MARKER).exists(), "no marker: a later gate tries again");
++    drop(held);
++    let _ = std::fs::remove_dir_all(&root);
++}
++
++#[test]
++fn local_packages_are_the_ones_without_a_source() {
++    let json = crate::json::parse(
++        r#"{"packages":[{"name":"camcraft-app","source":null},{"name":"serde","source":"registry+x"},{"name":"own"}]}"#,
++    )
++    .expect("json");
++    assert_eq!(seed::local_packages(&json), ["camcraft-app", "own"]);
++}
++
++#[test]
++fn a_unit_entry_of_a_local_package_is_never_copied() {
++    let local = ["camcraft-app".to_string(), "libc".to_string()];
++    for e in ["camcraft-app-0a1b", "libcamcraft_app-0a1b.rlib", "camcraft_app-0a1b.d", "liblibc-9f.rlib", "libc-9f"] {
++        assert!(seed::is_local(e, &local), "{e} is local");
++    }
++    for e in ["serde-0a1b", "libserde-0a1b.rmeta", "solidcore-77", "libsolidcore-77.rlib"] {
++        assert!(!seed::is_local(e, &local), "{e} is not local");
++    }
++}
+
+From 149e7a466f2c158ec0d88a91eec00bec1e0c3c25 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Sat, 21 Nov 2026 11:24:28 +0100
+Subject: [PATCH 2/2] fix(xtask): seed both Cargo artifact layouts
+
+Detect nested fingerprints and exclude bare local package directories. Keep the freshness fixture active with either artifact layout.
+
+Refs #2575
+---
+ xtask/src/seed.rs       | 21 +++++++++++----
+ xtask/src/seed_tests.rs | 60 ++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 72 insertions(+), 9 deletions(-)
+
+diff --git a/xtask/src/seed.rs b/xtask/src/seed.rs
+index 3600424fa..f69c30c22 100644
+--- a/xtask/src/seed.rs
++++ b/xtask/src/seed.rs
+@@ -1,6 +1,6 @@
+ //! Seeds a new worktree's `target/debug` from another checkout of the same repository (#2575), so cargo
+ //! finds the dependency units (solidcore, the build-script crates) Fresh instead of compiling them again.
+-//! Provenance: our own build tooling (#900, #2575); Cargo's documented target layout (deps/, build/, .fingerprint/).
++//! Provenance: our own build tooling (#900, #2575); Cargo's target layouts (deps/, .fingerprint/, and build/<package>/<hash>/).
+ //!
+ //! Why not sccache: its Rust key hashes the `OUT_DIR` value and the cwd, and both name the worktree, so a
+ //! build-script crate misses in each new worktree and every crate above it misses too. Cargo's own
+@@ -42,14 +42,24 @@ pub fn is_local(entry: &str, local: &[String]) -> bool {
+         let snake = name.replace('-', "_");
+         [name.as_str(), snake.as_str()].iter().any(|n| {
+             let head = format!("{n}-");
+-            entry.starts_with(&head) || bare.is_some_and(|b| b.starts_with(&head))
++            *n == entry || entry.starts_with(&head) || bare.is_some_and(|b| b.starts_with(&head))
+         })
+     })
+ }
+ 
+-/// The number of units in `<checkout>/target/debug/.fingerprint`; 0 when there is none.
++/// Counts legacy fingerprints and the units in `build/<package>/<hash>/fingerprint`.
+ fn units(checkout: &Path) -> usize {
+-    fs::read_dir(checkout.join("target").join("debug").join(".fingerprint")).map(|d| d.count()).unwrap_or(0)
++    let debug = checkout.join("target").join("debug");
++    let legacy = fs::read_dir(debug.join(".fingerprint")).map(|d| d.count()).unwrap_or(0);
++    let nested = fs::read_dir(debug.join("build"))
++        .into_iter()
++        .flatten()
++        .filter_map(Result::ok)
++        .flat_map(|package| fs::read_dir(package.path()).into_iter().flatten())
++        .filter_map(Result::ok)
++        .filter(|unit| unit.path().join("fingerprint").is_dir())
++        .count();
++    legacy + nested
+ }
+ 
+ /// Takes cargo's locks of `dir` without a wait. `Ok(None)` when a lock is held (a build runs there).
+@@ -171,7 +181,8 @@ fn copy_units(src: &Path, dest: &Path, local: &[String]) -> Result<usize, String
+     Ok(copied)
+ }
+ 
+-/// Copies one unit entry `from` into the directory `to` as `name`.
++/// Copies one entry `from` into the directory `to` as `name`. In the nested layout this is a whole
++/// package tree: its outputs and fingerprints become visible together, only after the copy completes.
+ fn copy_unit(from: &Path, to: &Path, name: &str) -> Result<(), String> {
+     // A copy under a temporary name, then one rename: a unit is complete or absent, never half there.
+     let tmp = to.join(format!(".seed-{name}"));
+diff --git a/xtask/src/seed_tests.rs b/xtask/src/seed_tests.rs
+index 2eaa92a35..6fc01d5f6 100644
+--- a/xtask/src/seed_tests.rs
++++ b/xtask/src/seed_tests.rs
+@@ -97,15 +97,22 @@ fn second_checkout(root: &Path, a: &Path) -> PathBuf {
+     let old = SystemTime::now() - Duration::from_secs(3600);
+     std::fs::File::options().write(true).open(&lib).expect("open").set_modified(old).expect("mtime");
+     // `cargo xtask` builds its own dependencies in b before the seed: b has seedbase's units already, newer.
+-    for part in ["deps", ".fingerprint"] {
++    let mut copied = 0;
++    for part in ["build", "deps", ".fingerprint"] {
+         let (from, to) = (a.join("target/debug").join(part), b.join("target/debug").join(part));
+-        for item in std::fs::read_dir(&from).expect("units").flatten() {
++        let Ok(entries) = std::fs::read_dir(&from) else {
++            continue;
++        };
++        for item in entries {
++            let item = item.expect("unit entry");
+             let name = item.file_name().to_string_lossy().into_owned();
+-            if name.starts_with("seedbase-") || name.starts_with("libseedbase-") {
++            if name == "seedbase" || name.starts_with("seedbase-") || name.starts_with("libseedbase-") {
+                 touched_copy(&item.path(), &to.join(name));
++                copied += 1;
+             }
+         }
+     }
++    assert!(copied > 0, "the fixture refreshes an existing dependency in either Cargo layout");
+     b
+ }
+ 
+@@ -194,10 +201,55 @@ fn local_packages_are_the_ones_without_a_source() {
+ #[test]
+ fn a_unit_entry_of_a_local_package_is_never_copied() {
+     let local = ["camcraft-app".to_string(), "libc".to_string()];
+-    for e in ["camcraft-app-0a1b", "libcamcraft_app-0a1b.rlib", "camcraft_app-0a1b.d", "liblibc-9f.rlib", "libc-9f"] {
++    for e in [
++        "camcraft-app",
++        "camcraft_app",
++        "libc",
++        "camcraft-app-0a1b",
++        "libcamcraft_app-0a1b.rlib",
++        "camcraft_app-0a1b.d",
++        "liblibc-9f.rlib",
++        "libc-9f",
++    ] {
+         assert!(seed::is_local(e, &local), "{e} is local");
+     }
+     for e in ["serde-0a1b", "libserde-0a1b.rmeta", "solidcore-77", "libsolidcore-77.rlib"] {
+         assert!(!seed::is_local(e, &local), "{e} is not local");
+     }
+ }
++
++#[test]
++fn both_artifact_layouts_copy_dependencies_and_exclude_local_packages() {
++    let root = scratch("layouts");
++    for nested in [false, true] {
++        let source = root.join(if nested { "nested" } else { "legacy" });
++        let dest = root.join(if nested { "nested-dest" } else { "legacy-dest" });
++        let files = if nested {
++            [
++                "build/serde/00/fingerprint/lib-serde",
++                "build/serde/00/out/libserde.rlib",
++                "build/camcraft-app/00/fingerprint/lib-camcraft_app",
++                "build/camcraft-app/00/out/libcamcraft_app.rlib",
++            ]
++        } else {
++            [
++                ".fingerprint/serde-00/lib-serde",
++                "deps/libserde-00.rlib",
++                ".fingerprint/camcraft-app-00/lib-camcraft_app",
++                "deps/libcamcraft_app-00.rlib",
++            ]
++        };
++        for file in files {
++            write(&source.join("target/debug").join(file), "unit");
++        }
++        let note = seed::seed(&dest, &[source], &["camcraft-app".into()]).expect("seed").expect("note");
++        assert!(note.contains("seeded"), "the source scan finds the layout: {note}");
++        for file in &files[..2] {
++            assert_eq!(std::fs::read_to_string(dest.join("target/debug").join(file)).expect("dependency unit"), "unit");
++        }
++        for file in &files[2..] {
++            assert!(!dest.join("target/debug").join(file).exists(), "local artifact is excluded: {file}");
++        }
++    }
++    let _ = std::fs::remove_dir_all(root);
++}

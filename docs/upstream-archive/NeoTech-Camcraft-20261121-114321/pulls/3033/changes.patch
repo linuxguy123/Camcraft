@@ -1,0 +1,1217 @@
+From 398a4a937a6267dce87da97495149713412920a5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 20 Nov 2026 08:42:21 -0800
+Subject: [PATCH 1/2] feat(mcp): compact read modes and chat context budgets
+
+get_job takes summary (no machine definition, only changed operation
+fields). list_operation_types filters by kind or section. list_features
+takes compact (short rows, default limit 25). provider::tools_in offers a
+core set of 25 tools; the chat sends it to local endpoints.
+
+The chat worker cuts each tool reply at 12000 JSON characters with a
+hint, sends one viewport image per request, stops a turn after 12
+rounds, and keeps 6 earlier turns plus the latest get_job reply when it
+drops older ones.
+
+Fixes #1944
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/mcp/compact.rs                 | 171 +++++++++++++++
+ crates/app/src/mcp/features.rs                |  11 +-
+ crates/app/src/mcp/job.rs                     |  16 +-
+ crates/app/src/mcp/mod.rs                     |   2 +
+ crates/app/src/mcp/pick.rs                    |   3 +-
+ crates/app/src/mcp/provider.rs                |  29 ++-
+ crates/app/src/mcp/tools.rs                   |   4 +-
+ crates/app/tests/mcp_compact.rs               | 196 +++++++++++++++++
+ crates/ui/src/egui_app/ai_chat/budget.rs      | 200 ++++++++++++++++++
+ crates/ui/src/egui_app/ai_chat/mod.rs         |   2 +
+ crates/ui/src/egui_app/ai_chat/transport.rs   |   7 +-
+ crates/ui/src/egui_app/ai_chat/turn.rs        |   7 +
+ crates/ui/src/egui_app/ai_chat/worker.rs      |  16 +-
+ crates/ui/src/egui_app/ai_chat/worker_mcp.rs  |   2 +
+ .../ui/src/egui_app/tests/ai_chat/budget.rs   |  95 +++++++++
+ crates/ui/src/egui_app/tests/ai_chat/mod.rs   |   1 +
+ docs/decisions/1944-ai-context-budgets.md     |  57 +++++
+ 17 files changed, 801 insertions(+), 18 deletions(-)
+ create mode 100644 crates/app/src/mcp/compact.rs
+ create mode 100644 crates/app/tests/mcp_compact.rs
+ create mode 100644 crates/ui/src/egui_app/ai_chat/budget.rs
+ create mode 100644 crates/ui/src/egui_app/tests/ai_chat/budget.rs
+ create mode 100644 docs/decisions/1944-ai-context-budgets.md
+
+diff --git a/crates/app/src/mcp/compact.rs b/crates/app/src/mcp/compact.rs
+new file mode 100644
+index 000000000..f16e534fb
+--- /dev/null
++++ b/crates/app/src/mcp/compact.rs
+@@ -0,0 +1,171 @@
++//! #1944: compact read modes that keep a CAM job inside a model's context
++//! window - the `get_job` summary, the `list_operation_types` kind and
++//! section filter, and the short `list_features` rows.
++//!
++//! Provenance: our own reductions over this repo's MCP JSON views; no
++//! vendor material consulted.
++
++use crate::operation::KindInfo;
++
++use serde_json::{json, Map, Value};
++use std::collections::HashMap;
++
++/// Rows per feature kind of a compact `list_features` without a `limit`:
++/// a chat-sized page. The full listing keeps its own default.
++pub(super) const COMPACT_LIMIT: usize = 25;
++
++/// The section names `list_operation_types` writes, in kind order, once each.
++fn sections() -> Vec<String> {
++    let mut out: Vec<String> = Vec::new();
++    for k in KindInfo::ALL {
++        let s = format!("{:?}", k.section);
++        if !out.contains(&s) {
++            out.push(s);
++        }
++    }
++    out
++}
++
++/// An optional boolean argument; absent or `null` is `false`.
++pub(super) fn flag(a: &Map<String, Value>, key: &str) -> Result<bool, String> {
++    match a.get(key) {
++        None | Some(Value::Null) => Ok(false),
++        Some(Value::Bool(b)) => Ok(*b),
++        Some(other) => Err(format!("\"{key}\" must be true or false, got {other}")),
++    }
++}
++
++pub(super) fn s_get_job() -> Value {
++    json!({ "type": "object", "additionalProperties": false, "required": [], "properties": {
++        "summary": { "type": "boolean", "description": "Short form: omit the machine definition and the operation fields that still hold their defaults (default false)." }
++    }})
++}
++
++pub(super) fn s_list_operation_types() -> Value {
++    json!({ "type": "object", "additionalProperties": false, "required": [], "properties": {
++        "kind": { "type": "string", "description": "Only this kind, by key or label (e.g. \"face\")." },
++        "section": { "type": "string", "description": format!("Only the kinds of this section: {}.", sections().join(", ")) }
++    }})
++}
++
++/// The default field object of every kind, by its file key.
++fn defaults_by_key() -> HashMap<String, Map<String, Value>> {
++    (0..KindInfo::ALL.len())
++        .filter_map(|i| match super::job::kind_defaults(i) {
++            (key, Value::Object(m)) if !key.is_empty() => Some((key, m)),
++            _ => None,
++        })
++        .collect()
++}
++
++/// Keep only the fields that differ from the kind's defaults.
++fn changed_fields(params: &Value, defaults: &HashMap<String, Map<String, Value>>) -> Value {
++    let Some(outer) = params.as_object() else {
++        return params.clone();
++    };
++    let mut out = Map::new();
++    for (key, fields) in outer {
++        let (Some(fields), Some(base)) = (fields.as_object(), defaults.get(key)) else {
++            out.insert(key.clone(), fields.clone());
++            continue;
++        };
++        let kept: Map<String, Value> =
++            fields.iter().filter(|(n, v)| base.get(*n) != Some(*v)).map(|(n, v)| (n.clone(), v.clone())).collect();
++        out.insert(key.clone(), Value::Object(kept));
++    }
++    Value::Object(out)
++}
++
++/// Drop the `null` and empty-list fields of one row (not inside `params`,
++/// where a `null` is a stated value).
++fn drop_empty(row: &mut Value) {
++    if let Some(m) = row.as_object_mut() {
++        m.retain(|k, v| k == "params" || !(v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
++    }
++}
++
++/// Turn a full `get_job` reply into its summary form, in place.
++pub(super) fn summarize_job(job: &mut Value) {
++    if let Some(machine) = job.get_mut("machine").and_then(Value::as_object_mut)
++        && let Some(def) = machine.remove("definition")
++    {
++        if let Some(name) = def.get("name").filter(|n| !n.is_null()) {
++            machine.insert("name".into(), name.clone());
++        }
++        machine.insert("definition_omitted".into(), json!(!def.is_null()));
++    }
++    let defaults = defaults_by_key();
++    if let Some(ops) = job.get_mut("operations").and_then(Value::as_array_mut) {
++        for op in ops {
++            if let Some(params) = op.get_mut("params") {
++                *params = changed_fields(params, &defaults);
++            }
++            drop_empty(op);
++        }
++    }
++    for list in ["setups", "tools", "models"] {
++        if let Some(rows) = job.get_mut(list).and_then(Value::as_array_mut) {
++            for row in rows {
++                drop_empty(row);
++                if let Some(wcs) = row.get_mut("wcs") {
++                    drop_empty(wcs);
++                }
++            }
++        }
++    }
++    job["summary"] = json!(true);
++    job["note"] = json!("Summary: operation params list only the fields changed from the kind's defaults (see list_operation_types). Call get_job without summary for the whole document.");
++}
++
++/// Keep the kinds that `kind` and `section` name; refuse a name that matches none.
++pub(super) fn filter_kinds(kinds: Vec<Value>, a: &Map<String, Value>) -> Result<Vec<Value>, String> {
++    let kind = super::tools::opt_str(a, "kind")?;
++    let section = super::tools::opt_str(a, "section")?;
++    if let Some(s) = section {
++        let known = sections();
++        if !known.iter().any(|n| n.eq_ignore_ascii_case(s)) {
++            return Err(format!("unknown section \"{s}\" - sections: {}", known.join(", ")));
++        }
++    }
++    let same = |v: &Value, want: &str| v.as_str().is_some_and(|t| t.eq_ignore_ascii_case(want));
++    let kept: Vec<Value> = kinds
++        .into_iter()
++        .filter(|k| kind.is_none_or(|want| same(&k["key"], want) || same(&k["label"], want)))
++        .filter(|k| section.is_none_or(|want| same(&k["section"], want)))
++        .collect();
++    if let (Some(want), true) = (kind, kept.is_empty()) {
++        return Err(format!("no operation kind \"{want}\"{} - call list_operation_types without \"kind\" for the list", section.map(|s| format!(" in section {s}")).unwrap_or_default()));
++    }
++    Ok(kept)
++}
++
++/// The short form of one `list_features` row: its id, its name and the
++/// facts a pick is chosen by; counts in place of nested lists.
++fn compact_row(kind: &str, row: &Value) -> Value {
++    let keep: &[&str] = match kind {
++        "faces" => &["id", "name", "facing", "area", "patch"],
++        "chains" => &["id", "name", "closed", "edges", "length"],
++        "patches" => &["id", "name"],
++        _ => &["id", "name", "at"],
++    };
++    let mut out = Map::new();
++    for k in keep {
++        if let Some(v) = row.get(*k) {
++            out.insert((*k).to_owned(), v.clone());
++        }
++    }
++    // #2186: a face whose outside cannot be told still says so.
++    if let Some(why) = row.get("outside_unknown").filter(|v| !v.is_null()) {
++        out.insert("outside_unknown".into(), why.clone());
++    }
++    for list in ["loops", "faces"] {
++        if let Some(items) = row.get(list).and_then(Value::as_array) {
++            out.insert(format!("{list}_count"), json!(items.len()));
++        }
++    }
++    Value::Object(out)
++}
++
++pub(super) fn compact_rows(kind: &str, rows: Vec<Value>) -> Vec<Value> {
++    rows.iter().map(|r| compact_row(kind, r)).collect()
++}
+diff --git a/crates/app/src/mcp/features.rs b/crates/app/src/mcp/features.rs
+index afa76c593..7dfcf042c 100644
+--- a/crates/app/src/mcp/features.rs
++++ b/crates/app/src/mcp/features.rs
+@@ -288,7 +288,12 @@ fn limit_of(a: &Map<String, Value>) -> Result<usize, String> {
+ pub(super) fn list_features(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
+     let name = req_str(a, "model")?;
+     let kinds = wanted_kinds(a)?;
+-    let limit = limit_of(a)?;
++    // #1944: compact rows, and a chat-sized page unless `limit` says otherwise.
++    let compact = super::compact::flag(a, "compact")?;
++    let limit = match a.get("limit") {
++        None | Some(Value::Null) if compact => super::compact::COMPACT_LIMIT,
++        _ => limit_of(a)?,
++    };
+     // #561: a fixture's faces are pickable too - `locate_part` mates them.
+     let e = match model::find_by_name(&env.world, name) {
+         Some(e) if model::is_fixture(&env.world, &e) => e,
+@@ -312,9 +317,13 @@ pub(super) fn list_features(env: &mut Env, a: &Map<String, Value>) -> Result<Val
+             _ => vertices_view(name, names.as_deref(), &g, &loc, limit),
+         };
+         truncated |= rows.len() < total;
++        let rows = if compact { super::compact::compact_rows(k, rows) } else { rows };
+         out[k] = Value::Array(rows);
+         out[format!("{k}_total")] = json!(total);
+     }
+     out["truncated"] = json!(truncated);
++    if compact {
++        out["compact"] = json!(true);
++    }
+     Ok(out)
+ }
+diff --git a/crates/app/src/mcp/job.rs b/crates/app/src/mcp/job.rs
+index ce4a8d0f9..e5a8ce10c 100644
+--- a/crates/app/src/mcp/job.rs
++++ b/crates/app/src/mcp/job.rs
+@@ -111,7 +111,9 @@ fn machine_view(w: &flecs_ecs::prelude::World) -> Value {
+     })
+ }
+ 
+-pub(super) fn get_job(env: &mut Env, _a: &Map<String, Value>) -> Result<Value, String> {
++pub(super) fn get_job(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    // #1944: the short form for a model's context window.
++    let summary = super::compact::flag(a, "summary")?;
+     let w = &env.world;
+     let models: Vec<Value> = model::model_entities(w)
+         .iter()
+@@ -156,7 +158,7 @@ pub(super) fn get_job(env: &mut Env, _a: &Map<String, Value>) -> Result<Value, S
+         }))
+         .collect();
+     let ops: Vec<Value> = inventory(env).iter().map(|(k, e, s)| op_full(env, k, e, *s)).collect();
+-    Ok(json!({
++    let mut job = json!({
+         "document": env.doc_path.as_ref().map(|p| p.display().to_string()),
+         // #902: the document's unit - display and posted program.
+         "units": super::units_tools::word(w),
+@@ -171,7 +173,11 @@ pub(super) fn get_job(env: &mut Env, _a: &Map<String, Value>) -> Result<Value, S
+         "machine": machine_view(w),
+         "can_undo": env.history.can_undo(),
+         "can_redo": env.history.can_redo(),
+-    }))
++    });
++    if summary {
++        super::compact::summarize_job(&mut job);
++    }
++    Ok(job)
+ }
+ 
+ /// The kind's file key (`"face"`, `"pocket3d"` ...) and its default
+@@ -195,7 +201,7 @@ fn json_type(v: &Value) -> &'static str {
+     }
+ }
+ 
+-pub(super) fn list_operation_types(_env: &mut Env, _a: &Map<String, Value>) -> Result<Value, String> {
++pub(super) fn list_operation_types(_env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
+     let kinds: Vec<Value> = KindInfo::ALL
+         .iter()
+         .enumerate()
+@@ -227,6 +233,8 @@ pub(super) fn list_operation_types(_env: &mut Env, _a: &Map<String, Value>) -> R
+             kind
+         })
+         .collect();
++    // #1944: one kind, or one section, for a small context window.
++    let kinds = super::compact::filter_kinds(kinds, a)?;
+     Ok(json!({
+         "kinds": kinds,
+         "note": "Fields absent from the defaults are optional and off; set them in a params patch to turn them on.",
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index fd5f329fe..2f1f4382f 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -24,6 +24,8 @@ mod align_tools;
+ mod area;
+ mod body_tools;
+ mod bridge;
++// #1944: compact read modes for a model's context window.
++mod compact;
+ mod coolant_tools;
+ // #93 slice 2: a milling tool's drawn cutter outline.
+ mod cutter_tools;
+diff --git a/crates/app/src/mcp/pick.rs b/crates/app/src/mcp/pick.rs
+index f8a2539f7..b06646b3e 100644
+--- a/crates/app/src/mcp/pick.rs
++++ b/crates/app/src/mcp/pick.rs
+@@ -196,7 +196,8 @@ pub(super) fn s_list_features() -> Value {
+             "model": { "type": "string", "description": "Model name (see get_job)." },
+             "kinds": { "type": "array", "items": { "type": "string", "enum": ["faces", "chains", "patches", "vertices"] },
+                 "description": "Which feature kinds to list; default all." },
+-            "limit": { "type": "integer", "minimum": 1, "description": "Rows per kind (default 500)." }
++            "limit": { "type": "integer", "minimum": 1, "description": "Rows per kind (default 500; 25 with compact)." },
++            "compact": { "type": "boolean", "description": "Short rows (id, name and the facts a pick is chosen by; counts in place of loops and bounds) for a small context window (default false)." }
+         }),
+         &["model"],
+     )
+diff --git a/crates/app/src/mcp/provider.rs b/crates/app/src/mcp/provider.rs
+index e63db1826..0b7359065 100644
+--- a/crates/app/src/mcp/provider.rs
++++ b/crates/app/src/mcp/provider.rs
+@@ -18,12 +18,37 @@ pub enum Provider {
+     Gemini,
+ }
+ 
+-/// The `tools` request field. Read the registry on every request, without a cache.
+-/// OpenAI stays non-strict: MCP has optional fields and typed additional properties.
++/// Which tools a request offers (#1944): the whole table, or the core
++/// CAM workflow subset whose schemas fit a small local model's context.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ToolSet {
++    Full,
++    Core,
++}
++
++/// The core set: open, read, set up, add and edit operations, pick
++/// features, generate, verify, post and undo. Every name is a live tool.
++pub const CORE_TOOLS: &[&str] = &[
++    "open_project", "save_project", "import_model", "get_job", "get_selection",
++    "list_operation_types", "list_tool_catalog", "add_tool", "set_stock", "add_setup",
++    "activate_setup", "set_wcs", "add_operation", "edit_operation", "delete_operation",
++    "set_tool", "detect_holes", "detect_pockets", "list_features", "set_operation_geometry",
++    "generate", "verify", "post", "undo", "redo",
++];
++
++/// The `tools` request field with every tool. Read the registry on every request, without a cache.
+ #[must_use]
+ pub fn tools(provider: Provider) -> Vec<Value> {
++    tools_in(provider, ToolSet::Full)
++}
++
++/// The `tools` request field for one tool set.
++/// OpenAI stays non-strict: MCP has optional fields and typed additional properties.
++#[must_use]
++pub fn tools_in(provider: Provider, set: ToolSet) -> Vec<Value> {
+     let rows: Vec<Value> = registry::list()
+         .into_iter()
++        .filter(|tool| set == ToolSet::Full || tool["name"].as_str().is_some_and(|n| CORE_TOOLS.contains(&n)))
+         .map(|tool| {
+             let name = &tool["name"];
+             let description = &tool["description"];
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index a16ef1fe1..a6f7bd810 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -25,9 +25,9 @@ const TOOLS: &[Tool] = &[
+     Tool { name: "open_project", description: "Open a .camproj project file, replacing the current document and clearing undo history.", schema: s_path, run: open_project },
+     Tool { name: "save_project", description: "Save the document as a .camproj file. Without a path, saves over the file last opened or saved.", schema: s_opt_path, run: save_project },
+     Tool { name: "import_model", description: "Import a mesh model (STL, STEP or OBJ) through the app's importers. A name already used by a model updates that model. A STEP model too large to import at full detail answers with reduced_fidelity: how closely its surfaces are approximated, in mm - gouge checks against it are stricter, and its operations are refused at the post when it is too coarse to check; import it again with a larger facet_budget to clear that. A STEP closed shell that meshes open imports incomplete: reduced_fidelity then says incomplete and names the hole, and every operation on the model is refused at the post. notes lists what the importer changed, e.g. a STEP face wound against its neighbours that was flipped, by name, or a closed STEP solid wound inward that was turned outward.", schema: s_import, run: import_model },
+-    Tool { name: "get_job", description: "The whole document as JSON: setups (each with model_reference: a solid part, or the virtual reference of its placed DXF profiles), stock, work offsets, models (one imported at reduced fidelity carries reduced_fidelity), DXF profiles, tools, and operations with their parameters and status (one on a DXF profile says what it checks against).", schema: s_empty, run: job::get_job },
++    Tool { name: "get_job", description: "The whole document as JSON: setups (each with model_reference: a solid part, or the virtual reference of its placed DXF profiles), stock, work offsets, models (one imported at reduced fidelity carries reduced_fidelity), DXF profiles, tools, and operations with their parameters and status (one on a DXF profile says what it checks against). With summary, a short form for a small context window: no machine definition, and each operation lists only the fields changed from its defaults.", schema: super::compact::s_get_job, run: job::get_job },
+     Tool { name: "get_selection", description: "Read currently selected entities, active setup, active operation, viewport pick mode (model, face, edge, vertex), and active geometry picks.", schema: s_empty, run: super::selection::get_selection },
+-    Tool { name: "list_operation_types", description: "Every operation kind with its parameter fields, JSON types and default values, and the tool kinds it accepts.", schema: s_empty, run: job::list_operation_types },
++    Tool { name: "list_operation_types", description: "Every operation kind with its parameter fields, JSON types and default values, and the tool kinds it accepts. kind or section lists only those kinds.", schema: super::compact::s_list_operation_types, run: job::list_operation_types },
+     Tool { name: "list_tool_catalog", description: "The built-in tool catalog: names and definitions add_tool can copy into the document.", schema: s_empty, run: job::list_tool_catalog },
+     Tool { name: "list_holder_library", description: "The built-in holder library: BT30, BT40 and CAT40 holders with ER collet or Weldon side-lock noses, and standalone ER11-ER40 chucks - names set_tool_holder takes, with their dimensions and the shanks they clamp.", schema: s_empty, run: holders::list_holder_library },
+     Tool { name: "set_tool_holder", description: "Set a document tool's holder: from the holder library by name (optional gauge_len and projection, mm; the tool stores the reference to the entry, shown as holder.library, not a copy of its outline), from a drawn spun profile (points; a custom holder), or back to the holder cylinder (clear). One undo step; an unknown entry, a shank the holder cannot take or a bad profile is refused by name.", schema: holders::s_set_tool_holder, run: holders::set_tool_holder },
+diff --git a/crates/app/tests/mcp_compact.rs b/crates/app/tests/mcp_compact.rs
+new file mode 100644
+index 000000000..9423d4ac2
+--- /dev/null
++++ b/crates/app/tests/mcp_compact.rs
+@@ -0,0 +1,196 @@
++//! #1944: compact MCP read modes keep a CAM job inside a model's context
++//! window. `get_job` with `summary` drops the machine definition and the
++//! operation fields that still hold their defaults; `list_operation_types`
++//! filters by kind or section; `list_features` with `compact` lists short
++//! rows under a chat-sized default limit; and `provider::tools_in` offers a
++//! core tool subset for small local models. Each reply fits a budget.
++//!
++//! Gate map (#1944): covers camcraft_app::mcp (compact, job, features,
++//! provider, tools).
++//!
++//! Provenance: our own fixtures (common::solid_part); no vendor material.
++
++mod common;
++
++use camcraft_app::geometry::Triangle;
++use camcraft_app::mcp::provider::{self, Provider, ToolSet};
++use camcraft_app::mcp::Server;
++use common::solid_part::{circle, plate, rect};
++use serde_json::{json, Value};
++
++fn call(s: &mut Server, id: i64, name: &str, args: Value) -> (bool, Value) {
++    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
++    let reply = s.handle(&msg).expect("a request gets a response");
++    let result = &reply["result"];
++    let err = result["isError"] == json!(true);
++    (err, if err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() })
++}
++
++fn ok(s: &mut Server, id: i64, name: &str, args: Value) -> Value {
++    let (err, body) = call(s, id, name, args);
++    assert!(!err, "{name} refused: {body}");
++    body
++}
++
++fn chars(v: &Value) -> usize {
++    v.to_string().chars().count()
++}
++
++/// A 60 x 40 plate, z 0..10, with eight round holes: many faces and chains.
++fn write_plate_stl(dir: &std::path::Path) -> std::path::PathBuf {
++    let mut f: Vec<Triangle> = Vec::new();
++    plate(&rect(-30.0, -20.0, 30.0, 20.0), None, 0.0, 10.0, &mut f);
++    for i in 0..8 {
++        let x = -24.0 + 6.0 * f64::from(i);
++        plate(&circle((x, 0.0), 2.0, 24), None, 10.0, 12.0, &mut f);
++    }
++    let mut s = String::from("solid plate\n");
++    for t in &f {
++        s.push_str(" facet normal 0 0 0\n  outer loop\n");
++        for p in [t.a, t.b, t.c] {
++            s.push_str(&format!("   vertex {} {} {}\n", p.x, p.y, p.z));
++        }
++        s.push_str("  endloop\n endfacet\n");
++    }
++    s.push_str("endsolid plate\n");
++    let path = dir.join("plate.stl");
++    std::fs::write(&path, s).expect("write stl");
++    path
++}
++
++fn temp_dir(tag: &str) -> std::path::PathBuf {
++    let dir = std::env::temp_dir().join(format!("camcraft-1944-{tag}-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    dir
++}
++
++/// A job with a machine, a stock, two tools and three operations.
++fn job(s: &mut Server) {
++    ok(s, 1, "load_machine", json!({ "builtin": "VMC 3-axis" }));
++    ok(s, 2, "set_stock", json!({ "box": { "dx": 60, "dy": 40, "dz": 10 } }));
++    ok(s, 3, "add_tool", json!({ "catalog": "EM-1000-4FL" }));
++    ok(s, 4, "add_tool", json!({ "catalog": "EM-0600-4FL" }));
++    ok(s, 5, "add_operation", json!({ "kind": "face", "tool": "EM-1000-4FL", "name": "F1" }));
++    ok(s, 6, "add_operation", json!({ "kind": "face", "tool": "EM-0600-4FL", "name": "F2", "params": { "stepover": 2.5 } }));
++    ok(s, 7, "add_operation", json!({ "kind": "pocket", "tool": "EM-0600-4FL", "name": "P1" }));
++}
++
++#[test]
++fn get_job_summary_drops_the_machine_definition_and_default_fields() {
++    let mut s = Server::new();
++    job(&mut s);
++    let full = ok(&mut s, 10, "get_job", json!({}));
++    let short = ok(&mut s, 11, "get_job", json!({ "summary": true }));
++
++    assert!(full["machine"]["definition"].is_object(), "the full job keeps the machine: {}", full["machine"]);
++    assert!(short["machine"].get("definition").is_none(), "{}", short["machine"]);
++    assert_eq!(short["machine"]["definition_omitted"], json!(true));
++    assert_eq!(short["summary"], json!(true));
++
++    // F2 changed its stepover: the summary keeps that field and drops the rest.
++    let ops = short["operations"].as_array().expect("operations");
++    assert_eq!(ops.len(), 3);
++    let f2 = ops.iter().find(|o| o["name"] == json!("F2")).expect("F2");
++    let changed = f2["params"]["face"].as_object().expect("face params");
++    assert_eq!(changed.get("stepover"), Some(&json!(2.5)), "{f2}");
++    assert!(changed.len() < 4, "only the changed fields remain: {f2}");
++    let full_f2 = full["operations"].as_array().and_then(|o| o.iter().find(|o| o["name"] == json!("F2"))).expect("F2");
++    assert!(full_f2["params"]["face"].as_object().map_or(0, |m| m.len()) > changed.len());
++
++    // No null rows outside params: a summary says only what is set.
++    assert!(f2.get("checks_against").is_none() && f2.get("needs_review").is_none(), "{f2}");
++
++    // The budget: the summary is at most two thirds of the full reply and fits 2500 characters.
++    assert!(chars(&short) * 3 <= chars(&full) * 2, "summary {} vs full {}", chars(&short), chars(&full));
++    assert!(chars(&short) <= 2_500, "summary is {} characters", chars(&short));
++}
++
++#[test]
++fn get_job_summary_refuses_a_non_boolean() {
++    let mut s = Server::new();
++    let (err, body) = call(&mut s, 1, "get_job", json!({ "summary": "yes" }));
++    assert!(err, "{body}");
++    assert!(body.as_str().is_some_and(|t| t.contains("\"summary\"")), "{body}");
++}
++
++#[test]
++fn list_operation_types_filters_by_kind_and_by_section() {
++    let mut s = Server::new();
++    let all = ok(&mut s, 1, "list_operation_types", json!({}));
++    let n_all = all["kinds"].as_array().map_or(0, Vec::len);
++
++    let face = ok(&mut s, 2, "list_operation_types", json!({ "kind": "face" }));
++    let kinds = face["kinds"].as_array().expect("kinds");
++    assert_eq!(kinds.len(), 1, "{face}");
++    assert_eq!(kinds[0]["key"], json!("face"));
++    let by_label = ok(&mut s, 3, "list_operation_types", json!({ "kind": "Face" }));
++    assert_eq!(by_label["kinds"], face["kinds"], "a label matches like a key");
++
++    let drilling = ok(&mut s, 4, "list_operation_types", json!({ "section": "drilling" }));
++    let rows = drilling["kinds"].as_array().expect("kinds");
++    assert!(!rows.is_empty() && rows.len() < n_all, "{} of {n_all}", rows.len());
++    assert!(rows.iter().all(|k| k["section"] == json!("Drilling")), "{drilling}");
++    assert!(rows.iter().any(|k| k["key"] == json!("drill")), "{drilling}");
++
++    // The budget: one kind fits 4000 characters; the whole table does not.
++    assert!(chars(&face) <= 4_000, "one kind is {} characters", chars(&face));
++    assert!(chars(&all) > 4_000);
++
++    let (err, body) = call(&mut s, 5, "list_operation_types", json!({ "kind": "laser" }));
++    assert!(err && body.as_str().is_some_and(|t| t.contains("laser")), "{body}");
++    let (err, body) = call(&mut s, 6, "list_operation_types", json!({ "section": "Sawing" }));
++    assert!(err && body.as_str().is_some_and(|t| t.contains("Mill2D")), "{body}");
++}
++
++#[test]
++fn list_features_compact_rows_are_short_and_the_default_limit_is_chat_sized() {
++    let dir = temp_dir("features");
++    let stl = write_plate_stl(&dir);
++    let mut s = Server::new();
++    ok(&mut s, 1, "import_model", json!({ "name": "plate", "path": stl.display().to_string() }));
++    let full = ok(&mut s, 2, "list_features", json!({ "model": "plate" }));
++    let short = ok(&mut s, 3, "list_features", json!({ "model": "plate", "compact": true }));
++    let _ = std::fs::remove_dir_all(&dir);
++
++    assert_eq!(short["compact"], json!(true));
++    let face = &short["faces"][0];
++    assert!(face["id"].is_string(), "{face}");
++    assert!(face.get("loops").is_none() && face.get("bounds").is_none(), "{face}");
++    assert!(face["loops_count"].is_number(), "{face}");
++    let chain = &short["chains"][0];
++    assert!(chain["id"].is_string() && chain.get("bounds").is_none(), "{chain}");
++    assert_eq!(short["faces_total"], full["faces_total"], "totals stay whole");
++
++    // The chat default: 25 rows per kind, and `truncated` says so.
++    let rows = short["chains"].as_array().map_or(0, Vec::len);
++    let total = short["chains_total"].as_u64().unwrap_or(0) as usize;
++    assert_eq!(rows, total.min(25), "{rows} of {total}");
++    assert!(total > 25, "the fixture has more chains than one compact page: {total}");
++    assert_eq!(short["truncated"], json!(true));
++
++    // The budget: the compact listing fits 12000 characters.
++    assert!(chars(&short) <= 12_000, "compact is {} characters", chars(&short));
++    assert!(chars(&short) * 2 < chars(&full), "compact {} vs full {}", chars(&short), chars(&full));
++}
++
++#[test]
++fn the_core_tool_set_is_a_small_subset_of_the_full_table() {
++    let full = provider::tools_in(Provider::Anthropic, ToolSet::Full);
++    let core = provider::tools_in(Provider::Anthropic, ToolSet::Core);
++    assert_eq!(full, provider::tools(Provider::Anthropic), "Full is today's table");
++    assert!((20..=25).contains(&core.len()), "core has {} tools", core.len());
++    let names: Vec<&str> = full.iter().filter_map(|t| t["name"].as_str()).collect();
++    for t in &core {
++        let name = t["name"].as_str().expect("name");
++        assert!(names.contains(&name), "{name} is not a live tool");
++    }
++    for must in ["get_job", "add_operation", "generate", "verify", "post", "undo"] {
++        assert!(core.iter().any(|t| t["name"] == json!(must)), "core lacks {must}");
++    }
++    // The budget: the core schemas are under a third of the full table.
++    let size = |v: &Vec<Value>| serde_json::to_string(v).map_or(0, |s| s.len());
++    assert!(size(&core) * 3 < size(&full), "core {} vs full {}", size(&core), size(&full));
++    // Gemini wraps its declarations: the core set does the same.
++    let gemini = provider::tools_in(Provider::Gemini, ToolSet::Core);
++    assert_eq!(gemini[0]["functionDeclarations"].as_array().map(Vec::len), Some(core.len()));
++}
+diff --git a/crates/ui/src/egui_app/ai_chat/budget.rs b/crates/ui/src/egui_app/ai_chat/budget.rs
+new file mode 100644
+index 000000000..ee2e99c02
+--- /dev/null
++++ b/crates/ui/src/egui_app/ai_chat/budget.rs
+@@ -0,0 +1,200 @@
++//! Context budgets of the chat worker loop (#1944): a character cap on each
++//! tool reply with a truncation hint, a cap on attached viewport images, a
++//! cap on tool rounds, the core tool set for local models, and rolling
++//! history that keeps the latest `get_job` reply when it drops old turns.
++//! Provenance: our own limits over our own chat transcript; no vendor material involved.
++
++use camcraft_app::mcp::provider::ToolSet;
++use serde_json::{Value, json};
++
++use super::transport::{EndpointKind, TurnMessage};
++use super::turn::ChatTurn;
++use super::worker::ToolCardStatus;
++
++/// The most characters of one tool reply that go back to the model.
++pub(crate) const MAX_TOOL_REPLY_CHARS: usize = 12_000;
++/// The most viewport images that one request carries (the newest win).
++pub(crate) const MAX_IMAGES_PER_REQUEST: usize = 1;
++/// The most model rounds of one turn before it stops without an answer.
++pub(crate) const MAX_TOOL_ROUNDS: usize = 12;
++/// The most earlier turns that one request carries (the newest win).
++pub(crate) const MAX_PRIOR_TURNS: usize = 6;
++
++/// A local model gets the core tool set; a cloud model the whole table.
++#[must_use]
++pub(super) fn tool_set_for(kind: EndpointKind) -> ToolSet {
++    match kind {
++        EndpointKind::Local => ToolSet::Core,
++        EndpointKind::Cloud => ToolSet::Full,
++    }
++}
++
++/// Characters one `char` takes in a JSON string (the provider sends the
++/// tool result as serialized JSON text).
++fn json_width(c: char) -> usize {
++    match c {
++        '"' | '\\' | '\n' | '\r' | '\t' => 2,
++        c if (c as u32) < 0x20 => 6,
++        _ => 1,
++    }
++}
++
++/// The longest start of `text` whose JSON form is at most `max`
++/// characters (never a split character), and whether it was cut.
++fn head(text: &str, max: usize) -> (&str, bool) {
++    let mut used = 0usize;
++    for (at, c) in text.char_indices() {
++        used = used.saturating_add(json_width(c));
++        if used > max {
++            return (&text[..at], true);
++        }
++    }
++    (text, false)
++}
++
++/// `text` cut to `max` characters with a hint that says what to ask for.
++#[must_use]
++pub(super) fn cut_with_hint(text: &str, max: usize) -> String {
++    let (kept, cut) = head(text, max);
++    if !cut {
++        return text.to_owned();
++    }
++    format!(
++        "{kept}\n[truncated by the chat: {} of {} characters shown. Ask for less: \
++         get_job {{\"summary\":true}}, list_operation_types {{\"kind\":...}}, \
++         list_features {{\"compact\":true}}.]",
++        kept.chars().count(),
++        text.chars().count()
++    )
++}
++
++/// Cap one MCP tool result before it goes back to the model. A result
++/// over the cap becomes one text block (the structured copy is dropped)
++/// that ends with the truncation hint; the error flag stays.
++#[must_use]
++pub(super) fn cap_tool_reply(result: Value, text: String) -> (Value, String) {
++    if result.to_string().chars().count() <= MAX_TOOL_REPLY_CHARS {
++        return (result, text);
++    }
++    let cut = cut_with_hint(&text, MAX_TOOL_REPLY_CHARS);
++    let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
++    (json!({ "content": [{ "type": "text", "text": cut }], "isError": is_error }), cut)
++}
++
++/// Keep the newest `MAX_IMAGES_PER_REQUEST` screenshots; drop the older ones.
++pub(super) fn cap_images(messages: &mut [TurnMessage]) {
++    let mut seen = 0usize;
++    for m in messages.iter_mut().rev() {
++        if m.screenshot.is_some() {
++            seen += 1;
++            if seen > MAX_IMAGES_PER_REQUEST {
++                m.screenshot = None;
++            }
++        }
++    }
++}
++
++/// The earlier turns that a request carries, and - when older turns were
++/// dropped - the latest successful `get_job` reply of all earlier turns,
++/// cut to the reply cap, so the model keeps the state of the job.
++#[must_use]
++pub(super) fn prior_window(prior: &[ChatTurn]) -> (&[ChatTurn], Option<String>) {
++    let skip = prior.len().saturating_sub(MAX_PRIOR_TURNS);
++    let kept = prior.get(skip..).unwrap_or(&[]);
++    if skip == 0 {
++        return (kept, None);
++    }
++    let job = prior
++        .iter()
++        .rev()
++        .flat_map(|t| t.tool_cards.iter().rev())
++        .find(|c| c.name == "get_job" && c.status == ToolCardStatus::Succeeded && !c.summary.is_empty())
++        .map(|c| {
++            format!(
++                "[Context: {skip} earlier turns were dropped. The latest get_job reply follows.]\n{}\n\n",
++                cut_with_hint(&c.summary, MAX_TOOL_REPLY_CHARS)
++            )
++        });
++    (kept, job)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::transport::ScreenshotAttachment;
++    use super::super::turn::build_turn_messages;
++    use super::super::worker::ToolCard;
++    use super::*;
++    use camcraft_app::commands::History;
++
++    fn shot() -> Option<ScreenshotAttachment> {
++        Some(ScreenshotAttachment { mime_type: "image/png".into(), data_base64: "AAAA".into() })
++    }
++
++    fn turn(id: u64, with_job: Option<&str>) -> ChatTurn {
++        let mut t = ChatTurn::running(id, format!("prompt {id}"), &History::default(), None, shot());
++        t.assistant_text = format!("answer {id}");
++        if let Some(text) = with_job {
++            t.tool_cards.push(ToolCard {
++                id: format!("c{id}"),
++                name: "get_job".into(),
++                arguments: json!({}),
++                status: ToolCardStatus::Succeeded,
++                summary: text.into(),
++            });
++        }
++        t
++    }
++
++    #[test]
++    fn a_cut_keeps_whole_characters_and_says_how_much_was_shown() {
++        let text = "é".repeat(30);
++        let cut = cut_with_hint(&text, 10);
++        assert!(cut.starts_with(&"é".repeat(10)));
++        assert!(cut.contains("10 of 30 characters shown"), "{cut}");
++        assert_eq!(cut_with_hint("short", 10), "short");
++    }
++
++    #[test]
++    fn a_small_reply_passes_and_a_long_one_is_one_capped_text_block() {
++        let small = json!({ "content": [{ "type": "text", "text": "ok" }], "structuredContent": {}, "isError": false });
++        assert_eq!(cap_tool_reply(small.clone(), "ok".into()).0, small);
++
++        let long = "x".repeat(MAX_TOOL_REPLY_CHARS * 3);
++        let big = json!({ "content": [{ "type": "text", "text": long }], "structuredContent": { "a": long }, "isError": true });
++        let (capped, text) = cap_tool_reply(big, long.clone());
++        assert!(capped.get("structuredContent").is_none());
++        assert_eq!(capped["isError"], json!(true));
++        assert_eq!(capped["content"][0]["text"], json!(text));
++        assert!(text.contains("truncated"));
++        assert!(capped.to_string().chars().count() < MAX_TOOL_REPLY_CHARS + 400);
++    }
++
++    #[test]
++    fn only_the_newest_image_goes_with_a_request() {
++        let prior = vec![turn(1, None), turn(2, None)];
++        let messages = build_turn_messages(&prior, "now", None, shot());
++        let images = messages.iter().filter(|m| m.screenshot.is_some()).count();
++        assert_eq!(images, MAX_IMAGES_PER_REQUEST);
++        assert!(messages.last().is_some_and(|m| m.screenshot.is_some()), "the current prompt keeps its image");
++    }
++
++    #[test]
++    fn old_turns_are_dropped_and_the_latest_get_job_reply_is_kept() {
++        let mut prior: Vec<ChatTurn> = (1..=MAX_PRIOR_TURNS as u64 + 3).map(|i| turn(i, None)).collect();
++        prior[0] = turn(1, Some("{\"old\":true}"));
++        prior[1] = turn(2, Some("{\"latest_job\":true}"));
++        let messages = build_turn_messages(&prior, "now", None, None);
++        // Each kept turn is a prompt and an answer; then the current prompt.
++        assert_eq!(messages.len(), MAX_PRIOR_TURNS * 2 + 1);
++        assert!(!messages.iter().any(|m| m.text.ends_with("prompt 1") || m.text == "answer 3"));
++        let first = &messages[0];
++        assert!(first.text.contains("latest_job"), "{}", first.text);
++        assert!(!first.text.contains("\"old\""));
++        assert!(first.text.ends_with(&format!("prompt {}", 4)), "{}", first.text);
++
++        // Few turns: nothing is dropped and no context note is added.
++        let few = build_turn_messages(&prior[..2], "now", None, None);
++        assert_eq!(few.len(), 5);
++        assert_eq!(few[0].text, "prompt 1");
++    }
++}
+diff --git a/crates/ui/src/egui_app/ai_chat/mod.rs b/crates/ui/src/egui_app/ai_chat/mod.rs
+index 796a9b15f..b09895bd7 100644
+--- a/crates/ui/src/egui_app/ai_chat/mod.rs
++++ b/crates/ui/src/egui_app/ai_chat/mod.rs
+@@ -1,6 +1,7 @@
+ //! Native AI chat dock panel, background worker, and offline/safety policies (#1946).
+ //! Provenance: our own code over our own shell, app MCP inbox, and egui; no vendor material involved.
+ 
++pub(crate) mod budget;
+ mod panel;
+ mod state;
+ mod transport;
+@@ -19,6 +20,7 @@ pub(crate) use worker::WakeFn;
+ pub(crate) use {
+     camcraft_app::mcp::provider::FallbackMode,
+     transport::{ChatTransport, TransportOutput, TransportRequest},
++    turn::TurnStatus,
+     worker::ToolCardStatus,
+ };
+ 
+diff --git a/crates/ui/src/egui_app/ai_chat/transport.rs b/crates/ui/src/egui_app/ai_chat/transport.rs
+index 7988df35c..0df38ae0b 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport.rs
+@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::Ordering;
+ 
+ use camcraft_app::mcp::provider::{
+-    FallbackMode, Provider, is_read_only_tool, prompt_context, qa_context, tools,
++    FallbackMode, Provider, ToolSet, is_read_only_tool, prompt_context, qa_context, tools_in,
+ };
+ use camcraft_app::mcp::requires_approval;
+ use serde_json::{Value, json};
+@@ -205,10 +205,11 @@ pub(crate) fn requires_confirmation(
+ }
+ 
+ /// Build the provider/fallback tool schema payload sent alongside chat messages.
++/// `set` picks the whole tool table or the core subset (#1944).
+ #[must_use]
+-pub(crate) fn build_tools_payload(provider: Provider, mode: FallbackMode, project: &Value) -> Value {
++pub(crate) fn build_tools_payload(provider: Provider, mode: FallbackMode, set: ToolSet, project: &Value) -> Value {
+     match mode {
+-        FallbackMode::Native => json!({ "tools": tools(provider) }),
++        FallbackMode::Native => json!({ "tools": tools_in(provider, set) }),
+         FallbackMode::PromptJson => prompt_context(project),
+         FallbackMode::ReadOnly => qa_context(project),
+     }
+diff --git a/crates/ui/src/egui_app/ai_chat/turn.rs b/crates/ui/src/egui_app/ai_chat/turn.rs
+index ec55448b8..4c28a56fb 100644
+--- a/crates/ui/src/egui_app/ai_chat/turn.rs
++++ b/crates/ui/src/egui_app/ai_chat/turn.rs
+@@ -4,6 +4,7 @@
+ use camcraft_app::commands::History;
+ use flecs_ecs::prelude::World;
+ 
++use super::budget;
+ use super::transport::{ScreenshotAttachment, SelectionSnapshot, TurnMessage};
+ use super::worker::{ToolCard, ToolCardStatus, TurnFinish};
+ 
+@@ -197,6 +198,8 @@ pub(super) fn build_turn_messages(
+     screenshot: Option<ScreenshotAttachment>,
+ ) -> Vec<TurnMessage> {
+     let mut messages = Vec::new();
++    // #1944: rolling history; a dropped span leaves the latest get_job reply.
++    let (prior_turns, kept_job) = budget::prior_window(prior_turns);
+     for prior in prior_turns {
+         messages.push(TurnMessage {
+             role: "user".to_owned(),
+@@ -222,5 +225,9 @@ pub(super) fn build_turn_messages(
+         screenshot,
+         raw: None,
+     });
++    if let (Some(job), Some(first)) = (kept_job, messages.first_mut()) {
++        first.text.insert_str(0, &job);
++    }
++    budget::cap_images(&mut messages);
+     messages
+ }
+diff --git a/crates/ui/src/egui_app/ai_chat/worker.rs b/crates/ui/src/egui_app/ai_chat/worker.rs
+index bc846460b..373ec2589 100644
+--- a/crates/ui/src/egui_app/ai_chat/worker.rs
++++ b/crates/ui/src/egui_app/ai_chat/worker.rs
+@@ -15,8 +15,9 @@ use super::transport::{
+ };
+ #[cfg(not(target_arch = "wasm32"))]
+ use super::worker_mcp::{ConfirmOutcome, dispatch_mcp_call, parse_step_calls, wait_confirmation};
++#[cfg(not(target_arch = "wasm32"))]
++use super::budget::{MAX_TOOL_ROUNDS, tool_set_for};
+ 
+-const MAX_TURN_STEPS: usize = 12;
+ pub(super) const POLL_STEP: Duration = Duration::from_millis(20);
+ 
+ /// Event-loop wake callback invoked whenever worker events or MCP requests are queued.
+@@ -211,13 +212,18 @@ fn run_turn_steps(
+     let mut messages = input.initial_messages.clone();
+     let mut rpc_seq = 1u64;
+ 
+-    for step in 0..MAX_TURN_STEPS {
++    for step in 0..MAX_TOOL_ROUNDS {
+         if cancel.load(Ordering::Relaxed) {
+             return Ok(true);
+         }
+         let configured_mode = input.preset.fallback_mode;
+-        let tools_payload =
+-            build_tools_payload(input.preset.provider, configured_mode, &input.project_snapshot);
++        // #1944: a local model gets the core tool set.
++        let tools_payload = build_tools_payload(
++            input.preset.provider,
++            configured_mode,
++            tool_set_for(input.preset.endpoint_kind),
++            &input.project_snapshot,
++        );
+         let req = TransportRequest {
+             preset: input.preset.clone(),
+             model: input.model.clone(),
+@@ -351,6 +357,6 @@ fn run_turn_steps(
+         }
+     }
+     Err(format!(
+-        "stopped after {MAX_TURN_STEPS} tool steps without a final answer"
++        "stopped after {MAX_TOOL_ROUNDS} tool steps without a final answer"
+     ))
+ }
+diff --git a/crates/ui/src/egui_app/ai_chat/worker_mcp.rs b/crates/ui/src/egui_app/ai_chat/worker_mcp.rs
+index 43aadc219..ec4041be7 100644
+--- a/crates/ui/src/egui_app/ai_chat/worker_mcp.rs
++++ b/crates/ui/src/egui_app/ai_chat/worker_mcp.rs
+@@ -160,6 +160,8 @@ pub(super) fn dispatch_mcp_call(
+             summary: summary.clone(),
+         },
+     );
++    // #1944: the model gets at most the reply cap, with a truncation hint.
++    let (result_val, summary) = super::budget::cap_tool_reply(result_val, summary);
+     let raw = tool_result(input.preset.provider, call, &result_val);
+     messages.push(TurnMessage {
+         role: "tool".to_owned(),
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/budget.rs b/crates/ui/src/egui_app/tests/ai_chat/budget.rs
+new file mode 100644
+index 000000000..b1aeca7f3
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/ai_chat/budget.rs
+@@ -0,0 +1,95 @@
++//! #1944: the chat worker keeps each request inside a context budget: a
++//! long tool reply is cut with a hint, a local model gets the core tool
++//! set, and a turn stops at the round cap. No network: scripted transport.
++//! Provenance: our own offline shell tests; no vendor material.
++
++use std::sync::atomic::Ordering;
++
++use serde_json::{Value, json};
++
++use super::super::super::ai_chat::{TransportOutput, TurnStatus, budget};
++use super::{ScriptedTransport, blank_harness, pump_until_idle, select_provider, submit_prompt, toggle_ai_chat_via_view_door};
++
++fn tool_use(id: &str, name: &str) -> Result<TransportOutput, String> {
++    Ok(TransportOutput::AssistantResponse {
++        text: String::new(),
++        envelope: json!({"content": [{"type": "tool_use", "id": id, "name": name, "input": {}}]}),
++        fallback_override: None,
++    })
++}
++
++fn final_text(text: &str) -> Result<TransportOutput, String> {
++    Ok(TransportOutput::AssistantResponse {
++        text: text.into(),
++        envelope: json!({"content": [{"type": "text", "text": text}]}),
++        fallback_override: None,
++    })
++}
++
++#[test]
++fn a_long_tool_reply_is_cut_to_the_character_cap_with_a_hint() {
++    let mut h = blank_harness();
++    h.run();
++    toggle_ai_chat_via_view_door(&mut h);
++    // The whole operation table is far longer than one reply may be.
++    let transport = ScriptedTransport::new(vec![tool_use("t1", "list_operation_types"), final_text("Done.")]);
++    h.state_mut().state.ai_chat.set_transport(transport.clone());
++    submit_prompt(&mut h, "List the operation kinds");
++    pump_until_idle(&mut h);
++
++    let reqs = transport.requests.lock().expect("lock");
++    assert_eq!(reqs.len(), 2);
++    let reply = reqs[1].messages.last().expect("tool reply");
++    assert_eq!(reply.role, "tool");
++    // The Anthropic tool_result carries the reply as one JSON text.
++    let content = reply.raw.as_ref().and_then(|r| r["content"].as_str()).unwrap_or_default();
++    assert!(content.contains("truncated"), "the cut reply says so");
++    assert!(
++        content.chars().count() <= budget::MAX_TOOL_REPLY_CHARS + 400,
++        "the reply sent back is {} characters",
++        content.chars().count()
++    );
++    assert!(reply.text.chars().count() <= budget::MAX_TOOL_REPLY_CHARS + 400);
++}
++
++#[test]
++fn a_local_model_gets_the_core_tool_set_and_a_cloud_model_the_full_table() {
++    let mut h = blank_harness();
++    h.run();
++    toggle_ai_chat_via_view_door(&mut h);
++    let transport = ScriptedTransport::new(vec![final_text("Cloud."), final_text("Local.")]);
++    h.state_mut().state.ai_chat.set_transport(transport.clone());
++    submit_prompt(&mut h, "Hello cloud");
++    pump_until_idle(&mut h);
++    select_provider(&mut h, "Offline local (Ollama)");
++    submit_prompt(&mut h, "Hello local");
++    pump_until_idle(&mut h);
++
++    let reqs = transport.requests.lock().expect("lock");
++    assert_eq!(reqs.len(), 2);
++    let count = |v: &Value| v["tools"].as_array().map_or(0, Vec::len);
++    let cloud = count(&reqs[0].tools_payload);
++    let local = count(&reqs[1].tools_payload);
++    assert!(cloud > 40, "cloud has the full table: {cloud}");
++    assert!((20..=25).contains(&local), "local has the core set: {local}");
++}
++
++#[test]
++fn a_turn_stops_at_the_round_cap() {
++    let mut h = blank_harness();
++    h.run();
++    toggle_ai_chat_via_view_door(&mut h);
++    let rounds: Vec<_> = (0..budget::MAX_TOOL_ROUNDS + 2).map(|i| tool_use(&format!("r{i}"), "get_selection")).collect();
++    let transport = ScriptedTransport::new(rounds);
++    h.state_mut().state.ai_chat.set_transport(transport.clone());
++    submit_prompt(&mut h, "Loop forever");
++    pump_until_idle(&mut h);
++
++    assert_eq!(transport.calls.load(Ordering::Relaxed), budget::MAX_TOOL_ROUNDS);
++    let turn = h.state().state.ai_chat.turns().last().expect("turn");
++    assert!(
++        matches!(&turn.status, TurnStatus::Failed(e) if e.contains("tool steps")),
++        "{:?}",
++        turn.status
++    );
++}
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/mod.rs b/crates/ui/src/egui_app/tests/ai_chat/mod.rs
+index 7f9d379a8..8fe534908 100644
+--- a/crates/ui/src/egui_app/tests/ai_chat/mod.rs
++++ b/crates/ui/src/egui_app/tests/ai_chat/mod.rs
+@@ -2,6 +2,7 @@
+ //! Provenance: our own tests over our own shell and egui_kittest; no external SDKs or vendor material.
+ 
+ mod basic;
++mod budget;
+ mod regressions;
+ mod safety;
+ 
+diff --git a/docs/decisions/1944-ai-context-budgets.md b/docs/decisions/1944-ai-context-budgets.md
+new file mode 100644
+index 000000000..b9da1fd41
+--- /dev/null
++++ b/docs/decisions/1944-ai-context-budgets.md
+@@ -0,0 +1,57 @@
++## #1944 - AI context budgets and compact MCP read modes
++
++**Decided.**
++
++- `get_job` takes `summary: true`. The summary removes `machine.definition`
++  and keeps the machine `path` and `name`, with `definition_omitted: true`.
++  Each operation's `params` keeps only the fields that differ from the
++  default that `add_operation` seeds for its kind. Null and empty-list
++  fields of operation, setup, tool and model rows are removed. Inside
++  `params`, a `null` stays, because there it is a stated value.
++- `list_operation_types` takes `kind` (a key or a label, any case) and
++  `section` (`Mill2D`, `Mill3D`, `Drilling`, `MultiAxis`, `Turning`,
++  `Plasma`, `WireEdm`, `Sinker`). A name that matches no kind or section
++  is refused with the valid names.
++- `list_features` takes `compact: true`. Compact rows keep the id, the
++  name and the facts that a pick is chosen by. Counts replace the loop and
++  face lists. A face whose outside is unknown still says so. The compact
++  default `limit` is 25 rows for each kind. The full listing keeps 500, so
++  that no current caller changes.
++- `mcp::provider::tools_in(provider, ToolSet)` gives the full table or a
++  core set of 25 workflow tools (`CORE_TOOLS`). `tools(provider)` stays the
++  full table.
++- The chat worker (`crates/ui/src/egui_app/ai_chat/budget.rs`):
++  - Cuts each tool reply that goes back to the model at 12000 JSON
++    characters. The cut keeps whole characters and ends with a hint that
++    names the compact read modes. The tool card in the panel keeps the
++    full text.
++  - Sends at most one viewport image in each request (the newest).
++  - Stops a turn after 12 model rounds. This cap existed as
++    `MAX_TURN_STEPS`; it moved to `budget::MAX_TOOL_ROUNDS` and has a test.
++  - Sends at most 6 earlier turns. When it drops older turns, it puts the
++    latest successful `get_job` reply of all earlier turns (cut to the
++    reply cap) in front of the first kept prompt.
++  - Offers the core tool set to a local endpoint and the full table to a
++    cloud endpoint.
++
++**Why.** Small local models have context windows of 8k to 32k tokens. The
++full tool table and one full `get_job` or `list_features` reply can fill
++that alone. Each cap is a constant with a test, so a later change is one
++line.
++
++**Dropped.**
++
++- A smaller default `limit` for every `list_features` call. It would change
++  the reply of each current MCP client. The small default applies only with
++  `compact`.
++- A panel control to choose the tool set. The endpoint kind already tells
++  local from cloud, and a new control needs layout and snapshot work. A
++  follow-up can add it if a user wants the full table on a local model.
++- Removing old tool results inside one turn. Provider formats pair each
++  tool call with its result; to remove one safely needs the call record
++  in each message. The reply cap and the round cap bound one turn.
++- A tool refusal for a model that calls a tool outside the core set. The
++  call goes through the same MCP door and approvals as any other call.
++
++**Cost to change.** Each limit is one constant in `budget.rs` or
++`compact.rs`. The core set is one list in `mcp/provider.rs`.
+
+From 8c1e8e0449b981c723e092a142c94b59442a1d4c Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 20 Nov 2026 16:02:26 -0800
+Subject: [PATCH 2/2] fix(ai): honor core tools in Prompt-JSON payloads
+
+Preserve the prompt context and confirmation instructions. Extend the offline payload test for native and Prompt-JSON core tools.
+
+Fixes #1944
+---
+ crates/ui/src/egui_app/ai_chat/transport.rs   | 10 ++++--
+ .../ui/src/egui_app/tests/ai_chat/budget.rs   | 31 +++++++++++++++++--
+ 2 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/crates/ui/src/egui_app/ai_chat/transport.rs b/crates/ui/src/egui_app/ai_chat/transport.rs
+index 0df38ae0b..0b47edde8 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport.rs
+@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::Ordering;
+ 
+ use camcraft_app::mcp::provider::{
+-    FallbackMode, Provider, ToolSet, is_read_only_tool, prompt_context, qa_context, tools_in,
++    CORE_TOOLS, FallbackMode, Provider, ToolSet, is_read_only_tool, prompt_context, qa_context, tools_in,
+ };
+ use camcraft_app::mcp::requires_approval;
+ use serde_json::{Value, json};
+@@ -210,7 +210,13 @@ pub(crate) fn requires_confirmation(
+ pub(crate) fn build_tools_payload(provider: Provider, mode: FallbackMode, set: ToolSet, project: &Value) -> Value {
+     match mode {
+         FallbackMode::Native => json!({ "tools": tools_in(provider, set) }),
+-        FallbackMode::PromptJson => prompt_context(project),
++        FallbackMode::PromptJson => {
++            let mut context = prompt_context(project);
++            if set == ToolSet::Core && let Some(tools) = context["tools"].as_array_mut() {
++                tools.retain(|tool| tool["name"].as_str().is_some_and(|name| CORE_TOOLS.contains(&name)));
++            }
++            context
++        }
+         FallbackMode::ReadOnly => qa_context(project),
+     }
+ }
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/budget.rs b/crates/ui/src/egui_app/tests/ai_chat/budget.rs
+index b1aeca7f3..6616850fe 100644
+--- a/crates/ui/src/egui_app/tests/ai_chat/budget.rs
++++ b/crates/ui/src/egui_app/tests/ai_chat/budget.rs
+@@ -5,6 +5,7 @@
+ 
+ use std::sync::atomic::Ordering;
+ 
++use camcraft_app::mcp::provider::CORE_TOOLS;
+ use serde_json::{Value, json};
+ 
+ use super::super::super::ai_chat::{TransportOutput, TurnStatus, budget};
+@@ -57,21 +58,45 @@ fn a_local_model_gets_the_core_tool_set_and_a_cloud_model_the_full_table() {
+     let mut h = blank_harness();
+     h.run();
+     toggle_ai_chat_via_view_door(&mut h);
+-    let transport = ScriptedTransport::new(vec![final_text("Cloud."), final_text("Local.")]);
++    let transport = ScriptedTransport::new(vec![final_text("Cloud."), final_text("Local."), final_text("Prompt JSON.")]);
+     h.state_mut().state.ai_chat.set_transport(transport.clone());
+     submit_prompt(&mut h, "Hello cloud");
+     pump_until_idle(&mut h);
+     select_provider(&mut h, "Offline local (Ollama)");
+     submit_prompt(&mut h, "Hello local");
+     pump_until_idle(&mut h);
++    select_provider(&mut h, "Local Prompt-JSON");
++    submit_prompt(&mut h, "Hello Prompt-JSON");
++    pump_until_idle(&mut h);
+ 
+     let reqs = transport.requests.lock().expect("lock");
+-    assert_eq!(reqs.len(), 2);
++    assert_eq!(reqs.len(), 3);
+     let count = |v: &Value| v["tools"].as_array().map_or(0, Vec::len);
+     let cloud = count(&reqs[0].tools_payload);
+     let local = count(&reqs[1].tools_payload);
+     assert!(cloud > 40, "cloud has the full table: {cloud}");
+-    assert!((20..=25).contains(&local), "local has the core set: {local}");
++    assert_eq!(local, CORE_TOOLS.len(), "native local has the core set");
++    let mut expected = CORE_TOOLS.to_vec();
++    expected.sort_unstable();
++    for (request, native) in [(&reqs[1], true), (&reqs[2], false)] {
++        let tools = request.tools_payload["tools"].as_array().expect("tools");
++        let mut names: Vec<_> = tools.iter().map(|tool| {
++            let name = if native { &tool["function"]["name"] } else { &tool["name"] };
++            name.as_str().expect("tool name")
++        }).collect();
++        names.sort_unstable();
++        assert_eq!(names, expected, "both local payloads contain exactly the core tools");
++    }
++    let fallback = &reqs[2].tools_payload;
++    assert!(fallback["project"].is_object(), "fallback retains the project context");
++    assert!(fallback["instructions"].as_str().expect("instructions")
++        .contains("Mutating edits require user confirmation before execution."));
++    assert!(fallback["tools"].as_array().expect("tools").iter()
++        .all(|tool| tool["inputSchema"].is_object()), "fallback retains the raw MCP schemas");
++    let (wire_tools, system_prompt) = camcraft_app::ai::wire::split_payload(fallback);
++    assert!(wire_tools.is_empty(), "Prompt-JSON sends its tools in the system prompt");
++    assert!(system_prompt.expect("fallback system prompt")
++        .contains("Mutating edits require user confirmation before execution."));
+ }
+ 
+ #[test]
