@@ -1,0 +1,1194 @@
+From b8f98af9814070b6f9f54cc7c7ba51103994dff6 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 18:15:15 -0800
+Subject: [PATCH 1/2] fix(geometry): order sheet cuts before material release
+
+Build a global containment forest for placed contours and open chains.
+Resolve cut sides and schedule deterministic pass phases.
+Refuse cuts after material release and report circular-tool corner limits.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #2159
+---
+ crates/geometry/src/nesting.rs                |   1 +
+ crates/geometry/src/nesting/cut_order.rs      | 236 +++++++++++
+ .../src/nesting/cut_order/geometry.rs         | 244 ++++++++++++
+ .../src/nesting/cut_order/validate.rs         | 104 +++++
+ crates/geometry/tests/nesting_cut_order.rs    | 375 ++++++++++++++++++
+ docs/decisions/2159-sheet-cut-order.md        |  41 ++
+ 6 files changed, 1001 insertions(+)
+ create mode 100644 crates/geometry/src/nesting/cut_order.rs
+ create mode 100644 crates/geometry/src/nesting/cut_order/geometry.rs
+ create mode 100644 crates/geometry/src/nesting/cut_order/validate.rs
+ create mode 100644 crates/geometry/tests/nesting_cut_order.rs
+ create mode 100644 docs/decisions/2159-sheet-cut-order.md
+
+diff --git a/crates/geometry/src/nesting.rs b/crates/geometry/src/nesting.rs
+index c358c14e6..b5d8ecb50 100644
+--- a/crates/geometry/src/nesting.rs
++++ b/crates/geometry/src/nesting.rs
+@@ -1,6 +1,7 @@
+ //! Deterministic 2D true-shape nesting kernel (NFP/IFP and bottom-left-fill, #2158).
+ //! Provenance: Bennell & Oliveira (EJOR 2008); Burke, Hellier, Kendall & Whitwell (OR 2006, EJOR 2007).
+ 
++pub mod cut_order;
+ pub mod raster;
+ 
+ mod blf;
+diff --git a/crates/geometry/src/nesting/cut_order.rs b/crates/geometry/src/nesting/cut_order.rs
+new file mode 100644
+index 000000000..dcf710a93
+--- /dev/null
++++ b/crates/geometry/src/nesting/cut_order.rs
+@@ -0,0 +1,236 @@
++//! Provenance: Jordan-curve containment and post-order traversal; CamCraft plasma nesting and issue #2159 hold-down rules.
++//!
++//! Inputs are already placed, polygonal features in sheet millimeters. This
++//! module orders cuts; placement clearance and offset toolpaths remain the
++//! caller's responsibility. Diagnostics describe ideal sharp corners that
++//! a circular cutter cannot reach. They do not change the picked geometry.
++
++use crate::geo2d::{COORD_LIMIT, GeoError, Loop, Point2, SCALE};
++
++mod geometry;
++mod validate;
++
++/// A side is relative to the contour interior, or to the directed open chain.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CutSide {
++    Auto,
++    Outside,
++    OnLine,
++    Inside,
++    Left,
++    Right,
++}
++
++/// Global sheet phases. Marking and RoughProfile retain stock. Internal may
++/// contain blind pockets or through holes; release_phase distinguishes them.
++/// Breakthrough is always a through cut on a closed contour.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub enum CutPhase {
++    Marking,
++    Internal,
++    RoughProfile,
++    Breakthrough,
++}
++
++impl CutPhase {
++    const ALL: [Self; 4] = [
++        Self::Marking,
++        Self::Internal,
++        Self::RoughProfile,
++        Self::Breakthrough,
++    ];
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum CutGeometry {
++    Closed(Loop),
++    Open(Vec<Point2>),
++}
++
++/// Stable IDs must be unique across the sheet. Request each phase at most once.
++/// Multiple physical passes within a phase remain the caller's responsibility.
++#[derive(Clone, Debug, PartialEq)]
++pub struct CutFeature {
++    pub id: u64,
++    pub geometry: CutGeometry,
++    pub side: CutSide,
++    pub passes: Vec<CutPhase>,
++    /// The through pass that frees material. None means all passes retain
++    /// stock. Only a closed Internal or Breakthrough pass can release stock.
++    pub release_phase: Option<CutPhase>,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CutRole {
++    PartOutline,
++    Hole,
++    OpenFeature,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ResolvedFeature {
++    pub id: u64,
++    pub parent: Option<u64>,
++    pub depth: usize,
++    pub role: CutRole,
++    /// Always explicit: the planner never returns Auto.
++    pub side: CutSide,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PlannedCut {
++    pub feature_id: u64,
++    pub phase: CutPhase,
++}
++
++/// A sharp corner needs at least tool_radius of rounding on the cutter side.
++#[derive(Clone, Debug, PartialEq)]
++pub struct CornerClearance {
++    pub feature_id: u64,
++    /// Index into the original input vertices (no winding reversal occurs).
++    pub vertex: usize,
++    pub tool_radius: f64,
++    /// Angle of the wedge on the cutter side, between zero and pi.
++    pub angle_radians: f64,
++    /// Distance left uncut from the ideal corner along its angle bisector.
++    pub min_unreachable_distance: f64,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct SheetCutPlan {
++    /// Sorted by stable ID, independent of input enumeration.
++    pub features: Vec<ResolvedFeature>,
++    pub cuts: Vec<PlannedCut>,
++    pub corner_limits: Vec<CornerClearance>,
++}
++
++fn invalid(message: impl Into<String>) -> GeoError {
++    GeoError::Invalid(message.into())
++}
++
++fn resolve(
++    features: &[CutFeature],
++    nodes: &[geometry::Node],
++) -> Result<Vec<ResolvedFeature>, GeoError> {
++    let mut resolved = Vec::with_capacity(features.len());
++    for (feature, node) in features.iter().zip(nodes) {
++        let role = if !node.closed {
++            CutRole::OpenFeature
++        } else if node.depth % 2 == 0 {
++            CutRole::PartOutline
++        } else {
++            CutRole::Hole
++        };
++        let side = match (node.closed, feature.side) {
++            (false, CutSide::Inside | CutSide::Outside) => {
++                return Err(invalid(format!(
++                    "open chain {} cannot use {:?}",
++                    feature.id, feature.side
++                )));
++            }
++            (true, CutSide::Left | CutSide::Right) => {
++                return Err(invalid(format!(
++                    "closed contour {} cannot use {:?}",
++                    feature.id, feature.side
++                )));
++            }
++            (false, CutSide::Auto) => CutSide::OnLine,
++            (true, CutSide::Auto) if role == CutRole::Hole => CutSide::Inside,
++            (true, CutSide::Auto) => CutSide::Outside,
++            (_, side) => side,
++        };
++        resolved.push(ResolvedFeature {
++            id: feature.id,
++            parent: node.parent.map(|p| features[p].id),
++            depth: node.depth,
++            role,
++            side,
++        });
++    }
++    Ok(resolved)
++}
++
++/// Construct the global forest, then visit siblings by increasing area with
++/// stable IDs breaking ties. Traversal uses a stack, including for deep nesting.
++fn post_order(features: &[CutFeature], nodes: &[geometry::Node]) -> Vec<usize> {
++    let mut roots = Vec::new();
++    let mut children = vec![Vec::new(); nodes.len()];
++    for (i, node) in nodes.iter().enumerate() {
++        if let Some(parent) = node.parent {
++            children[parent].push(i);
++        } else {
++            roots.push(i);
++        }
++    }
++    let sort = |list: &mut Vec<usize>| {
++        list.sort_by_key(|&i| (nodes[i].area2.unsigned_abs(), features[i].id));
++    };
++    sort(&mut roots);
++    for list in &mut children {
++        sort(list);
++    }
++    let mut stack: Vec<_> = roots.into_iter().rev().map(|i| (i, false)).collect();
++    let mut out = Vec::with_capacity(nodes.len());
++    while let Some((i, visited)) = stack.pop() {
++        if visited {
++            out.push(i);
++        } else {
++            stack.push((i, true));
++            stack.extend(children[i].iter().rev().map(|&child| (child, false)));
++        }
++    }
++    out
++}
++
++/// Plan one sheet. Refuse ambiguous geometry and phase requests that would cut
++/// a feature after its enclosing contour has freed the material.
++pub fn plan_sheet(features: &[CutFeature], cut_width: f64) -> Result<SheetCutPlan, GeoError> {
++    if !cut_width.is_finite() || !(1.0 / SCALE..COORD_LIMIT).contains(&cut_width) {
++        return Err(invalid(
++            "cut_width must be finite, at least one geometry grid unit, and within range",
++        ));
++    }
++    // Resolve IDs and pass requests before the geometric pair checks so duplicate
++    // IDs always get their own diagnostic, even when their geometry also overlaps.
++    validate::requests(features)?;
++    let nodes = geometry::forest(features)?;
++    let mut resolved = resolve(features, &nodes)?;
++    let order = post_order(features, &nodes);
++    let mut cuts = Vec::new();
++    for phase in CutPhase::ALL {
++        for &i in &order {
++            if features[i].passes.contains(&phase) {
++                cuts.push(PlannedCut {
++                    feature_id: features[i].id,
++                    phase,
++                });
++            }
++        }
++    }
++    validate::order(features, &nodes, &cuts)?;
++    let mut corner_limits = Vec::new();
++    for (i, node) in nodes.iter().enumerate() {
++        corner_limits.extend(geometry::corners(
++            features[i].id,
++            node,
++            resolved[i].side,
++            cut_width / 2.0,
++        ));
++    }
++    resolved.sort_by_key(|feature| feature.id);
++    corner_limits.sort_by_key(|corner| (corner.feature_id, corner.vertex));
++    Ok(SheetCutPlan {
++        features: resolved,
++        cuts,
++        corner_limits,
++    })
++}
++
++/// Check a caller-supplied schedule, including completeness and global phases.
++/// Safe sibling permutations are accepted; descendant cuts after release are not.
++pub fn validate_cut_order(features: &[CutFeature], cuts: &[PlannedCut]) -> Result<(), GeoError> {
++    validate::requests(features)?;
++    let nodes = geometry::forest(features)?;
++    resolve(features, &nodes)?;
++    validate::order(features, &nodes, cuts)
++}
+diff --git a/crates/geometry/src/nesting/cut_order/geometry.rs b/crates/geometry/src/nesting/cut_order/geometry.rs
+new file mode 100644
+index 000000000..459002803
+--- /dev/null
++++ b/crates/geometry/src/nesting/cut_order/geometry.rs
+@@ -0,0 +1,244 @@
++//! Provenance: integer polygon predicates (Jordan parity) and circular-tool tangent geometry; CamCraft plasma nesting rules.
++
++use crate::geo2d::{COORD_LIMIT, SCALE};
++
++use super::{CornerClearance, CutFeature, CutGeometry, CutSide, GeoError, invalid};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct GridPoint {
++    x: i64,
++    y: i64,
++}
++
++pub(super) struct Node {
++    points: Vec<GridPoint>,
++    pub closed: bool,
++    pub area2: i128,
++    pub parent: Option<usize>,
++    pub depth: usize,
++}
++
++// |coordinate| < 1e18, so each difference is below 2e18 and the two
++// products and their difference fit i128. Area accumulation is checked.
++fn cross(a: GridPoint, b: GridPoint, c: GridPoint) -> i128 {
++    (i128::from(b.x) - i128::from(a.x)) * (i128::from(c.y) - i128::from(a.y))
++        - (i128::from(b.y) - i128::from(a.y)) * (i128::from(c.x) - i128::from(a.x))
++}
++
++fn dot(a: GridPoint, b: GridPoint, c: GridPoint) -> i128 {
++    (i128::from(a.x) - i128::from(b.x)) * (i128::from(c.x) - i128::from(b.x))
++        + (i128::from(a.y) - i128::from(b.y)) * (i128::from(c.y) - i128::from(b.y))
++}
++
++fn on(a: GridPoint, b: GridPoint, p: GridPoint) -> bool {
++    cross(a, b, p) == 0
++        && p.x >= a.x.min(b.x)
++        && p.x <= a.x.max(b.x)
++        && p.y >= a.y.min(b.y)
++        && p.y <= a.y.max(b.y)
++}
++
++fn intersects(a: GridPoint, b: GridPoint, c: GridPoint, d: GridPoint) -> bool {
++    if a.x.max(b.x) < c.x.min(d.x)
++        || c.x.max(d.x) < a.x.min(b.x)
++        || a.y.max(b.y) < c.y.min(d.y)
++        || c.y.max(d.y) < a.y.min(b.y)
++    {
++        return false;
++    }
++    let (ab_c, ab_d, cd_a, cd_b) = (
++        cross(a, b, c),
++        cross(a, b, d),
++        cross(c, d, a),
++        cross(c, d, b),
++    );
++    (ab_c.signum() != ab_d.signum()
++        && cd_a.signum() != cd_b.signum()
++        && ab_c != 0
++        && ab_d != 0
++        && cd_a != 0
++        && cd_b != 0)
++        || on(a, b, c)
++        || on(a, b, d)
++        || on(c, d, a)
++        || on(c, d, b)
++}
++
++impl Node {
++    fn segments(&self) -> impl Iterator<Item = (GridPoint, GridPoint)> + '_ {
++        let count = if self.closed {
++            self.points.len()
++        } else {
++            self.points.len() - 1
++        };
++        (0..count).map(|i| (self.points[i], self.points[(i + 1) % self.points.len()]))
++    }
++
++    fn contains(&self, p: GridPoint) -> bool {
++        let mut inside = false;
++        for (a, b) in self.segments() {
++            if (a.y > p.y) != (b.y > p.y) {
++                let turn = cross(a, b, p);
++                if (b.y > a.y && turn > 0) || (b.y < a.y && turn < 0) {
++                    inside = !inside;
++                }
++            }
++        }
++        inside
++    }
++}
++
++fn node(feature: &CutFeature) -> Result<Node, GeoError> {
++    let (raw, closed) = match &feature.geometry {
++        CutGeometry::Closed(ring) => (ring.points(), true),
++        CutGeometry::Open(points) => (points.as_slice(), false),
++    };
++    let fail = |why: &str| invalid(format!("feature {} {why}", feature.id));
++    if raw.len() < if closed { 3 } else { 2 } {
++        return Err(fail("has too few vertices"));
++    }
++    let mut points = Vec::with_capacity(raw.len());
++    for p in raw {
++        if !p.x.is_finite() || !p.y.is_finite() {
++            return Err(fail("has a non-finite vertex"));
++        }
++        if p.x.abs() >= COORD_LIMIT || p.y.abs() >= COORD_LIMIT {
++            return Err(fail("has a coordinate outside the machinable range"));
++        }
++        points.push(GridPoint {
++            x: (p.x * SCALE).round() as i64,
++            y: (p.y * SCALE).round() as i64,
++        });
++    }
++    let mut node = Node {
++        points,
++        closed,
++        area2: 0,
++        parent: None,
++        depth: 0,
++    };
++    for (a, b) in node.segments() {
++        if a == b {
++            return Err(fail("has a zero-length segment on the geometry grid"));
++        }
++    }
++    if !closed && node.points.first() == node.points.last() {
++        return Err(fail("is marked open but closes on itself"));
++    }
++    let n = node.points.len();
++    for i in 0..n {
++        if !closed && (i == 0 || i == n - 1) {
++            continue;
++        }
++        let (a, b, c) = (
++            node.points[(i + n - 1) % n],
++            node.points[i],
++            node.points[(i + 1) % n],
++        );
++        if cross(a, b, c) == 0 && dot(a, b, c) > 0 {
++            return Err(fail("retraces an adjacent segment (a slit or spike)"));
++        }
++    }
++    for (i, (a, b)) in node.segments().enumerate() {
++        for (j, (c, d)) in node.segments().enumerate().skip(i + 2) {
++            if closed && i == 0 && j == n - 1 {
++                continue;
++            }
++            if intersects(a, b, c, d) {
++                return Err(fail("crosses or touches itself"));
++            }
++        }
++    }
++    if closed {
++        let mut area2 = 0i128;
++        for (a, b) in node.segments() {
++            area2 = area2
++                .checked_add(cross(node.points[0], a, b))
++                .ok_or_else(|| fail("area exceeds the geometry range"))?;
++        }
++        // The simple, non-retracing closed ring already has nonzero area.
++        node.area2 = area2;
++    }
++    Ok(node)
++}
++
++pub(super) fn forest(features: &[CutFeature]) -> Result<Vec<Node>, GeoError> {
++    let mut nodes: Vec<_> = features.iter().map(node).collect::<Result<_, _>>()?;
++    // Intersections must be checked before testing a containment probe. Even
++    // two endpoints inside a concave contour can have an outside middle.
++    for i in 0..nodes.len() {
++        for j in i + 1..nodes.len() {
++            // Open features may meet each other; only a closed boundary
++            // separates material and determines containment.
++            if !nodes[i].closed && !nodes[j].closed {
++                continue;
++            }
++            if nodes[i]
++                .segments()
++                .any(|(a, b)| nodes[j].segments().any(|(c, d)| intersects(a, b, c, d)))
++            {
++                return Err(invalid(format!(
++                    "features {} and {} cross or touch",
++                    features[i].id, features[j].id
++                )));
++            }
++        }
++    }
++    for i in 0..nodes.len() {
++        nodes[i].parent = (0..nodes.len())
++            .filter(|&j| {
++                j != i
++                    && nodes[j].closed
++                    && nodes[j].area2.unsigned_abs() > nodes[i].area2.unsigned_abs()
++                    && nodes[j].contains(nodes[i].points[0])
++            })
++            .min_by_key(|&j| nodes[j].area2.unsigned_abs());
++    }
++    for i in 0..nodes.len() {
++        let mut at = nodes[i].parent;
++        let mut depth = 0;
++        while let Some(parent) = at {
++            // Every parent has strictly larger area, so no cycle is possible.
++            depth += 1;
++            at = nodes[parent].parent;
++        }
++        nodes[i].depth = depth;
++    }
++    Ok(nodes)
++}
++
++pub(super) fn corners(id: u64, node: &Node, side: CutSide, radius: f64) -> Vec<CornerClearance> {
++    let mut limits = Vec::new();
++    let n = node.points.len();
++    for i in 0..n {
++        if !node.closed && (i == 0 || i == n - 1) {
++            continue;
++        }
++        let (a, b, c) = (
++            node.points[(i + n - 1) % n],
++            node.points[i],
++            node.points[(i + 1) % n],
++        );
++        let turn = cross(a, b, c);
++        let inside_turn = turn.signum() == node.area2.signum();
++        let unreachable = turn != 0
++            && match side {
++                CutSide::Inside => inside_turn,
++                CutSide::Outside => !inside_turn,
++                CutSide::Left => turn > 0,
++                CutSide::Right => turn < 0,
++                _ => false,
++            };
++        if unreachable {
++            let angle = (turn.unsigned_abs() as f64).atan2(dot(a, b, c) as f64);
++            limits.push(CornerClearance {
++                feature_id: id,
++                vertex: i,
++                tool_radius: radius,
++                angle_radians: angle,
++                min_unreachable_distance: radius * (1.0 / (angle / 2.0).sin() - 1.0),
++            });
++        }
++    }
++    limits
++}
+diff --git a/crates/geometry/src/nesting/cut_order/validate.rs b/crates/geometry/src/nesting/cut_order/validate.rs
+new file mode 100644
+index 000000000..55746639d
+--- /dev/null
++++ b/crates/geometry/src/nesting/cut_order/validate.rs
+@@ -0,0 +1,104 @@
++//! Provenance: issue #2159 sheet hold-down rules and ordered-phase scheduling.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use super::{CutFeature, CutGeometry, CutPhase, GeoError, PlannedCut, geometry::Node, invalid};
++
++pub(super) fn requests(features: &[CutFeature]) -> Result<(), GeoError> {
++    let mut ids = BTreeSet::new();
++    for feature in features {
++        if !ids.insert(feature.id) {
++            return Err(invalid(format!(
++                "duplicate sheet feature id {}",
++                feature.id
++            )));
++        }
++        let phases: BTreeSet<_> = feature.passes.iter().collect();
++        if phases.is_empty() || phases.len() != feature.passes.len() {
++            return Err(invalid(format!(
++                "feature {} needs nonempty, distinct pass phases",
++                feature.id
++            )));
++        }
++        if let Some(phase) = feature.release_phase
++            && (!matches!(feature.geometry, CutGeometry::Closed(_))
++                || !matches!(phase, CutPhase::Internal | CutPhase::Breakthrough)
++                || !feature.passes.contains(&phase))
++        {
++            return Err(invalid(format!(
++                "feature {} needs a requested closed through pass for release_phase",
++                feature.id
++            )));
++        }
++        if matches!(feature.geometry, CutGeometry::Closed(_))
++            && feature.passes.contains(&CutPhase::Breakthrough)
++            && feature.release_phase.is_none()
++        {
++            return Err(invalid(format!(
++                "contour {} Breakthrough must release material",
++                feature.id
++            )));
++        }
++    }
++    Ok(())
++}
++
++pub(super) fn order(
++    features: &[CutFeature],
++    nodes: &[Node],
++    cuts: &[PlannedCut],
++) -> Result<(), GeoError> {
++    let indices: BTreeMap<_, _> = features
++        .iter()
++        .enumerate()
++        .map(|(i, f)| (f.id, i))
++        .collect();
++    let mut seen = BTreeSet::new();
++    let mut released = vec![false; features.len()];
++    let mut previous = None;
++    for cut in cuts {
++        let Some(&i) = indices.get(&cut.feature_id) else {
++            return Err(invalid(format!(
++                "cut names unknown feature {}",
++                cut.feature_id
++            )));
++        };
++        if !features[i].passes.contains(&cut.phase) || !seen.insert((cut.feature_id, cut.phase)) {
++            return Err(invalid(format!(
++                "feature {} has an unrequested or duplicate {:?} pass",
++                cut.feature_id, cut.phase
++            )));
++        }
++        if previous.is_some_and(|phase| phase > cut.phase) {
++            return Err(invalid(format!(
++                "feature {} violates global pass phase order",
++                cut.feature_id
++            )));
++        }
++        previous = Some(cut.phase);
++        let mut at = Some(i);
++        while let Some(j) = at {
++            if released[j] {
++                return Err(invalid(format!(
++                    "feature {} cuts after contour {} freed its material",
++                    cut.feature_id, features[j].id
++                )));
++            }
++            at = nodes[j].parent;
++        }
++        if features[i].release_phase == Some(cut.phase) {
++            released[i] = true;
++        }
++    }
++    for feature in features {
++        for phase in &feature.passes {
++            if !seen.contains(&(feature.id, *phase)) {
++                return Err(invalid(format!(
++                    "feature {} is missing its {:?} pass",
++                    feature.id, phase
++                )));
++            }
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/geometry/tests/nesting_cut_order.rs b/crates/geometry/tests/nesting_cut_order.rs
+new file mode 100644
+index 000000000..26987f90e
+--- /dev/null
++++ b/crates/geometry/tests/nesting_cut_order.rs
+@@ -0,0 +1,375 @@
++//! Provenance: sheet hold-down and inside-out cutting rules from issue #2159 and CamCraft plasma nesting.
++//! Gate map: covers camcraft_geometry::nesting::cut_order.
++
++use camcraft_geometry::geo2d::{Loop, Point2};
++use camcraft_geometry::nesting::cut_order::{
++    CutFeature, CutGeometry, CutPhase, CutRole, CutSide, PlannedCut, plan_sheet, validate_cut_order,
++};
++
++fn poly(points: &[(f64, f64)]) -> Loop {
++    Loop::new(points.iter().map(|&(x, y)| Point2::new(x, y)).collect()).expect("fixture loop")
++}
++
++fn rect(x: f64, y: f64, w: f64, h: f64) -> Loop {
++    poly(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)])
++}
++
++fn closed(id: u64, ring: Loop) -> CutFeature {
++    CutFeature {
++        id,
++        geometry: CutGeometry::Closed(ring),
++        side: CutSide::Auto,
++        passes: vec![CutPhase::Breakthrough],
++        release_phase: Some(CutPhase::Breakthrough),
++    }
++}
++
++fn open(id: u64, points: &[(f64, f64)]) -> CutFeature {
++    CutFeature {
++        id,
++        geometry: CutGeometry::Open(points.iter().map(|&(x, y)| Point2::new(x, y)).collect()),
++        side: CutSide::Auto,
++        passes: vec![CutPhase::Internal],
++        release_phase: None,
++    }
++}
++
++fn sheet() -> Vec<CutFeature> {
++    vec![
++        closed(1, rect(0.0, 0.0, 20.0, 20.0)),
++        closed(2, rect(2.0, 2.0, 16.0, 16.0)),
++        closed(3, rect(4.0, 4.0, 2.0, 2.0)),
++        open(4, &[(4.3, 5.0), (5.7, 5.0)]),
++        open(5, &[(19.0, 10.0), (19.5, 10.0)]),
++        open(6, &[(40.0, 1.0), (41.0, 1.0)]),
++        closed(8, rect(30.0, 0.0, 3.0, 3.0)),
++        closed(7, rect(25.0, 0.0, 3.0, 3.0)),
++    ]
++}
++
++#[test]
++fn sheet_tree_cuts_parts_in_holes_before_release_and_small_siblings_first() {
++    let features = sheet();
++    let plan = plan_sheet(&features, 0.2).expect("safe sheet");
++    let resolved = |id| plan.features.iter().find(|f| f.id == id).expect("resolved id");
++    assert_eq!((resolved(1).parent, resolved(1).depth), (None, 0));
++    assert_eq!((resolved(2).parent, resolved(2).depth), (Some(1), 1));
++    assert_eq!((resolved(3).parent, resolved(3).depth), (Some(2), 2));
++    assert_eq!(resolved(4).parent, Some(3));
++    assert_eq!(resolved(5).parent, Some(1));
++    assert_eq!(resolved(6).parent, None);
++    assert_eq!((resolved(1).role, resolved(1).side), (CutRole::PartOutline, CutSide::Outside));
++    assert_eq!((resolved(2).role, resolved(2).side), (CutRole::Hole, CutSide::Inside));
++    assert_eq!((resolved(3).role, resolved(3).side), (CutRole::PartOutline, CutSide::Outside));
++    assert_eq!((resolved(4).role, resolved(4).side), (CutRole::OpenFeature, CutSide::OnLine));
++    let profiles: Vec<_> =
++        plan.cuts.iter().filter(|c| c.phase == CutPhase::Breakthrough).map(|c| c.feature_id).collect();
++    assert_eq!(profiles, vec![7, 8, 3, 2, 1]);
++    validate_cut_order(&features, &plan.cuts).expect("generated order is safe");
++    let mut reversed = features.clone();
++    reversed.reverse();
++    assert_eq!(plan.cuts, plan_sheet(&reversed, 0.2).expect("permuted sheet").cuts);
++}
++
++#[test]
++fn sheet_pass_phases_keep_marking_first_and_breakthrough_last() {
++    let mut features = sheet();
++    features[0].passes = vec![CutPhase::Breakthrough, CutPhase::Marking, CutPhase::RoughProfile];
++    features[2].passes = vec![CutPhase::RoughProfile, CutPhase::Breakthrough, CutPhase::Marking];
++    let plan = plan_sheet(&features, 0.2).expect("ordered phases");
++    assert!(plan.cuts.windows(2).all(|w| w[0].phase <= w[1].phase));
++    assert_eq!(plan.cuts.first().expect("marking").phase, CutPhase::Marking);
++    assert_eq!(plan.cuts.last().expect("release").phase, CutPhase::Breakthrough);
++    let rough_ids: Vec<_> =
++        plan.cuts.iter().filter(|c| c.phase == CutPhase::RoughProfile).map(|c| c.feature_id).collect();
++    assert_eq!(rough_ids, vec![3, 1]);
++}
++
++#[test]
++fn sheet_refuses_a_phase_that_frees_a_hole_before_its_nested_part() {
++    let mut features = sheet();
++    features[1].passes = vec![CutPhase::Internal];
++    features[1].release_phase = Some(CutPhase::Internal);
++    let error = plan_sheet(&features, 0.2).expect_err("hole releases too early").to_string();
++    assert!(error.contains('2') && error.contains('3'), "{error}");
++}
++
++#[test]
++fn sheet_order_validator_refuses_released_ancestors_missing_and_extra_passes() {
++    let features = sheet();
++    let plan = plan_sheet(&features, 0.2).expect("safe sheet");
++    let mut swapped = plan.cuts.clone();
++    let hole = swapped.iter().position(|c| c.feature_id == 2).expect("hole");
++    let island = swapped.iter().position(|c| c.feature_id == 3).expect("island");
++    swapped.swap(hole, island);
++    let error = validate_cut_order(&features, &swapped).expect_err("part after hole").to_string();
++    assert!(error.contains('2') && error.contains('3'), "{error}");
++    assert!(validate_cut_order(&features, &plan.cuts[1..]).is_err());
++    let mut duplicate = plan.cuts.clone();
++    duplicate.push(plan.cuts[0].clone());
++    assert!(validate_cut_order(&features, &duplicate).is_err());
++    duplicate.pop();
++    duplicate.push(PlannedCut { feature_id: 999, phase: CutPhase::Breakthrough });
++    assert!(validate_cut_order(&features, &duplicate).is_err());
++    let mut wrong_phase = plan.cuts.clone();
++    wrong_phase[0].phase = CutPhase::Marking;
++    assert!(validate_cut_order(&features, &wrong_phase).is_err());
++}
++
++#[test]
++fn sheet_order_validator_checks_global_phases_but_accepts_safe_sibling_orders() {
++    let mut first = closed(1, rect(0.0, 0.0, 2.0, 2.0));
++    first.passes = vec![CutPhase::Marking, CutPhase::Breakthrough];
++    let mut second = closed(2, rect(4.0, 0.0, 2.0, 2.0));
++    second.passes = vec![CutPhase::Marking, CutPhase::Breakthrough];
++    let features = vec![first, second];
++    let safe = vec![
++        PlannedCut { feature_id: 2, phase: CutPhase::Marking },
++        PlannedCut { feature_id: 1, phase: CutPhase::Marking },
++        PlannedCut { feature_id: 2, phase: CutPhase::Breakthrough },
++        PlannedCut { feature_id: 1, phase: CutPhase::Breakthrough },
++    ];
++    validate_cut_order(&features, &safe).expect("safe alternative sibling order");
++    let mut wrong = safe;
++    wrong.swap(1, 2);
++    assert!(validate_cut_order(&features, &wrong).is_err());
++}
++
++#[test]
++fn sheet_order_validator_names_unrequested_and_duplicate_open_passes() {
++    let feature = open(70, &[(0.0, 0.0), (2.0, 0.0)]);
++    let unrequested = vec![
++        PlannedCut { feature_id: 70, phase: CutPhase::Marking },
++        PlannedCut { feature_id: 70, phase: CutPhase::Internal },
++    ];
++    let error = validate_cut_order(std::slice::from_ref(&feature), &unrequested)
++        .expect_err("all requested passes are present, but an extra pass is not permitted").to_string();
++    assert!(error.contains("unrequested") && error.contains("70"), "{error}");
++    let duplicate = vec![
++        PlannedCut { feature_id: 70, phase: CutPhase::Internal },
++        PlannedCut { feature_id: 70, phase: CutPhase::Internal },
++    ];
++    let error = validate_cut_order(&[feature], &duplicate).expect_err("duplicate open pass").to_string();
++    assert!(error.contains("duplicate") && error.contains("70"), "{error}");
++}
++
++#[test]
++fn sheet_refuses_a_later_pass_after_the_same_contour_releases() {
++    let mut feature = closed(19, rect(0.0, 0.0, 2.0, 2.0));
++    feature.passes = vec![CutPhase::Internal, CutPhase::Breakthrough];
++    feature.release_phase = Some(CutPhase::Internal);
++    let error = plan_sheet(&[feature], 0.2).expect_err("contour already released").to_string();
++    assert!(error.contains("19"), "{error}");
++}
++
++#[test]
++fn sheet_blind_pocket_pass_keeps_material_until_final_breakthrough() {
++    let mut feature = closed(19, rect(0.0, 0.0, 2.0, 2.0));
++    feature.passes = vec![CutPhase::Internal, CutPhase::RoughProfile, CutPhase::Breakthrough];
++    feature.release_phase = Some(CutPhase::Breakthrough);
++    let plan = plan_sheet(&[feature], 0.2).expect("blind pocket retains material");
++    assert_eq!(
++        plan.cuts.iter().map(|c| c.phase).collect::<Vec<_>>(),
++        vec![CutPhase::Internal, CutPhase::RoughProfile, CutPhase::Breakthrough]
++    );
++    let mut marking = closed(20, rect(0.0, 0.0, 2.0, 2.0));
++    marking.passes = vec![CutPhase::Marking];
++    marking.release_phase = None;
++    assert_eq!(plan_sheet(&[marking], 0.2).expect("marking does not release").cuts.len(), 1);
++}
++
++#[test]
++fn sheet_refuses_invalid_release_phase_requests() {
++    let feature = closed(19, rect(0.0, 0.0, 2.0, 2.0));
++    let mut unrequested = feature.clone();
++    unrequested.release_phase = Some(CutPhase::Internal);
++    assert!(plan_sheet(&[unrequested], 0.2).is_err());
++    for phase in [CutPhase::Marking, CutPhase::RoughProfile] {
++        let mut invalid = feature.clone();
++        invalid.passes = vec![phase];
++        invalid.release_phase = Some(phase);
++        assert!(plan_sheet(&[invalid], 0.2).is_err());
++    }
++    let mut chain = open(21, &[(0.0, 0.0), (2.0, 0.0)]);
++    chain.release_phase = Some(CutPhase::Internal);
++    assert!(plan_sheet(&[chain], 0.2).is_err());
++    let mut no_release = feature;
++    no_release.release_phase = None;
++    assert!(plan_sheet(&[no_release], 0.2).is_err());
++}
++
++#[test]
++fn sheet_open_chain_sides_resolve_and_invalid_sides_name_the_chain() {
++    for side in [CutSide::Auto, CutSide::OnLine, CutSide::Left, CutSide::Right] {
++        let mut chain = open(17, &[(0.0, 0.0), (1.0, 0.0)]);
++        chain.side = side;
++        let plan = plan_sheet(&[chain], 0.2).expect("legal open side");
++        assert_eq!(plan.features[0].side, if side == CutSide::Auto { CutSide::OnLine } else { side });
++    }
++    for side in [CutSide::Inside, CutSide::Outside] {
++        let mut chain = open(17, &[(0.0, 0.0), (1.0, 0.0)]);
++        chain.side = side;
++        let error = plan_sheet(&[chain], 0.2).expect_err("invalid open side").to_string();
++        assert!(error.contains("17") && error.contains(&format!("{side:?}")), "{error}");
++    }
++    for side in [CutSide::Inside, CutSide::Outside, CutSide::OnLine] {
++        let mut contour = closed(1, rect(0.0, 0.0, 2.0, 2.0));
++        contour.side = side;
++        assert_eq!(plan_sheet(&[contour], 0.2).expect("legal closed side").features[0].side, side);
++    }
++    for side in [CutSide::Left, CutSide::Right] {
++        let mut contour = closed(1, rect(0.0, 0.0, 2.0, 2.0));
++        contour.side = side;
++        assert!(plan_sheet(&[contour], 0.2).is_err());
++    }
++}
++
++#[test]
++fn sheet_refuses_invalid_width_ids_and_pass_requests() {
++    let feature = closed(1, rect(0.0, 0.0, 2.0, 2.0));
++    for width in [0.0, -1.0, f64::NAN, f64::INFINITY] {
++        let error = plan_sheet(std::slice::from_ref(&feature), width).expect_err("invalid width").to_string();
++        assert!(error.contains("cut_width"), "{error}");
++    }
++    let same_id = closed(1, rect(4.0, 0.0, 2.0, 2.0));
++    let error = plan_sheet(&[feature.clone(), same_id], 0.2).expect_err("duplicate id").to_string();
++    assert!(error.contains("duplicate sheet feature id 1"), "{error}");
++    let mut invalid = feature.clone();
++    invalid.passes.clear();
++    assert!(plan_sheet(&[invalid], 0.2).is_err());
++    let mut duplicate = feature;
++    duplicate.passes.push(CutPhase::Breakthrough);
++    assert!(plan_sheet(&[duplicate], 0.2).is_err());
++    assert!(plan_sheet(&[], 0.2).expect("empty sheet").cuts.is_empty());
++}
++
++#[test]
++fn sheet_refuses_degenerate_self_crossing_and_retraced_geometry() {
++    let bad_loops = [
++        Loop::default(),
++        poly(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]),
++        poly(&[(0.0, 0.0), (2.0, 2.0), (0.0, 2.0), (2.0, 0.0)]),
++        poly(&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (1.0, 2.0), (1.0, 3.0), (1.0, 2.0), (0.0, 2.0)]),
++    ];
++    for ring in bad_loops {
++        let error = plan_sheet(&[closed(27, ring)], 0.2).expect_err("invalid contour").to_string();
++        assert!(error.contains("27"), "{error}");
++    }
++    for points in [
++        vec![],
++        vec![(0.0, 0.0)],
++        vec![(0.0, 0.0), (0.0, 0.0)],
++        vec![(0.0, 0.0), (1e-8, 0.0)],
++        vec![(0.0, 0.0), (2.0, 2.0), (0.0, 2.0), (2.0, 0.0)],
++        vec![(0.0, 0.0), (2.0, 0.0), (1.0, 0.0)],
++    ] {
++        let error = plan_sheet(&[open(28, &points)], 0.2).expect_err("invalid chain").to_string();
++        assert!(error.contains("28"), "{error}");
++    }
++    for (points, reason) in [
++        (vec![(0.0, 0.0), (f64::NAN, 1.0)], "non-finite"),
++        (vec![(0.0, 0.0), (1e13, 1.0)], "range"),
++        (vec![(0.0, 0.0), (1e-8, 0.0)], "zero-length"),
++        (vec![(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (0.0, 0.0)], "marked open"),
++        (vec![(0.0, 0.0), (2.0, 0.0), (1.0, 0.0)], "retraces"),
++    ] {
++        let error = plan_sheet(&[open(28, &points)], 0.2).expect_err("invalid coordinates").to_string();
++        assert!(error.contains("28") && error.contains(reason), "{error}");
++    }
++}
++
++#[test]
++fn sheet_refuses_area_accumulation_overflow_by_name() {
++    let axes = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)];
++    for mirror in [-1.0, 1.0] {
++        let point = |i: usize, inset: f64| {
++            let radius = 9e11 - i as f64 * 1e8 - inset;
++            let (x, y) = axes[i % 4];
++            Point2::new(mirror * x * radius, y * radius)
++        };
++        // A thin simple spiral: fan area overflows before the return path cancels it.
++        let mut points: Vec<_> = (0..=320).map(|i| point(i, 0.0)).collect();
++        points.extend((0..=320).rev().map(|i| point(i, 1e6)));
++        let ring = Loop::new(points).expect("simple spiral within coordinate range");
++        let error = plan_sheet(&[closed(88, ring)], 0.2).expect_err("area sum exceeds i128").to_string();
++        assert!(error.contains("88") && error.contains("area") && error.contains("range"), "{error}");
++    }
++}
++
++#[test]
++fn sheet_refuses_crossing_or_touching_contours_and_boundary_crossing_chains() {
++    let outer = closed(1, rect(0.0, 0.0, 10.0, 10.0));
++    for ring in [rect(9.0, 2.0, 2.0, 2.0), rect(10.0, 2.0, 2.0, 2.0), rect(0.0, 0.0, 10.0, 10.0)] {
++        let error =
++            plan_sheet(&[outer.clone(), closed(2, ring)], 0.2).expect_err("ambiguous contour relation").to_string();
++        assert!(error.contains('1') && error.contains('2'), "{error}");
++    }
++    for chain in [open(3, &[(5.0, 5.0), (15.0, 5.0)]), open(3, &[(0.0, 5.0), (5.0, 5.0)])] {
++        assert!(plan_sheet(&[outer.clone(), chain], 0.2).is_err());
++    }
++    let concave = closed(
++        10,
++        poly(&[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (4.0, 6.0), (4.0, 2.0), (2.0, 2.0), (2.0, 6.0), (0.0, 6.0)]),
++    );
++    // Both endpoints are inside, but the segment crosses the notch twice.
++    let chain = open(11, &[(1.0, 5.0), (5.0, 5.0)]);
++    assert!(plan_sheet(&[concave, chain], 0.2).is_err());
++}
++
++#[test]
++fn sheet_crossing_open_features_keep_the_same_containing_parent() {
++    let features = vec![
++        closed(1, rect(0.0, 0.0, 10.0, 10.0)),
++        open(2, &[(2.0, 5.0), (8.0, 5.0)]),
++        open(3, &[(5.0, 2.0), (5.0, 8.0)]),
++    ];
++    let plan = plan_sheet(&features, 0.2).expect("independent open cuts may cross");
++    for id in [2, 3] {
++        let feature = plan.features.iter().find(|f| f.id == id).expect("open feature");
++        assert_eq!((feature.parent, feature.role), (Some(1), CutRole::OpenFeature));
++    }
++    validate_cut_order(&features, &plan.cuts).expect("open features precede outline release");
++}
++
++#[test]
++fn sheet_corner_limits_use_tool_radius_and_ignore_input_winding() {
++    let points = [(0.0, 0.0), (6.0, 0.0), (6.0, 2.0), (2.0, 2.0), (2.0, 6.0), (0.0, 6.0)];
++    for vertices in [points.to_vec(), points.into_iter().rev().collect::<Vec<_>>()] {
++        let plan = plan_sheet(&[closed(9, poly(&vertices))], 2.0).expect("concave part");
++        assert_eq!(plan.corner_limits.len(), 1);
++        let limit = &plan.corner_limits[0];
++        assert_eq!(limit.feature_id, 9);
++        assert_eq!(vertices[limit.vertex], (2.0, 2.0));
++        assert!((limit.tool_radius - 1.0).abs() < 1e-10);
++        assert!((limit.angle_radians - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
++        assert!((limit.min_unreachable_distance - (2.0_f64.sqrt() - 1.0)).abs() < 1e-10);
++    }
++    let mut inside = closed(12, rect(0.0, 0.0, 10.0, 10.0));
++    inside.side = CutSide::Inside;
++    assert_eq!(plan_sheet(&[inside.clone()], 2.0).expect("inside corners").corner_limits.len(), 4);
++    inside.side = CutSide::OnLine;
++    assert!(plan_sheet(&[inside], 2.0).expect("on-line profile").corner_limits.is_empty());
++}
++
++#[test]
++fn sheet_open_side_corner_limits_follow_the_directed_cut_side() {
++    let points = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)];
++    let cases: [(Vec<(f64, f64)>, CutSide); 2] =
++        [(points.to_vec(), CutSide::Left), (points.into_iter().rev().collect::<Vec<_>>(), CutSide::Right)];
++    for (vertices, side) in cases {
++        let mut chain = open(22, &vertices);
++        chain.side = side;
++        let plan = plan_sheet(&[chain], 2.0).expect("side-cut chain");
++        assert_eq!(plan.corner_limits.len(), 1);
++        let limit = &plan.corner_limits[0];
++        assert_eq!((limit.feature_id, limit.vertex), (22, 1));
++        assert!((limit.tool_radius - 1.0).abs() < 1e-10);
++        assert!((limit.angle_radians - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
++        assert!((limit.min_unreachable_distance - (2.0_f64.sqrt() - 1.0)).abs() < 1e-10);
++    }
++    for side in [CutSide::Right, CutSide::OnLine, CutSide::Auto] {
++        let mut chain = open(22, &points);
++        chain.side = side;
++        assert!(plan_sheet(&[chain], 2.0).expect("no inside corner").corner_limits.is_empty());
++    }
++}
+diff --git a/docs/decisions/2159-sheet-cut-order.md b/docs/decisions/2159-sheet-cut-order.md
+new file mode 100644
+index 000000000..7aaecee56
+--- /dev/null
++++ b/docs/decisions/2159-sheet-cut-order.md
+@@ -0,0 +1,41 @@
++## #2159 - Global sheet cut order
++
++**Chosen.** Keep the planner in the geometry crate. Its API accepts placed
++closed loops, open points, and stable feature IDs in sheet coordinates.
++The planner does not depend on the placement kernel's output types.
++It adds no dependencies or serialization changes.
++
++Stack on #2808 because it changes the shared nesting entry file.
++Add the planner export beside the placement API.
++Keep the placement functions unchanged.
++
++Build one containment forest on the geometry integer grid. Refuse touching
++or crossing closed boundaries and chains that cross those boundaries.
++Check self-intersections and adjacent retracing before containment.
++Use checked `i128` area accumulation and refuse values outside its range.
++
++Traverse the forest in iterative post-order. Sort siblings by increasing
++enclosed area, then stable ID. Resolve `Auto` closed sides by depth parity;
++resolve open chains to `OnLine`. Refuse invalid side requests by name.
++
++Schedule four global phases: marking, internal cuts, rough profiles, and
++final breakthrough. Each feature states its `release_phase` explicitly.
++A blind pocket can retain stock through its internal passes. A through cut
++can release material in the internal or breakthrough phase. Refuse any
++schedule that cuts a feature after its material or an ancestor is released.
++Refuse conflicting requests instead of changing their phase.
++
++Report circular-tool corner limits from `cut_width / 2`. Keep the original
++vertex indices in the diagnostics. The planner does not offset cut paths.
++
++**Why.** Global containment protects parts placed inside another part's hole.
++Small parts cut first while the surrounding sheet still supports them.
++Explicit release information distinguishes a pocket from a through cut.
++
++**Dropped.** Input order and position do not set sibling priority.
++Vertex-only containment misses boundary crossings. Region normalization can
++remove a slit or spike, so it does not validate the requested cut path.
++A phase alone does not determine release. Unsafe partial schedules are refused.
++
++**Cost to change.** The placement kernel will need an adapter for this API.
++Changes to phase rules or sibling priorities need new policy pins.
+
+From ff18a784dd2f5f80c15a25c21fd02097a37bd85f Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 20 Nov 2026 20:24:54 -0800
+Subject: [PATCH 2/2] fix(geometry): ignore retained stock contours in cut
+ depth
+
+Count material-releasing ancestors for cut roles and automatic sides. Pin through holes within engravings and blind pockets, including corner diagnostics.
+
+Fixes #2159
+---
+ .../src/nesting/cut_order/geometry.rs         |  4 +-
+ .../tests/nesting_cut_order_retained_stock.rs | 69 +++++++++++++++++++
+ docs/decisions/2159-sheet-cut-order.md        |  8 ++-
+ 3 files changed, 78 insertions(+), 3 deletions(-)
+ create mode 100644 crates/geometry/tests/nesting_cut_order_retained_stock.rs
+
+diff --git a/crates/geometry/src/nesting/cut_order/geometry.rs b/crates/geometry/src/nesting/cut_order/geometry.rs
+index 459002803..a2aa6eeee 100644
+--- a/crates/geometry/src/nesting/cut_order/geometry.rs
++++ b/crates/geometry/src/nesting/cut_order/geometry.rs
+@@ -199,7 +199,9 @@ pub(super) fn forest(features: &[CutFeature]) -> Result<Vec<Node>, GeoError> {
+         let mut depth = 0;
+         while let Some(parent) = at {
+             // Every parent has strictly larger area, so no cycle is possible.
+-            depth += 1;
++            if features[parent].release_phase.is_some() {
++                depth += 1;
++            }
+             at = nodes[parent].parent;
+         }
+         nodes[i].depth = depth;
+diff --git a/crates/geometry/tests/nesting_cut_order_retained_stock.rs b/crates/geometry/tests/nesting_cut_order_retained_stock.rs
+new file mode 100644
+index 000000000..370c4690b
+--- /dev/null
++++ b/crates/geometry/tests/nesting_cut_order_retained_stock.rs
+@@ -0,0 +1,69 @@
++//! Provenance: issue #2159 sheet hold-down rules and PR #2847 nested retained-stock cases.
++//! Gate map: covers camcraft_geometry::nesting::cut_order.
++
++use camcraft_geometry::geo2d::{Loop, Point2};
++use camcraft_geometry::nesting::cut_order::{
++    CutFeature, CutGeometry, CutPhase, CutRole, CutSide, plan_sheet,
++};
++
++fn rectangle(id: u64, low: f64, high: f64) -> CutFeature {
++    let ring = Loop::new(vec![
++        Point2::new(low, low),
++        Point2::new(high, low),
++        Point2::new(high, high),
++        Point2::new(low, high),
++    ])
++    .expect("fixture rectangle");
++    CutFeature {
++        id,
++        geometry: CutGeometry::Closed(ring),
++        side: CutSide::Auto,
++        passes: vec![CutPhase::Breakthrough],
++        release_phase: Some(CutPhase::Breakthrough),
++    }
++}
++
++fn assert_hole_inside_retained_contour(phase: CutPhase) {
++    let mut retained = rectangle(2, 2.0, 18.0);
++    retained.passes = vec![phase];
++    retained.release_phase = None;
++    let features = [rectangle(1, 0.0, 20.0), retained, rectangle(3, 5.0, 8.0)];
++    let plan = plan_sheet(&features, 0.2).expect("retained contour does not separate material");
++    let hole = plan
++        .features
++        .iter()
++        .find(|feature| feature.id == 3)
++        .expect("hole");
++    assert_eq!(
++        hole.parent,
++        Some(2),
++        "keep the geometric parent for scheduling"
++    );
++    assert_eq!(hole.depth, 1, "only the outer part releases material");
++    assert_eq!((hole.role, hole.side), (CutRole::Hole, CutSide::Inside));
++    let corners: Vec<_> = plan
++        .corner_limits
++        .iter()
++        .filter(|corner| corner.feature_id == 3)
++        .collect();
++    assert_eq!(
++        corners.len(),
++        4,
++        "the cutter cannot reach the four inside corners"
++    );
++    for (vertex, corner) in corners.iter().enumerate() {
++        assert_eq!(corner.vertex, vertex);
++        assert!((corner.angle_radians - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
++        assert!((corner.min_unreachable_distance - 0.1 * (2.0_f64.sqrt() - 1.0)).abs() < 1e-12);
++    }
++}
++
++#[test]
++fn through_hole_inside_engraving_uses_material_depth() {
++    assert_hole_inside_retained_contour(CutPhase::Marking);
++}
++
++#[test]
++fn through_hole_inside_blind_pocket_uses_material_depth() {
++    assert_hole_inside_retained_contour(CutPhase::Internal);
++}
+diff --git a/docs/decisions/2159-sheet-cut-order.md b/docs/decisions/2159-sheet-cut-order.md
+index 7aaecee56..baed2f0f4 100644
+--- a/docs/decisions/2159-sheet-cut-order.md
++++ b/docs/decisions/2159-sheet-cut-order.md
+@@ -15,8 +15,12 @@ Check self-intersections and adjacent retracing before containment.
+ Use checked `i128` area accumulation and refuse values outside its range.
+ 
+ Traverse the forest in iterative post-order. Sort siblings by increasing
+-enclosed area, then stable ID. Resolve `Auto` closed sides by depth parity;
+-resolve open chains to `OnLine`. Refuse invalid side requests by name.
++enclosed area, then stable ID. Resolve `Auto` closed sides by the parity of
++material-releasing ancestors. Retain non-releasing geometric parents for
++scheduling, but exclude them from this depth because they do not separate
++material. Reject counting all closed ancestors: an engraving or blind pocket
++would reverse the side of a nested through hole.
++Resolve open chains to `OnLine`. Refuse invalid side requests by name.
+ 
+ Schedule four global phases: marking, internal cuts, rough profiles, and
+ final breakthrough. Each feature states its `release_phase` explicitly.
