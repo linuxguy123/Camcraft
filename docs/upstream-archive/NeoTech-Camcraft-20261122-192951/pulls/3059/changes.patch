@@ -1,0 +1,937 @@
+From 4e22c8dbe915bfa9131486395c4237898532370d Mon Sep 17 00:00:00 2001
+From: Paul Robinson <parobin@microsoft.com>
+Date: Fri, 20 Nov 2026 19:31:33 +0000
+Subject: [PATCH 1/2] feat(chamfer): machine selected open edge chains
+
+Allow 2D Chamfer to route closed loops and grouped open chains with safe air-side entry and exit. Emit one break record for each selected run.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+
+Fixes #2988
+---
+ crates/app/src/operation/generate.rs          | 118 +++++++---
+ crates/app/src/operation/job.rs               |  27 ++-
+ crates/app/src/operation/selection.rs         |  19 +-
+ crates/app/tests/chamfer_open_edges.rs        | 214 ++++++++++++++++++
+ crates/motion/src/machining2d/chamfer.rs      | 103 +++++++++
+ crates/motion/src/machining2d/mod.rs          |   2 +-
+ crates/motion/tests/chamfer_circular.rs       | 127 ++++++++++-
+ .../2988-chamfer-open-edge-chains.md          |  21 ++
+ 8 files changed, 591 insertions(+), 40 deletions(-)
+ create mode 100644 crates/app/tests/chamfer_open_edges.rs
+ create mode 100644 docs/decisions/2988-chamfer-open-edge-chains.md
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 5fe42c39c..4bc49eb5d 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -265,9 +265,16 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+ 
+     // The area controls (M11.5): the region every arm takes is the
+     // controlled one, resolved here once into the slot `region_for_job`
+-    // reads first. The Contour selection arm resolves its own (its side
+-    // is only known there). Face keeps the band constraints and turn.
+-    let contour_sel_arm = matches!((&params, &src), (OpParams::Contour { .. }, SrcRef::Selection(_)));
++    // reads first. Contour and Chamfer selection arms resolve their own
++    // raw loops and runs (an open run has no region). Face keeps the band
++    // constraints and turn.
++    let contour_sel_arm = matches!(
++        (&params, &src),
++        (
++            OpParams::Contour { .. } | OpParams::Chamfer2D { .. },
++            SrcRef::Selection(_)
++        )
++    );
+     let mut area = area.transpose()?;
+     // A Contour under an open boundary rides the chain itself (its arm
+     // below, `contour_open`): no area law runs for it.
+@@ -2227,31 +2234,86 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                     width * angle_deg.to_radians().tan()
+                 )));
+             }
+-            let region = region_for_job(
+-                    &mut picked_region,
+-                    &mut section_z,
+-                    &src,
+-                    &params,
+-                m_gen,
+-                frame.as_ref(),
+-            )?;
+-            let path = machining2d::chamfer(
+-                &region,
+-                &ChamferParams {
+-                    width: *width,
+-                    angle_deg: *angle_deg,
+-                    clearance_z: hl.clearance,
+-                    retract_z: hl.retract,
+-                    top_z: req_z(hl.top, "Top of Part Z")?,
+-                    feed: *feed,
+-                    plunge_feed: *plunge_feed,
+-                    climb: *climb,
+-                    // #1555: which side of the picked loops the material
+-                    // stands on - the travel climb needs follows from it.
+-                    inside: *side == Side::Inside,
+-                },
+-            )?;
+-            (region, path)
++            let cp = ChamferParams {
++                width: *width,
++                angle_deg: *angle_deg,
++                clearance_z: hl.clearance,
++                retract_z: hl.retract,
++                top_z: req_z(hl.top, "Top of Part Z")?,
++                feed: *feed,
++                plunge_feed: *plunge_feed,
++                climb: *climb,
++                // #1555: which side of closed picked loops the material
++                // stands on - the travel climb follows from it. Open
++                // chains read their actual wall side in the motion arm.
++                inside: *side == Side::Inside,
++            };
++            match &src {
++                SrcRef::Selection(_) => {
++                    let (loops, runs, _) = contour_sel
++                        .take()
++                        .ok_or_else(|| unreached("chamfer selection geometry"))??;
++                    if loops.is_empty() && runs.is_empty() {
++                        return Err(GenError::Empty(
++                            "nothing in the selection bounds an area or an edge run".into(),
++                        ));
++                    }
++                    if loops.is_empty() && area.is_some() {
++                        return Err(GenError::Invalid(
++                            "the Boundary settings shape an area, and these picks are open chamfer runs - reset them, or pick closed rings".into(),
++                        ));
++                    }
++                    let base = if loops.is_empty() {
++                        Region::empty()
++                    } else {
++                        Region::new(loops)?
++                    };
++                    let region = if let Some(ctx) = area.take() {
++                        apply_area_controls(base, Some(&ctx))?
++                    } else {
++                        base
++                    };
++                    let mut path = if region.is_empty() {
++                        Toolpath::new(Vec::new())
++                    } else {
++                        machining2d::chamfer(&region, &cp)?
++                    };
++                    if !runs.is_empty() {
++                        let cut = |facets: &[Triangle],
++                                   bodies: &[std::ops::Range<usize>],
++                                   z: f64| match super::material::section(facets, bodies, z) {
++                            Ok(r) => Ok(Some(r)),
++                            Err(GenError::Empty(_)) => Ok(None),
++                            Err(e) => Err(e),
++                        };
++                        let section_at = |z: f64| cut(&m_gen.facets, &m_gen.bodies, z);
++                        let mut next = machining2d::chamfer_open_runs(&runs, &cp, &section_at)
++                            .map_err(|e| e.after_moves(&path.moves))?;
++                        let notes = std::mem::take(&mut next.notes);
++                        let breaks = std::mem::take(&mut next.breaks);
++                        path = stitch(path, next);
++                        path.breaks.extend(breaks);
++                        for note in notes {
++                            if !path.notes.contains(&note) {
++                                path.notes.push(note);
++                            }
++                        }
++                    }
++                    (region, path)
++                }
++                _ => {
++                    let region = region_for_job(
++                            &mut picked_region,
++                            &mut section_z,
++                            &src,
++                            &params,
++                        m_gen,
++                        frame.as_ref(),
++                    )?;
++                    let path = machining2d::chamfer(&region, &cp)?;
++                    (region, path)
++                }
++            }
+         }
+         // Circular interpolation (M2.4 B): concentric rings about an
+         // authored center - the pocket family's heights and doors
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index 57b0c7daa..3b97854bd 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -247,13 +247,19 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     // arm's own statement in `run_job`.
+     let section_z = section_z_of(world, setup, Some(&op.src), &op.params, frame.as_ref());
+     let picked_region = match (&op.params, &op.src) {
+-        // Contour's Selection pair is resolved as raw geometry below
+-        // (its arm never asks for a region first); every other kind
+-        // whose picks author the region takes selection_region's
++        // Contour's and 2D Chamfer's Selection pairs are resolved as
++        // raw geometry below (their arms can ride open runs); every
++        // other kind whose picks author the region takes selection_region's
+         // answer.
+         (params, SrcRef::Selection(items))
+             if selection_drives_region(params)
+-                && !matches!(params, OpParams::Contour { .. } | OpParams::PlasmaProfile(_) | OpParams::WireContour(_)) =>
++                && !matches!(
++                    params,
++                    OpParams::Contour { .. }
++                        | OpParams::PlasmaProfile(_)
++                        | OpParams::WireContour(_)
++                        | OpParams::Chamfer2D { .. }
++                ) =>
+         {
+             Some(selection_region(world, setup, items, params, &op.area))
+         }
+@@ -268,9 +274,16 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     let around_part = super::keep_law::is_keep_kind(&op.params) && matches!(op.src, SrcRef::Entity(_)) && picked_region.is_some();
+     let wire_ruled = super::wire_ruled::picks_of(world, op);
+     let contour_sel = match (&op.params, &op.src) {
+-        // The plasma cut reads its picks the contour's way (#670):
+-        // closed rings AND open runs, each cut as picked.
+-        (OpParams::Contour { .. } | OpParams::PlasmaProfile(_) | OpParams::WireContour(_), SrcRef::Selection(items))
++        // The plasma cut and 2D Chamfer read their picks the contour's
++        // way (#670, #2988): closed rings AND open runs, each cut as
++        // picked.
++        (
++            OpParams::Contour { .. }
++                | OpParams::PlasmaProfile(_)
++                | OpParams::WireContour(_)
++                | OpParams::Chamfer2D { .. },
++            SrcRef::Selection(items),
++        )
+             if wire_ruled.is_none() =>
+         {
+             Some(selection_geometry_impl(world, setup, items, &op.params, None))
+diff --git a/crates/app/src/operation/selection.rs b/crates/app/src/operation/selection.rs
+index 5dc0a28ef..61d1b0812 100644
+--- a/crates/app/src/operation/selection.rs
++++ b/crates/app/src/operation/selection.rs
+@@ -179,7 +179,13 @@ pub(super) fn selection_geometry_impl(
+     notes: Option<&mut Vec<String>>,
+ ) -> Result<SelectionGeometry, GenError> {
+     let (loops, mut chains, auto) = selection_geometry_in(world, setup, items, params, notes, None)?;
+-    if matches!(params, OpParams::Contour { .. } | OpParams::PlasmaProfile(_) | OpParams::WireContour(_))
++    if matches!(
++        params,
++        OpParams::Contour { .. }
++            | OpParams::PlasmaProfile(_)
++            | OpParams::WireContour(_)
++            | OpParams::Chamfer2D { .. }
++    )
+         && !chains.is_empty()
+     {
+         chains = boundary_chains::join_open_runs(chains);
+@@ -220,8 +226,15 @@ pub(super) fn selection_geometry_in(
+         params,
+         OpParams::Pocket { .. } | OpParams::Adaptive2D { .. } | OpParams::Offset2D { .. }
+     );
+-    // The plasma profile takes open runs as the contour does (#670).
+-    let contour = matches!(params, OpParams::Contour { .. } | OpParams::PlasmaProfile(_) | OpParams::WireContour(_));
++    // The plasma profile and 2D Chamfer take open runs as the contour
++    // does (#670, #2988).
++    let contour = matches!(
++        params,
++        OpParams::Contour { .. }
++            | OpParams::PlasmaProfile(_)
++            | OpParams::WireContour(_)
++            | OpParams::Chamfer2D { .. }
++    );
+     let contour_side = match params {
+         OpParams::Contour { side, .. } => *side,
+         _ => Side::Auto,
+diff --git a/crates/app/tests/chamfer_open_edges.rs b/crates/app/tests/chamfer_open_edges.rs
+new file mode 100644
+index 000000000..8160b1e58
+--- /dev/null
++++ b/crates/app/tests/chamfer_open_edges.rs
+@@ -0,0 +1,214 @@
++//! #2988 through the operation layer: a 2D Chamfer takes one or more
++//! selected open edge chains, keeps connected picks in one pass, enters
++//! and exits each chain in air, and declares only the selected edges for
++//! stock verification.
++//!
++//! Gate map (#2988): covers app::operation (selection, generate, stitch),
++//! app::posting, motion::machining2d (chamfer), sim::stock_sim (edge_break,
++//! wall_anchor).
++
++mod area_support;
++
++use area_support::*;
++use camcraft_app::commands::GenerateOperation;
++use camcraft_app::posting;
++
++/// The 90-degree chamfer mill the selected-edge ride needs.
++const CONE: &str = "CM-0600-90";
++
++fn world() -> World {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(
++        &world,
++        ImportModel::from_mesh(
++            "part",
++            cube(
++                Point3::new(-20.0, -20.0, 0.0),
++                Point3::new(20.0, 20.0, 10.0),
++            ),
++        ),
++    );
++    h.execute(
++        &world,
++        SetStock::new(
++            &world,
++            StockShape::FromModel {
++                source: "part".into(),
++            },
++            Default::default(),
++        )
++        .expect("stock"),
++    );
++    let tool = catalog()
++        .into_iter()
++        .find(|(name, _)| *name == CONE)
++        .map(|(_, tool)| tool)
++        .expect("catalog cone");
++    h.execute(&world, AddTool::new(&world, CONE, tool).expect("tool"));
++    world
++}
++
++fn params() -> OpParams {
++    OpParams::Chamfer2D {
++        width: 1.0,
++        angle_deg: 45.0,
++        clearance_z: Height::fixed(25.0),
++        retract_z: Some(Height::fixed(12.0)),
++        top_z: Height::fixed(10.0),
++        feed: 500.0,
++        plunge_feed: 100.0,
++        climb: true,
++        side: Side::Outside,
++        tolerance: 0.01,
++        tilt: None,
++    }
++}
++
++fn north(w: &World) -> GeoSel {
++    GeoSel {
++        entity: "part".into(),
++        feature: rim_edge(w, |q| (q[1] - 20.0).abs() < 1e-9),
++    }
++}
++
++fn east(w: &World) -> GeoSel {
++    GeoSel {
++        entity: "part".into(),
++        feature: rim_edge(w, |q| (q[0] - 20.0).abs() < 1e-9),
++    }
++}
++
++fn south(w: &World) -> GeoSel {
++    GeoSel {
++        entity: "part".into(),
++        feature: rim_edge(w, |q| (q[1] + 20.0).abs() < 1e-9),
++    }
++}
++
++fn generate(w: &World, picks: Vec<GeoSel>) -> Toolpath {
++    let mut h = History::default();
++    h.execute(
++        w,
++        CreateOperation::new(w, "CHM", CONE, SrcRef::Selection(picks), params()).expect("create"),
++    );
++    h.execute(w, GenerateOperation::new(w, "CHM").expect("generate"));
++    let e = model::find_by_name(w, "CHM").expect("operation");
++    model::toolpath_of(w, &e)
++        .expect("cached chamfer")
++        .path
++        .clone()
++}
++
++fn corner_feeds(path: &Toolpath) -> Vec<Point3> {
++    path.moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && (m.to.z - 9.0).abs() < 1e-9)
++        .map(|m| m.to)
++        .collect()
++}
++
++#[test]
++fn a_selected_edge_generates_and_verifies_one_open_chamfer() {
++    let w = world();
++    let path = generate(&w, vec![north(&w)]);
++    assert_eq!(path.breaks.len(), 1, "one selected edge, one break");
++    let edge = &path.breaks[0].edge;
++    assert_eq!(edge.len(), 2, "the selected edge stays a two-point run");
++    assert_ne!(edge.first(), edge.last(), "the edge is not closed");
++    assert!(
++        edge.iter()
++            .all(|q| (q.y - 20.0).abs() < 1e-9 && q.z == 10.0),
++        "only the selected top edge is declared: {edge:?}"
++    );
++    let feeds = corner_feeds(&path);
++    assert_eq!(
++        feeds.iter().filter(|q| (q.y - 20.0).abs() < 1e-9).count(),
++        2,
++        "the two selected ends are ridden: {feeds:?}"
++    );
++    let e = model::find_by_name(&w, "CHM").expect("operation");
++    let cached = model::toolpath_of(&w, &e).expect("cached");
++    assert!(
++        cached.warnings.is_empty(),
++        "the open ride is clean: {:?}",
++        cached.warnings
++    );
++    assert!(
++        posting::post_setup_unwritten(&w).is_ok(),
++        "the selected chamfer verifies and posts"
++    );
++}
++
++#[test]
++fn connected_selected_edges_generate_one_open_pass() {
++    let w = world();
++    let path = generate(&w, vec![north(&w), east(&w)]);
++    assert_eq!(path.breaks.len(), 1, "two connected edges form one chain");
++    assert_eq!(
++        path.breaks[0].edge.len(),
++        3,
++        "the joined chain keeps its corner"
++    );
++    assert_eq!(
++        path.moves
++            .iter()
++            .filter(|m| m.kind == MoveKind::Plunge)
++            .count(),
++        1,
++        "one connected chain has one entry"
++    );
++    assert!(
++        corner_feeds(&path)
++            .iter()
++            .any(|q| { (q.x - 20.0).abs() < 1e-9 && (q.y - 20.0).abs() < 1e-9 }),
++        "the connected pass reaches the selected corner"
++    );
++}
++
++#[test]
++fn separate_selected_edges_generate_separate_open_passes() {
++    let w = world();
++    let path = generate(&w, vec![north(&w), south(&w)]);
++    assert_eq!(path.breaks.len(), 2, "separate chains keep separate breaks");
++    assert_eq!(
++        path.moves
++            .iter()
++            .filter(|m| m.kind == MoveKind::Plunge)
++            .count(),
++        2,
++        "each chain is entered as a separate pass"
++    );
++    assert!(
++        path.breaks
++            .iter()
++            .all(|b| b.edge.iter().all(|q| (q.y - 20.0).abs() < 1e-9)
++                || b.edge.iter().all(|q| (q.y + 20.0).abs() < 1e-9)),
++        "a break never joins the separated north and south edges: {:?}",
++        path.breaks
++    );
++}
++
++#[test]
++fn an_open_chamfer_does_not_credit_an_unselected_edge() {
++    let w = world();
++    let path = generate(&w, vec![north(&w)]);
++    assert!(
++        posting::verification_gate(&w).is_empty(),
++        "the declared selected edge posts"
++    );
++    let e = model::find_by_name(&w, "CHM").expect("operation");
++    let cached = model::toolpath_of(&w, &e).expect("cached");
++    let mut moved = path;
++    for m in &mut moved.moves {
++        m.from.y -= 40.0;
++        m.to.y -= 40.0;
++    }
++    let rebuilt = camcraft_app::schema::Toolpath::new(moved, cached.warnings);
++    e.entity_view(&w).set(rebuilt);
++    let gate = posting::verification_gate(&w);
++    assert!(
++        gate.iter().any(|line| line.starts_with("gouge:")),
++        "moving the cut to the unselected south edge is still a gouge: {gate:?}"
++    );
++}
+diff --git a/crates/motion/src/machining2d/chamfer.rs b/crates/motion/src/machining2d/chamfer.rs
+index f814730ee..14d548b36 100644
+--- a/crates/motion/src/machining2d/chamfer.rs
++++ b/crates/motion/src/machining2d/chamfer.rs
+@@ -26,9 +26,16 @@ use crate::cl::{EdgeBreak, MoveKind, PathBuilder, Toolpath};
+ use crate::geo2d::{Loop, Point2};
+ use crate::geometry::Point3;
+ 
++use super::contour::air_side;
++use super::contour_run_side::{LIFT, SectionAt, Words, material_side, simple};
+ use super::face::GenError;
+ use super::levels::{Motion, run_levels};
+ 
++const CHAMFER_WORDS: Words = Words {
++    body: "selected model",
++    both: "a chamfer on that edge would meet material on both sides; pick a boundary edge with air on one side",
++};
++
+ /// One chamfer ride's numbers. `top_z` is the plane the chamfer's wide
+ /// end opens in (the picked edge's top); the corner depth follows from
+ /// it and is never an independent input - that is what makes the
+@@ -157,3 +164,99 @@ pub fn chamfer(region: &crate::geo2d::Region, p: &ChamferParams) -> Result<Toolp
+         .collect();
+     Ok(path)
+ }
++
++/// Chamfer joined open edge chains, one safe approach and exit per
++/// chain. Every pass stands on the selected wall only: it descends in
++/// the air one chamfer width off the first end, feeds onto and through
++/// every selected point, then feeds back to the air at the other end
++/// before retracting. The material side is read from the model at the
++/// chamfer's own heights, so climb never depends on an arbitrary edge
++/// chain orientation. The `EdgeBreak` contains the selected chain alone;
++/// the two air leads grant no extra credit.
++pub fn chamfer_open_runs(
++    runs: &[Vec<Point2>],
++    p: &ChamferParams,
++    section: &SectionAt<'_>,
++) -> Result<Toolpath, GenError> {
++    p.validate()?;
++    if runs.is_empty() {
++        return Err(GenError::Empty("a 2D Chamfer needs a selected edge chain".into()));
++    }
++    let z = p.corner_z();
++    if !z.is_finite() {
++        return Err(GenError::Invalid("corner depth left the finite horizon".into()));
++    }
++    let depth = p.top_z - z;
++    let probe = LIFT.min(depth * 0.25);
++    let mut passes: Vec<Vec<Point2>> = Vec::with_capacity(runs.len());
++    let mut breaks: Vec<EdgeBreak> = Vec::with_capacity(runs.len());
++    for pts in runs {
++        let run = simple(pts)?;
++        let mut levels = Vec::new();
++        for at in [z + probe, p.top_z - probe] {
++            if let Some(region) = section(at)?
++                && !region.is_empty()
++            {
++                levels.push((at, region));
++            }
++        }
++        let material_left = material_side(&run, &levels, &CHAMFER_WORDS)?.ok_or_else(|| {
++            GenError::Invalid(
++                "the selected open chamfer edge has no model wall at the programmed chamfer depth - pick an edge on the part, or change Top of Part Z"
++                    .into(),
++            )
++        })?;
++        let mut pass = run.clone();
++        // Material stays on the RIGHT for climb, as on every loop. The
++        // model read above supplies the side that a feature chain's
++        // arbitrary storage direction otherwise cannot.
++        if p.climb == material_left {
++            pass.reverse();
++        }
++        let (Some(&first), Some(&second), Some(&last), Some(&before_last)) =
++            (pass.first(), pass.get(1), pass.last(), pass.get(pass.len() - 2))
++        else {
++            return Err(GenError::Empty("a chamfer edge needs at least two points".into()));
++        };
++        let tangent = |a: Point2, b: Point2| -> Result<Point2, GenError> {
++            let len = (b.x - a.x).hypot(b.y - a.y);
++            if !len.is_finite() || len <= 0.0 {
++                return Err(GenError::Empty("a chamfer edge holds a collapsed segment".into()));
++            }
++            Ok(Point2::new((b.x - a.x) / len, (b.y - a.y) / len))
++        };
++        let entry_air = air_side(tangent(first, second)?, p.climb);
++        let exit_air = air_side(tangent(before_last, last)?, p.climb);
++        let mut ride = Vec::with_capacity(pass.len() + 2);
++        ride.push(Point2::new(
++            first.x + entry_air.x * p.width,
++            first.y + entry_air.y * p.width,
++        ));
++        ride.extend(pass);
++        ride.push(Point2::new(
++            last.x + exit_air.x * p.width,
++            last.y + exit_air.y * p.width,
++        ));
++        passes.push(ride);
++        breaks.push(EdgeBreak {
++            edge: run.iter().map(|q| Point3::new(q.x, q.y, p.top_z)).collect(),
++            depth: p.top_z - z,
++            slope: p.angle_deg.to_radians().tan(),
++            volume: None,
++        });
++    }
++
++    let mut b = PathBuilder::approached(Point3::new(0.0, 0.0, p.clearance_z));
++    let motion = Motion::new(p.clearance_z, p.retract_z, p.feed, p.plunge_feed);
++    run_levels(&mut b, &passes, &[z], &motion, None, None, None);
++    let cur = b.at();
++    if cur.z < p.clearance_z {
++        b.push(MoveKind::Rapid, Point3::new(cur.x, cur.y, p.clearance_z), None);
++    }
++    let mut path = b.finish();
++    if !path.all_finite() {
++        return Err(GenError::Invalid("open chamfer path left the finite horizon".into()));
++    }
++    path.breaks = breaks.into_iter().filter(EdgeBreak::is_sane).collect();
++    Ok(path)
++}
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 0399928ea..08a6cfa3e 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -127,7 +127,7 @@ pub use arcs::{fit_arcs, fit_arcs_sided, Seg, ARC_FIT_TOL};
+ pub use blend::MIN_BLEND_RADIUS;
+ pub use bore::{bore, BoreHole, BoreParams};
+ pub use bore_core::{bore_core_gap, bore_floor_reach, bore_leaves_core, cutting_radius_at, max_bore_diameter};
+-pub use chamfer::{chamfer, ChamferParams};
++pub use chamfer::{chamfer, chamfer_open_runs, ChamferParams};
+ pub use chamfer_ride::ride_loops as chamfer_ride_loops;
+ pub use circular::{circular, CircularParams};
+ pub use contour::{contour, contour_on_bodies, contour_on_part, contour_on_picked, ContourParams, Lead, Side};
+diff --git a/crates/motion/tests/chamfer_circular.rs b/crates/motion/tests/chamfer_circular.rs
+index edee20e22..8887aa045 100644
+--- a/crates/motion/tests/chamfer_circular.rs
++++ b/crates/motion/tests/chamfer_circular.rs
+@@ -13,7 +13,7 @@ use camcraft_motion::cl::MoveKind;
+ use camcraft_motion::entry::Entry3D;
+ use camcraft_motion::geo2d::{Loop, Point2, Region};
+ use camcraft_motion::machining2d::{
+-    chamfer, circular, ChamferParams, CircularParams, GenError,
++    chamfer, chamfer_open_runs, circular, ChamferParams, CircularParams, GenError,
+ };
+ 
+ fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
+@@ -96,6 +96,11 @@ fn chamfer_path(p: &ChamferParams) -> camcraft_motion::cl::Toolpath {
+     chamfer(&rect(0.0, 0.0, 60.0, 60.0), p).expect("a well-made ride")
+ }
+ 
++fn open_chamfer_path(runs: &[Vec<Point2>], p: &ChamferParams) -> camcraft_motion::cl::Toolpath {
++    chamfer_open_runs(runs, p, &|_| Ok(Some(rect(-20.0, -20.0, 20.0, 20.0))))
++        .expect("the selected edge of a block chamfers")
++}
++
+ #[test]
+ fn the_corner_depth_is_not_45_only() {
+     // The tan law for a slope the shop also cuts: 3 wide at 30
+@@ -154,6 +159,126 @@ fn chamfer_refuses_its_own_numbers_by_name() {
+     );
+ }
+ 
++#[test]
++fn an_open_chamfer_rides_one_edge_from_end_to_end() {
++    let p = chamfer_params();
++    let run = vec![
++        Point2::new(-20.0, 20.0),
++        Point2::new(20.0, 20.0),
++    ];
++    let t = open_chamfer_path(std::slice::from_ref(&run), &p);
++    assert_eq!(t.breaks.len(), 1, "one selected chain, one break");
++    let b = &t.breaks[0];
++    assert_eq!(
++        b.edge,
++        run.iter()
++            .map(|q| camcraft_motion::geometry::Point3::new(q.x, q.y, p.top_z))
++            .collect::<Vec<_>>(),
++        "the selected points alone declare credit"
++    );
++    assert_ne!(b.edge.first(), b.edge.last(), "the open break is not a loop");
++
++    let cut: Vec<_> = t
++        .moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && (m.to.z - p.corner_z()).abs() < 1e-9)
++        .collect();
++    assert_eq!(cut.len(), 3, "air lead in, selected edge, air lead out");
++    assert!(
++        cut.iter().any(|m| (m.to.x + 20.0).abs() < 1e-9 && (m.to.y - 20.0).abs() < 1e-9),
++        "the first selected end is cut: {cut:?}"
++    );
++    assert!(
++        cut.iter().any(|m| (m.to.x - 20.0).abs() < 1e-9 && (m.to.y - 20.0).abs() < 1e-9),
++        "the last selected end is cut: {cut:?}"
++    );
++    assert!(
++        (cut[0].from.y - 22.0).abs() < 1e-9
++            && (cut[cut.len() - 1].to.y - 22.0).abs() < 1e-9,
++        "entry and exit stand off the wall in air: {cut:?}"
++    );
++    assert_eq!(
++        t.moves.last().map(|m| m.kind),
++        Some(MoveKind::Rapid),
++        "the cutter leaves by lifting"
++    );
++    assert_eq!(
++        t.moves.last().map(|m| m.to.z),
++        Some(p.clearance_z),
++        "the final lift reaches clearance"
++    );
++}
++
++#[test]
++fn connected_open_chamfer_edges_are_one_run() {
++    let p = chamfer_params();
++    let chain = vec![
++        Point2::new(-20.0, 20.0),
++        Point2::new(20.0, 20.0),
++        Point2::new(20.0, -20.0),
++    ];
++    let t = open_chamfer_path(std::slice::from_ref(&chain), &p);
++    assert_eq!(t.breaks.len(), 1, "connected edges stay in one break");
++    assert_eq!(t.breaks[0].edge.len(), 3, "every selected vertex is kept");
++    assert_eq!(
++        t.moves
++            .iter()
++            .filter(|m| m.kind == MoveKind::Plunge)
++            .count(),
++        1,
++        "one pass enters once"
++    );
++    let cut: Vec<_> = t
++        .moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && (m.to.z - p.corner_z()).abs() < 1e-9)
++        .collect();
++    assert!(
++        cut.iter().any(|m| (m.to.x - 20.0).abs() < 1e-9 && (m.to.y - 20.0).abs() < 1e-9),
++        "the connected chain crosses its corner: {cut:?}"
++    );
++}
++
++#[test]
++fn separate_open_chamfer_chains_are_separate_passes() {
++    let p = chamfer_params();
++    let runs = vec![
++        vec![
++            Point2::new(-20.0, 20.0),
++            Point2::new(20.0, 20.0),
++        ],
++        vec![
++            Point2::new(20.0, -20.0),
++            Point2::new(-20.0, -20.0),
++        ],
++    ];
++    let t = open_chamfer_path(&runs, &p);
++    assert_eq!(t.breaks.len(), 2, "one break for each selected run");
++    assert_eq!(
++        t.moves
++            .iter()
++            .filter(|m| m.kind == MoveKind::Plunge)
++            .count(),
++        2,
++        "each separated chain enters as its own pass"
++    );
++    assert!(
++        t.moves.windows(2).any(|m| {
++            m[0].to.z == p.clearance_z
++                && m[1].kind == MoveKind::Rapid
++                && m[1].from.z == p.clearance_z
++                && m[1].to.z == p.clearance_z
++        }),
++        "the pass link travels between chains only at clearance"
++    );
++    assert!(
++        t.breaks
++            .iter()
++            .all(|b| b.edge.iter().all(|q| q.z == p.top_z)),
++        "each run keeps its own top-plane edge"
++    );
++}
++
+ #[test]
+ fn flat_rings_step_inward_ring_major() {
+     // 25 R with a 8 mm cutter: the first ring rides 21, and each
+diff --git a/docs/decisions/2988-chamfer-open-edge-chains.md b/docs/decisions/2988-chamfer-open-edge-chains.md
+new file mode 100644
+index 000000000..c492de133
+--- /dev/null
++++ b/docs/decisions/2988-chamfer-open-edge-chains.md
+@@ -0,0 +1,21 @@
++## #2988 - 2D Chamfer selected open edge chains
++
++**Decided:** Treat a 2D Chamfer selection as raw closed loops plus joined
++open runs. Machine each open run from air to the first selected end,
++through only the selected chain, and from the last end back to air.
++Emit one edge-break record for each selected run.
++
++**Why:** This preserves the existing closed-loop generator and the
++Contour selection grouping. It also gives an open chain a safe,
++vertical entry and exit without closing it or adding credit for the
++unselected part of a rim.
++
++**Considered and dropped:** Reusing `chamfer` as if the open run were a
++closed loop was dropped because it would add an unselected closing cut.
++Entering on the selected endpoint was dropped because a diagonal move
++after the cut could cross unselected material.
++
++**Cost to change:** A different lead convention requires a motion
++change and new endpoint stock-simulation tests. A new edge-break
++representation requires compatible project-file and simulation
++handling.
+
+From 2fbe6f2fbb33d3be8181ae6097766f2b1415c94e Mon Sep 17 00:00:00 2001
+From: Paul Robinson <parobin@microsoft.com>
+Date: Sat, 21 Nov 2026 00:36:12 +0000
+Subject: [PATCH 2/2] fix(chamfer): pin open-chain refusal doors
+
+Refs #2988
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ crates/app/src/operation/generate.rs     | 17 ++++++++++----
+ crates/app/tests/chamfer_open_edges.rs   | 21 +++++++++++++++++
+ crates/motion/src/machining2d/chamfer.rs | 19 ++++++++++------
+ crates/motion/tests/chamfer_circular.rs  | 29 ++++++++++++++++++++++++
+ 4 files changed, 74 insertions(+), 12 deletions(-)
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 4bc49eb5d..2f95131ab 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -275,6 +275,18 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             SrcRef::Selection(_)
+         )
+     );
++    if matches!((&params, &src), (OpParams::Chamfer2D { .. }, SrcRef::Selection(_)))
++        && area.is_some()
++        && matches!(
++            contour_sel.as_ref(),
++            Some(Ok((loops, runs, _))) if loops.is_empty() && !runs.is_empty()
++        )
++    {
++        return Err(GenError::Invalid(
++            "the Boundary settings shape an area, and these picks are open chamfer runs - reset them, or pick closed rings"
++                .into(),
++        ));
++    }
+     let mut area = area.transpose()?;
+     // A Contour under an open boundary rides the chain itself (its arm
+     // below, `contour_open`): no area law runs for it.
+@@ -2258,11 +2270,6 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+                             "nothing in the selection bounds an area or an edge run".into(),
+                         ));
+                     }
+-                    if loops.is_empty() && area.is_some() {
+-                        return Err(GenError::Invalid(
+-                            "the Boundary settings shape an area, and these picks are open chamfer runs - reset them, or pick closed rings".into(),
+-                        ));
+-                    }
+                     let base = if loops.is_empty() {
+                         Region::empty()
+                     } else {
+diff --git a/crates/app/tests/chamfer_open_edges.rs b/crates/app/tests/chamfer_open_edges.rs
+index 8160b1e58..28bd42dd0 100644
+--- a/crates/app/tests/chamfer_open_edges.rs
++++ b/crates/app/tests/chamfer_open_edges.rs
+@@ -189,6 +189,27 @@ fn separate_selected_edges_generate_separate_open_passes() {
+     );
+ }
+ 
++#[test]
++fn open_chamfer_runs_with_boundary_area_settings_refuse_by_name() {
++    let w = world();
++    let mut o = op(
++        SrcRef::Selection(vec![north(&w)]),
++        params(),
++        AreaControls {
++            offset: 1.0,
++            ..Default::default()
++        },
++    );
++    o.tool = CONE.into();
++    let why = run(&w, &o).expect_err("Boundary settings cannot shape open chamfer runs");
++    assert!(
++        why.contains("Boundary settings shape an area"),
++        "{why}"
++    );
++    assert!(why.contains("open chamfer runs"), "{why}");
++    assert!(why.contains("reset them"), "{why}");
++}
++
+ #[test]
+ fn an_open_chamfer_does_not_credit_an_unselected_edge() {
+     let w = world();
+diff --git a/crates/motion/src/machining2d/chamfer.rs b/crates/motion/src/machining2d/chamfer.rs
+index 14d548b36..9c8f19b9a 100644
+--- a/crates/motion/src/machining2d/chamfer.rs
++++ b/crates/motion/src/machining2d/chamfer.rs
+@@ -191,6 +191,18 @@ pub fn chamfer_open_runs(
+     let mut passes: Vec<Vec<Point2>> = Vec::with_capacity(runs.len());
+     let mut breaks: Vec<EdgeBreak> = Vec::with_capacity(runs.len());
+     for pts in runs {
++        let tangent = |a: Point2, b: Point2| -> Result<Point2, GenError> {
++            let len = (b.x - a.x).hypot(b.y - a.y);
++            if !len.is_finite() || len <= 1e-9 {
++                return Err(GenError::Empty(
++                    "a chamfer edge holds a collapsed segment - re-pick the edge".into(),
++                ));
++            }
++            Ok(Point2::new((b.x - a.x) / len, (b.y - a.y) / len))
++        };
++        for pair in pts.windows(2) {
++            tangent(pair[0], pair[1])?;
++        }
+         let run = simple(pts)?;
+         let mut levels = Vec::new();
+         for at in [z + probe, p.top_z - probe] {
+@@ -218,13 +230,6 @@ pub fn chamfer_open_runs(
+         else {
+             return Err(GenError::Empty("a chamfer edge needs at least two points".into()));
+         };
+-        let tangent = |a: Point2, b: Point2| -> Result<Point2, GenError> {
+-            let len = (b.x - a.x).hypot(b.y - a.y);
+-            if !len.is_finite() || len <= 0.0 {
+-                return Err(GenError::Empty("a chamfer edge holds a collapsed segment".into()));
+-            }
+-            Ok(Point2::new((b.x - a.x) / len, (b.y - a.y) / len))
+-        };
+         let entry_air = air_side(tangent(first, second)?, p.climb);
+         let exit_air = air_side(tangent(before_last, last)?, p.climb);
+         let mut ride = Vec::with_capacity(pass.len() + 2);
+diff --git a/crates/motion/tests/chamfer_circular.rs b/crates/motion/tests/chamfer_circular.rs
+index 8887aa045..5364c6392 100644
+--- a/crates/motion/tests/chamfer_circular.rs
++++ b/crates/motion/tests/chamfer_circular.rs
+@@ -209,6 +209,35 @@ fn an_open_chamfer_rides_one_edge_from_end_to_end() {
+     );
+ }
+ 
++#[test]
++fn an_open_chamfer_with_a_collapsed_segment_refuses_by_name() {
++    let p = chamfer_params();
++    let runs = vec![vec![
++        Point2::new(-20.0, 20.0),
++        Point2::new(20.0, 20.0),
++        Point2::new(20.0, 20.0),
++    ]];
++    let why = err(chamfer_open_runs(
++        &runs,
++        &p,
++        &|_| Ok(Some(rect(-20.0, -20.0, 20.0, 20.0))),
++    ));
++    assert!(why.contains("collapsed segment"), "{why}");
++    assert!(why.contains("re-pick the edge"), "{why}");
++}
++
++#[test]
++fn an_open_chamfer_without_a_model_wall_refuses_by_name() {
++    let p = chamfer_params();
++    let runs = vec![vec![
++        Point2::new(-20.0, 20.0),
++        Point2::new(20.0, 20.0),
++    ]];
++    let why = err(chamfer_open_runs(&runs, &p, &|_| Ok(None)));
++    assert!(why.contains("no model wall"), "{why}");
++    assert!(why.contains("change Top of Part Z"), "{why}");
++}
++
+ #[test]
+ fn connected_open_chamfer_edges_are_one_run() {
+     let p = chamfer_params();
