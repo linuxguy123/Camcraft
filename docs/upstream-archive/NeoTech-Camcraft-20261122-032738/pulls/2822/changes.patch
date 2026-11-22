@@ -1,0 +1,1819 @@
+From 702dbf02a45ae8722409456c846cef0aa4cdb0d0 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 19 Nov 2026 13:33:53 -0800
+Subject: [PATCH 1/2] feat(2d): rest machining on the 2D Pocket from the
+ previous operations
+
+The rest group of the 2D Pocket gets a mode. "Entered tool" is the
+behaviour of #1489. "Previous operations" reads the stock that the earlier
+operations of the setup leave (rest::prior_state), at every cut depth of
+the Pocket.
+
+- motion: RestSource on RestParams; rest_pocket_previous,
+  rest_plan_stock and rest_stock_from_columns (rest_prior.rs) build a
+  RestStock from the column grid. A column stands when its top is above a
+  cut depth. Standing columns grow by one cell diagonal. A column that
+  cannot be read, and the pocket outside the grid, stand. The rest area is
+  the union over all cut depths.
+- The two modes never use each other's planner: each refuses by name.
+- app: the Pocket arm routes the mode; job collection refuses by name a
+  tilted plane and an earlier operation that has no toolpath, a stale
+  toolpath, or is suppressed with a cut on record. The project key
+  rest.source and the MCP parameter ride the existing DTO. The stamp gets
+  the byte 0xD8 in the new mode only.
+- ui: the "Rest stock from" row; the previous tool rows hide in the new
+  mode.
+
+Invalidation uses the program-ahead digest that each unposed operation
+already has in its stamp.
+
+Fixes #2033
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/operation/generate.rs          |  11 +
+ crates/app/src/operation/job.rs               |  18 +
+ crates/app/src/operation/params.rs            |   5 +
+ crates/app/src/operation/rest_op.rs           |  61 ++-
+ crates/app/src/operation/rest_op_tests.rs     |   6 +-
+ crates/app/src/project/rest_dto.rs            |  38 +-
+ crates/app/tests/rest_pocket.rs               |   2 +-
+ crates/app/tests/rest_previous_ops.rs         | 363 ++++++++++++++++++
+ crates/app/tests/sketch_project.rs            |   1 +
+ .../src/machining2d/adaptive/rest/stock.rs    |   7 +
+ crates/motion/src/machining2d/mod.rs          |   7 +-
+ crates/motion/src/machining2d/rest2d.rs       |  54 ++-
+ crates/motion/src/machining2d/rest_prior.rs   | 244 ++++++++++++
+ .../src/machining2d/rest_prior_tests.rs       | 108 ++++++
+ crates/motion/tests/rest2d.rs                 |   1 +
+ crates/motion/tests/rest_previous.rs          | 237 ++++++++++++
+ crates/motion/tests/rest_zigzag.rs            |   2 +
+ crates/ui/src/egui_app/rest_pocket_page.rs    |  47 ++-
+ crates/ui/src/egui_app/rest_pocket_tests.rs   |   5 +
+ crates/ui/src/egui_app/rest_source_tests.rs   |  62 +++
+ crates/ui/src/egui_app/tests/guide_images.rs  |   2 +-
+ docs/decisions/2033-rest-previous-ops.md      |  87 +++++
+ 22 files changed, 1335 insertions(+), 33 deletions(-)
+ create mode 100644 crates/app/tests/rest_previous_ops.rs
+ create mode 100644 crates/motion/src/machining2d/rest_prior.rs
+ create mode 100644 crates/motion/src/machining2d/rest_prior_tests.rs
+ create mode 100644 crates/motion/tests/rest_previous.rs
+ create mode 100644 crates/ui/src/egui_app/rest_source_tests.rs
+ create mode 100644 docs/decisions/2033-rest-previous-ops.md
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index fbff32a96..4eb287ed8 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -709,7 +709,18 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // #1559: when carried stock stands above the entry, the same
+             // generator runs again with the entries lifted to that top
+             // (rest or plain: only the entry plane moves, the cut does not).
++            // #2033: in previous-operations mode the rest area is read
++            // from the stock that the program ahead leaves, at every cut
++            // depth; that mode never falls back to the entered tool.
++            let from_ops = rest.is_some_and(|r| r.source == machining2d::RestSource::PreviousOperations);
++            let ahead = if from_ops {
++                Some(prior.take().ok_or_else(|| unreached("previous-operations rest stock"))??)
++            } else {
++                None
++            };
++            let ahead_cols = ahead.as_ref().and_then(|p| p.grid.as_ref()).map(crate::stock_sim::Columns::of_grid);
+             let pocket = |pp: &PocketParams| match rest {
++                Some(r) if from_ops => machining2d::rest_pocket_previous(&region, pp, r, ahead_cols.as_ref()),
+                 Some(r) => machining2d::rest_pocket(&region, pp, r),
+                 None => machining2d::pocket_entered(&region, pp, &holes),
+             };
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index 627a29bbe..c9a3d43fa 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -315,6 +315,24 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+                     .map(Arc::new),
+             )
+         }
++        // #2033: a 2D Pocket whose rest area is read from the previous
++        // operations takes the same grid. The stock must be established:
++        // a tilted plane, or an earlier operation without a current
++        // toolpath, is refused by name. Declared material past a carried
++        // grid is no grid: the whole pocket stands.
++        p if super::rest_op::reads_previous_ops(p) => {
++            if frame.is_some() {
++                return Err(GenError::Invalid(format!("{op_name}: {}", super::rest_op::REST_PREVIOUS_TILTED)));
++            }
++            if let Some(why) = super::rest_op::previous_ops_refusal(world, op_name, setup) {
++                return Err(GenError::Invalid(format!("{op_name}: {why}")));
++            }
++            Some(
++                crate::rest::prior_state(world, op_name, setup, tool.diameter * 0.5)
++                    .map(|p| if carried.distrust_prior { crate::rest::PriorState { grid: None, ..p } } else { p })
++                    .map(Arc::new),
++            )
++        }
+         _ => None,
+     };
+     // Verify's prior reading (#96 review): collected here, cut on the
+diff --git a/crates/app/src/operation/params.rs b/crates/app/src/operation/params.rs
+index b00a60a8e..952f2d680 100644
+--- a/crates/app/src/operation/params.rs
++++ b/crates/app/src/operation/params.rs
+@@ -234,6 +234,11 @@ impl OpParams {
+                     for v in [r.previous_tool_diameter, r.previous_corner_radius, r.previous_stock_to_leave, r.allowance] {
+                         w(h, v);
+                     }
++                    // #2033: written only in previous-operations mode, so
++                    // every entered-tool rest pocket keeps its digest.
++                    if r.source == crate::machining2d::RestSource::PreviousOperations {
++                        h.write_u8(0xD8);
++                    }
+                 }
+             }
+             // The roughing twins (M2.4 A): the pocket's digest minus
+diff --git a/crates/app/src/operation/rest_op.rs b/crates/app/src/operation/rest_op.rs
+index a9715de02..205ce3bf5 100644
+--- a/crates/app/src/operation/rest_op.rs
++++ b/crates/app/src/operation/rest_op.rs
+@@ -6,9 +6,63 @@
+ //! Provenance: our own operation laws over this project's rest
+ //! generator; no other CAM product's code, text or output consulted.
+ 
+-use crate::machining2d::{GenError, RestParams, rest_strategy};
++use crate::machining2d::{GenError, RestParams, RestSource, rest_strategy};
++use crate::model;
++use flecs_ecs::prelude::World;
+ 
+-use super::OpParams;
++use super::{OpParams, OpStatus};
++
++/// Previous-operations rest mode on a tilted plane (#2033): the stock
++/// grid is read along the setup's Z only, so the plane's own depths are
++/// not proved by it.
++pub const REST_PREVIOUS_TILTED: &str = "rest machining from the previous operations is not available on a tilted Pocket: the stock of the previous operations is read along the setup's Z only - clear the tilt, or use the entered previous tool";
++
++/// Is `p` a 2D Pocket whose rest area is read from the previous
++/// operations (#2033)?
++pub fn reads_previous_ops(p: &OpParams) -> bool {
++    rest_of(p).is_some_and(|r| r.source == RestSource::PreviousOperations)
++}
++
++/// Why the stock ahead of `name` cannot be established for
++/// previous-operations rest mode (#2033): an earlier operation of its
++/// setup has no current toolpath, or is suppressed with a cut on record.
++/// The stock is then not guessed: generation refuses by this name.
++pub(super) fn previous_ops_refusal(world: &World, name: &str, setup: Option<&str>) -> Option<String> {
++    let consumer = crate::setup::effective(world, setup);
++    let head = "rest machining from the previous operations";
++    for (n, e) in crate::setup::operation_order(world) {
++        if n == name {
++            break;
++        }
++        let Some(op) = model::operation_of(world, &e) else {
++            continue;
++        };
++        if crate::setup::effective(world, op.setup.as_deref()) != consumer {
++            continue;
++        }
++        if op.suppressed {
++            // A suppressed cut is never made: it proves nothing.
++            if model::toolpath_nonempty(world, &e) {
++                return Some(format!(
++                    "{head}: operation '{n}' ahead is suppressed, so its cut is not made - unsuppress it, or use the entered previous tool"
++                ));
++            }
++            continue;
++        }
++        match super::status_of(world, &e) {
++            OpStatus::Ok => {}
++            OpStatus::Never => {
++                return Some(format!("{head}: operation '{n}' ahead has no toolpath - generate the program in order"));
++            }
++            OpStatus::Stale => {
++                return Some(format!(
++                    "{head}: the toolpath of operation '{n}' ahead is stale - regenerate the program in order"
++                ));
++            }
++        }
++    }
++    None
++}
+ 
+ /// Rest machining beside pre-drilled entry: the rest pass enters its
+ /// own areas and does not read the holes yet, so one of them is turned
+@@ -45,6 +99,9 @@ pub fn rest_refusal(p: &OpParams) -> Option<String> {
+     if let Err(e) = rest_strategy(*strategy) {
+         return Some(said(e));
+     }
++    if r.source == RestSource::PreviousOperations && p.tilt().is_some() {
++        return Some(REST_PREVIOUS_TILTED.to_string());
++    }
+     links.approach.predrilled.then(|| REST_PREDRILLED.to_string())
+ }
+ 
+diff --git a/crates/app/src/operation/rest_op_tests.rs b/crates/app/src/operation/rest_op_tests.rs
+index e36ef95b1..7e4b2bdf8 100644
+--- a/crates/app/src/operation/rest_op_tests.rs
++++ b/crates/app/src/operation/rest_op_tests.rs
+@@ -5,7 +5,7 @@
+ 
+ use std::hash::Hasher;
+ 
+-use crate::machining2d::{PocketStrategy, RestParams};
++use crate::machining2d::{PocketStrategy, RestParams, RestSource};
+ use crate::machining3d::Entry3D;
+ use crate::operation::{Height, OpParams};
+ 
+@@ -34,7 +34,7 @@ fn pocket(rest: Option<RestParams>) -> OpParams {
+ }
+ 
+ const PREV: RestParams =
+-    RestParams { previous_tool_diameter: 12.0, previous_corner_radius: 0.0, previous_stock_to_leave: 0.0, allowance: 0.0 };
++    RestParams { source: RestSource::EnteredTool, previous_tool_diameter: 12.0, previous_corner_radius: 0.0, previous_stock_to_leave: 0.0, allowance: 0.0 };
+ 
+ #[test]
+ fn the_rest_group_moves_the_stamp() {
+@@ -52,6 +52,8 @@ fn the_rest_group_moves_the_stamp() {
+         RestParams { previous_corner_radius: 1.0, ..PREV },
+         RestParams { previous_stock_to_leave: 0.2, ..PREV },
+         RestParams { allowance: 0.1, ..PREV },
++        // #2033: the mode is an input - the two modes never share a path.
++        RestParams { source: RestSource::PreviousOperations, ..PREV },
+     ] {
+         assert_ne!(on, digest(&pocket(Some(other))), "{other:?} must move the stamp");
+     }
+diff --git a/crates/app/src/project/rest_dto.rs b/crates/app/src/project/rest_dto.rs
+index 33fb82f64..88ef495f4 100644
+--- a/crates/app/src/project/rest_dto.rs
++++ b/crates/app/src/project/rest_dto.rs
+@@ -1,14 +1,38 @@
+ //! The 2D Pocket's rest machining group in the project file (#1489): the
+ //! previous tool as the user entered it, as plain keys. Absent is off -
+-//! every earlier file. Provenance: our own file format (`project/mod.rs`).
++//! every earlier file. #2033: `source` says which reading plans the rest
++//! area; absent is the entered tool - every file before it.
++//! Provenance: our own file format (`project/mod.rs`).
+ 
+ use super::*;
+ 
+-use crate::machining2d::RestParams;
++use crate::machining2d::{RestParams, RestSource};
++
++/// Where the rest area is read from (#2033), as the file and MCP say it.
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum RestSourceDto {
++    /// The entered previous tool.
++    #[default]
++    EnteredTool,
++    /// The stock that the earlier operations of the setup leave.
++    PreviousOperations,
++}
++
++impl RestSourceDto {
++    fn is_entered(&self) -> bool {
++        *self == RestSourceDto::EnteredTool
++    }
++}
+ 
+ #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+ pub struct RestDto {
+-    /// The diameter of the tool that roughed the pocket (mm).
++    /// Which reading plans the rest area; absent is the entered tool.
++    #[serde(default, skip_serializing_if = "RestSourceDto::is_entered")]
++    pub source: RestSourceDto,
++    /// The diameter of the tool that roughed the pocket (mm). Not read
++    /// (and it can be absent) in `previous_operations` mode.
++    #[serde(default)]
+     pub previous_tool_diameter: f64,
+     /// Its corner radius (mm); absent is a flat end mill.
+     #[serde(default)]
+@@ -24,6 +48,10 @@ pub struct RestDto {
+ impl From<RestParams> for RestDto {
+     fn from(r: RestParams) -> Self {
+         RestDto {
++            source: match r.source {
++                RestSource::EnteredTool => RestSourceDto::EnteredTool,
++                RestSource::PreviousOperations => RestSourceDto::PreviousOperations,
++            },
+             previous_tool_diameter: r.previous_tool_diameter,
+             previous_corner_radius: r.previous_corner_radius,
+             previous_stock_to_leave: r.previous_stock_to_leave,
+@@ -35,6 +63,10 @@ impl From<RestParams> for RestDto {
+ impl From<RestDto> for RestParams {
+     fn from(r: RestDto) -> Self {
+         RestParams {
++            source: match r.source {
++                RestSourceDto::EnteredTool => RestSource::EnteredTool,
++                RestSourceDto::PreviousOperations => RestSource::PreviousOperations,
++            },
+             previous_tool_diameter: r.previous_tool_diameter,
+             previous_corner_radius: r.previous_corner_radius,
+             previous_stock_to_leave: r.previous_stock_to_leave,
+diff --git a/crates/app/tests/rest_pocket.rs b/crates/app/tests/rest_pocket.rs
+index 144c22cac..da5353b67 100644
+--- a/crates/app/tests/rest_pocket.rs
++++ b/crates/app/tests/rest_pocket.rs
+@@ -55,7 +55,7 @@ fn part() -> camcraft_app::geometry::Mesh {
+ }
+ 
+ fn prev() -> RestParams {
+-    RestParams { previous_tool_diameter: 12.0, previous_corner_radius: 0.0, previous_stock_to_leave: 0.0, allowance: 0.0 }
++    RestParams { source: Default::default(), previous_tool_diameter: 12.0, previous_corner_radius: 0.0, previous_stock_to_leave: 0.0, allowance: 0.0 }
+ }
+ 
+ fn pocket(stepover: f64, entry: Entry3D, strategy: PocketStrategy, rest: Option<RestParams>) -> OpParams {
+diff --git a/crates/app/tests/rest_previous_ops.rs b/crates/app/tests/rest_previous_ops.rs
+new file mode 100644
+index 000000000..7677f0f48
+--- /dev/null
++++ b/crates/app/tests/rest_previous_ops.rs
+@@ -0,0 +1,363 @@
++//! #2033: the 2D Pocket's rest machining read from the previous
++//! operations. A 60 x 40 pocket with 3 mm corners, roughed by a 12 mm end
++//! mill; the rest pass with a 4 mm end mill reads the stock that the
++//! roughing pass leaves, at every cut depth. Read against an independent
++//! simulation of the roughing pass. A roughing pass that stops above the
++//! floor leaves the whole pocket. A stock that cannot be established (an
++//! earlier operation with no current toolpath or suppressed, a tilted
++//! plane) is refused by name. An earlier change makes the rest pass stale.
++//! The mode is an undoable edit, a project-file key and an MCP parameter.
++//!
++//! Gate map (#2033): covers app::operation (rest_op, the Pocket arm of
++//! generate, job's previous-operations stock, params' 0xD8 stamp byte),
++//! app::rest (prior_state, prior_digest), app::project (rest_dto),
++//! app::mcp (edit_operation), app::posting (verification_gate).
++//!
++//! Provenance: our own fixtures (pocket_support's block with a pocket);
++//! no other CAM product's code, text or output consulted.
++
++mod common;
++mod pocket_support;
++
++use camcraft_app::cl::{MoveKind, Toolpath};
++use camcraft_app::commands::{
++    AddTool, ChangeTool, CreateOperation, EditOperationParams, GenerateOperation, History, ImportModel, RegenerateAll,
++    ReorderOperation, SetStock,
++};
++use camcraft_app::geo2d::Point2;
++use camcraft_app::links::Links;
++use camcraft_app::machining2d::{PocketStrategy, RestParams, RestSource};
++use camcraft_app::machining3d::Entry3D;
++use camcraft_app::mcp::Server;
++use camcraft_app::operation::rest_op::REST_PREVIOUS_TILTED;
++use camcraft_app::operation::{self, FeatureSel, GeoSel, Height, OpParams, OpStatus, SrcRef, Tilt};
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_sim::Columns;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++use camcraft_app::{model, posting, project, recognize};
++use flecs_ecs::prelude::*;
++use pocket_support::{block_with_pocket, rounded_rect, write_stl};
++use serde_json::{Value, json};
++
++const BIG: &str = "EM-1200-2FL";
++const SMALL: &str = "EM-0400-2FL";
++const TOP: f64 = 20.0;
++const FLOOR: f64 = 16.0;
++const A: f64 = 30.0;
++const B: f64 = 20.0;
++const CORNER: f64 = 3.0;
++
++fn part() -> camcraft_app::geometry::Mesh {
++    block_with_pocket(40.0, 30.0, &rounded_rect(A, B, CORNER, 16), FLOOR, TOP)
++}
++
++fn from_ops() -> RestParams {
++    RestParams {
++        source: RestSource::PreviousOperations,
++        previous_tool_diameter: 0.0,
++        previous_corner_radius: 0.0,
++        previous_stock_to_leave: 0.0,
++        allowance: 0.0,
++    }
++}
++
++fn pocket(stepover: f64, bottom: f64, rest: Option<RestParams>, tilt: Option<Tilt>) -> OpParams {
++    OpParams::Pocket {
++        rest,
++        blend_radius: None,
++        links: Links::PLANAR,
++        stepover,
++        stock_to_leave: 0.0,
++        clearance_z: Height::fixed(TOP + 10.0),
++        retract_z: Some(Height::fixed(TOP + 2.0)),
++        top_z: Height::fixed(TOP),
++        bottom_z: Height::fixed(bottom),
++        stepdown: 2.0,
++        feed: 600.0,
++        plunge_feed: 150.0,
++        climb: true,
++        strategy: PocketStrategy::Waterline,
++        entry: Entry3D::Plunge,
++        helix_radius: 2.0,
++        optimal_load: camcraft_app::load::DEFAULT_OPTIMAL_LOAD,
++        blend_turns: false,
++        tilt,
++    }
++}
++
++fn rough(bottom: f64) -> OpParams {
++    pocket(5.0, bottom, None, None)
++}
++
++fn rest_op(rest: Option<RestParams>) -> OpParams {
++    pocket(1.5, FLOOR, rest, None)
++}
++
++/// The part, its stock, both tools; R1 roughs with the 12 mm tool down to
++/// `rough_bottom`, P2 is the 4 mm rest pass in previous-operations mode.
++/// Nothing is generated.
++fn job(rough_bottom: f64) -> (World, History, SrcRef) {
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("part", part()));
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx: 80.0, dy: 60.0, dz: 20.0 }, Default::default()).expect("stock"));
++    for name in [BIG, SMALL] {
++        let t = catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog");
++        h.execute(&world, AddTool::new(&world, name, t).expect("tool"));
++    }
++    let p = recognize::pockets_of(&world, "part").expect("recognised").into_iter().next().expect("the pocket");
++    let src = SrcRef::Selection(vec![GeoSel { entity: "part".into(), feature: FeatureSel::Face(p.floor) }]);
++    h.execute(&world, CreateOperation::new(&world, "R1", BIG, src.clone(), rough(rough_bottom)).expect("rough"));
++    h.execute(&world, CreateOperation::new(&world, "P2", SMALL, src.clone(), rest_op(Some(from_ops()))).expect("rest"));
++    (world, h, src)
++}
++
++fn generate(world: &World, h: &mut History, name: &str) -> Toolpath {
++    h.execute(world, GenerateOperation::new(world, name).unwrap_or_else(|e| panic!("{name}: {e}")));
++    let e = model::find_by_name(world, name).expect("op");
++    let c = model::toolpath_of(world, &e).unwrap_or_else(|| panic!("{name} generated no path"));
++    let bad: Vec<_> = c.warnings.iter().filter(|w| w.blocks_post()).collect();
++    assert!(bad.is_empty(), "{name}: {bad:?}");
++    c.path.clone()
++}
++
++fn refused(world: &World, name: &str) -> String {
++    match GenerateOperation::new(world, name) {
++        Err(e) => e.to_string(),
++        Ok(_) => panic!("{name} generated, a refusal was expected"),
++    }
++}
++
++fn status(world: &World, name: &str) -> OpStatus {
++    operation::status_of(world, &model::find_by_name(world, name).expect("op"))
++}
++
++fn rest_of(world: &World, name: &str) -> Option<RestParams> {
++    let e = model::find_by_name(world, name).expect("op");
++    match model::operation_of(world, &e).expect("operation").params {
++        OpParams::Pocket { rest, .. } => rest,
++        other => panic!("not a Pocket: {other:?}"),
++    }
++}
++
++/// Signed distance into the pocket (positive inside).
++fn depth_in(p: Point2) -> f64 {
++    let qx = p.x.abs() - (A - CORNER);
++    let qy = p.y.abs() - (B - CORNER);
++    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
++    CORNER - outside - qx.max(qy).min(0.0)
++}
++
++fn feed_len(p: &Toolpath) -> f64 {
++    p.moves.iter().filter(|m| m.kind != MoveKind::Rapid).map(|m| (m.to.x - m.from.x).hypot(m.to.y - m.from.y)).sum()
++}
++
++/// The columns at least `margin` inside the pocket that stand above the floor.
++fn standing(cols: &Columns<'_>, margin: f64) -> Vec<Point2> {
++    let mut out = Vec::new();
++    for iy in 0..cols.ny() {
++        for ix in 0..cols.nx() {
++            let c = cols.center(ix, iy);
++            if depth_in(c) > margin && cols.top_at(ix, iy) > FLOOR + 1e-6 {
++                out.push(c);
++            }
++        }
++    }
++    out
++}
++
++#[test]
++fn the_rest_pass_cuts_what_the_simulated_roughing_pass_left() {
++    let (world, mut h, src) = job(FLOOR);
++    let r = generate(&world, &mut h, "R1");
++    let p = generate(&world, &mut h, "P2");
++    assert!(
++        p.notes.iter().any(|n| n.contains("reads the stock that the previous operations leave")),
++        "the path says where its rest area comes from: {:?}",
++        p.notes
++    );
++    assert!(!p.notes.iter().any(|n| n.contains("trusts the entered previous tool")), "{:?}", p.notes);
++    // The independent reading: the stock grid, cut by the roughing pass.
++    let mut stock = camcraft_app::stock_sim::stock_grid(&world, None, 2.0).expect("the stock grid");
++    for m in &r.moves {
++        stock.subtract(m, 6.0, 0.005);
++    }
++    let cell = stock.cell;
++    let left = standing(&Columns::of_grid(&stock), 2.0 * cell).len();
++    assert!(left > 0, "the 12 mm tool leaves the 3 mm corners");
++    for m in &p.moves {
++        stock.subtract(m, 2.0, 0.005);
++    }
++    let still = standing(&Columns::of_grid(&stock), 2.0 * cell);
++    assert!(still.is_empty(), "{} of {left} standing column(s) were not cut, first {:?}", still.len(), still.first());
++    // It is a rest pass: far less feed than the plain pocket of the same tool.
++    h.execute(&world, CreateOperation::new(&world, "P3", SMALL, src, rest_op(None)).expect("plain"));
++    let plain = generate(&world, &mut h, "P3");
++    assert!(feed_len(&p) < 0.6 * feed_len(&plain), "rest {:.0} mm, plain {:.0} mm", feed_len(&p), feed_len(&plain));
++}
++
++#[test]
++fn a_roughing_pass_that_stops_above_the_floor_leaves_the_whole_pocket() {
++    let (world, mut h, _) = job(18.0);
++    let r = generate(&world, &mut h, "R1");
++    let p = generate(&world, &mut h, "P2");
++    assert!(p.notes.iter().any(|n| n.contains("the whole pocket is cut")), "{:?}", p.notes);
++    // The floor is cut everywhere, not only in the corners.
++    let mut stock = camcraft_app::stock_sim::stock_grid(&world, None, 2.0).expect("the stock grid");
++    for m in &r.moves {
++        stock.subtract(m, 6.0, 0.005);
++    }
++    let cell = stock.cell;
++    let left = standing(&Columns::of_grid(&stock), 2.0 * cell).len();
++    for m in &p.moves {
++        stock.subtract(m, 2.0, 0.005);
++    }
++    let still = standing(&Columns::of_grid(&stock), 2.0 * cell);
++    assert!(left > 1000, "the shallow roughing pass leaves the lower floor: {left} column(s)");
++    assert!(still.is_empty(), "{} of {left} standing column(s) were not cut, first {:?}", still.len(), still.first());
++}
++
++#[test]
++fn a_stock_that_cannot_be_established_is_refused_by_name() {
++    let (world, mut h, _) = job(FLOOR);
++    // Missing: the roughing pass was never generated.
++    let why = refused(&world, "P2");
++    assert!(why.contains("operation 'R1' ahead has no toolpath"), "{why}");
++    generate(&world, &mut h, "R1");
++    generate(&world, &mut h, "P2");
++    // Stale: the roughing pass was edited and not generated again.
++    h.execute(&world, EditOperationParams::new(&world, "R1", pocket(4.0, FLOOR, None, None)).expect("edit"));
++    assert_eq!(status(&world, "R1"), OpStatus::Stale);
++    let why = refused(&world, "P2");
++    assert!(why.contains("the toolpath of operation 'R1' ahead is stale"), "{why}");
++    generate(&world, &mut h, "R1");
++    generate(&world, &mut h, "P2");
++    // Suppressed: its cut is not made, so it proves nothing.
++    h.execute(&world, EditOperationParams::with_suppressed(&world, "R1", true).expect("suppress"));
++    let why = refused(&world, "P2");
++    assert!(why.contains("operation 'R1' ahead is suppressed"), "{why}");
++    // The path on record was generated against the suppressed cut: the post refuses it.
++    let gate = posting::verification_gate(&world).join("\n");
++    assert!(gate.contains("P2 was generated against the cut of suppressed R1"), "{gate}");
++}
++
++#[test]
++fn a_tilted_plane_is_refused_by_name_at_the_edit_and_at_generation() {
++    let (world, mut h, _) = job(FLOOR);
++    generate(&world, &mut h, "R1");
++    let tilt = Tilt { basis_version: 1, a_deg: 20.0, b_deg: 0.0, origin: [0.0, 0.0, TOP] };
++    let tilted = pocket(1.5, FLOOR, Some(from_ops()), Some(tilt));
++    let why = match EditOperationParams::new(&world, "P2", tilted.clone()) {
++        Err(e) => e.to_string(),
++        Ok(_) => panic!("the tilted edit was accepted"),
++    };
++    assert!(why.contains(REST_PREVIOUS_TILTED), "{why}");
++    // A document that holds the pair anyway (written past the door) is
++    // refused at generation: the frame is not guessed.
++    let e = model::find_by_name(&world, "P2").expect("op");
++    let mut op = model::operation_of(&world, &e).expect("operation");
++    op.params = tilted;
++    op.src = SrcRef::Entity("part".into());
++    e.entity_view(&world).set(op);
++    let why = refused(&world, "P2");
++    assert!(why.contains(REST_PREVIOUS_TILTED), "{why}");
++}
++
++#[test]
++fn an_earlier_change_makes_the_rest_pass_stale() {
++    let (world, mut h, _) = job(FLOOR);
++    generate(&world, &mut h, "R1");
++    generate(&world, &mut h, "P2");
++    assert_eq!(status(&world, "P2"), OpStatus::Ok);
++    // The earlier tool changes.
++    let big = model::find_by_name(&world, BIG).and_then(|e| model::tool_of(&world, &e)).expect("tool");
++    h.execute(&world, ChangeTool::new(&world, BIG, camcraft_app::tools::Tool { diameter: 10.0, ..big }).expect("retool"));
++    assert_eq!(status(&world, "P2"), OpStatus::Stale, "a changed earlier tool");
++    h.undo(&world);
++    assert_eq!(status(&world, "P2"), OpStatus::Ok);
++    // The earlier depth changes and that operation is generated again.
++    h.execute(&world, EditOperationParams::new(&world, "R1", rough(18.0)).expect("edit"));
++    generate(&world, &mut h, "R1");
++    assert_eq!(status(&world, "P2"), OpStatus::Stale, "a changed earlier depth");
++    let e = model::find_by_name(&world, "P2").expect("op");
++    let why = operation::stale_reason(&world, &e).unwrap_or_default();
++    assert!(why.contains("'R1'"), "{why}");
++    // One batch brings the program current, and the rest pass now cuts the whole pocket.
++    h.execute(&world, RegenerateAll::new(&world));
++    assert_eq!(status(&world, "P2"), OpStatus::Ok);
++    let p = model::toolpath_of(&world, &e).expect("path").path.clone();
++    assert!(p.notes.iter().any(|n| n.contains("the whole pocket is cut")), "{:?}", p.notes);
++    // The order changes: the rest pass moves ahead of the roughing pass.
++    h.execute(&world, ReorderOperation::new(&world, "P2", "R1", false).expect("reorder"));
++    assert_eq!(status(&world, "P2"), OpStatus::Stale, "a changed order");
++}
++
++#[test]
++fn the_mode_is_an_undoable_edit_and_a_project_file_key() {
++    let (world, mut h, _) = job(FLOOR);
++    let entered = RestParams { source: RestSource::EnteredTool, previous_tool_diameter: 12.0, ..from_ops() };
++    assert_eq!(rest_of(&world, "P2"), Some(from_ops()));
++    h.execute(&world, EditOperationParams::new(&world, "P2", rest_op(Some(entered))).expect("edit"));
++    assert_eq!(rest_of(&world, "P2"), Some(entered));
++    h.undo(&world);
++    assert_eq!(rest_of(&world, "P2"), Some(from_ops()));
++    h.redo(&world);
++    assert_eq!(rest_of(&world, "P2"), Some(entered));
++    // The file states the mode; the entered-tool mode states no key, as before.
++    let on = project::params_to_json(&rest_op(Some(from_ops())));
++    assert_eq!(on.pointer("/pocket/rest/source"), Some(&json!("previous_operations")), "{on}");
++    assert_eq!(project::params_from_json(&on).expect("round trip"), rest_op(Some(from_ops())));
++    let old = project::params_to_json(&rest_op(Some(entered)));
++    assert!(old.pointer("/pocket/rest/source").is_none(), "{old}");
++    assert_eq!(project::params_from_json(&old).expect("round trip"), rest_op(Some(entered)));
++}
++
++fn call(s: &mut Server, id: i64, name: &str, args: Value) -> (bool, Value) {
++    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
++    let reply = s.handle(&msg).expect("a reply");
++    let r = &reply["result"];
++    let err = r["isError"] == json!(true);
++    (err, if err { r["content"][0]["text"].clone() } else { r["structuredContent"].clone() })
++}
++
++#[test]
++fn mcp_sets_the_mode_undoes_it_and_the_project_keeps_it() {
++    let dir = std::env::temp_dir();
++    let stl = dir.join(format!("camcraft-2033-{}.stl", std::process::id()));
++    write_stl(&part(), &stl);
++    let mut s = Server::new();
++    for (i, (name, args)) in [
++        ("import_model", json!({ "path": stl.to_string_lossy(), "name": "part" })),
++        ("add_tool", json!({ "catalog": SMALL })),
++        ("add_operation", json!({ "kind": "pocket", "tool": SMALL, "source": "part", "name": "P" })),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let (err, body) = call(&mut s, i as i64 + 1, name, args);
++        assert!(!err, "{name}: {body}");
++    }
++    let _ = std::fs::remove_file(&stl);
++    // No previous tool is needed in this mode.
++    let (err, body) = call(&mut s, 10, "edit_operation", json!({ "name": "P", "params": { "rest": { "source": "previous_operations" } } }));
++    assert!(!err, "{body}");
++    assert_eq!(body["params"].pointer("/pocket/rest/source"), Some(&json!("previous_operations")), "{body}");
++    // A mode that does not exist is refused.
++    let (err, body) = call(&mut s, 11, "edit_operation", json!({ "name": "P", "params": { "rest": { "source": "guess" } } }));
++    assert!(err, "{body}");
++    let file = dir.join(format!("camcraft-2033-{}.camproj", std::process::id()));
++    let path = file.to_string_lossy().into_owned();
++    let (err, body) = call(&mut s, 12, "save_project", json!({ "path": path }));
++    assert!(!err, "{body}");
++    let mut loaded = Server::new();
++    let (err, body) = call(&mut loaded, 1, "open_project", json!({ "path": path }));
++    let _ = std::fs::remove_file(&file);
++    assert!(!err, "{body}");
++    let (_, job) = call(&mut loaded, 2, "get_job", json!({}));
++    assert!(job.to_string().contains("previous_operations"), "the reopened project keeps the mode: {job}");
++    let (err, body) = call(&mut s, 13, "undo", json!({}));
++    assert!(!err, "{body}");
++    let (_, job) = call(&mut s, 14, "get_job", json!({}));
++    assert!(!job.to_string().contains("previous_operations"), "undo removes the mode: {job}");
++}
+diff --git a/crates/app/tests/sketch_project.rs b/crates/app/tests/sketch_project.rs
+index 121f0e26a..52bd5440b 100644
+--- a/crates/app/tests/sketch_project.rs
++++ b/crates/app/tests/sketch_project.rs
+@@ -140,6 +140,7 @@ fn rest_parameters_and_profile_rows_share_the_v71_project_file() {
+     let mut history = History::default();
+     let mut pocket = operation::seed_params(OpType::Pocket.ordinal());
+     let previous = camcraft_app::machining2d::RestParams {
++        source: Default::default(),
+         previous_tool_diameter: 12.0,
+         previous_corner_radius: 1.0,
+         previous_stock_to_leave: 0.2,
+diff --git a/crates/motion/src/machining2d/adaptive/rest/stock.rs b/crates/motion/src/machining2d/adaptive/rest/stock.rs
+index d3c502e54..a1b555943 100644
+--- a/crates/motion/src/machining2d/adaptive/rest/stock.rs
++++ b/crates/motion/src/machining2d/adaptive/rest/stock.rs
+@@ -120,6 +120,13 @@ impl RestStock {
+         self.floors.iter().map(|f| f.z).fold(f64::INFINITY, f64::min)
+     }
+ 
++    /// [`Self::material_at`] with every guard on, for the 2D rest pocket
++    /// that reads the previous operations (#2033): uncertain stock
++    /// stands, and an unproved depth is refused by name.
++    pub fn standing_at(&self, z: f64) -> Result<Region, GenError> {
++        self.material_at(z, Guards::ALL)
++    }
++
+     /// A bound on the material standing at or above the cut depth `z`:
+     /// the intersection of what every floor proved at least that deep
+     /// allows (each is a bound, so their intersection is one). A depth
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 08cacc700..a60d34e67 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -92,6 +92,7 @@ mod adaptive_troch_lanes;
+ mod adaptive_troch_level;
+ mod adaptive_troch_slice;
+ mod rest2d;
++mod rest_prior;
+ mod rest_anchor;
+ mod rest_rings;
+ mod chord_clear;
+@@ -146,7 +147,11 @@ pub use levels::{cut_levels, cut_levels_under};
+ pub use pocket::{pocket, pocket_entered, PocketParams, PocketStrategy};
+ pub use pocket_avoid::pocket_avoid;
+ pub use predrilled::PreHole;
+-pub use rest2d::{rest_plan, rest_pocket, rest_strategy, RestParams, RestPlan, REST_FILM, REST_MARGIN, REST_REACH};
++pub use rest2d::{
++    rest_plan, rest_pocket, rest_strategy, RestParams, RestPlan, RestSource, REST_FILM, REST_MARGIN, REST_NEEDS_STOCK,
++    REST_REACH,
++};
++pub use rest_prior::{rest_plan_stock, rest_pocket_previous, rest_stock_from_columns, PRIOR_Z_TOL};
+ pub use ring::{on_boundary, ring_is_circular};
+ pub use slots::{chord_clears, slot, trace, SlotParams, TraceParams};
+ pub use slot_ends::extended_ends as slot_extended_ends;
+diff --git a/crates/motion/src/machining2d/rest2d.rs b/crates/motion/src/machining2d/rest2d.rs
+index a4e00dc74..21872855d 100644
+--- a/crates/motion/src/machining2d/rest2d.rs
++++ b/crates/motion/src/machining2d/rest2d.rs
+@@ -57,10 +57,31 @@ pub const REST_FILM: f64 = 0.02;
+ /// all of them inside the pocket's own center area.
+ pub const REST_REACH: f64 = 0.05;
+ 
++/// Where the rest area is read from (#2033). The two modes never mix: a
++/// rest pass in `PreviousOperations` mode is never planned from the
++/// entered previous tool.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum RestSource {
++    /// The entered previous tool, trusted ([`rest_pocket`]).
++    #[default]
++    EnteredTool,
++    /// The stock the earlier operations of the setup leave, read at every
++    /// cut depth ([`super::rest_pocket_previous`]). The previous tool
++    /// fields are kept but not read.
++    PreviousOperations,
++}
++
++/// The refusal of the entered-tool planner for a rest group in
++/// `PreviousOperations` mode (#2033): it does not fall back to the
++/// entered tool.
++pub const REST_NEEDS_STOCK: &str = "rest machining from the previous operations needs the stock they leave: it is never planned from the entered previous tool";
++
+ /// The previous tool, as the user entered it. The generator trusts it:
+ /// it cannot see what really cut the pocket.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub struct RestParams {
++    /// Which reading plans the rest area (#2033).
++    pub source: RestSource,
+     /// Diameter of the tool that roughed the pocket; must be larger than
+     /// this operation's tool.
+     pub previous_tool_diameter: f64,
+@@ -80,7 +101,7 @@ impl RestParams {
+     /// [`Self::validate_alone`], and the previous tool must be larger.
+     pub fn validate(&self, tool_diameter: f64) -> Result<(), GenError> {
+         self.validate_alone()?;
+-        if self.previous_tool_diameter <= tool_diameter {
++        if self.source == RestSource::EnteredTool && self.previous_tool_diameter <= tool_diameter {
+             return Err(GenError::Invalid(format!(
+                 "rest machining needs a previous tool larger than this one: the previous tool is {} mm, this tool is {} mm",
+                 self.previous_tool_diameter, tool_diameter
+@@ -102,15 +123,19 @@ impl RestParams {
+         if !all.into_iter().all(f64::is_finite) {
+             return Err(GenError::Invalid("rest machining parameters must be finite".into()));
+         }
+-        if self.previous_tool_diameter <= 0.0 {
++        // #2033: the previous tool is not read in `PreviousOperations` mode.
++        let entered = self.source == RestSource::EnteredTool;
++        if entered && self.previous_tool_diameter <= 0.0 {
+             return Err(GenError::Invalid("the previous tool diameter must be positive".into()));
+         }
+-        if self.previous_corner_radius < 0.0 || self.previous_corner_radius > self.previous_tool_diameter * 0.5 {
++        if entered
++            && (self.previous_corner_radius < 0.0 || self.previous_corner_radius > self.previous_tool_diameter * 0.5)
++        {
+             return Err(GenError::Invalid(
+                 "the previous tool's corner radius must be between 0 and its radius".into(),
+             ));
+         }
+-        if self.previous_stock_to_leave < 0.0 {
++        if entered && self.previous_stock_to_leave < 0.0 {
+             return Err(GenError::Invalid("the previous stock to leave must not be negative".into()));
+         }
+         if self.allowance < 0.0 {
+@@ -150,6 +175,9 @@ pub fn rest_plan(
+         return Err(GenError::Invalid("tool diameter must be positive and stock to leave not negative".into()));
+     }
+     rest.validate(tool_diameter)?;
++    if rest.source != RestSource::EnteredTool {
++        return Err(GenError::Invalid(REST_NEEDS_STOCK.into()));
++    }
+     if region.is_empty() {
+         return Err(GenError::Empty("empty pocket region".into()));
+     }
+@@ -224,13 +252,27 @@ pub fn rest_pocket(region: &Region, p: &PocketParams, rest: &RestParams) -> Resu
+     )];
+     if !plan.previous_fits {
+         notes.push("the previous tool fits nowhere in this pocket: the whole pocket is cut".into());
++    }
++    emit_rest(region, p, &plan, notes)
++}
++
++/// The passes of `plan` for the tool of `p` (its strategy already read
++/// through [`rest_strategy`]): the plain pocket when nothing was cleared,
++/// the rest rings (or rows) otherwise. Shared by both rest modes (#2033).
++pub(super) fn emit_rest(
++    region: &Region,
++    p: &PocketParams,
++    plan: &RestPlan,
++    notes: Vec<String>,
++) -> Result<Toolpath, GenError> {
++    if !plan.previous_fits {
+         return pocket_over(region, &plan.center, p, notes, true, &[]);
+     }
+-    let (mut passes, cut_center) = rest_passes(&plan, p.tool_diameter, p.tiling_step(), p.climb)?;
++    let (mut passes, cut_center) = rest_passes(plan, p.tool_diameter, p.tiling_step(), p.climb)?;
+     if p.strategy == PocketStrategy::Zigzag {
+         passes = super::pocket_zigzag::rest_passes(&plan.center, p.tiling_step(), p.climb)?;
+     }
+-    anchor_first_pass(&mut passes, &plan, p);
++    anchor_first_pass(&mut passes, plan, p);
+     let mut b = PathBuilder::approached(Point3::new(0.0, 0.0, p.clearance_z));
+     notes.into_iter().for_each(|n| b.note(n));
+     emit_pocket_passes(
+diff --git a/crates/motion/src/machining2d/rest_prior.rs b/crates/motion/src/machining2d/rest_prior.rs
+new file mode 100644
+index 000000000..23377a837
+--- /dev/null
++++ b/crates/motion/src/machining2d/rest_prior.rs
+@@ -0,0 +1,244 @@
++//! 2D rest machining from the previous operations (#2033): the rest area
++//! is the material the earlier operations of the setup are NOT proved to
++//! have cut, read from the stock they leave at every cut depth.
++//!
++//! Provenance: the in-process workpiece of 2.5D pocketing as planar
++//! regions per depth (M. Held, "On the Computational Geometry of Pocket
++//! Machining", LNCS 500, Springer 1991; Z. Yao, S. K. Gupta and D. S.
++//! Nau, "Algorithms for selecting cutters in multi-part milling
++//! problems", Computer-Aided Design 35(9), 2003). The reading rules (one
++//! cell of growth, unknown columns stand, every depth is read) are this
++//! project's decision; no other CAM product's code or output was consulted.
++//!
++//! Prime Directive: the rest area is read large, never small.
++//! - A column stands at a cut depth when its top is above that depth. A
++//!   shallow earlier pass proves nothing about the floor under it.
++//! - The standing columns grow by one cell diagonal: the grid samples the
++//!   stock, so material thinner than a cell beside a standing column is
++//!   not proved absent.
++//! - A column that cannot be read, and the pocket outside the grid, stand.
++//! - The rest area is the union over every cut depth. A level can cut air
++//!   that a deeper level needs; it never skips material.
++//! - The passes are the pocket's own (`rest2d`): every move under the top
++//!   of the cut is a feed or a plunge.
++
++use crate::cl::Toolpath;
++use crate::geo2d::{Loop, Point2, Region};
++use crate::stock_sim::Columns;
++
++use super::adaptive::{RestStock, StockFloor};
++use super::face::GenError;
++use super::levels::cut_levels_under;
++use super::pocket::PocketParams;
++use super::rest2d::{emit_rest, rest_strategy, RestParams, RestPlan, RestSource, REST_REACH};
++
++/// A column whose top is within this much (mm) above a cut depth does
++/// not stand there: float noise of a floor cut at that depth.
++pub const PRIOR_Z_TOL: f64 = 1e-6;
++
++/// The area under which the whole target counts as standing (mm2).
++const WHOLE_TOL: f64 = 1e-9;
++
++/// The reading guards, each on in every build. The unit tests switch one
++/// off at a time to show that its pinning test then fails (#2033).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Guards {
++    /// Every cut depth is read, not only the first.
++    pub depth: bool,
++    /// A column that cannot be read stands.
++    pub unknown: bool,
++    /// The pocket outside the grid stands.
++    pub outside: bool,
++    /// The standing columns grow by one cell diagonal.
++    pub cell: bool,
++}
++
++impl Guards {
++    pub(super) const ALL: Guards = Guards { depth: true, unknown: true, outside: true, cell: true };
++}
++
++/// The stock the columns `cols` prove inside `region`, one floor for each
++/// depth of `levels`. Refused by name: an empty pocket, no depth, a depth
++/// that is not finite, a grid without cells.
++pub fn rest_stock_from_columns(cols: &Columns<'_>, region: &Region, levels: &[f64]) -> Result<RestStock, GenError> {
++    stock_from(cols, region, levels, Guards::ALL)
++}
++
++pub(super) fn stock_from(cols: &Columns<'_>, region: &Region, levels: &[f64], g: Guards) -> Result<RestStock, GenError> {
++    let cell = cols.cell();
++    if !(cell.is_finite() && cell > 0.0) || cols.nx() == 0 || cols.ny() == 0 {
++        return Err(GenError::Invalid(
++            "the stock of the previous operations has no readable grid: rest machining cannot be planned from it".into(),
++        ));
++    }
++    if region.is_empty() {
++        return Err(GenError::Empty("empty pocket region".into()));
++    }
++    if levels.is_empty() || levels.iter().any(|z| !z.is_finite()) {
++        return Err(GenError::Invalid("rest machining needs finite cut depths to read the stock at".into()));
++    }
++    let grow = cell * std::f64::consts::SQRT_2;
++    let o = cols.origin();
++    let (x1, y1) = (o.x + cols.nx() as f64 * cell, o.y + cols.ny() as f64 * cell);
++    let lattice = Region::new(vec![Loop::new(vec![o, Point2::new(x1, o.y), Point2::new(x1, y1), Point2::new(o.x, y1)])?])?;
++    let mut uncertain = if g.outside { region.difference(&lattice)? } else { Region::empty() };
++    if g.unknown && unreadable(cols, region, grow) {
++        uncertain = region.clone();
++    }
++    let mut floors = Vec::with_capacity(levels.len());
++    for &z in levels {
++        let above = cols
++            .above(z + PRIOR_Z_TOL)
++            .map_err(|e| GenError::Invalid(format!("the stock of the previous operations cannot be read at Z{z:.3}: {e}")))?;
++        let read = if g.cell && !above.is_empty() { above.offset(grow)? } else { above };
++        floors.push(StockFloor { z, remaining: read.intersect(region)?, uncertain: uncertain.clone() });
++    }
++    RestStock::from_verified(floors)?.with_film(grow)
++}
++
++/// Does a column that can meet `region` have no readable top (NaN)?
++fn unreadable(cols: &Columns<'_>, region: &Region, pad: f64) -> bool {
++    let Some((lo, hi)) = region.bounds() else {
++        return false;
++    };
++    let (cell, o) = (cols.cell(), cols.origin());
++    let span = |a: f64, b: f64, o: f64, n: usize| {
++        let i0 = ((a - pad - o) / cell).floor().clamp(0.0, n as f64) as usize;
++        let i1 = ((b + pad - o) / cell).ceil().clamp(0.0, n as f64) as usize;
++        i0..i1
++    };
++    let xs = span(lo.x, hi.x, o.x, cols.nx());
++    span(lo.y, hi.y, o.y, cols.ny()).any(|iy| xs.clone().any(|ix| cols.top_at(ix, iy).is_nan()))
++}
++
++/// The rest plan of `region` for a tool of `tool_diameter` leaving
++/// `stock_to_leave`, on the proved `stock`, cut at `levels`. The rest
++/// area is the material standing at ANY of the levels, grown by
++/// `allowance`, inside the pocket. An empty plan (the earlier operations
++/// cleared every level) is `Ok` with empty regions.
++///
++/// Refused by name: a level the stock does not prove ([`RestStock`]),
++/// bad numbers, an empty pocket, a pocket narrower than the tool.
++pub fn rest_plan_stock(
++    region: &Region,
++    tool_diameter: f64,
++    stock_to_leave: f64,
++    allowance: f64,
++    stock: &RestStock,
++    levels: &[f64],
++) -> Result<RestPlan, GenError> {
++    plan_from(region, tool_diameter, stock_to_leave, allowance, stock, levels, Guards::ALL)
++}
++
++pub(super) fn plan_from(
++    region: &Region,
++    tool_diameter: f64,
++    stock_to_leave: f64,
++    allowance: f64,
++    stock: &RestStock,
++    levels: &[f64],
++    g: Guards,
++) -> Result<RestPlan, GenError> {
++    let (target, own_center) = target_of(region, tool_diameter, stock_to_leave)?;
++    if !(allowance.is_finite() && allowance >= 0.0) {
++        return Err(GenError::Invalid("the rest allowance must not be negative".into()));
++    }
++    if levels.is_empty() {
++        return Err(GenError::Invalid("rest machining needs finite cut depths to read the stock at".into()));
++    }
++    // The depth guard: every level speaks. Without it only the first does.
++    let read = if g.depth { levels } else { &levels[..1] };
++    let mut material = Region::empty();
++    for &z in read {
++        material = material.union(&stock.standing_at(z)?)?;
++    }
++    let raw = target.intersect(&material)?;
++    if raw.is_empty() {
++        return Ok(RestPlan { rest: Region::empty(), center: Region::empty(), previous_fits: true });
++    }
++    if target.difference(&raw)?.area().abs() <= WHOLE_TOL {
++        return Ok(RestPlan { rest: target, center: own_center, previous_fits: false });
++    }
++    let rest = if allowance > 0.0 { raw.offset(allowance)?.intersect(&target)? } else { raw };
++    let center = rest.offset(tool_diameter * 0.5 + REST_REACH)?.intersect(&own_center)?;
++    Ok(RestPlan { rest, center, previous_fits: true })
++}
++
++/// What the operation is to leave free of material, and its own
++/// cutter-center area.
++fn target_of(region: &Region, tool_diameter: f64, stock_to_leave: f64) -> Result<(Region, Region), GenError> {
++    if !(tool_diameter.is_finite() && stock_to_leave.is_finite()) || tool_diameter <= 0.0 || stock_to_leave < 0.0 {
++        return Err(GenError::Invalid("tool diameter must be positive and stock to leave not negative".into()));
++    }
++    if region.is_empty() {
++        return Err(GenError::Empty("empty pocket region".into()));
++    }
++    let own_center = region.offset(-(tool_diameter * 0.5 + stock_to_leave))?;
++    if own_center.is_empty() {
++        return Err(GenError::Invalid("pocket is narrower than the tool".into()));
++    }
++    let target = if stock_to_leave > 0.0 { region.offset(-stock_to_leave)? } else { region.clone() };
++    Ok((target, own_center))
++}
++
++/// Pocket `region` with the tool of `p`, cutting only what the earlier
++/// operations are not proved to have cut. `prior` is the stock they
++/// leave, in the generator's frame; `None` means that no earlier
++/// operation cut, so the whole pocket stands. Levels, entries, links and
++/// strategies are [`super::rest_pocket`]'s.
++///
++/// Refused by name: a rest group that is not in `PreviousOperations`
++/// mode; `Adaptive`; a stock that cannot be read; nothing left to cut;
++/// rest material that this tool cannot reach.
++pub fn rest_pocket_previous(
++    region: &Region,
++    p: &PocketParams,
++    rest: &RestParams,
++    prior: Option<&Columns<'_>>,
++) -> Result<Toolpath, GenError> {
++    p.validate()?;
++    if rest.source != RestSource::PreviousOperations {
++        return Err(GenError::Invalid(
++            "this rest group reads the entered previous tool: it is not planned from the previous operations".into(),
++        ));
++    }
++    rest.validate_alone()?;
++    let p = &PocketParams { strategy: rest_strategy(p.strategy)?, ..*p };
++    let zs = cut_levels_under(p.top_z, p.links.approach.stock_top, p.bottom_z, p.stepdown)?;
++    let bottom = zs.iter().copied().fold(f64::INFINITY, f64::min);
++    let (plan, read) = match prior {
++        Some(cols) => {
++            let stock = rest_stock_from_columns(cols, region, &zs)?;
++            let plan = rest_plan_stock(region, p.tool_diameter, p.stock_to_leave, rest.allowance, &stock, &zs)?;
++            (plan, format!("on a {:.3} mm grid, read large by one cell", cols.cell()))
++        }
++        None => {
++            let (target, own_center) = target_of(region, p.tool_diameter, p.stock_to_leave)?;
++            (RestPlan { rest: target, center: own_center, previous_fits: false }, "no earlier operation cut".to_string())
++        }
++    };
++    if plan.rest.is_empty() {
++        return Err(GenError::Empty(format!(
++            "no rest material: the previous operations cleared this pocket at every cut depth down to Z{bottom:.3}"
++        )));
++    }
++    if plan.center.is_empty() {
++        return Err(GenError::Invalid(
++            "the rest material is narrower than the tool: no legal tool position touches it".into(),
++        ));
++    }
++    let mut notes = vec![format!(
++        "rest machining reads the stock that the previous operations leave ({read}) at {} cut depth(s) down to Z{bottom:.3}: {:.1} of {:.1} mm2 is read as rest material",
++        zs.len(),
++        plan.rest.area().abs(),
++        region.area().abs(),
++    )];
++    if !plan.previous_fits {
++        notes.push("the previous operations cleared nothing of this pocket at its cut depths: the whole pocket is cut".into());
++    }
++    emit_rest(region, p, &plan, notes)
++}
++
++#[cfg(test)]
++#[path = "rest_prior_tests.rs"]
++mod tests;
+diff --git a/crates/motion/src/machining2d/rest_prior_tests.rs b/crates/motion/src/machining2d/rest_prior_tests.rs
+new file mode 100644
+index 000000000..29cce630c
+--- /dev/null
++++ b/crates/motion/src/machining2d/rest_prior_tests.rs
+@@ -0,0 +1,108 @@
++//! The reading guards of `rest_prior` (#2033), each switched off alone:
++//! its pin holds with every guard on and fails without that guard.
++
++use super::*;
++use crate::stock_sim::{Dexel, Stock};
++
++const CELL: f64 = 0.25;
++const TOP: f64 = 0.0;
++
++fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
++    Region::new(vec![
++        Loop::new(vec![Point2::new(x0, y0), Point2::new(x1, y0), Point2::new(x1, y1), Point2::new(x0, y1)]).unwrap(),
++    ])
++    .unwrap()
++}
++
++/// A 40 x 30 block whose columns inside `x 8..32, y 8..22` are cut to
++/// `floor`; `edit` then rewrites single tops.
++fn stock(floor: f64, mut edit: impl FnMut(Point2, f64) -> f64) -> Stock {
++    let mut s = Stock::Column(Dexel::block(0.0, 0.0, 40.0, 30.0, TOP, CELL).unwrap());
++    s.set_tops(|_, c, cur| {
++        let cut = if c.x > 8.0 && c.x < 32.0 && c.y > 8.0 && c.y < 22.0 { cur.min(floor) } else { cur };
++        edit(c, cut)
++    })
++    .unwrap();
++    s
++}
++
++fn pocket() -> Region {
++    rect(5.0, 5.0, 35.0, 25.0)
++}
++
++/// The depth pin: an earlier cut to Z-2 proves nothing at Z-4, so the
++/// whole pocket stands for a rest pass that cuts at both.
++fn depth_pin(g: Guards) -> bool {
++    let s = stock(-2.0, |_, z| z);
++    let cols = s.columns().unwrap();
++    let levels = [-2.0, -4.0];
++    let st = stock_from(&cols, &pocket(), &levels, g).unwrap();
++    let plan = plan_from(&pocket(), 4.0, 0.0, 0.0, &st, &levels, g).unwrap();
++    !plan.previous_fits && (plan.rest.area().abs() - pocket().area().abs()).abs() < 1e-6
++}
++
++/// The unknown pin: a column with no readable top stands.
++fn unknown_pin(g: Guards) -> bool {
++    let hole = Point2::new(20.125, 15.125);
++    let s = stock(-4.0, |c, z| if (c.x - hole.x).abs() < 1e-9 && (c.y - hole.y).abs() < 1e-9 { f64::NAN } else { z });
++    let cols = s.columns().unwrap();
++    let st = stock_from(&cols, &pocket(), &[-4.0], g).unwrap();
++    st.standing_at(-4.0).unwrap().contains(hole)
++}
++
++/// The outside pin: the pocket outside the grid stands.
++fn outside_pin(g: Guards) -> bool {
++    let s = stock(-4.0, |_, z| z);
++    let cols = s.columns().unwrap();
++    let wide = rect(-6.0, 5.0, 35.0, 25.0);
++    let st = stock_from(&cols, &wide, &[-4.0], g).unwrap();
++    st.standing_at(-4.0).unwrap().contains(Point2::new(-3.0, 15.0))
++}
++
++/// The cell pin: a point in a cut column 0.1 mm from a standing column
++/// is not proved clear.
++fn cell_pin(g: Guards) -> bool {
++    let s = stock(-4.0, |_, z| z);
++    let cols = s.columns().unwrap();
++    let st = stock_from(&cols, &pocket(), &[-4.0], g).unwrap();
++    st.standing_at(-4.0).unwrap().contains(Point2::new(8.1, 15.0))
++}
++
++#[test]
++fn each_reading_guard_is_pinned_and_its_removal_fails_the_pin() {
++    let all = Guards::ALL;
++    assert!(depth_pin(all), "every cut depth is read");
++    assert!(!depth_pin(Guards { depth: false, ..all }), "without the depth guard the lower floor reads clear");
++    assert!(unknown_pin(all), "an unreadable column stands");
++    assert!(!unknown_pin(Guards { unknown: false, ..all }), "without the unknown guard a NaN column reads clear");
++    assert!(outside_pin(all), "the pocket outside the grid stands");
++    assert!(!outside_pin(Guards { outside: false, ..all }), "without the outside guard it reads clear");
++    assert!(cell_pin(all), "the standing columns grow by a cell");
++    assert!(!cell_pin(Guards { cell: false, ..all }), "without the cell guard the wall band reads clear");
++}
++
++#[test]
++fn a_floor_cut_at_the_cut_depth_does_not_stand_and_one_above_it_does() {
++    // A floor allowance of 0.2 mm is material at Z-4; float noise is not.
++    for (floor, standing) in [(-4.0, false), (-4.0 + 1e-9, false), (-3.8, true)] {
++        let s = stock(floor, |_, z| z);
++        let cols = s.columns().unwrap();
++        let st = rest_stock_from_columns(&cols, &pocket(), &[-4.0]).unwrap();
++        assert_eq!(st.standing_at(-4.0).unwrap().contains(Point2::new(20.0, 15.0)), standing, "floor {floor}");
++    }
++}
++
++#[test]
++fn bad_input_is_refused_by_name() {
++    let s = stock(-4.0, |_, z| z);
++    let cols = s.columns().unwrap();
++    let no_levels = rest_stock_from_columns(&cols, &pocket(), &[]).unwrap_err().to_string();
++    assert!(no_levels.contains("finite cut depths"), "{no_levels}");
++    let nan = rest_stock_from_columns(&cols, &pocket(), &[f64::NAN]).unwrap_err().to_string();
++    assert!(nan.contains("finite cut depths"), "{nan}");
++    assert!(rest_stock_from_columns(&cols, &Region::empty(), &[-4.0]).is_err());
++    // A depth the stock was not read at is refused, never guessed.
++    let st = rest_stock_from_columns(&cols, &pocket(), &[-2.0]).unwrap();
++    let deep = rest_plan_stock(&pocket(), 4.0, 0.0, 0.0, &st, &[-2.0, -4.0]).unwrap_err().to_string();
++    assert!(deep.contains("not proved at Z-4.000"), "{deep}");
++}
+diff --git a/crates/motion/tests/rest2d.rs b/crates/motion/tests/rest2d.rs
+index 52d46c621..94a82f51f 100644
+--- a/crates/motion/tests/rest2d.rs
++++ b/crates/motion/tests/rest2d.rs
+@@ -50,6 +50,7 @@ fn depth_in(p: Point2, cr: f64) -> f64 {
+ 
+ fn prev() -> RestParams {
+     RestParams {
++        source: Default::default(),
+         previous_tool_diameter: PREV_D,
+         previous_corner_radius: 0.0,
+         previous_stock_to_leave: 0.0,
+diff --git a/crates/motion/tests/rest_previous.rs b/crates/motion/tests/rest_previous.rs
+new file mode 100644
+index 000000000..adeca0c59
+--- /dev/null
++++ b/crates/motion/tests/rest_previous.rs
+@@ -0,0 +1,237 @@
++//! 2D rest machining from the previous operations (#2033): the rest area
++//! holds every column that an independent simulation of the earlier
++//! operations leaves standing at a cut depth, the rest path cuts it and
++//! keeps the walls, a shallow earlier pass leaves the whole pocket, and
++//! the two rest modes refuse each other's planner by name.
++//!
++//! Gate map (#2033): covers camcraft_motion::machining2d (rest_prior,
++//! rest2d).
++
++use camcraft_motion::cl::Toolpath;
++use camcraft_motion::entry::Entry3D;
++use camcraft_motion::geo2d::{Loop, Point2, Region};
++use camcraft_motion::load::DEFAULT_OPTIMAL_LOAD;
++use camcraft_motion::machining2d::{
++    cut_levels, pocket, rest_plan_stock, rest_pocket, rest_pocket_previous, rest_stock_from_columns, GenError,
++    PocketParams, PocketStrategy, RestParams, RestSource, PRIOR_Z_TOL, REST_NEEDS_STOCK,
++};
++use camcraft_motion::stock_sim::{Dexel, SimOp, Stock};
++
++const CELL: f64 = 0.25;
++const TOP: f64 = 0.0;
++const BOTTOM: f64 = -4.0;
++const TOOL_D: f64 = 4.0;
++
++fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
++    Region::new(vec![
++        Loop::new(vec![Point2::new(x0, y0), Point2::new(x1, y0), Point2::new(x1, y1), Point2::new(x0, y1)]).unwrap(),
++    ])
++    .unwrap()
++}
++
++/// A 40 x 30 pocket with 3 mm corners, inside a 50 x 40 block.
++fn pocket_region() -> Region {
++    rect(5.0, 5.0, 45.0, 35.0).offset(-3.0).unwrap().offset(3.0).unwrap()
++}
++
++fn block() -> Stock {
++    Stock::Column(Dexel::block(0.0, 0.0, 50.0, 40.0, TOP, CELL).unwrap())
++}
++
++fn pp(d: f64, bottom: f64, stock_to_leave: f64) -> PocketParams {
++    PocketParams {
++        blend_radius: None,
++        links: camcraft_motion::links::Links::PLANAR,
++        tool_diameter: d,
++        stepover: d * 0.4,
++        stock_to_leave,
++        clearance_z: 5.0,
++        retract_z: None,
++        top_z: TOP,
++        bottom_z: bottom,
++        stepdown: 2.0,
++        feed: 400.0,
++        plunge_feed: 80.0,
++        climb: true,
++        strategy: PocketStrategy::Waterline,
++        entry: Entry3D::Plunge,
++        helix_radius: 1.0,
++        optimal_load: DEFAULT_OPTIMAL_LOAD,
++        blend_turns: false,
++    }
++}
++
++fn previous_ops() -> RestParams {
++    RestParams {
++        source: RestSource::PreviousOperations,
++        previous_tool_diameter: 0.0,
++        previous_corner_radius: 0.0,
++        previous_stock_to_leave: 0.0,
++        allowance: 0.0,
++    }
++}
++
++fn cut(stock: &mut Stock, path: &Toolpath, d: f64, corner: Option<f64>) {
++    stock.simulate(&[SimOp { moves: &path.moves, radius: d * 0.5, ball: false, cone: None, corner }]).unwrap();
++}
++
++/// The centers of the columns inside `region` whose top stands above `z`.
++fn standing(stock: &Stock, region: &Region, z: f64) -> Vec<Point2> {
++    let cols = stock.columns().unwrap();
++    let mut out = Vec::new();
++    for iy in 0..cols.ny() {
++        for ix in 0..cols.nx() {
++            let c = cols.center(ix, iy);
++            if region.contains(c) && cols.top_at(ix, iy) > z + PRIOR_Z_TOL {
++                out.push(c);
++            }
++        }
++    }
++    out
++}
++
++/// The earlier operations of each scenario, simulated on a fresh block.
++fn scenarios() -> Vec<(&'static str, Region, Stock)> {
++    let region = pocket_region();
++    let mut out = Vec::new();
++    // A 12 mm flat end mill to the full depth.
++    let mut s = block();
++    cut(&mut s, &pocket(&region, &pp(12.0, BOTTOM, 0.0)).unwrap(), 12.0, None);
++    out.push(("flat 12 mm", region.clone(), s));
++    // The same with 0.5 mm left on the walls.
++    let mut s = block();
++    cut(&mut s, &pocket(&region, &pp(12.0, BOTTOM, 0.5)).unwrap(), 12.0, None);
++    out.push(("wall allowance", region.clone(), s));
++    // A 12 mm bull-nose tool, corner radius 2 mm: its fillet ring stands.
++    let mut s = block();
++    cut(&mut s, &pocket(&region, &pp(12.0, BOTTOM, 0.0)).unwrap(), 12.0, Some(2.0));
++    out.push(("bull nose", region.clone(), s));
++    // Mixed tools and a partial depth: 12 mm to Z-2 everywhere, then
++    // 8 mm to Z-4 over two disconnected patches.
++    let mut s = block();
++    cut(&mut s, &pocket(&region, &pp(12.0, -2.0, 0.0)).unwrap(), 12.0, None);
++    for patch in [rect(6.0, 6.0, 20.0, 34.0), rect(30.0, 6.0, 44.0, 20.0)] {
++        cut(&mut s, &pocket(&patch, &pp(8.0, BOTTOM, 0.0)).unwrap(), 8.0, None);
++    }
++    out.push(("mixed tools, partial depth, disconnected cuts", region.clone(), s));
++    // An island in the pocket.
++    let island = region.difference(&rect(20.0, 15.0, 30.0, 25.0)).unwrap();
++    let mut s = block();
++    cut(&mut s, &pocket(&island, &pp(12.0, BOTTOM, 0.0)).unwrap(), 12.0, None);
++    out.push(("island", island, s));
++    out
++}
++
++#[test]
++fn the_rest_region_holds_every_column_the_simulated_earlier_operations_left() {
++    let zs = cut_levels(TOP, BOTTOM, 2.0).unwrap();
++    for (name, region, stock) in scenarios() {
++        let cols = stock.columns().unwrap();
++        let proved = rest_stock_from_columns(&cols, &region, &zs).unwrap();
++        let plan = rest_plan_stock(&region, TOOL_D, 0.0, 0.0, &proved, &zs).unwrap();
++        // The independent reading: a column that stands above any cut
++        // depth (so above the deepest) is rest material.
++        let left = standing(&stock, &region, BOTTOM);
++        assert!(!left.is_empty(), "{name}: the earlier operations leave material for the rest pass");
++        let missed: Vec<_> = left.iter().filter(|c| !plan.rest.contains(**c)).collect();
++        assert!(missed.is_empty(), "{name}: {} standing column(s) are not in the rest area, first {:?}", missed.len(), missed[0]);
++        // And the reading is not the trivial one: cleared floor is not rest.
++        let (rest, whole) = (plan.rest.area().abs(), region.area().abs());
++        assert!(rest < whole * 0.75, "{name}: {rest:.1} of {whole:.1} mm2 reads as rest");
++    }
++}
++
++#[test]
++fn the_rest_path_cuts_what_was_left_and_keeps_the_walls() {
++    for (name, region, mut stock) in scenarios() {
++        let path = {
++            let cols = stock.columns().unwrap();
++            rest_pocket_previous(&region, &pp(TOOL_D, BOTTOM, 0.0), &previous_ops(), Some(&cols))
++                .unwrap_or_else(|e| panic!("{name}: {e}"))
++        };
++        assert!(path.notes.iter().any(|n| n.contains("reads the stock that the previous operations leave")), "{name}: {:?}", path.notes);
++        cut(&mut stock, &path, TOOL_D, None);
++        // The floor is at depth wherever the 4 mm tool reaches (the
++        // corners are 3 mm, so everywhere a cell inside the wall).
++        let inner = region.offset(-2.0 * CELL).unwrap();
++        let left = standing(&stock, &inner, BOTTOM);
++        assert!(left.is_empty(), "{name}: {} column(s) still stand after the rest pass, first {:?}", left.len(), left.first());
++        // No column outside the pocket was cut.
++        let cols = stock.columns().unwrap();
++        let outer = region.offset(2.0 * CELL).unwrap();
++        for iy in 0..cols.ny() {
++            for ix in 0..cols.nx() {
++                let c = cols.center(ix, iy);
++                assert!(outer.contains(c) || cols.top_at(ix, iy) >= TOP - PRIOR_Z_TOL, "{name}: the wall at {c:?} was cut");
++            }
++        }
++    }
++}
++
++#[test]
++fn a_shallow_earlier_pass_leaves_the_whole_pocket_for_the_rest_pass() {
++    let region = pocket_region();
++    let mut stock = block();
++    cut(&mut stock, &pocket(&region, &pp(12.0, -2.0, 0.0)).unwrap(), 12.0, None);
++    let path = {
++        let cols = stock.columns().unwrap();
++        rest_pocket_previous(&region, &pp(TOOL_D, BOTTOM, 0.0), &previous_ops(), Some(&cols)).unwrap()
++    };
++    assert!(path.notes.iter().any(|n| n.contains("the whole pocket is cut")), "{:?}", path.notes);
++    cut(&mut stock, &path, TOOL_D, None);
++    assert!(standing(&stock, &region.offset(-2.0 * CELL).unwrap(), BOTTOM).is_empty());
++}
++
++#[test]
++fn no_earlier_cut_is_the_whole_pocket_and_a_cleared_pocket_is_refused_by_name() {
++    let region = pocket_region();
++    let whole = rest_pocket_previous(&region, &pp(TOOL_D, BOTTOM, 0.0), &previous_ops(), None).unwrap();
++    assert!(whole.notes.iter().any(|n| n.contains("no earlier operation cut")), "{:?}", whole.notes);
++    let plain = pocket(&region, &pp(TOOL_D, BOTTOM, 0.0)).unwrap();
++    assert_eq!(whole.moves.len(), plain.moves.len(), "the whole pocket is the plain pocket's passes");
++    // Everything at depth already: nothing to cut.
++    let mut cleared = Stock::Column(Dexel::block(0.0, 0.0, 50.0, 40.0, TOP, CELL).unwrap());
++    cleared.set_tops(|_, _, _| BOTTOM).unwrap();
++    let cols = cleared.columns().unwrap();
++    match rest_pocket_previous(&region, &pp(TOOL_D, BOTTOM, 0.0), &previous_ops(), Some(&cols)) {
++        Err(GenError::Empty(why)) => assert!(why.contains("no rest material") && why.contains("Z-4.000"), "{why}"),
++        other => panic!("expected the no-rest refusal, got {:?}", other.map(|p| p.moves.len())),
++    }
++}
++
++#[test]
++fn the_two_rest_modes_never_use_each_others_planner() {
++    let region = pocket_region();
++    let stock = block();
++    let cols = stock.columns().unwrap();
++    // Previous-operations mode is never planned from the entered tool,
++    // even when the entered tool is a legal one.
++    let typed = RestParams { previous_tool_diameter: 12.0, ..previous_ops() };
++    let why = rest_pocket(&region, &pp(TOOL_D, BOTTOM, 0.0), &typed).unwrap_err().to_string();
++    assert!(why.contains(REST_NEEDS_STOCK), "{why}");
++    // Entered-tool mode is not planned from the stock.
++    let entered = RestParams { source: RestSource::EnteredTool, ..typed };
++    let why = rest_pocket_previous(&region, &pp(TOOL_D, BOTTOM, 0.0), &entered, Some(&cols)).unwrap_err().to_string();
++    assert!(why.contains("reads the entered previous tool"), "{why}");
++    // The previous tool is not read in previous-operations mode, the
++    // allowance is.
++    assert!(previous_ops().validate(TOOL_D).is_ok());
++    let why = RestParams { allowance: -0.1, ..previous_ops() }.validate(TOOL_D).unwrap_err().to_string();
++    assert!(why.contains("rest allowance"), "{why}");
++    // Adaptive stays refused by name.
++    let adaptive = PocketParams { strategy: PocketStrategy::Adaptive, ..pp(TOOL_D, BOTTOM, 0.0) };
++    let why = rest_pocket_previous(&region, &adaptive, &previous_ops(), Some(&cols)).unwrap_err().to_string();
++    assert!(why.contains("Adaptive"), "{why}");
++}
++
++#[test]
++fn the_allowance_only_grows_the_rest_area() {
++    let (_, region, stock) = scenarios().swap_remove(0);
++    let cols = stock.columns().unwrap();
++    let zs = cut_levels(TOP, BOTTOM, 2.0).unwrap();
++    let proved = rest_stock_from_columns(&cols, &region, &zs).unwrap();
++    let tight = rest_plan_stock(&region, TOOL_D, 0.0, 0.0, &proved, &zs).unwrap();
++    let grown = rest_plan_stock(&region, TOOL_D, 0.0, 0.5, &proved, &zs).unwrap();
++    assert!(grown.rest.area().abs() > tight.rest.area().abs());
++    assert!(tight.rest.difference(&grown.rest).unwrap().area().abs() < 1e-6, "the allowance removed rest material");
++}
+diff --git a/crates/motion/tests/rest_zigzag.rs b/crates/motion/tests/rest_zigzag.rs
+index fe774888e..b2ff67d53 100644
+--- a/crates/motion/tests/rest_zigzag.rs
++++ b/crates/motion/tests/rest_zigzag.rs
+@@ -47,6 +47,7 @@ fn zigzag_rest_covers_corner_residue_without_gouges_or_unsafe_rapids() {
+ fn check_rest(climb: bool, stepover: f64) {
+     let region = rounded();
+     let previous = RestParams {
++        source: Default::default(),
+         previous_tool_diameter: 12.0,
+         previous_corner_radius: 0.0,
+         previous_stock_to_leave: 0.0,
+@@ -149,6 +150,7 @@ fn tiny_rest_pocket_keeps_interior_rows_when_previous_tool_fits_nowhere() {
+         Point2::new(0.0, 0.015),
+     ]).unwrap()]).unwrap();
+     let previous = RestParams {
++        source: Default::default(),
+         previous_tool_diameter: 0.03,
+         previous_corner_radius: 0.0,
+         previous_stock_to_leave: 0.0,
+diff --git a/crates/ui/src/egui_app/rest_pocket_page.rs b/crates/ui/src/egui_app/rest_pocket_page.rs
+index 69af25865..bd5ac15f6 100644
+--- a/crates/ui/src/egui_app/rest_pocket_page.rs
++++ b/crates/ui/src/egui_app/rest_pocket_page.rs
+@@ -6,11 +6,11 @@
+ use egui::Ui;
+ 
+ use camcraft_app::links::Approach;
+-use camcraft_app::machining2d::{GenError, PocketStrategy, RestParams, rest_strategy};
++use camcraft_app::machining2d::{GenError, PocketStrategy, RestParams, RestSource, rest_strategy};
+ use camcraft_app::operation::{POCKET_ADAPTIVE_RETIRED, REST_PREDRILLED};
+ use camcraft_app::units::Unit;
+ 
+-use super::fields::num_row;
++use super::fields::{combo, num_row};
+ use super::layout::{consequence, group, prop_row_hint};
+ 
+ fn seed_rest(tool_diameter: Option<f64>) -> RestParams {
+@@ -19,6 +19,7 @@ fn seed_rest(tool_diameter: Option<f64>) -> RestParams {
+         _ => 12.0,
+     };
+     RestParams {
++        source: RestSource::EnteredTool,
+         previous_tool_diameter,
+         previous_corner_radius: 0.0,
+         previous_stock_to_leave: 0.0,
+@@ -39,24 +40,36 @@ pub(super) fn rest_group(
+     let mut armed = rest.is_some();
+     let g = group(ui, "Rest machining", Some(&mut armed), |ui| {
+         if let Some(r) = rest.as_mut() {
++            // #2033: which reading plans the rest area. The previous tool
++            // rows are not read from the previous operations, so they hide.
++            let mut from = usize::from(r.source == RestSource::PreviousOperations);
+             prop_row_hint(
+                 ui,
+-                "Prev. tool Ø",
+-                "diameter of the larger tool that previously roughed this pocket; must exceed this tool's diameter",
+-                |ui| num_row(ui, u, &mut r.previous_tool_diameter),
+-            );
+-            prop_row_hint(
+-                ui,
+-                "Prev. corner rad.",
+-                "corner (bull-nose) radius of that previous tool (0 for a flat end mill)",
+-                |ui| num_row(ui, u, &mut r.previous_corner_radius),
+-            );
+-            prop_row_hint(
+-                ui,
+-                "Prev. stock left",
+-                "radial stock left on the pocket walls by the previous operation",
+-                |ui| num_row(ui, u, &mut r.previous_stock_to_leave),
++                "Rest stock from",
++                "entered tool: trusts the previous tool below; previous operations: reads the stock that the earlier operations of this setup leave at every cut depth",
++                |ui| combo(ui, "rest_source", &mut from, &["Entered tool", "Previous operations"]),
+             );
++            r.source = if from == 1 { RestSource::PreviousOperations } else { RestSource::EnteredTool };
++            if r.source == RestSource::EnteredTool {
++                prop_row_hint(
++                    ui,
++                    "Prev. tool Ø",
++                    "diameter of the larger tool that previously roughed this pocket; must exceed this tool's diameter",
++                    |ui| num_row(ui, u, &mut r.previous_tool_diameter),
++                );
++                prop_row_hint(
++                    ui,
++                    "Prev. corner rad.",
++                    "corner (bull-nose) radius of that previous tool (0 for a flat end mill)",
++                    |ui| num_row(ui, u, &mut r.previous_corner_radius),
++                );
++                prop_row_hint(
++                    ui,
++                    "Prev. stock left",
++                    "radial stock left on the pocket walls by the previous operation",
++                    |ui| num_row(ui, u, &mut r.previous_stock_to_leave),
++                );
++            }
+             prop_row_hint(
+                 ui,
+                 "Rest allowance",
+diff --git a/crates/ui/src/egui_app/rest_pocket_tests.rs b/crates/ui/src/egui_app/rest_pocket_tests.rs
+index 86214d471..6b128b72e 100644
+--- a/crates/ui/src/egui_app/rest_pocket_tests.rs
++++ b/crates/ui/src/egui_app/rest_pocket_tests.rs
+@@ -216,6 +216,7 @@ fn rest_group_toggles_edits_draft_commits_via_apply_and_undoes() {
+     set_row_number(&mut h, "Rest allowance", "0.1");
+ 
+     let want = RestParams {
++        source: Default::default(),
+         previous_tool_diameter: 10.0,
+         previous_corner_radius: 1.5,
+         previous_stock_to_leave: 0.25,
+@@ -386,6 +387,7 @@ fn rest_group_auto_note_shows_waterline_when_rest_is_on() {
+     let mut h_saved = page(opened_pocket(
+         PocketStrategy::Auto,
+         Some(RestParams {
++            source: Default::default(),
+             previous_tool_diameter: 8.0,
+             previous_corner_radius: 0.0,
+             previous_stock_to_leave: 0.0,
+@@ -399,3 +401,6 @@ fn rest_group_auto_note_shows_waterline_when_rest_is_on() {
+     );
+     assert!(h_saved.query_by_label_contains("Auto -> Zigzag").is_none());
+ }
++
++#[path = "rest_source_tests.rs"]
++mod source;
+diff --git a/crates/ui/src/egui_app/rest_source_tests.rs b/crates/ui/src/egui_app/rest_source_tests.rs
+new file mode 100644
+index 000000000..1e35823a3
+--- /dev/null
++++ b/crates/ui/src/egui_app/rest_source_tests.rs
+@@ -0,0 +1,62 @@
++//! #2033: the "Rest stock from" row of the Rest machining group. The
++//! previous-operations mode hides the previous tool rows, keeps the
++//! allowance, and commits through `EditOperationParams` on Apply.
++//! Provenance: our own page law over `camcraft_app::machining2d::RestSource`.
++
++use camcraft_app::machining2d::RestSource;
++
++use super::*;
++
++const TOOL_ROWS: [&str; 3] = ["Prev. tool Ø", "Prev. corner rad.", "Prev. stock left"];
++
++fn entered() -> RestParams {
++    RestParams {
++        source: RestSource::EnteredTool,
++        previous_tool_diameter: 8.0,
++        previous_corner_radius: 0.0,
++        previous_stock_to_leave: 0.0,
++        allowance: 0.0,
++    }
++}
++
++#[test]
++fn the_source_row_switches_the_mode_hides_the_tool_rows_and_commits_on_apply() {
++    let mut h = page(opened_pocket(PocketStrategy::Auto, Some(entered())));
++    h.run();
++    assert_eq!(h.query_all_by_label("Rest stock from").count(), 1, "the mode row shows while rest is on");
++    for row in TOOL_ROWS {
++        assert!(h.query_by_label(row).is_some(), "{row} shows for the entered tool");
++    }
++
++    on_row(&h, "Rest stock from", Role::ComboBox).click();
++    h.run();
++    h.get_by_label("Previous operations").click();
++    h.run();
++    assert_eq!(draft_rest(h.state()).map(|r| r.source), Some(RestSource::PreviousOperations));
++    assert_eq!(live_rest(h.state()), Some(entered()), "the mode waits for Apply");
++    for row in TOOL_ROWS {
++        assert!(h.query_by_label(row).is_none(), "{row} hides: the previous operations are read, not a tool");
++    }
++    assert!(h.query_by_label("Rest allowance").is_some(), "the allowance stays");
++
++    click_apply(&mut h);
++    let want = RestParams { source: RestSource::PreviousOperations, ..entered() };
++    assert_eq!(live_rest(h.state()), Some(want), "Apply commits the mode");
++    let st = h.state_mut();
++    assert!(st.history.undo(&st.world));
++    assert_eq!(live_rest(st), Some(entered()), "undo restores the entered tool");
++}
++
++#[test]
++fn the_previous_operations_mode_applies_without_a_previous_tool() {
++    // No previous tool at all (0 mm, not larger than the 4 mm tool).
++    let stored = RestParams { source: RestSource::PreviousOperations, previous_tool_diameter: 0.0, ..entered() };
++    let mut h = page(opened_pocket(PocketStrategy::Auto, Some(stored)));
++    h.run();
++    for row in TOOL_ROWS {
++        assert!(h.query_by_label(row).is_none(), "{row} is hidden on a stored previous-operations pocket");
++    }
++    set_row_number(&mut h, "Rest allowance", "0.2");
++    click_apply(&mut h);
++    assert_eq!(live_rest(h.state()), Some(RestParams { allowance: 0.2, ..stored }));
++}
+diff --git a/crates/ui/src/egui_app/tests/guide_images.rs b/crates/ui/src/egui_app/tests/guide_images.rs
+index 4c42c43c6..7ceb2682f 100644
+--- a/crates/ui/src/egui_app/tests/guide_images.rs
++++ b/crates/ui/src/egui_app/tests/guide_images.rs
+@@ -394,7 +394,7 @@ fn guide_pocket_variants_preserve_rest_parameters() {
+     camcraft_app::project::load_noted(&world, &workspace_root().join("examples/first-part.camproj")).unwrap();
+     let entity = model::find_by_name(&world, "2D Pocket1").unwrap();
+     let mut base = model::operation_of(&world, &entity).unwrap().params;
+-    for expected in [None, Some(RestParams { previous_tool_diameter: 12.0,
++    for expected in [None, Some(RestParams { source: Default::default(), previous_tool_diameter: 12.0,
+         previous_corner_radius: 1.0, previous_stock_to_leave: 0.2, allowance: 0.1 })] {
+         let OpParams::Pocket { rest, .. } = &mut base else { panic!("guide pocket"); };
+         *rest = expected;
+diff --git a/docs/decisions/2033-rest-previous-ops.md b/docs/decisions/2033-rest-previous-ops.md
+new file mode 100644
+index 000000000..6868963b6
+--- /dev/null
++++ b/docs/decisions/2033-rest-previous-ops.md
+@@ -0,0 +1,87 @@
++## #2033 - 2D rest machining reads the stock of the previous operations
++
++**What was decided**
++
++- The rest group of the 2D Pocket has a mode, `RestSource`: `EnteredTool`
++  (the default, the behaviour of #1489) or `PreviousOperations`. The mode is
++  one field of `RestParams`. It rides the existing `EditOperationParams`
++  command, the project key `rest.source` and the MCP `edit_operation`
++  parameter. A file without the key reads as the entered tool.
++- The two modes never mix. `rest_pocket` and `rest_plan` refuse a group in
++  `PreviousOperations` mode by name. `rest_pocket_previous` refuses a group in
++  `EnteredTool` mode by name. No path falls back to the entered tool.
++- The stock is the grid that `rest::prior_state` already builds for the 3D
++  Pocket: the setup's stock, cut by the cached paths of the earlier
++  operations in program order, each with its own tool shape (flat, ball,
++  bull-nose, cone). No new stock backend is added (#586 and #637 stay apart).
++- The motion crate builds a `RestStock` (the contract of #2031) from the grid:
++  one `StockFloor` for each cut depth of the Pocket's level ladder.
++  - A column stands at a cut depth when its top is more than 1e-6 mm above it.
++    A floor allowance of the earlier operation is material. A wall allowance
++    is material, because those columns were not cut.
++  - The standing columns grow by one cell diagonal. The grid samples the
++    stock, so material thinner than a cell beside a standing column is not
++    proved absent.
++  - A column with no readable top (NaN) makes the whole pocket uncertain.
++    The part of the pocket outside the grid is uncertain. Uncertain stands.
++- The rest area is the union of the standing material over all cut depths.
++  The grid is a height field, so this union is the reading at the deepest
++  cut. A roughing pass that stops above the floor leaves the whole pocket,
++  and the path says so in a note.
++- The passes are the entered-tool mode's own passes (`emit_rest`): rings,
++  offset rings or zigzag rows. Each move below the top of the cut is a feed
++  or a plunge. A rest area that is too large costs air cuts, never a rapid
++  into stock.
++- The stock must be established. Generation refuses by name when an earlier
++  operation of the setup has no toolpath, has a stale toolpath, or is
++  suppressed with a cut on record. A tilted Pocket is refused at the edit and
++  again at generation.
++- No earlier cut at all is not a refusal. The stock is then known (it is
++  uncut), the whole pocket is cut, and a note says it.
++- Invalidation uses the existing program-ahead digest (`rest::prior_digest`),
++  which each unposed operation already has in its stamp. A changed path,
++  tool, depth or order of an earlier operation makes the rest pass stale.
++  The stamp of the Pocket gets one byte (0xD8) only in the new mode.
++- A suppressed earlier operation does not change the digest. Two existing or
++  new refusals cover it: generation refuses in this mode, and the post gate
++  (`posting_suppressed`) refuses a path that was generated against a
++  suppressed cut.
++
++**Why**
++
++- The entered tool is no proof. A typed diameter says nothing about the depth
++  that the earlier operation reached (#1490 item 3).
++- The carried-stock infrastructure already decides the order, the tool
++  shapes, the carry across setups and the refusals. A second reading of
++  "what was cut before" could disagree with the post.
++- One conservative rest area for all levels keeps the proven pocket passes
++  and the level ladder unchanged.
++
++**Considered and dropped**
++
++- A separate field on `OpParams::Pocket` for the mode. It changes each Pocket
++  literal in the repository. A field of `RestParams` changes eleven.
++- A different rest area for each level. The pocket emitter takes one set of
++  passes for all levels. It needs a new level walk. The cost of the union is
++  air cuts on the upper levels when only the lower levels have material.
++- A film tolerance of one cell (as `rest2d` drops its 0.02 mm film). It
++  removes a band along each wall from the rest area that the grid cannot
++  prove absent. Consequence of the strict reading: in this mode the rest pass
++  follows each wall that an earlier tool rode, about 1.5 cells wide.
++- Lifting the Adaptive refusal with `rest_adaptive`. The 2D Pocket's Adaptive
++  strategy is retired (`POCKET_ADAPTIVE_RETIRED`), so no door leads to it
++  from this operation. `rest_stock_from_columns` is public for a later
++  consumer.
++- A stamp term for suppression of an earlier operation. The post gate and
++  the generation refusal already hold the result.
++- To leave a suppressed earlier cut out of the simulation and continue. It
++  needs a second walk beside `rest::ahead_of`, which keeps suppressed cuts by
++  design. The refusal is simpler and says what to do.
++
++**Cost to change later**
++
++- The per-level rest area needs a level-aware emitter; `RestStock` already
++  holds one floor for each level, so the stock side does not change.
++- When the stock moves to the field engine (#586, #637), `Columns` already
++  reads the two engines. The NaN rule matters more there: a field column
++  whose march cannot finish answers NaN.
+
+From ebab595344f1a2d8074a4eb7588b8aa7f8691978 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Sat, 21 Nov 2026 19:51:19 +0100
+Subject: [PATCH 2/2] test(motion): place rest stock fixtures behind the test
+ seam
+
+Keep the unchanged rest stock fixtures under a tests directory. Extend the stock seam gate map to cover the previous-operation rest reader.
+
+Refs #2033
+---
+ crates/motion/src/machining2d/rest_prior.rs                    | 2 +-
+ .../machining2d/{rest_prior_tests.rs => tests/rest_prior.rs}   | 0
+ crates/motion/tests/stock_seam.rs                              | 3 ++-
+ 3 files changed, 3 insertions(+), 2 deletions(-)
+ rename crates/motion/src/machining2d/{rest_prior_tests.rs => tests/rest_prior.rs} (100%)
+
+diff --git a/crates/motion/src/machining2d/rest_prior.rs b/crates/motion/src/machining2d/rest_prior.rs
+index a6daf4d85..e8485c855 100644
+--- a/crates/motion/src/machining2d/rest_prior.rs
++++ b/crates/motion/src/machining2d/rest_prior.rs
+@@ -254,5 +254,5 @@ pub fn rest_pocket_previous_with_relief(
+ }
+ 
+ #[cfg(test)]
+-#[path = "rest_prior_tests.rs"]
++#[path = "tests/rest_prior.rs"]
+ mod tests;
+diff --git a/crates/motion/src/machining2d/rest_prior_tests.rs b/crates/motion/src/machining2d/tests/rest_prior.rs
+similarity index 100%
+rename from crates/motion/src/machining2d/rest_prior_tests.rs
+rename to crates/motion/src/machining2d/tests/rest_prior.rs
+diff --git a/crates/motion/tests/stock_seam.rs b/crates/motion/tests/stock_seam.rs
+index 01e8a0237..c8c2e4893 100644
+--- a/crates/motion/tests/stock_seam.rs
++++ b/crates/motion/tests/stock_seam.rs
+@@ -8,7 +8,8 @@
+ //! `origin_approach`'s; no vendor material.
+ //!
+ //! Gate map (M7.3): covers camcraft_motion::machining3d,
+-//! camcraft_motion::multiaxis, camcraft_motion::quality.
++//! camcraft_motion::multiaxis, camcraft_motion::quality,
++//! camcraft_motion::machining2d::rest_prior.
+ 
+ #[test]
+ fn motion_names_no_dexel_outside_tests() {
