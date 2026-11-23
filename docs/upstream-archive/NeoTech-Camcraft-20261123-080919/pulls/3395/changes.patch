@@ -1,0 +1,2588 @@
+From 20ef111cd41597ce7f0081d43e07ae88937c7574 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 03:48:22 -0800
+Subject: [PATCH 1/6] feat(text): place typed text in a TrueType outline font
+ as closed shapes
+
+Add camcraft_geometry::outline_text: a bounds-checked TrueType reader
+(cmap 4/12, loca, glyf simple and composite, hmtx, OS/2 cap height),
+quadratic contours flattened within 0.005 mm, and a sketch of closed
+chains on the layer "text". Unreadable fonts, CFF outlines, font
+collections, missing glyphs and crossing outlines are refused by name.
+
+Add the undoable InsertOutlineText command and the MCP tool
+insert_outline_text. The profile keeps the shapes, not the font, and
+2D operations take it as their source like a DXF profile.
+
+Fixes #3072
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../app/src/commands/insert_outline_text.rs   | 170 ++++++++
+ crates/app/src/commands/mod.rs                |   3 +
+ crates/app/src/mcp/mod.rs                     |   2 +
+ crates/app/src/mcp/outline_text_tools.rs      |  67 +++
+ crates/app/src/mcp/tools.rs                   |   1 +
+ crates/app/tests/insert_outline_text.rs       | 207 +++++++++
+ crates/geometry/src/lib.rs                    |   2 +
+ crates/geometry/src/outline_text/mod.rs       | 254 +++++++++++
+ .../geometry/src/outline_text/sample_font.rs  | 193 +++++++++
+ crates/geometry/src/outline_text/ttf.rs       | 400 ++++++++++++++++++
+ crates/geometry/tests/outline_text.rs         | 111 +++++
+ docs/agents/mcp-tools.md                      |   3 +-
+ site/content/guide/automate/mcp.md            |   1 +
+ 13 files changed, 1413 insertions(+), 1 deletion(-)
+ create mode 100644 crates/app/src/commands/insert_outline_text.rs
+ create mode 100644 crates/app/src/mcp/outline_text_tools.rs
+ create mode 100644 crates/app/tests/insert_outline_text.rs
+ create mode 100644 crates/geometry/src/outline_text/mod.rs
+ create mode 100644 crates/geometry/src/outline_text/sample_font.rs
+ create mode 100644 crates/geometry/src/outline_text/ttf.rs
+ create mode 100644 crates/geometry/tests/outline_text.rs
+
+diff --git a/crates/app/src/commands/insert_outline_text.rs b/crates/app/src/commands/insert_outline_text.rs
+new file mode 100644
+index 000000000..36c273a3b
+--- /dev/null
++++ b/crates/app/src/commands/insert_outline_text.rs
+@@ -0,0 +1,170 @@
++//! InsertOutlineText (#3072): make a typed string in a TrueType outline
++//! font into closed shapes at construction, place them as a profile on
++//! the top face of a setup's stock on apply, remove the profile on
++//! invert. The shapes take a pocket, a V-carve or a cut-out.
++//!
++//! Provenance: our own command over this repo's outline reader
++//! (`camcraft_geometry::outline_text`, from the public OpenType
++//! specification); the pattern is `InsertText`'s. No vendor material
++//! consulted.
++//!
++//! ## The laws this command keeps
++//!
++//! - **Everything is refused at construction.** A font file that cannot
++//!   be read, is too large or has CFF outlines, an empty text, a
++//!   character the font does not have, outlines that cross or touch, a
++//!   height or spacing outside the limits, a placement that is not
++//!   finite, a setup that does not exist, a setup without a stock and a
++//!   name in use never reach the history.
++//! - **The text is a profile of closed shapes.** It is the same `Sketch`
++//!   entity that a DXF drawing gives, in millimetres, on the layer
++//!   `text`, and it moves with `MoveSketch`. The font file is read once:
++//!   the profile keeps the shapes, not the font.
++//! - **`apply` and `invert` are pure writes**, keyed by name.
++
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use flecs_ecs::prelude::World;
++
++use crate::commands::{Command, CommandError};
++use crate::model;
++use crate::schema::{LEGACY_WCS_NAMES, Location, STOCK_NAME, Sketch};
++use crate::sketch;
++use camcraft_geometry::outline_text::{self, OutlineSpec, MAX_FONT_BYTES};
++
++/// What the caller states for a text in an outline font.
++#[derive(Clone, Debug, PartialEq)]
++pub struct OutlineTextOptions {
++    /// The TrueType font file (.ttf, or .otf with TrueType outlines).
++    pub font: PathBuf,
++    /// The string, on one line.
++    pub text: String,
++    /// The cap height, mm.
++    pub height: f64,
++    /// The extra gap between two characters, mm; 0 is the font's own gap.
++    pub letter_spacing: f64,
++    /// The left end of the baseline on the stock's top face, mm from the
++    /// stock origin.
++    pub x: f64,
++    pub y: f64,
++    /// The turn of the baseline about the face normal, degrees,
++    /// counterclockwise seen from above.
++    pub angle_deg: f64,
++    /// The profile's name; `None` is `Text <string>`, made unique.
++    pub name: Option<String>,
++}
++
++pub struct InsertOutlineText {
++    name: String,
++    at: Location,
++    sketch: Sketch,
++}
++
++impl InsertOutlineText {
++    /// Read the font, check `options` and make the shapes now, for
++    /// `setup` (`None`: the active setup).
++    pub fn new(world: &World, setup: Option<&str>, options: &OutlineTextOptions) -> Result<Self, CommandError> {
++        let font = read_font(&options.font)?;
++        Self::with_font(world, setup, &font, options)
++    }
++
++    /// [`InsertOutlineText::new`] over font bytes already in hand; the
++    /// path in `options` only names the font in a refusal.
++    pub fn with_font(
++        world: &World,
++        setup: Option<&str>,
++        font: &[u8],
++        options: &OutlineTextOptions,
++    ) -> Result<Self, CommandError> {
++        let setup = match setup {
++            Some(name) if !crate::setup::exists(world, name) => return Err(CommandError::NotFound(name.to_owned())),
++            Some(name) => Some(name.to_owned()),
++            None => crate::setup::active(world),
++        };
++        if sketch::face_frame(world, setup.as_deref()).is_none() {
++            return Err(CommandError::Invalid(format!(
++                "{} has no stock - make a stock first, then place the text on it",
++                setup.as_deref().map_or_else(|| "the document".to_owned(), |s| format!("setup '{s}'"))
++            )));
++        }
++        let OutlineTextOptions { x, y, angle_deg, .. } = *options;
++        if !(x.is_finite() && y.is_finite() && angle_deg.is_finite()) {
++            return Err(CommandError::Invalid("the text placement must be finite".to_owned()));
++        }
++        if x.abs() > sketch::MAX_OFFSET || y.abs() > sketch::MAX_OFFSET {
++            return Err(CommandError::Invalid(format!(
++                "the text placement is more than {} mm from the stock origin",
++                sketch::MAX_OFFSET
++            )));
++        }
++        let spec = OutlineSpec { font, text: &options.text, height: options.height, letter_spacing: options.letter_spacing };
++        let data = outline_text::sketch(&spec).map_err(|e| match e {
++            outline_text::OutlineTextError::Font(_) | outline_text::OutlineTextError::FontTooLarge { .. } => {
++                CommandError::Invalid(format!("{}: {e}", options.font.display()))
++            }
++            other => CommandError::Invalid(other.to_string()),
++        })?;
++        let name = text_name(world, &options.text, options.name.as_deref())?;
++        // One turn is every turn: keep the angle in (-180, 180], as `MoveSketch` does.
++        let angle = 180.0 - (180.0 - angle_deg).rem_euclid(360.0);
++        Ok(InsertOutlineText { name, at: sketch::on_face(x, y, angle), sketch: Sketch { setup, data: Arc::new(data) } })
++    }
++
++    /// The name the profile lands under.
++    #[must_use]
++    pub fn name(&self) -> &str {
++        &self.name
++    }
++
++    /// The setup the profile joins (`None` in a document without setups).
++    #[must_use]
++    pub fn setup(&self) -> Option<&str> {
++        self.sketch.setup.as_deref()
++    }
++}
++
++fn read_font(path: &Path) -> Result<Vec<u8>, CommandError> {
++    let read_err = |e: std::io::Error| CommandError::Invalid(format!("cannot read the font {}: {e}", path.display()));
++    let cap = u64::try_from(MAX_FONT_BYTES).unwrap_or(u64::MAX);
++    if std::fs::metadata(path).map_err(read_err)?.len() > cap {
++        return Err(CommandError::Invalid(format!("the font {} is larger than the {cap} byte limit", path.display())));
++    }
++    std::fs::read(path).map_err(read_err)
++}
++
++/// A stated name must be free and must not be a setup-furniture name. A
++/// name made from the text is made unique (`Text A1`, `Text A1 (2)`).
++fn text_name(world: &World, text: &str, stated: Option<&str>) -> Result<String, CommandError> {
++    let reserved = |n: &str| n.eq_ignore_ascii_case(STOCK_NAME) || LEGACY_WCS_NAMES.contains(&n) || crate::setup::is_furniture_shape(n);
++    if let Some(name) = stated {
++        if name.trim().is_empty() || reserved(name) {
++            return Err(CommandError::Invalid(format!("'{name}' is not a usable name for a text profile")));
++        }
++        if model::find_by_name(world, name).is_some() {
++            return Err(CommandError::NameConflict(name.to_owned()));
++        }
++        return Ok(name.to_owned());
++    }
++    let stem = format!("Text {}", text.trim());
++    sketch::free_name(world, &stem).ok_or(CommandError::NameConflict(stem))
++}
++
++impl Command for InsertOutlineText {
++    fn apply(&self, world: &World) {
++        if model::find_by_name(world, &self.name).is_some() {
++            return; // already there (an idempotent redo path)
++        }
++        let entity = model::spawn(world, &self.name);
++        model::set_transform(world, &entity, self.at);
++        entity.entity_view(world).set(self.sketch.clone());
++    }
++
++    fn invert(&self, world: &World) {
++        // Name-keyed, and only ever a profile: finding nothing, or
++        // something else under the name, must no-op, not delete it.
++        if let Some((entity, _)) = sketch::find(world, &self.name) {
++            model::remove(world, &entity);
++        }
++    }
++}
+diff --git a/crates/app/src/commands/mod.rs b/crates/app/src/commands/mod.rs
+index f5af4224a..fe2a1d451 100644
+--- a/crates/app/src/commands/mod.rs
++++ b/crates/app/src/commands/mod.rs
+@@ -24,6 +24,8 @@ pub mod import_dxf;
+ pub mod move_sketch;
+ // #2679: typed text placed as a profile of engraving strokes.
+ pub mod insert_text;
++// #3072: typed text in an outline font placed as a profile of closed shapes.
++pub mod insert_outline_text;
+ // #339 slice 6: a fixture library entry placed into a setup.
+ pub mod insert_fixture;
+ // #744: DXF/profile fixtures and STEP profile derivation.
+@@ -110,6 +112,7 @@ pub use import_fixture::ImportFixture;
+ pub use import_dxf::{DxfOptions, ImportDxf};
+ pub use import_model::ImportModel;
+ pub use insert_text::{InsertText, TextOptions};
++pub use insert_outline_text::{InsertOutlineText, OutlineTextOptions};
+ pub use move_sketch::MoveSketch;
+ pub use insert_fixture::InsertFixture;
+ pub use profile_fixture::{DeriveFixtureProfile, InsertProfileFixture, SetFixtureProfile};
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 4946df4cd..ac7255cf2 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -46,6 +46,8 @@ mod live;
+ mod model_tools;
+ // #1862: DXF profiles placed on a setup's stock.
+ mod sketch_tools;
++// #3072: typed text in an outline font as a profile of closed shapes.
++mod outline_text_tools;
+ // #45: an operation's display name and its place in its setup.
+ mod machine_tools;
+ mod order_tools;
+diff --git a/crates/app/src/mcp/outline_text_tools.rs b/crates/app/src/mcp/outline_text_tools.rs
+new file mode 100644
+index 000000000..bc473304d
+--- /dev/null
++++ b/crates/app/src/mcp/outline_text_tools.rs
+@@ -0,0 +1,67 @@
++//! The MCP outline-text tool (#3072): `insert_outline_text` places a
++//! typed string in a TrueType outline font as a profile of closed shapes
++//! through the undoable `InsertOutlineText`. One History step; every
++//! refusal is the command's own text, returned as a tool error.
++//!
++//! Provenance: our own tool surface over this repo's `InsertOutlineText`
++//! command; no vendor material consulted.
++
++use super::setup_tools::{cmd_err, obj, opt_nums};
++use super::tools::{opt_str, req_str, Tool};
++use crate::commands::{InsertOutlineText, OutlineTextOptions};
++use crate::script::{dxf, Env};
++
++use serde_json::{json, Map, Value};
++
++pub(super) const TOOLS: &[Tool] = &[Tool {
++    name: "insert_outline_text",
++    description: "Place a typed string in a TrueType outline font as a profile of closed shapes on the top face of a setup's stock - the active setup by default. The shapes take a pocket, a V-carve or a cut-out (insert_text gives single-line engraving strokes instead). font is the path of a .ttf file, or an .otf file with TrueType outlines; the profile keeps the shapes, not the font. height is the font's cap height in mm (0.5 to 1000). position [x, y] is the left end of the baseline in mm from the stock origin (default [0, 0]); angle turns the baseline in degrees about the face normal, counterclockwise seen from above (default 0). letter_spacing adds a gap between characters in mm (default 0). The shapes are lines in mm on the layer \"text\"; a letter's hole (O, A) is a hole of its shape. move_dxf_profile moves the profile, and get_job lists it under \"profiles\". One undo step. Refused by name: a font that cannot be read, a font with CFF outlines or a font collection, an empty text, a character the font does not have, outlines that cross or touch, a height or spacing outside the limits, a setup with no stock, an unknown setup, a name in use.",
++    schema: s_insert_outline_text,
++    run: insert_outline_text,
++}];
++
++fn insert_outline_text(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let num = |key: &str| match a.get(key) {
++        None | Some(Value::Null) => Ok(None),
++        Some(v) => v.as_f64().map(Some).ok_or_else(|| format!("\"{key}\" must be a number, got {v}")),
++    };
++    let [x, y] = opt_nums::<2>(a, "position")?.unwrap_or_default();
++    let options = OutlineTextOptions {
++        font: req_str(a, "font")?.into(),
++        text: req_str(a, "text")?.to_owned(),
++        height: num("height")?.ok_or("\"height\" is required")?,
++        letter_spacing: num("letter_spacing")?.unwrap_or(0.0),
++        x,
++        y,
++        angle_deg: num("angle")?.unwrap_or(0.0),
++        name: opt_str(a, "name")?.map(str::to_owned),
++    };
++    let cmd = InsertOutlineText::new(&env.world, opt_str(a, "setup")?, &options).map_err(cmd_err)?;
++    let name = cmd.name().to_owned();
++    env.history.execute(&env.world, cmd);
++    let mut out = dxf::profile_view(&env.world, &name).ok_or_else(|| format!("the text profile '{name}' did not land"))?;
++    out["text"] = json!(options.text);
++    out["height"] = json!(options.height);
++    out["summary"] = json!(format!(
++        "'{name}' placed on the stock top: \"{}\" at a cap height of {} mm, {} closed shapes",
++        options.text, options.height, out["chains"]["closed"],
++    ));
++    Ok(out)
++}
++
++fn s_insert_outline_text() -> Value {
++    obj(
++        json!({
++            "font": { "type": "string", "description": "The TrueType font file: .ttf, or .otf with TrueType outlines." },
++            "text": { "type": "string", "description": "The string, on one line." },
++            "height": { "type": "number", "description": "The font's cap height in mm (0.5 to 1000)." },
++            "position": { "type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2,
++                "description": "[x, y] of the left end of the baseline on the stock's top face, in mm from the stock origin (default [0, 0])." },
++            "angle": { "type": "number", "description": "Turn of the baseline about the face normal in degrees, counterclockwise seen from above (default 0)." },
++            "letter_spacing": { "type": "number", "description": "Extra gap between two characters in mm (default 0; 0 to 1000)." },
++            "setup": { "type": "string", "description": "The setup whose stock takes the text; omitted: the active setup." },
++            "name": { "type": "string", "description": "The profile's name; omitted: \"Text <string>\", made unique." }
++        }),
++        &["font", "text", "height"],
++    )
++}
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 95effd8c7..fc5ace75e 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -94,6 +94,7 @@ pub(super) fn all() -> impl Iterator<Item = &'static Tool> {
+         .chain(super::tool_number_tools::TOOLS)
+         .chain(super::post_options_tools::TOOLS)
+         .chain(super::sketch_tools::TOOLS)
++        .chain(super::outline_text_tools::TOOLS)
+         .chain(super::holder_dxf_tools::TOOLS)
+ }
+ 
+diff --git a/crates/app/tests/insert_outline_text.rs b/crates/app/tests/insert_outline_text.rs
+new file mode 100644
+index 000000000..f65add1c7
+--- /dev/null
++++ b/crates/app/tests/insert_outline_text.rs
+@@ -0,0 +1,207 @@
++//! #3072: typed text in a TrueType outline font becomes a profile of
++//! closed shapes on the top face of a setup's stock - through the
++//! undoable `InsertOutlineText` and through the MCP tool
++//! `insert_outline_text`. The placement, undo and redo, the `.camproj`
++//! round trip, the refusals by name and a 2D Pocket and a 2D Contour
++//! generated on the shapes are pinned here.
++//!
++//! Provenance: our own tests over our own command and tool, on the
++//! generated font of `camcraft_geometry::outline_text::sample_font`.
++//!
++//! Gate map: covers app::commands (InsertOutlineText), app::mcp
++//! (outline_text_tools insert_outline_text), app::project (sketch_dto),
++//! app::sketch.
++
++use std::path::PathBuf;
++
++use flecs_ecs::prelude::World;
++use serde_json::{json, Value};
++
++use camcraft_app::commands::{
++    Command, CommandError, CreateSetup, History, InsertOutlineText, OutlineTextOptions, SetStock,
++};
++use camcraft_app::geometry::Point3;
++use camcraft_app::mcp::Server;
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::world::new_world;
++use camcraft_app::{project, sketch};
++use camcraft_geometry::outline_text::sample_font::sample_font;
++use camcraft_geometry::sketch_chains::LoopRole;
++
++fn font_file(tag: &str) -> PathBuf {
++    let mut dir = std::env::temp_dir();
++    dir.push(format!("camcraft-outline-text-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let path = dir.join("sample.ttf");
++    std::fs::write(&path, sample_font()).expect("write the font");
++    path
++}
++
++fn options(font: &PathBuf, text: &str) -> OutlineTextOptions {
++    OutlineTextOptions {
++        font: font.clone(),
++        text: text.into(),
++        height: 7.0,
++        letter_spacing: 0.0,
++        x: 0.0,
++        y: 0.0,
++        angle_deg: 0.0,
++        name: None,
++    }
++}
++
++fn run(world: &World, history: &mut History, cmd: Result<impl Command + 'static, CommandError>, what: &str) {
++    history.execute(world, cmd.unwrap_or_else(|e| panic!("{what}: {e}")));
++}
++
++/// One setup `Plate` with a 100 x 60 x 10 stock whose origin is at Z 5.
++fn plate_job() -> (World, History) {
++    let world = new_world();
++    let mut history = History::default();
++    run(&world, &mut history, CreateSetup::new(&world, Some("Plate"), None), "Plate");
++    let at = Location { pos: Point3::new(0.0, 0.0, 5.0), ..Default::default() };
++    run(&world, &mut history, SetStock::new(&world, StockShape::Box { dx: 100.0, dy: 60.0, dz: 10.0 }, at), "stock");
++    (world, history)
++}
++
++fn refusal(world: &World, o: &OutlineTextOptions) -> String {
++    match InsertOutlineText::new(world, None, o) {
++        Ok(_) => panic!("{o:?} must be refused"),
++        Err(e) => e.to_string(),
++    }
++}
++
++#[test]
++fn outline_text_lands_as_closed_shapes_and_undoes() {
++    let font = font_file("lands");
++    let (world, mut history) = plate_job();
++    let o = OutlineTextOptions { x: 12.0, y: 20.0, angle_deg: 90.0, ..options(&font, "HOD") };
++    run(&world, &mut history, InsertOutlineText::new(&world, None, &o), "text");
++
++    let (entity, profile) = sketch::find(&world, "Text HOD").expect("the text is a profile");
++    assert_eq!(profile.setup.as_deref(), Some("Plate"));
++    assert_eq!(profile.data.layers(), ["text"]);
++    let chains = profile.data.chains();
++    assert!(chains.open.is_empty() && chains.rejected.is_empty(), "only closed shapes");
++    let holes = chains.closed.iter().filter(|c| matches!(c.nesting, Ok(n) if n.role == LoopRole::Hole)).count();
++    assert_eq!((chains.closed.len(), holes), (4, 1), "H, O with its hole, D");
++    let (lo, hi) = profile.data.bounds().expect("bounds");
++    assert_eq!((lo.x, lo.y, hi.y), (0.0, 0.0, 7.0), "the baseline origin and the cap height");
++    assert_eq!(sketch::world_pose(&world, &entity).map(|p| p.pos), Some(Point3::new(12.0, 20.0, 15.0)));
++
++    assert!(history.undo(&world), "undo the text");
++    assert!(sketch::sketches(&world).is_empty(), "undo removes the profile");
++    assert!(history.redo(&world));
++    let (_, back) = sketch::find(&world, "Text HOD").expect("redo puts the text back");
++    assert_eq!(back, profile);
++}
++
++#[test]
++fn bad_fonts_and_bad_text_are_refused_by_name_and_nothing_lands() {
++    let font = font_file("refusals");
++    let (world, _history) = plate_job();
++    let missing = font.with_file_name("missing.ttf");
++    assert!(refusal(&world, &options(&missing, "H")).contains("cannot read the font"));
++    let junk = font.with_file_name("junk.ttf");
++    std::fs::write(&junk, b"this is not a font").expect("write");
++    let why = refusal(&world, &options(&junk, "H"));
++    assert!(why.contains("junk.ttf") && why.contains("not a TrueType or OpenType font"), "{why}");
++    let cff = font.with_file_name("cff.otf");
++    std::fs::write(&cff, b"OTTO\0\0\0\0\0\0\0\0").expect("write");
++    assert!(refusal(&world, &options(&cff, "H")).contains("CFF (PostScript) outlines"));
++    assert!(refusal(&world, &options(&font, "HZ")).contains("'Z' at character 2 is not in the font"));
++    assert!(refusal(&world, &options(&font, "X")).contains("the text outlines cross or touch"));
++    assert!(refusal(&world, &options(&font, " ")).contains("the text is empty"));
++    let why = refusal(&world, &OutlineTextOptions { x: f64::NAN, ..options(&font, "H") });
++    assert!(why.contains("placement must be finite"), "{why}");
++    let why = refusal(&world, &OutlineTextOptions { name: Some("Stock".into()), ..options(&font, "H") });
++    assert!(why.contains("'Stock' is not a usable name"), "{why}");
++    assert!(sketch::sketches(&world).is_empty(), "a refused text leaves the document as it was");
++    let bare = new_world();
++    assert!(refusal(&bare, &options(&font, "H")).contains("has no stock - make a stock first"));
++}
++
++#[test]
++fn an_outline_text_profile_saves_and_loads_with_its_shapes() {
++    let font = font_file("save");
++    let (world, mut history) = plate_job();
++    let o = OutlineTextOptions { x: -8.0, y: 3.5, angle_deg: -30.0, letter_spacing: 0.75, name: Some("Sign".into()), ..options(&font, "8 Do") };
++    run(&world, &mut history, InsertOutlineText::new(&world, Some("Plate"), &o), "text");
++    let text = project::save_text(&world).expect("the document saves");
++    let again = new_world();
++    project::open(&again, &text).unwrap_or_else(|e| panic!("the file opens: {e}"));
++    let (_, before) = sketch::find(&world, "Sign").expect("profile");
++    let (_, after) = sketch::find(&again, "Sign").expect("the text profile loads");
++    assert_eq!(after, before, "shapes, layer, units, tolerance, chains and summary");
++    assert_eq!(project::save_text(&again).expect("saves again"), text, "save, load, save: the same bytes");
++}
++
++struct Client {
++    server: Server,
++    next: i64,
++}
++
++impl Client {
++    fn call(&mut self, name: &str, args: Value) -> (bool, Value) {
++        let id = self.next;
++        self.next += 1;
++        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
++        let reply = self.server.handle(&msg).expect("a request gets a response");
++        let result = &reply["result"];
++        let is_err = result["isError"] == json!(true);
++        let body = if is_err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() };
++        (is_err, body)
++    }
++
++    fn ok(&mut self, name: &str, args: Value) -> Value {
++        let (err, body) = self.call(name, args);
++        assert!(!err, "{name} failed: {body}");
++        body
++    }
++
++    fn refused(&mut self, name: &str, args: Value) -> String {
++        let (err, body) = self.call(name, args);
++        assert!(err, "{name} should have refused, got {body}");
++        body.as_str().unwrap_or_default().to_owned()
++    }
++}
++
++#[test]
++fn the_mcp_tool_places_outline_text_for_a_pocket_and_a_contour() {
++    let font = font_file("mcp");
++    let path = font.to_string_lossy().into_owned();
++    let mut c = Client { server: Server::new(), next: 1 };
++    let why = c.refused("insert_outline_text", json!({ "font": path, "text": "HO", "height": 7.0 }));
++    assert!(why.starts_with("insert_outline_text:") && why.contains("has no stock - make a stock first"), "{why}");
++    c.ok("set_stock", json!({ "box": { "dx": 120.0, "dy": 80.0, "dz": 6.0 } }));
++    c.ok("add_tool", json!({ "catalog": "EM-0400-2FL" }));
++
++    let r = c.ok("insert_outline_text", json!({ "font": path, "text": "HO", "height": 7.0, "position": [10.0, 15.0] }));
++    assert_eq!(r["profile"], json!("Text HO"));
++    assert_eq!(r["layers"], json!(["text"]));
++    assert_eq!(r["chains"], json!({ "closed": 3, "open": 0, "rejected": 0 }));
++    assert_eq!(r["bounds"], json!({ "min": [0.0, 0.0], "max": [12.0, 7.0] }), "H advances 6 mm, O is 6 mm wide");
++    let summary = r["summary"].as_str().expect("summary");
++    assert!(summary.contains("\"HO\" at a cap height of 7 mm, 3 closed shapes"), "{summary}");
++    let why = c.refused("insert_outline_text", json!({ "font": path, "text": "HO" }));
++    assert!(why.contains("\"height\" is required"), "{why}");
++    let why = c.refused("insert_outline_text", json!({ "text": "HO", "height": 7.0 }));
++    assert!(why.contains("font"), "{why}");
++
++    // A 2D Pocket and a 2D Contour take the whole text profile as their source: only closed
++    // chains reach them. (A toolpath from profile chains is #1867's work.)
++    for (index, (kind, name)) in [("2D Pocket", "Clear"), ("2D Contour", "Cut")].into_iter().enumerate() {
++        c.ok("add_operation", json!({ "kind": kind, "tool": "EM-0400-2FL", "source": "Text HO", "name": name }));
++        let job = c.ok("get_job", json!({}));
++        let checks = job["operations"][index]["checks_against"].as_str().expect("an operation on a profile states its checks");
++        assert!(checks.contains("'Text HO'") && checks.contains("3 closed, 0 open"), "{checks}");
++    }
++
++    // Undo the two operations, then the text.
++    for _ in 0..3 {
++        c.ok("undo", json!({}));
++    }
++    assert!(c.ok("get_job", json!({}))["profiles"].as_array().is_some_and(Vec::is_empty), "undo removes the text");
++}
+diff --git a/crates/geometry/src/lib.rs b/crates/geometry/src/lib.rs
+index 3c3ec32c4..ae986d8d0 100644
+--- a/crates/geometry/src/lib.rs
++++ b/crates/geometry/src/lib.rs
+@@ -39,3 +39,5 @@ pub mod step_units;
+ pub mod sketch_data;
+ // #2679: typed text as single-line engraving strokes.
+ pub mod stroke_text;
++// #3072: typed text in an outline font as closed shapes.
++pub mod outline_text;
+diff --git a/crates/geometry/src/outline_text/mod.rs b/crates/geometry/src/outline_text/mod.rs
+new file mode 100644
+index 000000000..939227237
+--- /dev/null
++++ b/crates/geometry/src/outline_text/mod.rs
+@@ -0,0 +1,254 @@
++//! Outline text: a typed string in a TrueType outline font made into closed shapes, and into
++//! sketch data that the document places like a DXF drawing - for a pocket, a V-carve or a
++//! cut-out.
++//!
++//! Provenance: our own design for issue 3072. The font tables are read by `ttf` from the public
++//! OpenType specification; a quadratic B-spline contour is flattened to lines by the standard
++//! chord-error bound of a quadratic Bezier curve. No vendor material was consulted.
++//!
++//! Contract. The shapes are in millimetres. The origin is the left end of the baseline, and
++//! `height` is the cap height of the font. Nothing is guessed: a font that cannot be read, a
++//! font with CFF outlines, a character the font does not have, and outlines that cross or
++//! touch are refused by name. The sketch that [`sketch`] returns has only closed chains, each
++//! with a clear nesting, or the call fails. This module has no file I/O and no application
++//! state.
++
++#[doc(hidden)]
++pub mod sample_font;
++mod ttf;
++
++use crate::dxf::{ImportSummary, LayeredPrimitive, Primitive, Unit, Units};
++use crate::geo2d::Point2;
++use crate::sketch_data::{SketchData, SketchError, SourceUnits};
++use crate::stroke_text::{MAX_CHARS, MAX_HEIGHT, MIN_HEIGHT};
++use ttf::{Font, OutlinePoint};
++
++/// The layer of each shape.
++pub const LAYER: &str = "text";
++/// The largest font file that is read, bytes.
++pub const MAX_FONT_BYTES: usize = 32 * 1024 * 1024;
++/// The largest distance of a flattened curve from the true curve, mm.
++pub const CHORD_TOLERANCE: f64 = 0.005;
++/// The join tolerance of the text sketch, mm: far below the chord tolerance, so a short
++/// segment of a small letter is still a segment.
++pub const JOIN_TOLERANCE: f64 = 0.0005;
++/// A flattened point closer than this to the point before it is dropped, mm.
++const MIN_SEGMENT: f64 = 2.0 * JOIN_TOLERANCE;
++/// The most lines that one quadratic piece becomes.
++const MAX_PIECES: usize = 64;
++
++/// A font that cannot be used, by name.
++#[derive(Clone, Debug, PartialEq, thiserror::Error)]
++pub enum FontError {
++    #[error("the file is not a TrueType or OpenType font")]
++    NotAFont,
++    #[error(
++        "the font has CFF (PostScript) outlines: only fonts with TrueType outlines can be read - \
++         pick a .ttf font"
++    )]
++    CffOutlines,
++    #[error("the file is a font collection (.ttc): pick a single font file (.ttf or .otf)")]
++    Collection,
++    #[error("the font file is cut short or an offset in it points past its end")]
++    Truncated,
++    #[error("the font has no '{0}' table")]
++    MissingTable(&'static str),
++    #[error("the font is corrupt: {0}")]
++    Corrupt(&'static str),
++}
++
++#[derive(Clone, Debug, PartialEq, thiserror::Error)]
++pub enum OutlineTextError {
++    #[error("the text is empty: type one or more characters")]
++    Empty,
++    #[error("the text has {chars} characters: the limit is {max}")]
++    TooLong { chars: usize, max: usize },
++    #[error("the text height {height} mm is not usable: state a cap height from 0.5 mm to 1000 mm")]
++    Height { height: f64 },
++    #[error("the letter spacing {spacing} mm is not usable: state 0 mm to 1000 mm")]
++    Spacing { spacing: f64 },
++    #[error("the font file is {bytes} bytes: the limit is {max} bytes")]
++    FontTooLarge { bytes: usize, max: usize },
++    #[error("the font cannot be read: {0}")]
++    Font(#[from] FontError),
++    #[error("{ch:?} at character {position} is not in the font: pick a font that has it")]
++    NoGlyph { ch: char, position: usize },
++    #[error("the text has only spaces in this font: there is no shape to place")]
++    NoShape,
++    /// The outlines cross or touch (an overlap in the font, or letters that run into each
++    /// other), so a pocket or a cut-out of them is not clear.
++    #[error(
++        "the text outlines cross or touch, so the shapes are not clear: {0}. Add letter spacing, \
++         or pick a font whose letters do not overlap"
++    )]
++    Shapes(String),
++}
++
++/// What to write: the font file's bytes, the string, the cap height in mm, and the extra gap
++/// between two characters in mm (0 is the font's own advance).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct OutlineSpec<'a> {
++    pub font: &'a [u8],
++    pub text: &'a str,
++    pub height: f64,
++    pub letter_spacing: f64,
++}
++
++/// Check that `font` is a font this module reads, without a text.
++pub fn check_font(font: &[u8]) -> Result<(), OutlineTextError> {
++    if font.len() > MAX_FONT_BYTES {
++        return Err(OutlineTextError::FontTooLarge { bytes: font.len(), max: MAX_FONT_BYTES });
++    }
++    Font::parse(font)?;
++    Ok(())
++}
++
++/// The closed outlines of `spec` as polylines in millimetres, in reading order. Each polyline
++/// repeats its first point as its last point.
++pub fn outlines(spec: &OutlineSpec) -> Result<Vec<Vec<Point2>>, OutlineTextError> {
++    let OutlineSpec { font, text, height, letter_spacing } = *spec;
++    if text.trim().is_empty() {
++        return Err(OutlineTextError::Empty);
++    }
++    let chars = text.chars().count();
++    if chars > MAX_CHARS {
++        return Err(OutlineTextError::TooLong { chars, max: MAX_CHARS });
++    }
++    if !(height.is_finite() && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height)) {
++        return Err(OutlineTextError::Height { height });
++    }
++    if !(letter_spacing.is_finite() && (0.0..=MAX_HEIGHT).contains(&letter_spacing)) {
++        return Err(OutlineTextError::Spacing { spacing: letter_spacing });
++    }
++    check_font(font)?;
++    let font = Font::parse(font)?;
++    let scale = height / font.cap_height()?;
++    let space = font.glyph_id(' ')?;
++    let mut out = Vec::new();
++    let mut pen = 0.0_f64;
++    for (index, ch) in text.chars().enumerate() {
++        let gid = match font.glyph_id(ch)? {
++            Some(g) => g,
++            // A font that has no space glyph still spaces a word: a quarter of the em.
++            None if ch == ' ' && space.is_none() => {
++                pen += 0.25 * f64::from(font.units_per_em) * scale + letter_spacing;
++                continue;
++            }
++            None => return Err(OutlineTextError::NoGlyph { ch, position: index + 1 }),
++        };
++        for contour in font.outline(gid)? {
++            if let Some(line) = flatten(&contour, pen, scale) {
++                out.push(line);
++            }
++        }
++        pen += f64::from(font.advance(gid)?) * scale + letter_spacing;
++    }
++    if out.is_empty() {
++        return Err(OutlineTextError::NoShape);
++    }
++    Ok(out)
++}
++
++/// One TrueType contour (on-curve points and quadratic control points, closed) as a closed
++/// polyline in mm, moved right by `pen`. A contour that flattens to fewer than three distinct
++/// points encloses nothing and is dropped.
++fn flatten(contour: &[OutlinePoint], pen: f64, scale: f64) -> Option<Vec<Point2>> {
++    let at = |p: &OutlinePoint| Point2::new(pen + p.x * scale, p.y * scale);
++    let mid = |a: Point2, b: Point2| Point2::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
++    let n = contour.len();
++    // Start on the curve: an on point, else the midpoint of two control points.
++    let first_on = contour.iter().position(|p| p.on);
++    let (start, offset) = match first_on {
++        Some(i) => (at(&contour[i]), i),
++        None => (mid(at(contour.first()?), at(contour.last()?)), 0),
++    };
++    let mut line = vec![start];
++    // With no on point, the first control point follows the start; the last one closes.
++    let mut control = if first_on.is_some() { None } else { Some(at(&contour[0])) };
++    let mut last = start;
++    let steps = if first_on.is_some() { n } else { n - 1 };
++    for k in 1..=steps {
++        let p = &contour[(offset + k) % n];
++        let q = at(p);
++        let (end, next_control) = match (p.on, control) {
++            (true, _) => (q, None),
++            (false, None) => {
++                control = Some(q);
++                continue;
++            }
++            (false, Some(c)) => (mid(c, q), Some(q)),
++        };
++        match control {
++            Some(c) => quadratic(&mut line, last, c, end),
++            None => push(&mut line, end),
++        }
++        last = end;
++        control = next_control;
++    }
++    if let Some(c) = control {
++        quadratic(&mut line, last, c, start);
++    }
++    // Close exactly on the start point.
++    while line.len() > 1 && line.last().is_some_and(|p| dist(*p, start) < MIN_SEGMENT) {
++        line.pop();
++    }
++    line.push(start);
++    (line.len() >= 4).then_some(line)
++}
++
++fn dist(a: Point2, b: Point2) -> f64 {
++    (a.x - b.x).hypot(a.y - b.y)
++}
++
++fn push(line: &mut Vec<Point2>, p: Point2) {
++    if line.last().is_none_or(|q| dist(*q, p) >= MIN_SEGMENT) {
++        line.push(p);
++    }
++}
++
++/// The quadratic Bezier curve `a`, `c`, `b` as lines whose chord error is at most
++/// [`CHORD_TOLERANCE`]: the error of `n` even steps is |a - 2c + b| / (4 n^2).
++fn quadratic(line: &mut Vec<Point2>, a: Point2, c: Point2, b: Point2) {
++    let bend = (a.x - 2.0 * c.x + b.x).hypot(a.y - 2.0 * c.y + b.y);
++    let pieces = (bend / (4.0 * CHORD_TOLERANCE)).sqrt().ceil();
++    let pieces = if pieces.is_finite() { (pieces as usize).clamp(1, MAX_PIECES) } else { 1 };
++    for i in 1..=pieces {
++        let t = i as f64 / pieces as f64;
++        let s = 1.0 - t;
++        push(line, Point2::new(s * s * a.x + 2.0 * s * t * c.x + t * t * b.x, s * s * a.y + 2.0 * s * t * c.y + t * t * b.y));
++    }
++}
++
++/// The outlines of `spec` as sketch data: line primitives in millimetres on the layer
++/// [`LAYER`], chained with [`JOIN_TOLERANCE`]. Every chain is closed with a clear nesting.
++pub fn sketch(spec: &OutlineSpec) -> Result<SketchData, OutlineTextError> {
++    let lines = outlines(spec)?;
++    let mut primitives = Vec::new();
++    let mut vertices = 0_usize;
++    for line in &lines {
++        vertices = vertices.saturating_add(line.len());
++        for pair in line.windows(2) {
++            if let [start, end] = *pair {
++                primitives.push(LayeredPrimitive { layer: LAYER.into(), primitive: Primitive::Line { start, end } });
++            }
++        }
++    }
++    let units = SourceUnits { stated: Units::Known(Unit::Millimeters), applied: Unit::Millimeters };
++    let summary = ImportSummary { entities: primitives.len(), vertices, skipped: Default::default() };
++    let data = SketchData::from_parts(primitives, vec![LAYER.into()], units, Some(JOIN_TOLERANCE), summary)
++        .map_err(|e| match e {
++            SketchError::Empty { .. } => OutlineTextError::NoShape,
++            other => OutlineTextError::Shapes(other.to_string()),
++        })?;
++    let chains = data.chains();
++    if let Some(rejected) = chains.rejected.first() {
++        return Err(OutlineTextError::Shapes(rejected.error.to_string()));
++    }
++    if let Some(open) = chains.open.first() {
++        return Err(OutlineTextError::Shapes(format!("an outline does not close near ({:.3}, {:.3})", open.start.x, open.start.y)));
++    }
++    if let Some(error) = chains.closed.iter().find_map(|chain| chain.nesting.as_ref().err()) {
++        return Err(OutlineTextError::Shapes(error.to_string()));
++    }
++    Ok(data)
++}
+diff --git a/crates/geometry/src/outline_text/sample_font.rs b/crates/geometry/src/outline_text/sample_font.rs
+new file mode 100644
+index 000000000..6683868a7
+--- /dev/null
++++ b/crates/geometry/src/outline_text/sample_font.rs
+@@ -0,0 +1,193 @@
++//! A tiny TrueType font made in memory, for the tests of this module and of the document's
++//! text command: no font file needs to be stored or licensed.
++//!
++//! Provenance: our own glyphs (boxes and simple curves), written as the table layouts of the
++//! public OpenType specification. No font file was consulted.
++//!
++//! The em is 1000 units and `H` is 700 units tall, so the cap height is 700. The glyphs:
++//!
++//! - ` ` (space): no outline, advance 300.
++//! - `H`, `I`: one straight contour each.
++//! - `O`: a box with a box hole.
++//! - `D`: one contour with two quadratic control points.
++//! - `o`: one contour of four control points and no on-curve point.
++//! - `8`: a composite of two `O`s at half size, one over the other.
++//! - `X`: two bars that cross (an overlap that a pocket cannot take).
++
++type Contour = Vec<(i16, i16, bool)>;
++
++enum Glyph {
++    Empty,
++    Simple(Vec<Contour>),
++    /// (glyph index, x offset, y offset, scale in 2.14 fixed point) for each part.
++    Composite(Vec<(u16, i16, i16, i16)>),
++}
++
++fn rect(x0: i16, y0: i16, x1: i16, y1: i16, clockwise: bool) -> Contour {
++    let mut c = vec![(x0, y0, true), (x0, y1, true), (x1, y1, true), (x1, y0, true)];
++    if !clockwise {
++        c.reverse();
++    }
++    c
++}
++
++/// The glyph table: (character, advance, glyph). Glyph 0 is `.notdef`.
++fn glyphs() -> Vec<(Option<char>, u16, Glyph)> {
++    let h = vec![
++        (0, 0, true), (0, 700, true), (100, 700, true), (100, 400, true), (400, 400, true), (400, 700, true),
++        (500, 700, true), (500, 0, true), (400, 0, true), (400, 300, true), (100, 300, true), (100, 0, true),
++    ];
++    let d = vec![(0, 0, true), (0, 700, true), (300, 700, true), (600, 700, false), (600, 350, true), (600, 0, false), (300, 0, true)];
++    let o = vec![(300, 0, false), (0, 250, false), (300, 500, false), (600, 250, false)];
++    vec![
++        (None, 500, Glyph::Empty),
++        (Some(' '), 300, Glyph::Empty),
++        (Some('H'), 600, Glyph::Simple(vec![h])),
++        (Some('I'), 200, Glyph::Simple(vec![rect(0, 0, 100, 700, true)])),
++        (Some('O'), 700, Glyph::Simple(vec![rect(0, 0, 600, 700, true), rect(150, 150, 450, 550, false)])),
++        (Some('D'), 700, Glyph::Simple(vec![d])),
++        (Some('o'), 700, Glyph::Simple(vec![o])),
++        (Some('8'), 400, Glyph::Composite(vec![(4, 0, 0, 0x2000), (4, 0, 360, 0x2000)])),
++        (Some('X'), 700, Glyph::Simple(vec![rect(0, 300, 600, 400, true), rect(250, 0, 350, 700, true)])),
++    ]
++}
++
++fn be16(out: &mut Vec<u8>, v: u16) {
++    out.extend_from_slice(&v.to_be_bytes());
++}
++
++fn be32(out: &mut Vec<u8>, v: u32) {
++    out.extend_from_slice(&v.to_be_bytes());
++}
++
++fn len16(n: usize) -> u16 {
++    u16::try_from(n).unwrap_or(u16::MAX)
++}
++
++fn len32(n: usize) -> u32 {
++    u32::try_from(n).unwrap_or(u32::MAX)
++}
++
++fn glyph_bytes(glyph: &Glyph) -> Vec<u8> {
++    let mut g = Vec::new();
++    match glyph {
++        Glyph::Empty => {}
++        Glyph::Simple(contours) => {
++            let points: Vec<_> = contours.iter().flatten().copied().collect();
++            let xs = points.iter().map(|p| p.0);
++            let ys = points.iter().map(|p| p.1);
++            be16(&mut g, len16(contours.len()));
++            for v in [xs.clone().min(), ys.clone().min(), xs.max(), ys.max()] {
++                be16(&mut g, v.unwrap_or(0) as u16);
++            }
++            let mut end = 0_usize;
++            for c in contours {
++                end += c.len();
++                be16(&mut g, len16(end.saturating_sub(1)));
++            }
++            be16(&mut g, 0); // no instructions
++            g.extend(points.iter().map(|p| u8::from(p.2)));
++            for axis in 0..2 {
++                let mut last = 0_i16;
++                for p in &points {
++                    let v = if axis == 0 { p.0 } else { p.1 };
++                    be16(&mut g, v.wrapping_sub(last) as u16);
++                    last = v;
++                }
++            }
++        }
++        Glyph::Composite(parts) => {
++            be16(&mut g, u16::MAX); // -1 contours
++            for _ in 0..4 {
++                be16(&mut g, 0);
++            }
++            for (i, &(gid, dx, dy, scale)) in parts.iter().enumerate() {
++                let more = if i + 1 < parts.len() { 0x0020 } else { 0 };
++                be16(&mut g, 0x0001 | 0x0002 | 0x0008 | more);
++                be16(&mut g, gid);
++                be16(&mut g, dx as u16);
++                be16(&mut g, dy as u16);
++                be16(&mut g, scale as u16);
++            }
++        }
++    }
++    if g.len() % 2 == 1 {
++        g.push(0);
++    }
++    g
++}
++
++/// The font file's bytes.
++#[must_use]
++pub fn sample_font() -> Vec<u8> {
++    let table = glyphs();
++    let n = len16(table.len());
++    let mut glyf = Vec::new();
++    let mut loca = Vec::new();
++    let mut hmtx = Vec::new();
++    for (_, advance, glyph) in &table {
++        be32(&mut loca, len32(glyf.len()));
++        glyf.extend(glyph_bytes(glyph));
++        be16(&mut hmtx, *advance);
++        be16(&mut hmtx, 0);
++    }
++    be32(&mut loca, len32(glyf.len()));
++
++    // cmap: one format 4 subtable (platform 3, encoding 1), one segment for each character.
++    let mut chars: Vec<(u16, u16)> =
++        table.iter().enumerate().filter_map(|(gid, (ch, _, _))| ch.map(|c| (u32::from(c) as u16, len16(gid)))).collect();
++    chars.sort_unstable();
++    chars.push((0xFFFF, 0));
++    let segs = len16(chars.len());
++    let mut sub = Vec::new();
++    be16(&mut sub, 4);
++    be16(&mut sub, 16 + 8 * segs);
++    be16(&mut sub, 0);
++    be16(&mut sub, 2 * segs);
++    for _ in 0..3 {
++        be16(&mut sub, 0); // search hints, unused by the reader
++    }
++    chars.iter().for_each(|&(c, _)| be16(&mut sub, c));
++    be16(&mut sub, 0);
++    chars.iter().for_each(|&(c, _)| be16(&mut sub, c));
++    chars.iter().for_each(|&(c, gid)| be16(&mut sub, if c == 0xFFFF { 1 } else { gid.wrapping_sub(c) }));
++    chars.iter().for_each(|_| be16(&mut sub, 0));
++    let mut cmap = Vec::new();
++    be16(&mut cmap, 0);
++    be16(&mut cmap, 1);
++    be16(&mut cmap, 3);
++    be16(&mut cmap, 1);
++    be32(&mut cmap, 12);
++    cmap.extend(sub);
++
++    let mut head = vec![0_u8; 54];
++    head[18..20].copy_from_slice(&1000_u16.to_be_bytes());
++    head[50..52].copy_from_slice(&1_u16.to_be_bytes()); // long loca
++    let mut maxp = vec![0_u8; 6];
++    maxp[0..4].copy_from_slice(&0x0000_5000_u32.to_be_bytes());
++    maxp[4..6].copy_from_slice(&n.to_be_bytes());
++    let mut hhea = vec![0_u8; 36];
++    hhea[34..36].copy_from_slice(&n.to_be_bytes());
++
++    let tables: [(&[u8; 4], Vec<u8>); 7] =
++        [(b"cmap", cmap), (b"glyf", glyf), (b"head", head), (b"hhea", hhea), (b"hmtx", hmtx), (b"loca", loca), (b"maxp", maxp)];
++    let mut out = Vec::new();
++    be32(&mut out, 0x0001_0000);
++    be16(&mut out, len16(tables.len()));
++    for _ in 0..3 {
++        be16(&mut out, 0);
++    }
++    let mut offset = 12 + 16 * tables.len();
++    for (tag, data) in &tables {
++        out.extend_from_slice(*tag);
++        be32(&mut out, 0); // checksum, not checked by the reader
++        be32(&mut out, len32(offset));
++        be32(&mut out, len32(data.len()));
++        offset += data.len().next_multiple_of(4);
++    }
++    for (_, data) in &tables {
++        out.extend_from_slice(data);
++        out.resize(out.len().next_multiple_of(4), 0);
++    }
++    out
++}
+diff --git a/crates/geometry/src/outline_text/ttf.rs b/crates/geometry/src/outline_text/ttf.rs
+new file mode 100644
+index 000000000..5b89bafbe
+--- /dev/null
++++ b/crates/geometry/src/outline_text/ttf.rs
+@@ -0,0 +1,400 @@
++//! A read-only TrueType outline reader: the table directory, `head`, `maxp`, `hhea`, `hmtx`,
++//! `OS/2`, `cmap` (formats 4 and 12), `loca` and `glyf` (simple and composite glyphs).
++//!
++//! Provenance: written from the public OpenType specification (Microsoft Typography) and the
++//! Apple TrueType Reference Manual - table layouts only. No font library code was consulted.
++//!
++//! Contract. Each read is bounds-checked: a short or corrupt table is a [`FontError`], never
++//! a panic and never an out-of-range index. A composite glyph is resolved to depth
++//! [`MAX_DEPTH`], and the points of one glyph are capped at [`MAX_POINTS`].
++
++use super::FontError;
++
++/// The deepest chain of composite glyphs that is resolved.
++pub const MAX_DEPTH: usize = 8;
++/// The most points that one resolved glyph can have.
++pub const MAX_POINTS: usize = 100_000;
++
++/// One outline point in font units, and whether it lies on the curve.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct OutlinePoint {
++    pub x: f64,
++    pub y: f64,
++    pub on: bool,
++}
++
++/// The contours of one glyph, in font units.
++pub type Contours = Vec<Vec<OutlinePoint>>;
++
++pub struct Font<'a> {
++    data: &'a [u8],
++    glyf: (usize, usize),
++    loca: (usize, usize),
++    hmtx: (usize, usize),
++    cmap: Cmap,
++    long_loca: bool,
++    num_glyphs: u16,
++    num_h_metrics: u16,
++    pub units_per_em: u16,
++    os2_cap_height: Option<i16>,
++}
++
++#[derive(Clone, Copy)]
++enum Cmap {
++    Format4(usize),
++    Format12(usize),
++}
++
++fn u16_at(d: &[u8], at: usize) -> Result<u16, FontError> {
++    let b = d.get(at..at.checked_add(2).ok_or(FontError::Truncated)?).ok_or(FontError::Truncated)?;
++    Ok(u16::from_be_bytes([b[0], b[1]]))
++}
++
++fn i16_at(d: &[u8], at: usize) -> Result<i16, FontError> {
++    u16_at(d, at).map(|v| v as i16)
++}
++
++fn u32_at(d: &[u8], at: usize) -> Result<u32, FontError> {
++    let b = d.get(at..at.checked_add(4).ok_or(FontError::Truncated)?).ok_or(FontError::Truncated)?;
++    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn u8_at(d: &[u8], at: usize) -> Result<u8, FontError> {
++    d.get(at).copied().ok_or(FontError::Truncated)
++}
++
++fn f2dot14(d: &[u8], at: usize) -> Result<f64, FontError> {
++    Ok(f64::from(i16_at(d, at)?) / 16384.0)
++}
++
++fn to_usize(v: u32) -> usize {
++    usize::try_from(v).unwrap_or(usize::MAX)
++}
++
++/// The (offset, length) of each required table, checked against the file length.
++fn table(data: &[u8], tag: &[u8; 4]) -> Result<Option<(usize, usize)>, FontError> {
++    let count = usize::from(u16_at(data, 4)?);
++    for i in 0..count {
++        let rec = 12 + 16 * i;
++        let name = data.get(rec..rec + 4).ok_or(FontError::Truncated)?;
++        if name == tag {
++            let offset = to_usize(u32_at(data, rec + 8)?);
++            let length = to_usize(u32_at(data, rec + 12)?);
++            let end = offset.checked_add(length).ok_or(FontError::Truncated)?;
++            if end > data.len() {
++                return Err(FontError::Truncated);
++            }
++            return Ok(Some((offset, length)));
++        }
++    }
++    Ok(None)
++}
++
++fn required(data: &[u8], tag: &'static str) -> Result<(usize, usize), FontError> {
++    let mut t = [0_u8; 4];
++    t.copy_from_slice(tag.as_bytes());
++    table(data, &t)?.ok_or(FontError::MissingTable(tag))
++}
++
++impl<'a> Font<'a> {
++    pub fn parse(data: &'a [u8]) -> Result<Font<'a>, FontError> {
++        match data.get(0..4) {
++            Some([0, 1, 0, 0]) | Some(b"true") => {}
++            Some(b"OTTO") => return Err(FontError::CffOutlines),
++            Some(b"ttcf") => return Err(FontError::Collection),
++            _ => return Err(FontError::NotAFont),
++        }
++        let head = required(data, "head")?;
++        let units_per_em = u16_at(data, head.0 + 18)?;
++        if !(16..=16384).contains(&units_per_em) {
++            return Err(FontError::Corrupt("the units per em are outside 16 to 16384"));
++        }
++        let long_loca = match i16_at(data, head.0 + 50)? {
++            0 => false,
++            1 => true,
++            _ => return Err(FontError::Corrupt("the loca format is not 0 or 1")),
++        };
++        let num_glyphs = u16_at(data, required(data, "maxp")?.0 + 4)?;
++        let num_h_metrics = u16_at(data, required(data, "hhea")?.0 + 34)?;
++        if num_h_metrics == 0 {
++            return Err(FontError::Corrupt("the font has no horizontal metrics"));
++        }
++        let glyf = table(data, b"glyf")?.ok_or(if table(data, b"CFF ")?.is_some() {
++            FontError::CffOutlines
++        } else {
++            FontError::MissingTable("glyf")
++        })?;
++        let os2_cap_height = match table(data, b"OS/2")? {
++            Some((at, len)) if u16_at(data, at)? >= 2 && len >= 90 => Some(i16_at(data, at + 88)?),
++            _ => None,
++        };
++        Ok(Font {
++            data,
++            glyf,
++            loca: required(data, "loca")?,
++            hmtx: required(data, "hmtx")?,
++            cmap: pick_cmap(data, required(data, "cmap")?.0)?,
++            long_loca,
++            num_glyphs,
++            num_h_metrics,
++            units_per_em,
++            os2_cap_height,
++        })
++    }
++
++    /// The glyph of `ch`, or `None` when the font maps it to no glyph.
++    pub fn glyph_id(&self, ch: char) -> Result<Option<u16>, FontError> {
++        let c = u32::from(ch);
++        let d = self.data;
++        let gid = match self.cmap {
++            Cmap::Format12(at) => {
++                let groups = to_usize(u32_at(d, at + 12)?);
++                let mut found = 0_u32;
++                for i in 0..groups.min(1 << 20) {
++                    let g = at + 16 + 12 * i;
++                    let (start, end) = (u32_at(d, g)?, u32_at(d, g + 4)?);
++                    if (start..=end).contains(&c) {
++                        found = u32_at(d, g + 8)?.saturating_add(c - start);
++                        break;
++                    }
++                }
++                found
++            }
++            Cmap::Format4(at) => {
++                let Ok(c) = u16::try_from(c) else { return Ok(None) };
++                let segs = usize::from(u16_at(d, at + 6)? / 2);
++                let ends = at + 14;
++                let starts = ends + 2 * segs + 2;
++                let deltas = starts + 2 * segs;
++                let ranges = deltas + 2 * segs;
++                let mut found = 0_u32;
++                for s in 0..segs {
++                    if u16_at(d, ends + 2 * s)? < c {
++                        continue;
++                    }
++                    let start = u16_at(d, starts + 2 * s)?;
++                    if start > c {
++                        break;
++                    }
++                    let delta = u16_at(d, deltas + 2 * s)?;
++                    let range = u16_at(d, ranges + 2 * s)?;
++                    found = if range == 0 {
++                        u32::from(c.wrapping_add(delta))
++                    } else {
++                        let addr = ranges + 2 * s + usize::from(range) + 2 * usize::from(c - start);
++                        match u16_at(d, addr)? {
++                            0 => 0,
++                            g => u32::from(g.wrapping_add(delta)),
++                        }
++                    };
++                    break;
++                }
++                found
++            }
++        };
++        Ok(u16::try_from(gid).ok().filter(|&g| g != 0 && g < self.num_glyphs))
++    }
++
++    /// The advance width of `gid`, in font units.
++    pub fn advance(&self, gid: u16) -> Result<u16, FontError> {
++        let index = usize::from(gid.min(self.num_h_metrics - 1));
++        if 4 * (index + 1) > self.hmtx.1 {
++            return Err(FontError::Truncated);
++        }
++        u16_at(self.data, self.hmtx.0 + 4 * index)
++    }
++
++    /// The cap height in font units: the `OS/2` value, else the top of `H`, else 70 % of the
++    /// em.
++    pub fn cap_height(&self) -> Result<f64, FontError> {
++        if let Some(h) = self.os2_cap_height.filter(|&h| h > 0) {
++            return Ok(f64::from(h));
++        }
++        if let Some(gid) = self.glyph_id('H')? {
++            let top = self.outline(gid)?.iter().flatten().map(|p| p.y).fold(0.0_f64, f64::max);
++            if top > 0.0 {
++                return Ok(top);
++            }
++        }
++        Ok(0.7 * f64::from(self.units_per_em))
++    }
++
++    fn glyph_range(&self, gid: u16) -> Result<(usize, usize), FontError> {
++        let g = usize::from(gid);
++        let (a, b) = if self.long_loca {
++            (u32_at(self.data, self.loca.0 + 4 * g)?, u32_at(self.data, self.loca.0 + 4 * g + 4)?)
++        } else {
++            let a = u16_at(self.data, self.loca.0 + 2 * g)?;
++            let b = u16_at(self.data, self.loca.0 + 2 * g + 2)?;
++            (2 * u32::from(a), 2 * u32::from(b))
++        };
++        let (a, b) = (to_usize(a), to_usize(b));
++        if a > b || b > self.glyf.1 {
++            return Err(FontError::Corrupt("a glyph lies outside the glyf table"));
++        }
++        Ok((self.glyf.0 + a, self.glyf.0 + b))
++    }
++
++    /// The contours of `gid` in font units, composites resolved. A glyph with no outline (the
++    /// space) has no contours.
++    pub fn outline(&self, gid: u16) -> Result<Contours, FontError> {
++        let mut out = Vec::new();
++        self.append(gid, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 0, &mut out)?;
++        Ok(out)
++    }
++
++    fn append(&self, gid: u16, m: [f64; 6], depth: usize, out: &mut Contours) -> Result<(), FontError> {
++        if depth > MAX_DEPTH {
++            return Err(FontError::Corrupt("composite glyphs nest too deep"));
++        }
++        if gid >= self.num_glyphs {
++            return Err(FontError::Corrupt("a composite glyph names a glyph that does not exist"));
++        }
++        let (start, end) = self.glyph_range(gid)?;
++        if start == end {
++            return Ok(());
++        }
++        let d = self.data.get(start..end).ok_or(FontError::Truncated)?;
++        let contours = i16_at(d, 0)?;
++        if contours >= 0 {
++            for contour in simple(d, usize::from(contours.unsigned_abs()))? {
++                out.push(contour.into_iter().map(|p| transform(m, p)).collect());
++            }
++        } else {
++            self.composite(d, m, depth, out)?;
++        }
++        if out.iter().map(Vec::len).sum::<usize>() > MAX_POINTS {
++            return Err(FontError::Corrupt("a glyph has too many points"));
++        }
++        Ok(())
++    }
++
++    fn composite(&self, d: &[u8], m: [f64; 6], depth: usize, out: &mut Contours) -> Result<(), FontError> {
++        let mut at = 10;
++        loop {
++            let flags = u16_at(d, at)?;
++            let child = u16_at(d, at + 2)?;
++            at += 4;
++            if flags & 0x0002 == 0 {
++                return Err(FontError::Corrupt("a composite glyph places a part by point matching"));
++            }
++            let (dx, dy) = if flags & 0x0001 != 0 {
++                at += 4;
++                (f64::from(i16_at(d, at - 4)?), f64::from(i16_at(d, at - 2)?))
++            } else {
++                at += 2;
++                (f64::from(u8_at(d, at - 2)? as i8), f64::from(u8_at(d, at - 1)? as i8))
++            };
++            let (a, b, c, e) = if flags & 0x0008 != 0 {
++                at += 2;
++                let s = f2dot14(d, at - 2)?;
++                (s, 0.0, 0.0, s)
++            } else if flags & 0x0040 != 0 {
++                at += 4;
++                (f2dot14(d, at - 4)?, 0.0, 0.0, f2dot14(d, at - 2)?)
++            } else if flags & 0x0080 != 0 {
++                at += 8;
++                (f2dot14(d, at - 8)?, f2dot14(d, at - 6)?, f2dot14(d, at - 4)?, f2dot14(d, at - 2)?)
++            } else {
++                (1.0, 0.0, 0.0, 1.0)
++            };
++            // The part's own matrix, then the parent's: x' = a x + c y + dx, y' = b x + e y + dy.
++            let part = [a, b, c, e, dx, dy];
++            let joined = [
++                m[0] * part[0] + m[2] * part[1],
++                m[1] * part[0] + m[3] * part[1],
++                m[0] * part[2] + m[2] * part[3],
++                m[1] * part[2] + m[3] * part[3],
++                m[0] * part[4] + m[2] * part[5] + m[4],
++                m[1] * part[4] + m[3] * part[5] + m[5],
++            ];
++            self.append(child, joined, depth + 1, out)?;
++            if flags & 0x0020 == 0 {
++                return Ok(());
++            }
++        }
++    }
++}
++
++fn transform(m: [f64; 6], p: OutlinePoint) -> OutlinePoint {
++    OutlinePoint { x: m[0] * p.x + m[2] * p.y + m[4], y: m[1] * p.x + m[3] * p.y + m[5], on: p.on }
++}
++
++/// The contours of a simple glyph: end points, flags (with repeats), then the x and y deltas.
++fn simple(d: &[u8], contours: usize) -> Result<Contours, FontError> {
++    let mut ends = Vec::with_capacity(contours);
++    for i in 0..contours {
++        ends.push(usize::from(u16_at(d, 10 + 2 * i)?));
++    }
++    let Some(&last) = ends.last() else { return Ok(Vec::new()) };
++    if ends.windows(2).any(|w| w[0] >= w[1]) {
++        return Err(FontError::Corrupt("the contour end points of a glyph do not ascend"));
++    }
++    let count = last + 1;
++    if count > MAX_POINTS {
++        return Err(FontError::Corrupt("a glyph has too many points"));
++    }
++    let instructions = 10 + 2 * contours;
++    let mut at = instructions + 2 + usize::from(u16_at(d, instructions)?);
++    let mut flags = Vec::with_capacity(count);
++    while flags.len() < count {
++        let f = u8_at(d, at)?;
++        at += 1;
++        let repeat = if f & 0x08 != 0 {
++            at += 1;
++            usize::from(u8_at(d, at - 1)?)
++        } else {
++            0
++        };
++        for _ in 0..=repeat {
++            flags.push(f);
++        }
++    }
++    flags.truncate(count);
++    let mut coord = |short: u8, same: u8| -> Result<Vec<f64>, FontError> {
++        let mut v = 0_i32;
++        let mut out = Vec::with_capacity(count);
++        for &f in &flags {
++            if f & short != 0 {
++                let b = i32::from(u8_at(d, at)?);
++                at += 1;
++                v += if f & same != 0 { b } else { -b };
++            } else if f & same == 0 {
++                v += i32::from(i16_at(d, at)?);
++                at += 2;
++            }
++            out.push(f64::from(v));
++        }
++        Ok(out)
++    };
++    let xs = coord(0x02, 0x10)?;
++    let ys = coord(0x04, 0x20)?;
++    let mut out = Vec::with_capacity(contours);
++    let mut first = 0;
++    for end in ends {
++        out.push((first..=end).map(|i| OutlinePoint { x: xs[i], y: ys[i], on: flags[i] & 0x01 != 0 }).collect());
++        first = end + 1;
++    }
++    Ok(out)
++}
++
++/// The best Unicode subtable: format 12 (full Unicode) first, then format 4 (the BMP).
++fn pick_cmap(data: &[u8], at: usize) -> Result<Cmap, FontError> {
++    let count = usize::from(u16_at(data, at + 2)?);
++    let mut best: Option<Cmap> = None;
++    for i in 0..count {
++        let rec = at + 4 + 8 * i;
++        let (platform, encoding) = (u16_at(data, rec)?, u16_at(data, rec + 2)?);
++        let unicode = platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10));
++        if !unicode {
++            continue;
++        }
++        let sub = at.checked_add(to_usize(u32_at(data, rec + 4)?)).ok_or(FontError::Truncated)?;
++        match u16_at(data, sub)? {
++            12 => return Ok(Cmap::Format12(sub)),
++            4 if best.is_none() => best = Some(Cmap::Format4(sub)),
++            _ => {}
++        }
++    }
++    best.ok_or(FontError::MissingTable("cmap (a Unicode subtable of format 4 or 12)"))
++}
+diff --git a/crates/geometry/tests/outline_text.rs b/crates/geometry/tests/outline_text.rs
+new file mode 100644
+index 000000000..5311505e0
+--- /dev/null
++++ b/crates/geometry/tests/outline_text.rs
+@@ -0,0 +1,111 @@
++//! #3072: typed text in a TrueType outline font becomes closed shapes - holes nest in their
++//! letters, curves are flattened inside the chord tolerance, composite glyphs are resolved, and
++//! every font or text that cannot give clear shapes is refused by name.
++//!
++//! Provenance: our own tests over our own reader, on the generated font of
++//! `outline_text::sample_font` (our own glyphs, no font file).
++//!
++//! Gate map: covers camcraft_geometry::outline_text.
++
++use camcraft_geometry::outline_text::sample_font::sample_font;
++use camcraft_geometry::outline_text::{
++    CHORD_TOLERANCE, FontError, OutlineSpec, OutlineTextError, check_font, outlines, sketch,
++};
++use camcraft_geometry::sketch_chains::LoopRole;
++
++fn spec<'a>(font: &'a [u8], text: &'a str) -> OutlineSpec<'a> {
++    OutlineSpec { font, text, height: 7.0, letter_spacing: 0.0 }
++}
++
++fn roles(font: &[u8], text: &str) -> (usize, usize) {
++    let data = sketch(&spec(font, text)).unwrap_or_else(|e| panic!("{text}: {e}"));
++    let closed = &data.chains().closed;
++    let holes = closed.iter().filter(|c| matches!(c.nesting, Ok(n) if n.role == LoopRole::Hole)).count();
++    assert!(data.chains().open.is_empty() && data.chains().rejected.is_empty());
++    (closed.len() - holes, holes)
++}
++
++#[test]
++fn letters_become_closed_shapes_with_their_holes() {
++    let font = sample_font();
++    // H and I are one shape each; O is a shape with a hole.
++    assert_eq!(roles(&font, "HI"), (2, 0));
++    assert_eq!(roles(&font, "O"), (1, 1));
++    assert_eq!(roles(&font, "HOD O"), (4, 2));
++    // The composite 8 is two half-size Os: two shapes, two holes.
++    assert_eq!(roles(&font, "8"), (2, 2));
++}
++
++#[test]
++fn the_cap_height_and_the_advances_place_the_letters_in_mm() {
++    let font = sample_font();
++    // H is 700 units tall: at a cap height of 7 mm one unit is 0.01 mm.
++    let lines = outlines(&spec(&font, "H I")).expect("H I");
++    let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
++    for p in lines.iter().flatten() {
++        lo = (lo.0.min(p.x), lo.1.min(p.y));
++        hi = (hi.0.max(p.x), hi.1.max(p.y));
++    }
++    // H advances 600, the space 300; I is 100 wide.
++    assert_eq!((lo, hi), ((0.0, 0.0), (10.0, 7.0)));
++    // Letter spacing adds its gap after each character.
++    let spaced = outlines(&OutlineSpec { letter_spacing: 1.5, ..spec(&font, "II") }).expect("II");
++    let right = spaced.iter().flatten().map(|p| p.x).fold(f64::MIN, f64::max);
++    assert!((right - (2.0 + 1.5 + 1.0)).abs() < 1e-9, "{right}");
++}
++
++#[test]
++fn curves_are_flattened_inside_the_chord_tolerance() {
++    let font = sample_font();
++    // D's right side is two quadratic pieces through (6, 3.5); each point lies on the curve.
++    let lines = outlines(&spec(&font, "D")).expect("D");
++    let curve: Vec<_> = lines[0].iter().filter(|p| p.x > 3.0 + 1e-9).collect();
++    assert!(curve.len() > 8, "the curve is flattened into many lines, got {}", curve.len());
++    assert!(curve.iter().any(|p| (p.x - 6.0).abs() < 1e-9 && (p.y - 3.5).abs() < 1e-9));
++    // The upper piece is (3, 7) (6, 7) (6, 3.5): each flattened point lies on it.
++    for p in curve.iter().filter(|p| p.y > 3.5) {
++        // B(s) = (3 + 3 (2s - s^2), 7 - 3.5 s^2): find s from y, then check x.
++        let s = ((7.0 - p.y) / 3.5).sqrt();
++        assert!((3.0 + 3.0 * (2.0 * s - s * s) - p.x).abs() < 1e-6, "{p:?} is not on the curve");
++    }
++    // The contour of o has no on-curve point: it still closes as one smooth shape.
++    let o = outlines(&spec(&font, "o")).expect("o");
++    assert_eq!(o.len(), 1);
++    assert_eq!(o[0].first(), o[0].last());
++    assert!(o[0].len() > 16 && CHORD_TOLERANCE <= 0.005);
++}
++
++#[test]
++fn a_font_that_cannot_be_read_is_refused_by_name() {
++    let font = sample_font();
++    let why = |bytes: &[u8]| match check_font(bytes) {
++        Ok(()) => panic!("must be refused"),
++        Err(e) => e,
++    };
++    assert_eq!(why(b"not a font at all"), OutlineTextError::Font(FontError::NotAFont));
++    assert_eq!(why(b"OTTO\0\0\0\0\0\0\0\0"), OutlineTextError::Font(FontError::CffOutlines));
++    assert_eq!(why(b"ttcf\0\0\0\0\0\0\0\0"), OutlineTextError::Font(FontError::Collection));
++    assert!(why(&font[..40]).to_string().starts_with("the font cannot be read"));
++    // Every cut of the file is refused or read, never a panic.
++    for len in 0..font.len() {
++        let _ = sketch(&spec(&font[..len], "HO8Do"));
++    }
++    // Every flipped byte is refused or read, never a panic or a hang.
++    for at in 0..font.len() {
++        let mut bad = font.clone();
++        bad[at] ^= 0xA5;
++        let _ = sketch(&spec(&bad, "HO8Do X"));
++    }
++}
++
++#[test]
++fn bad_text_and_overlapping_outlines_are_refused_by_name() {
++    let font = sample_font();
++    let err = |s: OutlineSpec| sketch(&s).err().map(|e| e.to_string()).unwrap_or_default();
++    assert!(err(spec(&font, "  ")).contains("the text is empty"));
++    assert!(err(spec(&font, "HZ")).contains("'Z' at character 2 is not in the font"));
++    assert!(err(OutlineSpec { height: 0.1, ..spec(&font, "H") }).contains("cap height from 0.5 mm"));
++    assert!(err(OutlineSpec { letter_spacing: -1.0, ..spec(&font, "H") }).contains("letter spacing"));
++    // X's two bars cross: a pocket of them is not clear.
++    assert!(err(spec(&font, "X")).contains("the text outlines cross or touch"), "{}", err(spec(&font, "X")));
++}
+diff --git a/docs/agents/mcp-tools.md b/docs/agents/mcp-tools.md
+index 11a112844..6259b2ba2 100644
+--- a/docs/agents/mcp-tools.md
++++ b/docs/agents/mcp-tools.md
+@@ -1,7 +1,7 @@
+ <!-- Generated from crates/app/src/mcp/tools.rs. Do not edit by hand. Write it again with: cargo run -p camcraft-app --bin camcraft-cli -- mcp reference > docs/agents/mcp-tools.md -->
+ # CamCraft MCP tool reference
+ 
+-The server lists 117 tools. The live `tools/list` reply is the authority; this file is generated from the same table. An argument with `?` is optional.
++The server lists 118 tools. The live `tools/list` reply is the authority; this file is generated from the same table. An argument with `?` is optional.
+ 
+ | Tool | Arguments | What it does |
+ |---|---|---|
+@@ -119,6 +119,7 @@ The server lists 117 tools. The live `tools/list` reply is the authority; this f
+ | `import_dxf` | `join_tol?`, `name?`, `path`, `setup?`, `units?` | Place a DXF drawing (ASCII DXF: LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE) as a profile on the top face of a setup's stock, at the stock origin - the active setup by default. A profile is reference geometry for cutting, not a model: set_stock first, a setup needs no model. units "mm" or "in" wins over the file's $INSUNITS; a file that states no unit is refused by name until units is given (never guessed). The reply states the units used, the layers, the closed, open and rejected chains, and the skipped entities by kind. One undo step. Refused by name: a setup with no stock, an unknown setup, a file that is not .dxf, a malformed or binary DXF, a drawing with nothing to place, a name in use. |
+ | `move_dxf_profile` | `angle?`, `name`, `position` | Move a placed DXF profile on the top face of its setup's stock: position [x, y] in mm from the stock origin, and an optional angle in degrees about the face normal, counterclockwise seen from above (omitted keeps the current one). A profile has no Z and no tilt: it stays on the face and moves with the stock. One undo step. Refused by name: an unknown name, a name that is not a DXF profile, a placement that is not finite. |
+ | `insert_text` | `angle?`, `height`, `letter_spacing?`, `name?`, `position?`, `setup?`, `text` | Place a typed string as a profile of single-line engraving strokes on the top face of a setup's stock - the active setup by default. The strokes are tool-centreline paths in mm on the layer "text", made from CamCraft's own stroke font: capital letters, digits, the space and - _ . : / # + = ( ) only. height is the cap height in mm (0.5 to 1000). position [x, y] is the left end of the baseline in mm from the stock origin (default [0, 0]); angle turns the baseline in degrees about the face normal, counterclockwise seen from above (default 0). letter_spacing adds a gap between characters in mm (default 0). The result is a profile like one from import_dxf: move_dxf_profile moves it, and get_job lists it under "profiles". One undo step. Refused by name: an empty text, a character with no glyph (a lower-case letter is not changed to a capital), a height or spacing outside the limits, a setup with no stock, an unknown setup, a name in use. |
++| `insert_outline_text` | `angle?`, `font`, `height`, `letter_spacing?`, `name?`, `position?`, `setup?`, `text` | Place a typed string in a TrueType outline font as a profile of closed shapes on the top face of a setup's stock - the active setup by default. The shapes take a pocket, a V-carve or a cut-out (insert_text gives single-line engraving strokes instead). font is the path of a .ttf file, or an .otf file with TrueType outlines; the profile keeps the shapes, not the font. height is the font's cap height in mm (0.5 to 1000). position [x, y] is the left end of the baseline in mm from the stock origin (default [0, 0]); angle turns the baseline in degrees about the face normal, counterclockwise seen from above (default 0). letter_spacing adds a gap between characters in mm (default 0). The shapes are lines in mm on the layer "text"; a letter's hole (O, A) is a hole of its shape. move_dxf_profile moves the profile, and get_job lists it under "profiles". One undo step. Refused by name: a font that cannot be read, a font with CFF outlines or a font collection, an empty text, a character the font does not have, outlines that cross or touch, a height or spacing outside the limits, a setup with no stock, an unknown setup, a name in use. |
+ | `import_tool_holder_dxf` | `path`, `tool`, `units?` | Import a 2D half-profile ASCII DXF (one LINE on layer CENTRELINE plus an open LINE/ARC profile chain wholly on one side) as a tool's revolved holder body. The centreline must be parallel to Y. DXF +Y is tool +Z; z = 0 is the lower end of the centreline, independent of draw direction. One undo step; missing centreline, crossing geometry, closed loops, splines or missing $INSUNITS (unless "units" is stated) refuse by name. |
+ | `export_tool_holder_dxf` | `path`, `tool` | Export a document tool's holder body or drawn/converted spun profile to an ASCII DXF half-profile in millimetres (layers CENTRELINE and PROFILE, $INSUNITS = 4). |
+ | `convert_tool_step_to_profile` | `dxf_out_path?`, `step_path`, `tool` | Convert an ISO 13399 aligned STEP holder/body to a conservative outer-envelope half-profile on a document tool (non-revolved features are enveloped, never cut away) and optionally write it as ASCII DXF. Refuses STEP files with missing, degenerate or ambiguous ISO 13399 coordinate systems instead of guessing +Z. One undo step. |
+diff --git a/site/content/guide/automate/mcp.md b/site/content/guide/automate/mcp.md
+index afa227425..046deef45 100644
+--- a/site/content/guide/automate/mcp.md
++++ b/site/content/guide/automate/mcp.md
+@@ -70,6 +70,7 @@ time. The current, authoritative tool list is whatever the client's
+ | Models | `import_model`, `move_model`, `repair_model`, `set_part_axes`, `lay_part_on_points`, `lay_part_on_face`, `align_part_cylinder`, `delete_model`, `set_model_link`, `vouch_model_fidelity` |
+ | DXF profiles | `import_dxf`, `move_dxf_profile` |
+ | Engraving text | `insert_text` |
++| Outline-font text (closed shapes) | `insert_outline_text` |
+ | Setups and work offsets | `add_setup`, `activate_setup`, `set_wcs`, `set_wcs_from_features`, `set_wcs_circle_centre`, `place_setup_origin`, `set_work_offset`, `load_machine`, `set_workholding_max_rpm`, `set_sheet_job`, `set_stock`, `fit_stock`, `set_raw_stock_only`, `set_operation_setup`, `delete_setup`, `set_program`, `set_setup_post`, `set_wcs_flip`, `edit_machine`, `get_rotary_stack`, `set_setup_nose_to_axis` |
+ | Fixtures and workholding | `add_fixture`, `remove_fixture`, `move_fixture`, `locate_part`, `get_fixture_findings`, `add_builtin_vise`, `set_vise`, `add_mod_vise_pair`, `set_mod_jaw`, `refit_mod_vise`, `add_accessory`, `set_accessory`, `add_fixture_plate`, `set_fixture_plate`, `place_on_plate`, `detect_plate_grid`, `get_plate_grid`, `turn_fixture`, `import_dxf_fixture`, `set_fixture_profile`, `derive_fixture_profile`, `get_fixture_profile`, `export_fixture_dxf` |
+ | Tools and holders | `list_tool_catalog`, `add_tool`, `set_tool`, `import_tool_library`, `export_tool_library`, `list_holder_library`, `set_tool_holder`, `get_tool_cutter_profile`, `set_tool_cutter_profile`, `set_tool_cutter_params`, `edit_tool`, `delete_tool`, `import_tool_holder_dxf`, `export_tool_holder_dxf`, `convert_tool_step_to_profile` |
+
+From 416b45749cfe5c10bf643fd4eb12bacb212a344d Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 03:59:35 -0800
+Subject: [PATCH 2/6] docs(decisions): record the outline-text choices
+
+Refs #3072
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/decisions/3072-outline-text.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+ create mode 100644 docs/decisions/3072-outline-text.md
+
+diff --git a/docs/decisions/3072-outline-text.md b/docs/decisions/3072-outline-text.md
+new file mode 100644
+index 000000000..bcfb13906
+--- /dev/null
++++ b/docs/decisions/3072-outline-text.md
+@@ -0,0 +1,23 @@
++## #3072 - Text in an outline font as closed shapes
++
++**Decided.**
++
++- We wrote our own TrueType outline reader, `camcraft_geometry::outline_text::ttf`. We wrote it from the public OpenType specification. It reads the table directory, `head`, `maxp`, `hhea`, `hmtx`, `OS/2` (cap height), `cmap` formats 4 and 12, `loca`, and `glyf` (simple and composite glyphs).
++- A font with CFF (PostScript) outlines (`OTTO`, or a `CFF ` table and no `glyf`) is refused by name. A font collection (`ttcf`) is refused by name. Both refusals tell the user what to pick instead.
++- Quadratic contour pieces are flattened to lines. The chord error is at most 0.005 mm, from the bound |a - 2c + b| / (4 n²). Each piece gives 64 lines at most.
++- The text sketch uses a join tolerance of 0.0005 mm, not the 0.01 mm DXF default. A flattened point closer than 0.001 mm to the point before it is dropped. A small letter keeps its short segments, and the chainer never sees a segment shorter than its tolerance.
++- `height` is the font's cap height, as in `insert_text`. The reader takes the `OS/2` `sCapHeight`, then the top of `H`, then 70 % of the em.
++- The sketch must have only closed chains, each with a clear nesting. Outlines that cross or touch (a font with overlapping contours, or letters that run into each other) are refused by name. The refusal tells the user to add letter spacing or to pick a different font. We never send an unclear region to a pocket.
++- The command is a new `InsertOutlineText`, with the new MCP tool `insert_outline_text`. We did not add a `font` field to `InsertText` or `insert_text`. The font is read once at construction, and the profile stores the shapes. The project file therefore needs no font and no format change.
++- The tests use a font that is generated in memory (`outline_text::sample_font`, `#[doc(hidden)]`). It has our own box and curve glyphs. No font file is stored in the repository or licensed.
++
++**Why.** No new dependency: `ttf-parser` is in `Cargo.lock` only through eframe, and a direct dependency needs a maintainer decision. The reader is 400 lines and has bounds checks on every read. A byte-flip and truncation sweep in the tests shows that it never panics. Most hobby sign fonts are `.ttf` files with TrueType outlines.
++
++**Dropped.**
++
++- A direct `ttf-parser` dependency. It would also read CFF outlines, but it needs a new dependency.
++- A CFF (Type 2 charstring) reader. This is a larger format. It can come later as its own issue if users ask for `.otf` CFF fonts.
++- Silently joining overlapping contours with a boolean union. That changes the font's shapes without a word. A later issue can add an explicit union step.
++- The use of glyph arcs or splines in the sketch. The sketch primitives are lines and arcs only. Flattening within 0.005 mm is well below a cutter's tolerance.
++
++**Cost to change later.** The reader is private to `outline_text`. A change to `ttf-parser` or a CFF reader changes that one module, and the command and tool stay the same. Toolpaths from profile chains (2D Pocket, Contour) are #1867's work. The text profile goes to those operations as closed chains, the same as a DXF profile.
+
+From 4aa6eee82601d506344262803e262ec44af151ff Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 04:22:12 -0800
+Subject: [PATCH 3/6] test(app): take &Path in the outline-text test helper
+ (clippy ptr_arg)
+
+Refs #3072
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/insert_outline_text.rs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/crates/app/tests/insert_outline_text.rs b/crates/app/tests/insert_outline_text.rs
+index f65add1c7..b1d32547d 100644
+--- a/crates/app/tests/insert_outline_text.rs
++++ b/crates/app/tests/insert_outline_text.rs
+@@ -12,7 +12,7 @@
+ //! (outline_text_tools insert_outline_text), app::project (sketch_dto),
+ //! app::sketch.
+ 
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ 
+ use flecs_ecs::prelude::World;
+ use serde_json::{json, Value};
+@@ -39,9 +39,9 @@ fn font_file(tag: &str) -> PathBuf {
+     path
+ }
+ 
+-fn options(font: &PathBuf, text: &str) -> OutlineTextOptions {
++fn options(font: &Path, text: &str) -> OutlineTextOptions {
+     OutlineTextOptions {
+-        font: font.clone(),
++        font: font.to_path_buf(),
+         text: text.into(),
+         height: 7.0,
+         letter_spacing: 0.0,
+
+From 46c7c9ecc33eb92808c572006775a8a8828addf5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 08:13:32 -0800
+Subject: [PATCH 4/6] fix(geometry): enforce outline font bounds and curve
+ tolerance
+
+Keep chord error within tolerance at large text heights. Transform scaled component offsets and bound font reads by table and subtable lengths. Add regression pins for the three review findings.
+
+Fixes #3072
+---
+ crates/geometry/src/outline_text/mod.rs      |  28 +--
+ crates/geometry/src/outline_text/ttf.rs      | 177 ++++++++-----------
+ crates/geometry/src/outline_text/ttf/cmap.rs | 107 +++++++++++
+ crates/geometry/tests/outline_text.rs        | 157 ++++++++++++++++
+ docs/decisions/3072-outline-text.md          |   9 +-
+ 5 files changed, 360 insertions(+), 118 deletions(-)
+ create mode 100644 crates/geometry/src/outline_text/ttf/cmap.rs
+
+diff --git a/crates/geometry/src/outline_text/mod.rs b/crates/geometry/src/outline_text/mod.rs
+index 939227237..a60574d7c 100644
+--- a/crates/geometry/src/outline_text/mod.rs
++++ b/crates/geometry/src/outline_text/mod.rs
+@@ -35,7 +35,7 @@ pub const JOIN_TOLERANCE: f64 = 0.0005;
+ /// A flattened point closer than this to the point before it is dropped, mm.
+ const MIN_SEGMENT: f64 = 2.0 * JOIN_TOLERANCE;
+ /// The most lines that one quadratic piece becomes.
+-const MAX_PIECES: usize = 64;
++const MAX_PIECES: usize = 4096;
+ 
+ /// A font that cannot be used, by name.
+ #[derive(Clone, Debug, PartialEq, thiserror::Error)]
+@@ -137,7 +137,7 @@ pub fn outlines(spec: &OutlineSpec) -> Result<Vec<Vec<Point2>>, OutlineTextError
+             None => return Err(OutlineTextError::NoGlyph { ch, position: index + 1 }),
+         };
+         for contour in font.outline(gid)? {
+-            if let Some(line) = flatten(&contour, pen, scale) {
++            if let Some(line) = flatten(&contour, pen, scale)? {
+                 out.push(line);
+             }
+         }
+@@ -152,7 +152,10 @@ pub fn outlines(spec: &OutlineSpec) -> Result<Vec<Vec<Point2>>, OutlineTextError
+ /// One TrueType contour (on-curve points and quadratic control points, closed) as a closed
+ /// polyline in mm, moved right by `pen`. A contour that flattens to fewer than three distinct
+ /// points encloses nothing and is dropped.
+-fn flatten(contour: &[OutlinePoint], pen: f64, scale: f64) -> Option<Vec<Point2>> {
++fn flatten(contour: &[OutlinePoint], pen: f64, scale: f64) -> Result<Option<Vec<Point2>>, OutlineTextError> {
++    if contour.is_empty() {
++        return Ok(None);
++    }
+     let at = |p: &OutlinePoint| Point2::new(pen + p.x * scale, p.y * scale);
+     let mid = |a: Point2, b: Point2| Point2::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
+     let n = contour.len();
+@@ -160,7 +163,7 @@ fn flatten(contour: &[OutlinePoint], pen: f64, scale: f64) -> Option<Vec<Point2>
+     let first_on = contour.iter().position(|p| p.on);
+     let (start, offset) = match first_on {
+         Some(i) => (at(&contour[i]), i),
+-        None => (mid(at(contour.first()?), at(contour.last()?)), 0),
++        None => (mid(at(&contour[0]), at(&contour[n - 1])), 0),
+     };
+     let mut line = vec![start];
+     // With no on point, the first control point follows the start; the last one closes.
+@@ -179,21 +182,21 @@ fn flatten(contour: &[OutlinePoint], pen: f64, scale: f64) -> Option<Vec<Point2>
+             (false, Some(c)) => (mid(c, q), Some(q)),
+         };
+         match control {
+-            Some(c) => quadratic(&mut line, last, c, end),
++            Some(c) => quadratic(&mut line, last, c, end)?,
+             None => push(&mut line, end),
+         }
+         last = end;
+         control = next_control;
+     }
+     if let Some(c) = control {
+-        quadratic(&mut line, last, c, start);
++        quadratic(&mut line, last, c, start)?;
+     }
+     // Close exactly on the start point.
+     while line.len() > 1 && line.last().is_some_and(|p| dist(*p, start) < MIN_SEGMENT) {
+         line.pop();
+     }
+     line.push(start);
+-    (line.len() >= 4).then_some(line)
++    Ok((line.len() >= 4).then_some(line))
+ }
+ 
+ fn dist(a: Point2, b: Point2) -> f64 {
+@@ -208,15 +211,20 @@ fn push(line: &mut Vec<Point2>, p: Point2) {
+ 
+ /// The quadratic Bezier curve `a`, `c`, `b` as lines whose chord error is at most
+ /// [`CHORD_TOLERANCE`]: the error of `n` even steps is |a - 2c + b| / (4 n^2).
+-fn quadratic(line: &mut Vec<Point2>, a: Point2, c: Point2, b: Point2) {
++fn quadratic(line: &mut Vec<Point2>, a: Point2, c: Point2, b: Point2) -> Result<(), OutlineTextError> {
+     let bend = (a.x - 2.0 * c.x + b.x).hypot(a.y - 2.0 * c.y + b.y);
+-    let pieces = (bend / (4.0 * CHORD_TOLERANCE)).sqrt().ceil();
+-    let pieces = if pieces.is_finite() { (pieces as usize).clamp(1, MAX_PIECES) } else { 1 };
++    // Leave room for the displacement from dropping a point within MIN_SEGMENT.
++    let pieces = (bend / (4.0 * (CHORD_TOLERANCE - MIN_SEGMENT))).sqrt().ceil();
++    if !pieces.is_finite() || pieces > MAX_PIECES as f64 {
++        return Err(FontError::Corrupt("a curve needs too many segments for the chord tolerance").into());
++    }
++    let pieces = (pieces as usize).max(1);
+     for i in 1..=pieces {
+         let t = i as f64 / pieces as f64;
+         let s = 1.0 - t;
+         push(line, Point2::new(s * s * a.x + 2.0 * s * t * c.x + t * t * b.x, s * s * a.y + 2.0 * s * t * c.y + t * t * b.y));
+     }
++    Ok(())
+ }
+ 
+ /// The outlines of `spec` as sketch data: line primitives in millimetres on the layer
+diff --git a/crates/geometry/src/outline_text/ttf.rs b/crates/geometry/src/outline_text/ttf.rs
+index 5b89bafbe..0c004bf53 100644
+--- a/crates/geometry/src/outline_text/ttf.rs
++++ b/crates/geometry/src/outline_text/ttf.rs
+@@ -27,11 +27,10 @@ pub struct OutlinePoint {
+ pub type Contours = Vec<Vec<OutlinePoint>>;
+ 
+ pub struct Font<'a> {
+-    data: &'a [u8],
+-    glyf: (usize, usize),
+-    loca: (usize, usize),
+-    hmtx: (usize, usize),
+-    cmap: Cmap,
++    glyf: &'a [u8],
++    loca: &'a [u8],
++    hmtx: &'a [u8],
++    cmap: Cmap<'a>,
+     long_loca: bool,
+     num_glyphs: u16,
+     num_h_metrics: u16,
+@@ -39,11 +38,8 @@ pub struct Font<'a> {
+     os2_cap_height: Option<i16>,
+ }
+ 
+-#[derive(Clone, Copy)]
+-enum Cmap {
+-    Format4(usize),
+-    Format12(usize),
+-}
++mod cmap;
++use cmap::Cmap;
+ 
+ fn u16_at(d: &[u8], at: usize) -> Result<u16, FontError> {
+     let b = d.get(at..at.checked_add(2).ok_or(FontError::Truncated)?).ok_or(FontError::Truncated)?;
+@@ -71,8 +67,8 @@ fn to_usize(v: u32) -> usize {
+     usize::try_from(v).unwrap_or(usize::MAX)
+ }
+ 
+-/// The (offset, length) of each required table, checked against the file length.
+-fn table(data: &[u8], tag: &[u8; 4]) -> Result<Option<(usize, usize)>, FontError> {
++/// Each table as a slice bounded by its declared length and the file length.
++fn table<'a>(data: &'a [u8], tag: &[u8; 4]) -> Result<Option<&'a [u8]>, FontError> {
+     let count = usize::from(u16_at(data, 4)?);
+     for i in 0..count {
+         let rec = 12 + 16 * i;
+@@ -84,13 +80,13 @@ fn table(data: &[u8], tag: &[u8; 4]) -> Result<Option<(usize, usize)>, FontError
+             if end > data.len() {
+                 return Err(FontError::Truncated);
+             }
+-            return Ok(Some((offset, length)));
++            return Ok(Some(&data[offset..end]));
+         }
+     }
+     Ok(None)
+ }
+ 
+-fn required(data: &[u8], tag: &'static str) -> Result<(usize, usize), FontError> {
++fn required<'a>(data: &'a [u8], tag: &'static str) -> Result<&'a [u8], FontError> {
+     let mut t = [0_u8; 4];
+     t.copy_from_slice(tag.as_bytes());
+     table(data, &t)?.ok_or(FontError::MissingTable(tag))
+@@ -105,17 +101,19 @@ impl<'a> Font<'a> {
+             _ => return Err(FontError::NotAFont),
+         }
+         let head = required(data, "head")?;
+-        let units_per_em = u16_at(data, head.0 + 18)?;
++        let units_per_em = u16_at(head, 18)?;
+         if !(16..=16384).contains(&units_per_em) {
+-            return Err(FontError::Corrupt("the units per em are outside 16 to 16384"));
++            return Err(FontError::Corrupt(
++                "the units per em are outside 16 to 16384",
++            ));
+         }
+-        let long_loca = match i16_at(data, head.0 + 50)? {
++        let long_loca = match i16_at(head, 50)? {
+             0 => false,
+             1 => true,
+             _ => return Err(FontError::Corrupt("the loca format is not 0 or 1")),
+         };
+-        let num_glyphs = u16_at(data, required(data, "maxp")?.0 + 4)?;
+-        let num_h_metrics = u16_at(data, required(data, "hhea")?.0 + 34)?;
++        let num_glyphs = u16_at(required(data, "maxp")?, 4)?;
++        let num_h_metrics = u16_at(required(data, "hhea")?, 34)?;
+         if num_h_metrics == 0 {
+             return Err(FontError::Corrupt("the font has no horizontal metrics"));
+         }
+@@ -125,15 +123,14 @@ impl<'a> Font<'a> {
+             FontError::MissingTable("glyf")
+         })?;
+         let os2_cap_height = match table(data, b"OS/2")? {
+-            Some((at, len)) if u16_at(data, at)? >= 2 && len >= 90 => Some(i16_at(data, at + 88)?),
++            Some(os2) if u16_at(os2, 0)? >= 2 => Some(i16_at(os2, 88)?),
+             _ => None,
+         };
+         Ok(Font {
+-            data,
+             glyf,
+             loca: required(data, "loca")?,
+             hmtx: required(data, "hmtx")?,
+-            cmap: pick_cmap(data, required(data, "cmap")?.0)?,
++            cmap: Cmap::parse(required(data, "cmap")?)?,
+             long_loca,
+             num_glyphs,
+             num_h_metrics,
+@@ -144,64 +141,19 @@ impl<'a> Font<'a> {
+ 
+     /// The glyph of `ch`, or `None` when the font maps it to no glyph.
+     pub fn glyph_id(&self, ch: char) -> Result<Option<u16>, FontError> {
+-        let c = u32::from(ch);
+-        let d = self.data;
+-        let gid = match self.cmap {
+-            Cmap::Format12(at) => {
+-                let groups = to_usize(u32_at(d, at + 12)?);
+-                let mut found = 0_u32;
+-                for i in 0..groups.min(1 << 20) {
+-                    let g = at + 16 + 12 * i;
+-                    let (start, end) = (u32_at(d, g)?, u32_at(d, g + 4)?);
+-                    if (start..=end).contains(&c) {
+-                        found = u32_at(d, g + 8)?.saturating_add(c - start);
+-                        break;
+-                    }
+-                }
+-                found
+-            }
+-            Cmap::Format4(at) => {
+-                let Ok(c) = u16::try_from(c) else { return Ok(None) };
+-                let segs = usize::from(u16_at(d, at + 6)? / 2);
+-                let ends = at + 14;
+-                let starts = ends + 2 * segs + 2;
+-                let deltas = starts + 2 * segs;
+-                let ranges = deltas + 2 * segs;
+-                let mut found = 0_u32;
+-                for s in 0..segs {
+-                    if u16_at(d, ends + 2 * s)? < c {
+-                        continue;
+-                    }
+-                    let start = u16_at(d, starts + 2 * s)?;
+-                    if start > c {
+-                        break;
+-                    }
+-                    let delta = u16_at(d, deltas + 2 * s)?;
+-                    let range = u16_at(d, ranges + 2 * s)?;
+-                    found = if range == 0 {
+-                        u32::from(c.wrapping_add(delta))
+-                    } else {
+-                        let addr = ranges + 2 * s + usize::from(range) + 2 * usize::from(c - start);
+-                        match u16_at(d, addr)? {
+-                            0 => 0,
+-                            g => u32::from(g.wrapping_add(delta)),
+-                        }
+-                    };
+-                    break;
+-                }
+-                found
+-            }
+-        };
+-        Ok(u16::try_from(gid).ok().filter(|&g| g != 0 && g < self.num_glyphs))
++        let gid = self.cmap.glyph_id(ch)?;
++        Ok(u16::try_from(gid)
++            .ok()
++            .filter(|&g| g != 0 && g < self.num_glyphs))
+     }
+ 
+     /// The advance width of `gid`, in font units.
+     pub fn advance(&self, gid: u16) -> Result<u16, FontError> {
+         let index = usize::from(gid.min(self.num_h_metrics - 1));
+-        if 4 * (index + 1) > self.hmtx.1 {
++        if 4 * (index + 1) > self.hmtx.len() {
+             return Err(FontError::Truncated);
+         }
+-        u16_at(self.data, self.hmtx.0 + 4 * index)
++        u16_at(self.hmtx, 4 * index)
+     }
+ 
+     /// The cap height in font units: the `OS/2` value, else the top of `H`, else 70 % of the
+@@ -222,17 +174,17 @@ impl<'a> Font<'a> {
+     fn glyph_range(&self, gid: u16) -> Result<(usize, usize), FontError> {
+         let g = usize::from(gid);
+         let (a, b) = if self.long_loca {
+-            (u32_at(self.data, self.loca.0 + 4 * g)?, u32_at(self.data, self.loca.0 + 4 * g + 4)?)
++            (u32_at(self.loca, 4 * g)?, u32_at(self.loca, 4 * g + 4)?)
+         } else {
+-            let a = u16_at(self.data, self.loca.0 + 2 * g)?;
+-            let b = u16_at(self.data, self.loca.0 + 2 * g + 2)?;
++            let a = u16_at(self.loca, 2 * g)?;
++            let b = u16_at(self.loca, 2 * g + 2)?;
+             (2 * u32::from(a), 2 * u32::from(b))
+         };
+         let (a, b) = (to_usize(a), to_usize(b));
+-        if a > b || b > self.glyf.1 {
++        if a > b || b > self.glyf.len() {
+             return Err(FontError::Corrupt("a glyph lies outside the glyf table"));
+         }
+-        Ok((self.glyf.0 + a, self.glyf.0 + b))
++        Ok((a, b))
+     }
+ 
+     /// The contours of `gid` in font units, composites resolved. A glyph with no outline (the
+@@ -243,18 +195,26 @@ impl<'a> Font<'a> {
+         Ok(out)
+     }
+ 
+-    fn append(&self, gid: u16, m: [f64; 6], depth: usize, out: &mut Contours) -> Result<(), FontError> {
++    fn append(
++        &self,
++        gid: u16,
++        m: [f64; 6],
++        depth: usize,
++        out: &mut Contours,
++    ) -> Result<(), FontError> {
+         if depth > MAX_DEPTH {
+             return Err(FontError::Corrupt("composite glyphs nest too deep"));
+         }
+         if gid >= self.num_glyphs {
+-            return Err(FontError::Corrupt("a composite glyph names a glyph that does not exist"));
++            return Err(FontError::Corrupt(
++                "a composite glyph names a glyph that does not exist",
++            ));
+         }
+         let (start, end) = self.glyph_range(gid)?;
+         if start == end {
+             return Ok(());
+         }
+-        let d = self.data.get(start..end).ok_or(FontError::Truncated)?;
++        let d = self.glyf.get(start..end).ok_or(FontError::Truncated)?;
+         let contours = i16_at(d, 0)?;
+         if contours >= 0 {
+             for contour in simple(d, usize::from(contours.unsigned_abs()))? {
+@@ -269,21 +229,32 @@ impl<'a> Font<'a> {
+         Ok(())
+     }
+ 
+-    fn composite(&self, d: &[u8], m: [f64; 6], depth: usize, out: &mut Contours) -> Result<(), FontError> {
++    fn composite(
++        &self,
++        d: &[u8],
++        m: [f64; 6],
++        depth: usize,
++        out: &mut Contours,
++    ) -> Result<(), FontError> {
+         let mut at = 10;
+         loop {
+             let flags = u16_at(d, at)?;
+             let child = u16_at(d, at + 2)?;
+             at += 4;
+             if flags & 0x0002 == 0 {
+-                return Err(FontError::Corrupt("a composite glyph places a part by point matching"));
++                return Err(FontError::Corrupt(
++                    "a composite glyph places a part by point matching",
++                ));
+             }
+             let (dx, dy) = if flags & 0x0001 != 0 {
+                 at += 4;
+                 (f64::from(i16_at(d, at - 4)?), f64::from(i16_at(d, at - 2)?))
+             } else {
+                 at += 2;
+-                (f64::from(u8_at(d, at - 2)? as i8), f64::from(u8_at(d, at - 1)? as i8))
++                (
++                    f64::from(u8_at(d, at - 2)? as i8),
++                    f64::from(u8_at(d, at - 1)? as i8),
++                )
+             };
+             let (a, b, c, e) = if flags & 0x0008 != 0 {
+                 at += 2;
+@@ -294,10 +265,25 @@ impl<'a> Font<'a> {
+                 (f2dot14(d, at - 4)?, 0.0, 0.0, f2dot14(d, at - 2)?)
+             } else if flags & 0x0080 != 0 {
+                 at += 8;
+-                (f2dot14(d, at - 8)?, f2dot14(d, at - 6)?, f2dot14(d, at - 4)?, f2dot14(d, at - 2)?)
++                (
++                    f2dot14(d, at - 8)?,
++                    f2dot14(d, at - 6)?,
++                    f2dot14(d, at - 4)?,
++                    f2dot14(d, at - 2)?,
++                )
+             } else {
+                 (1.0, 0.0, 0.0, 1.0)
+             };
++            if flags & 0x1800 == 0x1800 {
++                return Err(FontError::Corrupt(
++                    "a composite glyph has conflicting offset flags",
++                ));
++            }
++            let (dx, dy) = if flags & 0x0800 != 0 {
++                (a * dx + c * dy, b * dx + e * dy)
++            } else {
++                (dx, dy)
++            };
+             // The part's own matrix, then the parent's: x' = a x + c y + dx, y' = b x + e y + dy.
+             let part = [a, b, c, e, dx, dy];
+             let joined = [
+@@ -377,24 +363,3 @@ fn simple(d: &[u8], contours: usize) -> Result<Contours, FontError> {
+     }
+     Ok(out)
+ }
+-
+-/// The best Unicode subtable: format 12 (full Unicode) first, then format 4 (the BMP).
+-fn pick_cmap(data: &[u8], at: usize) -> Result<Cmap, FontError> {
+-    let count = usize::from(u16_at(data, at + 2)?);
+-    let mut best: Option<Cmap> = None;
+-    for i in 0..count {
+-        let rec = at + 4 + 8 * i;
+-        let (platform, encoding) = (u16_at(data, rec)?, u16_at(data, rec + 2)?);
+-        let unicode = platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10));
+-        if !unicode {
+-            continue;
+-        }
+-        let sub = at.checked_add(to_usize(u32_at(data, rec + 4)?)).ok_or(FontError::Truncated)?;
+-        match u16_at(data, sub)? {
+-            12 => return Ok(Cmap::Format12(sub)),
+-            4 if best.is_none() => best = Some(Cmap::Format4(sub)),
+-            _ => {}
+-        }
+-    }
+-    best.ok_or(FontError::MissingTable("cmap (a Unicode subtable of format 4 or 12)"))
+-}
+diff --git a/crates/geometry/src/outline_text/ttf/cmap.rs b/crates/geometry/src/outline_text/ttf/cmap.rs
+new file mode 100644
+index 000000000..1d1db657c
+--- /dev/null
++++ b/crates/geometry/src/outline_text/ttf/cmap.rs
+@@ -0,0 +1,107 @@
++//! Bounded Unicode character maps, from the public OpenType cmap specification.
++
++use super::{FontError, to_usize, u16_at, u32_at};
++
++pub(super) enum Cmap<'a> {
++    Format4(&'a [u8]),
++    Format12(&'a [u8]),
++}
++
++impl<'a> Cmap<'a> {
++    pub(super) fn parse(data: &'a [u8]) -> Result<Self, FontError> {
++        let count = usize::from(u16_at(data, 2)?);
++        data.get(..4 + 8 * count).ok_or(FontError::Truncated)?;
++        let mut best = None;
++        for i in 0..count {
++            let rec = 4 + 8 * i;
++            let (platform, encoding) = (u16_at(data, rec)?, u16_at(data, rec + 2)?);
++            if !(platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10))) {
++                continue;
++            }
++            let offset = to_usize(u32_at(data, rec + 4)?);
++            let tail = data.get(offset..).ok_or(FontError::Truncated)?;
++            let format = u16_at(tail, 0)?;
++            let length = match format {
++                4 => usize::from(u16_at(tail, 2)?),
++                12 => to_usize(u32_at(tail, 4)?),
++                _ => continue,
++            };
++            let sub = tail.get(..length).ok_or(FontError::Truncated)?;
++            match format {
++                12 => {
++                    let groups = to_usize(u32_at(sub, 12)?);
++                    let end = groups
++                        .checked_mul(12)
++                        .and_then(|n| n.checked_add(16))
++                        .ok_or(FontError::Truncated)?;
++                    sub.get(..end).ok_or(FontError::Truncated)?;
++                    return Ok(Self::Format12(sub));
++                }
++                4 => {
++                    let seg_count = u16_at(sub, 6)?;
++                    if seg_count == 0 || seg_count % 2 != 0 {
++                        return Err(FontError::Corrupt(
++                            "a cmap segment count is not a positive even number",
++                        ));
++                    }
++                    sub.get(..16 + 4 * usize::from(seg_count))
++                        .ok_or(FontError::Truncated)?;
++                    if best.is_none() {
++                        best = Some(Self::Format4(sub));
++                    }
++                }
++                _ => {}
++            }
++        }
++        best.ok_or(FontError::MissingTable(
++            "cmap (a Unicode subtable of format 4 or 12)",
++        ))
++    }
++
++    pub(super) fn glyph_id(&self, ch: char) -> Result<u32, FontError> {
++        let c = u32::from(ch);
++        match self {
++            Self::Format12(d) => {
++                let groups = to_usize(u32_at(d, 12)?);
++                for i in 0..groups {
++                    let g = 16 + 12 * i;
++                    let (start, end) = (u32_at(d, g)?, u32_at(d, g + 4)?);
++                    if (start..=end).contains(&c) {
++                        return Ok(u32_at(d, g + 8)?.saturating_add(c - start));
++                    }
++                }
++            }
++            Self::Format4(d) => {
++                let Ok(c) = u16::try_from(c) else {
++                    return Ok(0);
++                };
++                let segs = usize::from(u16_at(d, 6)? / 2);
++                let ends = 14;
++                let starts = ends + 2 * segs + 2;
++                let deltas = starts + 2 * segs;
++                let ranges = deltas + 2 * segs;
++                for s in 0..segs {
++                    if u16_at(d, ends + 2 * s)? < c {
++                        continue;
++                    }
++                    let start = u16_at(d, starts + 2 * s)?;
++                    if start > c {
++                        break;
++                    }
++                    let delta = u16_at(d, deltas + 2 * s)?;
++                    let range = u16_at(d, ranges + 2 * s)?;
++                    return if range == 0 {
++                        Ok(u32::from(c.wrapping_add(delta)))
++                    } else {
++                        let addr = ranges + 2 * s + usize::from(range) + 2 * usize::from(c - start);
++                        Ok(match u16_at(d, addr)? {
++                            0 => 0,
++                            g => u32::from(g.wrapping_add(delta)),
++                        })
++                    };
++                }
++            }
++        }
++        Ok(0)
++    }
++}
+diff --git a/crates/geometry/tests/outline_text.rs b/crates/geometry/tests/outline_text.rs
+index 5311505e0..e6d1603c7 100644
+--- a/crates/geometry/tests/outline_text.rs
++++ b/crates/geometry/tests/outline_text.rs
+@@ -109,3 +109,160 @@ fn bad_text_and_overlapping_outlines_are_refused_by_name() {
+     // X's two bars cross: a pocket of them is not clear.
+     assert!(err(spec(&font, "X")).contains("the text outlines cross or touch"), "{}", err(spec(&font, "X")));
+ }
++
++#[test]
++fn large_curves_measure_inside_the_chord_tolerance() {
++    let font = sample_font();
++    for height in [7.0, 1000.0] {
++        let scale = height / 700.0;
++        let lines = outlines(&OutlineSpec {
++            height,
++            ..spec(&font, "D")
++        })
++        .expect("large D");
++        let mut chords = 0;
++        for pair in lines[0].windows(2) {
++            let (a, b) = (pair[0], pair[1]);
++            if a.x < 300.0 * scale || b.x < 300.0 * scale {
++                continue;
++            }
++            // Recover each endpoint's parameter on either of D's two quadratic pieces.
++            let upper = a.y >= 350.0 * scale && b.y >= 350.0 * scale;
++            let lower = a.y <= 350.0 * scale && b.y <= 350.0 * scale;
++            if !(upper || lower) {
++                continue;
++            }
++            let parameter = |y: f64| {
++                if upper {
++                    ((height - y) / (350.0 * scale)).max(0.0).sqrt()
++                } else {
++                    1.0 - (y / (350.0 * scale)).max(0.0).sqrt()
++                }
++            };
++            let (ta, tb) = (parameter(a.y), parameter(b.y));
++            for i in 1..16 {
++                let t = ta + (tb - ta) * f64::from(i) / 16.0;
++                let (x, y) = if upper {
++                    (300.0 + 300.0 * (2.0 * t - t * t), 700.0 - 350.0 * t * t)
++                } else {
++                    (600.0 - 300.0 * t * t, 350.0 * (1.0 - t).powi(2))
++                };
++                let (x, y) = (x * scale, y * scale);
++                let (dx, dy) = (b.x - a.x, b.y - a.y);
++                let u = (((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
++                let error = (x - a.x - u * dx).hypot(y - a.y - u * dy);
++                assert!(
++                    error <= CHORD_TOLERANCE,
++                    "height {height}, chord {a:?}..{b:?}, error {error}"
++                );
++            }
++            chords += 1;
++        }
++        assert!(chords > 8);
++    }
++}
++
++fn table_record(font: &[u8], tag: &[u8; 4]) -> usize {
++    (12..12 + 16 * usize::from(u16::from_be_bytes(font[4..6].try_into().unwrap())))
++        .step_by(16)
++        .find(|&at| &font[at..at + 4] == tag)
++        .expect("table")
++}
++
++fn table_offset(font: &[u8], tag: &[u8; 4]) -> usize {
++    let rec = table_record(font, tag);
++    u32::from_be_bytes(font[rec + 8..rec + 12].try_into().unwrap()) as usize
++}
++
++#[test]
++fn composite_offsets_use_the_component_transform() {
++    let mut font = sample_font();
++    let loca = table_offset(&font, b"loca");
++    let glyph = u32::from_be_bytes(font[loca + 28..loca + 32].try_into().unwrap()) as usize;
++    let at = table_offset(&font, b"glyf") + glyph + 10;
++    font[at..at + 2].copy_from_slice(&0x080b_u16.to_be_bytes());
++    font[at + 4..at + 6].copy_from_slice(&100_i16.to_be_bytes());
++    font[at + 6..at + 8].copy_from_slice(&360_i16.to_be_bytes());
++    let lines = outlines(&spec(&font, "8")).expect("scaled offset");
++    let min_x = lines
++        .iter()
++        .flatten()
++        .map(|p| p.x)
++        .fold(f64::INFINITY, f64::min);
++    let min_y = lines
++        .iter()
++        .flatten()
++        .map(|p| p.y)
++        .fold(f64::INFINITY, f64::min);
++    assert_eq!((min_x, min_y), (0.5, 1.8));
++    assert_eq!(roles(&font, "8"), (1, 1));
++    font[at..at + 2].copy_from_slice(&0x180b_u16.to_be_bytes());
++    assert!(
++        outlines(&spec(&font, "8"))
++            .unwrap_err()
++            .to_string()
++            .contains("conflicting offset flags")
++    );
++}
++
++#[test]
++fn declared_table_lengths_bound_reads_with_trailing_bytes() {
++    let font = sample_font();
++    for (tag, lengths) in [
++        (b"head", &[0_u32, 19, 51][..]),
++        (b"maxp", &[0, 5][..]),
++        (b"hhea", &[0, 35][..]),
++        (b"hmtx", &[0, 19][..]),
++        (b"loca", &[0, 23][..]),
++        (b"cmap", &[0, 11, 27][..]),
++    ] {
++        for &length in lengths {
++            let mut bad = font.clone();
++            let rec = table_record(&bad, tag);
++            bad[rec + 12..rec + 16].copy_from_slice(&length.to_be_bytes());
++            assert!(
++                matches!(sketch(&spec(&bad, "HO")), Err(OutlineTextError::Font(_))),
++                "{tag:?} length {length} was accepted"
++            );
++        }
++    }
++}
++
++#[test]
++fn declared_cmap_subtable_lengths_bound_reads() {
++    let mut font = sample_font();
++    let cmap = table_offset(&font, b"cmap");
++    let sub = cmap + 12;
++    font[sub + 2..sub + 4].copy_from_slice(&16_u16.to_be_bytes());
++    assert!(matches!(
++        sketch(&spec(&font, "HO")),
++        Err(OutlineTextError::Font(_))
++    ));
++    // Point the directory at a new format 12 cmap. The bytes after its short declared
++    // subtable length remain in the file, including the complete group for H.
++    let mut font = sample_font();
++    let rec = table_record(&font, b"cmap");
++    let offset = u32::try_from(font.len()).unwrap();
++    let mut cmap = vec![0, 0, 0, 1, 0, 3, 0, 10, 0, 0, 0, 12];
++    cmap.extend_from_slice(&12_u16.to_be_bytes());
++    cmap.extend_from_slice(&0_u16.to_be_bytes());
++    cmap.extend_from_slice(&28_u32.to_be_bytes());
++    cmap.extend_from_slice(&0_u32.to_be_bytes());
++    cmap.extend_from_slice(&1_u32.to_be_bytes());
++    cmap.extend_from_slice(&u32::from('H').to_be_bytes());
++    cmap.extend_from_slice(&u32::from('H').to_be_bytes());
++    cmap.extend_from_slice(&2_u32.to_be_bytes());
++    font[rec + 8..rec + 12].copy_from_slice(&offset.to_be_bytes());
++    font[rec + 12..rec + 16].copy_from_slice(&u32::try_from(cmap.len()).unwrap().to_be_bytes());
++    font.extend_from_slice(&cmap);
++    assert!(
++        sketch(&spec(&font, "H")).is_ok(),
++        "complete format 12 group"
++    );
++    let length_at = offset as usize + 12 + 4;
++    font[length_at..length_at + 4].copy_from_slice(&16_u32.to_be_bytes());
++    assert!(matches!(
++        sketch(&spec(&font, "H")),
++        Err(OutlineTextError::Font(_))
++    ));
++}
+diff --git a/docs/decisions/3072-outline-text.md b/docs/decisions/3072-outline-text.md
+index bcfb13906..a80e5be07 100644
+--- a/docs/decisions/3072-outline-text.md
++++ b/docs/decisions/3072-outline-text.md
+@@ -4,17 +4,22 @@
+ 
+ - We wrote our own TrueType outline reader, `camcraft_geometry::outline_text::ttf`. We wrote it from the public OpenType specification. It reads the table directory, `head`, `maxp`, `hhea`, `hmtx`, `OS/2` (cap height), `cmap` formats 4 and 12, `loca`, and `glyf` (simple and composite glyphs).
+ - A font with CFF (PostScript) outlines (`OTTO`, or a `CFF ` table and no `glyf`) is refused by name. A font collection (`ttcf`) is refused by name. Both refusals tell the user what to pick instead.
+-- Quadratic contour pieces are flattened to lines. The chord error is at most 0.005 mm, from the bound |a - 2c + b| / (4 n²). Each piece gives 64 lines at most.
++- Quadratic contour pieces are flattened to lines. The chord error is at most 0.005 mm, from the bound |a - 2c + b| / (4 n²). The bound reserves 0.001 mm for dropped near points. A piece can use up to 4096 lines. A curve that needs more lines is refused with a diagnostic.
+ - The text sketch uses a join tolerance of 0.0005 mm, not the 0.01 mm DXF default. A flattened point closer than 0.001 mm to the point before it is dropped. A small letter keeps its short segments, and the chainer never sees a segment shorter than its tolerance.
+ - `height` is the font's cap height, as in `insert_text`. The reader takes the `OS/2` `sCapHeight`, then the top of `H`, then 70 % of the em.
+ - The sketch must have only closed chains, each with a clear nesting. Outlines that cross or touch (a font with overlapping contours, or letters that run into each other) are refused by name. The refusal tells the user to add letter spacing or to pick a different font. We never send an unclear region to a pocket.
+ - The command is a new `InsertOutlineText`, with the new MCP tool `insert_outline_text`. We did not add a `font` field to `InsertText` or `insert_text`. The font is read once at construction, and the profile stores the shapes. The project file therefore needs no font and no format change.
++- Composite glyphs apply their component matrix to offsets when `SCALED_COMPONENT_OFFSET` is set. A component with both scaled and unscaled offset flags is refused.
++- Font reads use slices bounded by each declared table length. The `cmap` reader also checks each selected subtable length. Bytes after a short table cannot supply a missing field.
+ - The tests use a font that is generated in memory (`outline_text::sample_font`, `#[doc(hidden)]`). It has our own box and curve glyphs. No font file is stored in the repository or licensed.
+ 
+-**Why.** No new dependency: `ttf-parser` is in `Cargo.lock` only through eframe, and a direct dependency needs a maintainer decision. The reader is 400 lines and has bounds checks on every read. A byte-flip and truncation sweep in the tests shows that it never panics. Most hobby sign fonts are `.ttf` files with TrueType outlines.
++**Why.** No new dependency: `ttf-parser` is in `Cargo.lock` only through eframe, and a direct dependency needs a maintainer decision. The reader separates character mapping from outline decoding. Each read checks the declared table or subtable boundary. A byte-flip and truncation sweep in the tests shows that it never panics. Most hobby sign fonts are `.ttf` files with TrueType outlines.
+ 
+ **Dropped.**
+ 
++- Clamping the number of curve pieces to 64. At large heights, this silently exceeds the chord tolerance. The higher limit permits ordinary large letters and still bounds the work.
++- Ignoring scaled component offsets. This moves the outline without a diagnostic. Applying the specified transform preserves the font placement.
++- Checking table fields against the whole file. Trailing bytes can hide a corrupt table length. Bounded slices refuse these inputs.
+ - A direct `ttf-parser` dependency. It would also read CFF outlines, but it needs a new dependency.
+ - A CFF (Type 2 charstring) reader. This is a larger format. It can come later as its own issue if users ask for `.otf` CFF fonts.
+ - Silently joining overlapping contours with a boolean union. That changes the font's shapes without a word. A later issue can add an explicit union step.
+
+From d3b53cec9a2441d0f42a3ac82ca86321f47815d3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 11:52:35 -0800
+Subject: [PATCH 5/6] fix(geometry): refuse nested outlines whose winding
+ nonzero fill fills
+
+The sketch reads holes by nesting, but a TrueType font fills by the nonzero
+winding rule. A contour inside another that runs in the same direction is
+filled, not a hole. Refuse that arrangement by name (OutlineTextError::Winding)
+so a pocket or cut-out never takes the wrong region.
+
+Pinned by nested_outlines_follow_the_nonzero_winding_fill.
+
+Refs #3072
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/geometry/src/outline_text/mod.rs | 54 ++++++++++++++++++++++++-
+ crates/geometry/tests/outline_text.rs   | 32 +++++++++++++++
+ 2 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/crates/geometry/src/outline_text/mod.rs b/crates/geometry/src/outline_text/mod.rs
+index a60574d7c..1366fb723 100644
+--- a/crates/geometry/src/outline_text/mod.rs
++++ b/crates/geometry/src/outline_text/mod.rs
+@@ -8,8 +8,9 @@
+ //!
+ //! Contract. The shapes are in millimetres. The origin is the left end of the baseline, and
+ //! `height` is the cap height of the font. Nothing is guessed: a font that cannot be read, a
+-//! font with CFF outlines, a character the font does not have, and outlines that cross or
+-//! touch are refused by name. The sketch that [`sketch`] returns has only closed chains, each
++//! font with CFF outlines, a character the font does not have, outlines that cross or touch,
++//! and a nested outline that runs in the same direction as the one around it (nonzero fill
++//! would make it filled, not a hole) are refused by name. The sketch that [`sketch`] returns has only closed chains, each
+ //! with a clear nesting, or the call fails. This module has no file I/O and no application
+ //! state.
+ 
+@@ -82,6 +83,15 @@ pub enum OutlineTextError {
+          or pick a font whose letters do not overlap"
+     )]
+     Shapes(String),
++    /// An outline inside another runs in the same direction as it. The font fills by the
++    /// nonzero winding rule, so the inner region is filled, not a hole: a nesting reading of
++    /// the shapes would cut the wrong region.
++    #[error(
++        "the outline near ({x:.3}, {y:.3}) mm is inside another outline that runs in the same \
++         direction, so the font fills it instead of making a hole: the shapes are not clear. \
++         Pick a different font"
++    )]
++    Winding { x: f64, y: f64 },
+ }
+ 
+ /// What to write: the font file's bytes, the string, the cap height in mm, and the extra gap
+@@ -258,5 +268,45 @@ pub fn sketch(spec: &OutlineSpec) -> Result<SketchData, OutlineTextError> {
+     if let Some(error) = chains.closed.iter().find_map(|chain| chain.nesting.as_ref().err()) {
+         return Err(OutlineTextError::Shapes(error.to_string()));
+     }
++    check_winding(&lines)?;
+     Ok(data)
+ }
++
++/// The font fills by the nonzero winding rule; the sketch reads holes by nesting (even-odd).
++/// The two agree only when each outline runs opposite to the innermost outline around it.
++/// Call this after the outlines are known not to cross or touch, so one vertex of an outline
++/// tells if another outline contains it.
++fn check_winding(lines: &[Vec<Point2>]) -> Result<(), OutlineTextError> {
++    let areas: Vec<f64> = lines.iter().map(|l| signed_area(l)).collect();
++    for (i, line) in lines.iter().enumerate() {
++        let Some(&p) = line.first() else { continue };
++        let parent = lines
++            .iter()
++            .enumerate()
++            .filter(|&(j, other)| j != i && areas[j].abs() > areas[i].abs() && contains(other, p))
++            .min_by(|a, b| areas[a.0].abs().total_cmp(&areas[b.0].abs()));
++        if let Some((j, _)) = parent
++            && areas[j].signum() == areas[i].signum()
++        {
++            return Err(OutlineTextError::Winding { x: p.x, y: p.y });
++        }
++    }
++    Ok(())
++}
++
++/// The shoelace area of a closed polyline: positive counterclockwise.
++fn signed_area(line: &[Point2]) -> f64 {
++    0.5 * line.windows(2).map(|w| w[0].x * w[1].y - w[1].x * w[0].y).sum::<f64>()
++}
++
++/// Is `p` inside the closed polyline `line` (crossing count of a ray to +x)?
++fn contains(line: &[Point2], p: Point2) -> bool {
++    let mut inside = false;
++    for w in line.windows(2) {
++        let (a, b) = (w[0], w[1]);
++        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y) {
++            inside = !inside;
++        }
++    }
++    inside
++}
+diff --git a/crates/geometry/tests/outline_text.rs b/crates/geometry/tests/outline_text.rs
+index e6d1603c7..85802466b 100644
+--- a/crates/geometry/tests/outline_text.rs
++++ b/crates/geometry/tests/outline_text.rs
+@@ -205,6 +205,38 @@ fn composite_offsets_use_the_component_transform() {
+     );
+ }
+ 
++/// Write the x coordinates of the eight points of `O` (outer box, then inner box) into the
++/// font as deltas. The y coordinates stay: each box keeps its corners, in a new direction.
++fn set_o_xs(font: &mut [u8], xs: [i16; 8]) {
++    let loca = table_offset(font, b"loca");
++    let glyph = u32::from_be_bytes(font[loca + 16..loca + 20].try_into().unwrap()) as usize;
++    // Header 10, two contour ends 4, instruction length 2, eight flags 8.
++    let at = table_offset(font, b"glyf") + glyph + 24;
++    let mut last = 0_i16;
++    for (k, x) in xs.into_iter().enumerate() {
++        font[at + 2 * k..at + 2 * k + 2].copy_from_slice(&(x - last).to_be_bytes());
++        last = x;
++    }
++}
++
++#[test]
++fn nested_outlines_follow_the_nonzero_winding_fill() {
++    let mut font = sample_font();
++    // The unchanged O: the box runs clockwise and its hole counterclockwise.
++    set_o_xs(&mut font, [0, 0, 600, 600, 450, 450, 150, 150]);
++    assert_eq!(roles(&font, "O"), (1, 1));
++    // The two directions swapped are still a box with a hole under nonzero fill.
++    set_o_xs(&mut font, [600, 600, 0, 0, 150, 150, 450, 450]);
++    assert_eq!(roles(&font, "O"), (1, 1));
++    // The inner box in the same direction as the outer one: nonzero fill makes it filled.
++    set_o_xs(&mut font, [0, 0, 600, 600, 150, 150, 450, 450]);
++    let err = sketch(&spec(&font, "O")).expect_err("a same-direction inner box is not a hole");
++    assert!(matches!(err, OutlineTextError::Winding { .. }), "{err}");
++    assert!(err.to_string().contains("runs in the same direction"), "{err}");
++    // Side by side, two outlines in the same direction stay two shapes.
++    assert_eq!(roles(&sample_font(), "II"), (2, 0));
++}
++
+ #[test]
+ fn declared_table_lengths_bound_reads_with_trailing_bytes() {
+     let font = sample_font();
+
+From 4cc0638eee9155b2cdac957685a0014898caeff3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 17:20:28 -0800
+Subject: [PATCH 6/6] fix(gpu): iterate dimensions in cut bounds validation
+
+Clear the review-reported needless_range_loop warning. Keep all bounds checks and diagnostics.
+
+Refs #3072
+---
+ crates/gpu/src/cut.rs               | 4 ++--
+ docs/decisions/3072-outline-text.md | 2 ++
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpu/src/cut.rs b/crates/gpu/src/cut.rs
+index 92655cee6..c80aef75c 100644
+--- a/crates/gpu/src/cut.rs
++++ b/crates/gpu/src/cut.rs
+@@ -123,14 +123,14 @@ impl CutItem {
+         if !self.ball && self.flank <= 0.0 {
+             return Err(bad(format!("item {n} is a flat end mill with no flank")));
+         }
+-        for a in 0..3 {
++        for (a, dim) in dims.into_iter().enumerate() {
+             let (lo, hi) = (self.lo[a], self.hi[a]);
+             if lo > hi || hi >= CUT_BRICK {
+                 return Err(bad(format!("item {n} has the cells {lo}..={hi} on axis {a}: not inside one brick")));
+             }
+             let first = i64::from(self.base[a]) + i64::from(lo);
+             let last = i64::from(self.base[a]) + i64::from(hi);
+-            if first < 0 || last >= i64::from(dims[a]) {
++            if first < 0 || last >= i64::from(dim) {
+                 return Err(bad(format!("item {n} reaches the cells {first}..={last} on axis {a}, outside the lattice")));
+             }
+         }
+diff --git a/docs/decisions/3072-outline-text.md b/docs/decisions/3072-outline-text.md
+index a80e5be07..8edd8cf70 100644
+--- a/docs/decisions/3072-outline-text.md
++++ b/docs/decisions/3072-outline-text.md
+@@ -12,6 +12,7 @@
+ - Composite glyphs apply their component matrix to offsets when `SCALED_COMPONENT_OFFSET` is set. A component with both scaled and unscaled offset flags is refused.
+ - Font reads use slices bounded by each declared table length. The `cmap` reader also checks each selected subtable length. Bytes after a short table cannot supply a missing field.
+ - The tests use a font that is generated in memory (`outline_text::sample_font`, `#[doc(hidden)]`). It has our own box and curve glyphs. No font file is stored in the repository or licensed.
++- Final review verification uses a clean merge of current upstream. The GPU bounds loop iterates over dimensions to clear the reported Clippy warning. All bounds checks stay in place.
+ 
+ **Why.** No new dependency: `ttf-parser` is in `Cargo.lock` only through eframe, and a direct dependency needs a maintainer decision. The reader separates character mapping from outline decoding. Each read checks the declared table or subtable boundary. A byte-flip and truncation sweep in the tests shows that it never panics. Most hobby sign fonts are `.ttf` files with TrueType outlines.
+ 
+@@ -24,5 +25,6 @@
+ - A CFF (Type 2 charstring) reader. This is a larger format. It can come later as its own issue if users ask for `.otf` CFF fonts.
+ - Silently joining overlapping contours with a boolean union. That changes the font's shapes without a word. A later issue can add an explicit union step.
+ - The use of glyph arcs or splines in the sketch. The sketch primitives are lines and arcs only. Flattening within 0.005 mm is well below a cutter's tolerance.
++- Disabling the reported lint or changing the UI tests. These changes would hide the verification failures instead of clearing them.
+ 
+ **Cost to change later.** The reader is private to `outline_text`. A change to `ttf-parser` or a CFF reader changes that one module, and the command and tool stay the same. Toolpaths from profile chains (2D Pocket, Contour) are #1867's work. The text profile goes to those operations as closed chains, the same as a DXF profile.

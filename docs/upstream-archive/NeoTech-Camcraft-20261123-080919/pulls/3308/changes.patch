@@ -1,0 +1,1649 @@
+From a273ee0187325399ed84061cabaf9b7026ac0c09 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Sat, 21 Nov 2026 23:36:23 -0800
+Subject: [PATCH 1/3] feat(cl): translate, XY turn, A/B turn and vertical
+ mirror for toolpaths
+
+Add crates/cl/src/cl/transform.rs (re-exported as app::cl::transform):
+translate, transform_xy, rotate_about_axis and mirror_plane. One
+orthogonal map p -> M p + t carries moves, arc centres, cycles,
+compensated spans and edge breaks. A reflection swaps G2/G3 and
+G41/G42. PreserveClimb reverses each contour, profile or chamfer pass
+between its entry and its retract. TransformError refuses thread
+cycles, probe touches, C moves, tilted moves under a mirror, plasma
+under a mirror or tilt, vertical arcs a map cannot keep, tilted canned
+cycles, horizontal and tilted mirror planes, and passes that cannot
+reverse safely.
+
+Fixes #3011
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/cl/src/cl/mod.rs                    |   1 +
+ crates/cl/src/cl/transform.rs              | 317 +++++++++++++++++++++
+ crates/cl/src/cl/transform_climb.rs        | 206 +++++++++++++
+ crates/cl/src/cl/transform_mirror.rs       | 124 ++++++++
+ crates/cl/src/cl/transform_mirror_tests.rs | 175 ++++++++++++
+ crates/cl/src/cl/transform_rotary.rs       |  91 ++++++
+ crates/cl/src/cl/transform_tests.rs        | 224 +++++++++++++++
+ docs/decisions/3011-cl-transforms.md       |  67 +++++
+ 8 files changed, 1205 insertions(+)
+ create mode 100644 crates/cl/src/cl/transform.rs
+ create mode 100644 crates/cl/src/cl/transform_climb.rs
+ create mode 100644 crates/cl/src/cl/transform_mirror.rs
+ create mode 100644 crates/cl/src/cl/transform_mirror_tests.rs
+ create mode 100644 crates/cl/src/cl/transform_rotary.rs
+ create mode 100644 crates/cl/src/cl/transform_tests.rs
+ create mode 100644 docs/decisions/3011-cl-transforms.md
+
+diff --git a/crates/cl/src/cl/mod.rs b/crates/cl/src/cl/mod.rs
+index a1885773a..5151fb41e 100644
+--- a/crates/cl/src/cl/mod.rs
++++ b/crates/cl/src/cl/mod.rs
+@@ -34,6 +34,7 @@ mod pose;
+ mod rotary;
+ mod rotary_unwind;
+ pub mod text;
++pub mod transform;
+ mod thread;
+ mod torch;
+ mod touch;
+diff --git a/crates/cl/src/cl/transform.rs b/crates/cl/src/cl/transform.rs
+new file mode 100644
+index 000000000..24cd4f6c0
+--- /dev/null
++++ b/crates/cl/src/cl/transform.rs
+@@ -0,0 +1,317 @@
++//! Rigid toolpath transforms (#3011): translate, turn in XY, turn about
++//! the A or B axis, mirror across a vertical plane.
++//!
++//! Provenance: elementary Euclidean rigid motions and reflections; the
++//! G2 <-> G3 and G41 <-> G42 swap under a reflection is the RS-274 /
++//! ISO 6983 direction rule, the one `post::invert` applies to a
++//! machine's inverted axis. Our own model; no vendor material consulted.
++//!
++//! Every transform is one map `p -> M p + t` with `M` orthogonal
++//! ([`Rigid`]). A path maps move for move, so the index records (cycle
++//! `first_move`, compensated spans, torch spans) stay valid, except
++//! where a tilt flattens arcs ([`rotate_about_axis`]); there the index
++//! records that cannot follow are refused or dropped with a note.
++//! Moves, arc centers and cycles land on the 1 um [`lattice`]; edge
++//! break polylines do not, because a snap would bend their framed caps
++//! off orthonormal. A record a rigid map cannot carry is refused by name
++//! ([`TransformError`]), never guessed.
++
++use std::fmt;
++
++use crate::geo2d::Point2;
++use crate::geometry::Point3;
++
++use super::comp::{CompSide, CompSpan};
++use super::cycle::Cycle;
++use super::edge_break::EdgeBreak;
++use super::moves::{lattice, ArcMove, Move};
++use super::path::Toolpath;
++use super::pose::{is_vertical, normalize_axis};
++
++#[path = "transform_climb.rs"]
++mod climb;
++#[path = "transform_mirror.rs"]
++mod mirror;
++#[path = "transform_rotary.rs"]
++mod rotary;
++
++pub use mirror::{mirror_plane, MirrorMode, MirrorPlane, PassFamily};
++pub use rotary::{rotate_about_axis, RotaryAxis};
++
++/// Why a transform refused a path. Each names the record or the input
++/// it cannot carry; the path is never transformed in part.
++#[derive(Clone, Debug, PartialEq)]
++pub enum TransformError {
++    /// A non-finite or out-of-range input (offset, angle, plane,
++    /// tolerance), or a result that left the finite range.
++    BadInput(&'static str),
++    /// A turning thread cycle: lathe intent, not a milling map.
++    ThreadCycle,
++    /// A probing touch: it writes a work offset from its own target.
++    ProbeTouch,
++    /// A move with a stated spindle C angle (C-axis live tooling).
++    RotaryMove,
++    /// A tilted (A/B) move under a mirror.
++    TiltedMove,
++    /// A plasma statement under a mirror or a tilt: its kerf side and
++    /// lit spans do not follow.
++    PlasmaCut,
++    /// An XZ / YZ arc whose plane the transform does not keep.
++    VerticalArc,
++    /// A canned drilling cycle turned off the Z axis.
++    CannedCycleTilt,
++    /// A mirror plane that flips Z.
++    HorizontalMirrorPlane,
++    /// A mirror plane that is neither vertical nor horizontal.
++    TiltedMirrorPlane,
++    /// `PreserveClimb` cannot reverse this path safely; the text says why.
++    NotReversible(String),
++}
++
++impl fmt::Display for TransformError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let why = match self {
++            TransformError::BadInput(what) => return write!(f, "toolpath transform refused: {what} is not finite or out of range"),
++            TransformError::NotReversible(why) => return write!(f, "toolpath mirror refused: cannot keep the climb cut: {why}"),
++            TransformError::ThreadCycle => "a turning thread cycle does not ride a milling transform",
++            TransformError::ProbeTouch => "a probing touch writes a work offset; a transform does not move it",
++            TransformError::RotaryMove => "a move with a stated C angle (C-axis live tooling) does not ride a transform",
++            TransformError::TiltedMove => "a tilted (A/B) move cannot be mirrored",
++            TransformError::PlasmaCut => "a plasma cut's kerf side and torch spans do not follow a mirror or a tilt",
++            TransformError::VerticalArc => "an XZ / YZ arc does not keep its plane under this transform",
++            TransformError::CannedCycleTilt => "a canned drilling cycle cannot turn off the Z axis",
++            TransformError::HorizontalMirrorPlane => {
++                "a horizontal mirror plane flips Z: the tool would stand on the wrong side of its tip"
++            }
++            TransformError::TiltedMirrorPlane => "only a vertical mirror plane (normal with no Z part) is supported",
++        };
++        write!(f, "toolpath transform refused: {why}")
++    }
++}
++
++impl std::error::Error for TransformError {}
++
++/// Shift every move, arc center, cycle, compensated span and edge break
++/// by `d = (dx, dy, dz)`.
++pub fn translate(tp: &Toolpath, d: [f64; 3]) -> Result<Toolpath, TransformError> {
++    if !d.iter().all(|v| v.is_finite()) {
++        return Err(TransformError::BadInput("the translation"));
++    }
++    refuse_records(tp)?;
++    map_path(tp, &Rigid { m: IDENTITY, t: d })
++}
++
++/// Turn the path in XY by `angle_deg` (counter-clockwise seen from +Z)
++/// about `pivot`, then shift it by `(tx, ty)`. Z is unchanged. An XZ /
++/// YZ arc keeps its plane only at a half or a whole turn; at other
++/// angles it is refused ([`TransformError::VerticalArc`]).
++pub fn transform_xy(tp: &Toolpath, tx: f64, ty: f64, angle_deg: f64, pivot: Point2) -> Result<Toolpath, TransformError> {
++    if ![tx, ty, angle_deg, pivot.x, pivot.y].iter().all(|v| v.is_finite()) {
++        return Err(TransformError::BadInput("the XY transform"));
++    }
++    refuse_records(tp)?;
++    let (s, c) = sin_cos_deg(angle_deg);
++    let m = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]];
++    let o = [pivot.x, pivot.y, 0.0];
++    let t = Rigid::pivot_offset(&m, o, [tx, ty, 0.0]);
++    map_path(tp, &Rigid { m, t })
++}
++
++const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
++
++/// Sine and cosine of an angle in degrees, exact at the quarter turns
++/// so a 90 / 180 / 270 degree map keeps the lattice bit for bit.
++fn sin_cos_deg(deg: f64) -> (f64, f64) {
++    let r = deg.rem_euclid(360.0);
++    [(0.0, (0.0, 1.0)), (90.0, (1.0, 0.0)), (180.0, (0.0, -1.0)), (270.0, (-1.0, 0.0))]
++        .into_iter()
++        .find_map(|(q, sc)| (r == q).then_some(sc))
++        .unwrap_or_else(|| r.to_radians().sin_cos())
++}
++
++fn snap(p: Point3) -> Point3 {
++    Point3::new(lattice(p.x), lattice(p.y), lattice(p.z))
++}
++
++/// The records no transform carries, and a path that is not finite.
++fn refuse_records(tp: &Toolpath) -> Result<(), TransformError> {
++    if !tp.all_finite() {
++        return Err(TransformError::BadInput("the input path"));
++    }
++    if !tp.threads.is_empty() {
++        return Err(TransformError::ThreadCycle);
++    }
++    if !tp.probes.is_empty() {
++        return Err(TransformError::ProbeTouch);
++    }
++    if tp.moves.iter().any(|m| m.rotary.is_some()) {
++        return Err(TransformError::RotaryMove);
++    }
++    Ok(())
++}
++
++/// The map `p -> m p + t`: `m` orthogonal (rows), `t` the offset.
++#[derive(Clone, Copy, Debug)]
++struct Rigid {
++    m: [[f64; 3]; 3],
++    t: [f64; 3],
++}
++
++impl Rigid {
++    /// The offset that turns `m` about `pivot` and then shifts by
++    /// `shift`: `pivot + shift - m pivot`.
++    fn pivot_offset(m: &[[f64; 3]; 3], pivot: [f64; 3], shift: [f64; 3]) -> [f64; 3] {
++        let r = Rigid { m: *m, t: [0.0; 3] }.dir(pivot);
++        std::array::from_fn(|i| pivot[i] + shift[i] - r[i])
++    }
++
++    fn dir(&self, d: [f64; 3]) -> [f64; 3] {
++        std::array::from_fn(|i| self.m[i][0] * d[0] + self.m[i][1] * d[1] + self.m[i][2] * d[2])
++    }
++
++    fn raw(&self, p: Point3) -> Point3 {
++        let r = self.dir([p.x, p.y, p.z]);
++        Point3::new(r[0] + self.t[0], r[1] + self.t[1], r[2] + self.t[2])
++    }
++
++    fn point(&self, p: Point3) -> Point3 {
++        snap(self.raw(p))
++    }
++
++    fn det(&self) -> f64 {
++        let m = &self.m;
++        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
++            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
++    }
++
++    /// True when `+Z` maps exactly onto `+Z`: no tilt, cycles and
++    /// vertical edge-break cones keep their meaning.
++    fn keeps_up(&self) -> bool {
++        self.dir([0.0, 0.0, 1.0]) == [0.0, 0.0, 1.0]
++    }
++
++    /// The arc under the map, or None when its plane is not kept. The
++    /// plane is kept when its normal maps exactly onto plus or minus
++    /// itself; the turning sense then flips when the in-plane part of
++    /// the map is a reflection: `det(m)` times the normal's sign.
++    fn arc(&self, a: ArcMove) -> Option<ArcMove> {
++        let n = a.plane.point(0.0, 0.0, 1.0);
++        let n = [n.x, n.y, n.z];
++        let mn = self.dir(n);
++        let sign = if mn == n {
++            1.0
++        } else if mn == n.map(|v| -v) {
++            -1.0
++        } else {
++            return None;
++        };
++        let (cu, cv) = a.plane.center_uv(a.center);
++        let c = a.plane.words(self.raw(a.plane.point(cu, cv, 0.0)));
++        let flip = (self.det() < 0.0) != (sign < 0.0);
++        Some(ArcMove { center: Point2::new(lattice(c.x), lattice(c.y)), ccw: a.ccw != flip, plane: a.plane })
++    }
++
++    /// The pose under the map. No stated pose stays none while `+Z`
++    /// stays vertical; a tilt states the turned `+Z`.
++    fn axis(&self, a: Option<[f64; 3]>) -> Result<Option<[f64; 3]>, TransformError> {
++        let turned = |v: [f64; 3]| normalize_axis(self.dir(v)).ok_or(TransformError::BadInput("a turned tool axis"));
++        match a {
++            Some(v) => turned(v).map(Some),
++            None => {
++                let up = turned([0.0, 0.0, 1.0])?;
++                Ok((!is_vertical(&up)).then_some(up))
++            }
++        }
++    }
++
++    fn straight(&self, m: &Move, from: Point3, to: Point3) -> Result<Move, TransformError> {
++        Ok(Move { from: self.point(from), to: self.point(to), arc: None, axis: self.axis(m.axis)?, ..*m })
++    }
++
++    fn map_move(&self, m: &Move) -> Result<Move, TransformError> {
++        let arc = match m.arc {
++            None => None,
++            Some(a) => Some(self.arc(a).ok_or(TransformError::VerticalArc)?),
++        };
++        Ok(Move { arc, ..self.straight(m, m.from, m.to)? })
++    }
++
++    fn map_cycle(&self, c: &Cycle) -> Result<Cycle, TransformError> {
++        if !self.keeps_up() {
++            return Err(TransformError::CannedCycleTilt);
++        }
++        let xy = self.point(Point3::new(c.xy.x, c.xy.y, 0.0));
++        let dz = self.t[2];
++        Ok(Cycle {
++            xy: Point2::new(xy.x, xy.y),
++            r_z: lattice(c.r_z + dz),
++            bottom_z: lattice(c.bottom_z + dz),
++            entry_z: lattice(c.entry_z + dz),
++            ..*c
++        })
++    }
++
++    /// A compensated span: its moves map like the path's; a reflection
++    /// puts the cutter on the other side (G41 <-> G42).
++    fn map_comp(&self, c: &CompSpan) -> Result<CompSpan, TransformError> {
++        let side = if self.det() < 0.0 { swap_side(c.side) } else { c.side };
++        let programmed = c.programmed.iter().map(|m| self.map_move(m)).collect::<Result<_, _>>()?;
++        Ok(CompSpan { side, programmed, ..c.clone() })
++    }
++
++    /// An edge break, or None for a legacy vertical cone under a tilt
++    /// (it then declares nothing, as in a tilted frame).
++    fn map_break(&self, b: &EdgeBreak) -> Option<EdgeBreak> {
++        if b.volume.is_none() && !self.keeps_up() {
++            return None;
++        }
++        let mut out = EdgeBreak { edge: b.edge.iter().map(|p| self.raw(*p)).collect(), ..b.clone() };
++        if let Some(v) = &mut out.volume {
++            for f in &mut v.frames {
++                f.outward = self.dir(f.outward);
++                f.across = self.dir(f.across);
++            }
++        }
++        Some(out)
++    }
++}
++
++fn swap_side(s: CompSide) -> CompSide {
++    match s {
++        CompSide::Left => CompSide::Right,
++        CompSide::Right => CompSide::Left,
++    }
++}
++
++/// Map a path move for move: every index record stays valid.
++fn map_path(tp: &Toolpath, r: &Rigid) -> Result<Toolpath, TransformError> {
++    let moves = tp.moves.iter().map(|m| r.map_move(m)).collect::<Result<_, _>>()?;
++    let cycles = tp.cycles.iter().map(|c| r.map_cycle(c)).collect::<Result<_, _>>()?;
++    let comps = tp.comps.iter().map(|c| r.map_comp(c)).collect::<Result<_, _>>()?;
++    let mut notes = tp.notes.clone();
++    let breaks = map_breaks(tp, r, &mut notes);
++    checked(Toolpath { moves, cycles, notes, comps, threads: Vec::new(), probes: Vec::new(), breaks, plasma: tp.plasma.clone() })
++}
++
++fn map_breaks(tp: &Toolpath, r: &Rigid, notes: &mut Vec<String>) -> Vec<EdgeBreak> {
++    let breaks: Vec<EdgeBreak> = tp.breaks.iter().filter_map(|b| r.map_break(b)).collect();
++    if breaks.len() < tp.breaks.len() {
++        notes.push("edge break: a vertical chamfer cone does not ride a tilt - its bevel is not declared".into());
++    }
++    breaks
++}
++
++/// The finished path, or a refusal when the map left the finite range.
++fn checked(out: Toolpath) -> Result<Toolpath, TransformError> {
++    let finite = out.all_finite()
++        && out.comps.iter().all(|c| c.programmed.iter().all(|m| m.is_finite()))
++        && out.breaks.iter().all(|b| b.edge.iter().all(|p| p.is_finite()));
++    if finite { Ok(out) } else { Err(TransformError::BadInput("the transformed path")) }
++}
++
++#[cfg(test)]
++#[path = "transform_tests.rs"]
++mod tests;
++#[cfg(test)]
++#[path = "transform_mirror_tests.rs"]
++mod mirror_tests;
+diff --git a/crates/cl/src/cl/transform_climb.rs b/crates/cl/src/cl/transform_climb.rs
+new file mode 100644
+index 000000000..3446b0e6b
+--- /dev/null
++++ b/crates/cl/src/cl/transform_climb.rs
+@@ -0,0 +1,206 @@
++//! Walk each pass of a mirrored path backwards, so the mirror keeps the
++//! climb cut (#3011, `MirrorMode::PreserveClimb`).
++//!
++//! Provenance: climb versus conventional milling (general machining
++//! practice); a reflection reverses the cut sense and reversing the
++//! travel reverses it back. Our own model; no vendor material consulted.
++//!
++//! The path must read as passes the reversal cannot make unsafe:
++//!
++//! - an entry column: straight down at one XY, rapids first, then feeds;
++//! - a planar cut: feeds at one Z, straight or XY arcs;
++//! - an exit column: straight up at one XY, feeds first, then rapids,
++//!   back to the entry column's top and with the same rapid-to-feed
++//!   height, so the column profile is the same on both ends;
++//! - between passes: rapids on that one clearance plane.
++//!
++//! Each planar cut runs backwards (the lead-out becomes the lead-in).
++//! The entry column moves to the old cut end and the exit column to the
++//! old cut start, with the same heights, kinds and feeds. The clearance
++//! links are re-drawn on the same plane. Anything else - a ramp or
++//! helical entry, a level change without a retract, a link off the
++//! clearance plane, a canned cycle - is refused by name.
++
++use crate::geometry::Point3;
++
++use super::super::comp::CompSpan;
++use super::super::moves::{ArcMove, Move, MoveKind};
++use super::super::path::Toolpath;
++use super::{swap_side, TransformError};
++
++fn refuse<T>(why: &str) -> Result<T, TransformError> {
++    Err(TransformError::NotReversible(why.into()))
++}
++
++fn vertical(m: &Move) -> bool {
++    m.arc.is_none() && m.from.x == m.to.x && m.from.y == m.to.y && m.from.z != m.to.z
++}
++
++fn down(m: &Move) -> bool {
++    vertical(m) && m.to.z < m.from.z
++}
++
++fn up(m: &Move) -> bool {
++    vertical(m) && m.to.z > m.from.z
++}
++
++/// A horizontal rapid on the plane `z`.
++fn clearance(m: &Move, z: f64) -> bool {
++    m.kind == MoveKind::Rapid && m.arc.is_none() && m.from.z == z && m.to.z == z
++}
++
++/// One pass: entry column `d..c`, planar cut `c..a`, exit column `a..e`.
++struct Pass {
++    d: usize,
++    c: usize,
++    a: usize,
++    e: usize,
++}
++
++/// The height where a column switches between rapid and feed: the
++/// lowest rapid point. The column's top when it has no rapid.
++fn rapid_floor(col: &[Move], top: f64) -> f64 {
++    col.iter().filter(|m| m.kind == MoveKind::Rapid).map(|m| m.from.z.min(m.to.z)).fold(top, f64::min)
++}
++
++/// Rapids only at the top of a column, never below a feed.
++fn rapids_on_top(col: &[Move]) -> bool {
++    let mut zs: Vec<(f64, bool)> = col.iter().map(|m| (m.from.z.max(m.to.z), m.kind == MoveKind::Rapid)).collect();
++    zs.sort_by(|p, q| q.0.total_cmp(&p.0));
++    zs.windows(2).all(|w| w[0].1 || !w[1].1)
++}
++
++fn read_passes(ms: &[Move]) -> Result<Vec<Pass>, TransformError> {
++    let mut passes = Vec::new();
++    let mut i = 0;
++    while let Some(d) = (i..ms.len()).find(|&j| down(&ms[j])) {
++        let c = (d..ms.len()).find(|&j| !down(&ms[j])).unwrap_or(ms.len());
++        let level = ms[c - 1].to.z;
++        let planar = |m: &Move| m.kind != MoveKind::Rapid && m.from.z == level && m.to.z == level
++            && m.arc.is_none_or(|a| a.plane.is_xy());
++        let a = (c..ms.len()).find(|&j| !planar(&ms[j])).unwrap_or(ms.len());
++        if a == c {
++            return refuse("the cut does not start with a planar move at the entry depth (a ramp or helical entry)");
++        }
++        let e = (a..ms.len()).find(|&j| !up(&ms[j])).unwrap_or(ms.len());
++        if e == a {
++            return refuse("a pass leaves its cut level without a straight retract (a ramp, or a level change)");
++        }
++        let (entry, exit) = (&ms[d..c], &ms[a..e]);
++        let top = ms[d].from.z;
++        if ms[e - 1].to.z != top
++            || !rapids_on_top(entry)
++            || !rapids_on_top(exit)
++            || rapid_floor(entry, top) != rapid_floor(exit, top)
++        {
++            return refuse("the entry and the exit columns of a pass differ in height or in rapid travel");
++        }
++        passes.push(Pass { d, c, a, e });
++        i = e;
++    }
++    if passes.is_empty() {
++        return refuse("the path has no cutting pass between an entry and a retract");
++    }
++    Ok(passes)
++}
++
++/// The move run backwards: from and to swap, an arc turns the other way.
++fn reversed(m: &Move) -> Move {
++    Move { from: m.to, to: m.from, arc: m.arc.map(|a| ArcMove { ccw: !a.ccw, ..a }), ..*m }
++}
++
++/// The column moved to stand at `at`'s XY, heights kept.
++fn column_at(col: &[Move], at: Point3) -> impl Iterator<Item = Move> + '_ {
++    col.iter().map(move |m| Move {
++        from: Point3::new(at.x, at.y, m.from.z),
++        to: Point3::new(at.x, at.y, m.to.z),
++        ..*m
++    })
++}
++
++fn rapid(from: Point3, to: Point3) -> Option<Move> {
++    (from != to).then(|| Move::new(MoveKind::Rapid, from, to, None))
++}
++
++/// Reverse every pass of the mirrored path `tp`.
++pub(super) fn reverse_passes(tp: Toolpath) -> Result<Toolpath, TransformError> {
++    if !tp.cycles.is_empty() {
++        return refuse("a canned drilling cycle has no cut sense to keep - mirror it with GeometricMirror");
++    }
++    let ms = &tp.moves;
++    let passes = read_passes(ms)?;
++    let mut out: Vec<Move> = Vec::with_capacity(ms.len());
++    // Old index -> new index of each planar cut move.
++    let mut index: Vec<Option<usize>> = vec![None; ms.len()];
++    // The approach: kept up to its clearance run, which is re-aimed.
++    let first = &passes[0];
++    let top = ms[first.d].from.z;
++    let lead = (0..first.d).rev().take_while(|&j| clearance(&ms[j], top)).count();
++    if lead == 0 && first.d > 0 {
++        return refuse("the path does not reach its first pass along a clearance plane");
++    }
++    if ms[..first.d - lead].iter().any(|m| m.kind != MoveKind::Rapid) {
++        return refuse("the path cuts before its first pass");
++    }
++    out.extend_from_slice(&ms[..first.d - lead]);
++    let start = if lead > 0 { ms[first.d - lead].from } else { ms[first.d].from };
++    for (k, p) in passes.iter().enumerate() {
++        let top = ms[p.d].from.z;
++        let (cut_start, cut_end) = (ms[p.c].from, ms[p.a - 1].to);
++        let new_top = Point3::new(cut_end.x, cut_end.y, top);
++        let here = out.last().map_or(start, |m| m.to);
++        if k > 0 || lead > 0 {
++            out.extend(rapid(here, new_top));
++        }
++        out.extend(column_at(&ms[p.d..p.c], cut_end));
++        for j in (p.c..p.a).rev() {
++            index[j] = Some(out.len());
++            out.push(reversed(&ms[j]));
++        }
++        out.extend(column_at(&ms[p.a..p.e], cut_start));
++        // The link to the next pass, or the exit: clearance rapids only.
++        let next = passes.get(k + 1).map_or(ms.len(), |q| q.d);
++        let link = &ms[p.e..next];
++        let on_plane = link.iter().take_while(|m| clearance(m, top)).count();
++        if let Some(q) = passes.get(k + 1) {
++            // The new link runs from this pass's new exit (old cut start)
++            // to the next pass's new entry (old cut end), on the plane.
++            let next_end = ms[q.a - 1].to;
++            let same_xy = cut_start.x == next_end.x && cut_start.y == next_end.y;
++            if on_plane < link.len() || (link.is_empty() && !same_xy) {
++                return refuse("two passes are linked off their clearance plane");
++            }
++            if ms[next].from.z != top {
++                return refuse("two passes have different clearance planes");
++            }
++        } else if link[on_plane..].iter().any(|m| m.kind != MoveKind::Rapid) {
++            return refuse("the path cuts after its last pass");
++        } else if on_plane == 0 && !link.is_empty() {
++            return refuse("the path leaves its last pass off the clearance plane");
++        } else if on_plane > 0 {
++            let here = out.last().map_or(start, |m| m.to);
++            out.extend(rapid(here, link[on_plane - 1].to));
++            out.extend_from_slice(&link[on_plane..]);
++        }
++    }
++    let comps = tp.comps.iter().map(|c| reverse_comp(c, &index)).collect::<Result<_, _>>()?;
++    let out = Toolpath { moves: out, comps, ..tp };
++    if !out.is_chained() || !out.comps.iter().all(|c| c.is_sane(&out.moves)) {
++        return refuse("the reversed path does not chain");
++    }
++    Ok(out)
++}
++
++/// A compensated span inside one planar cut, run backwards: the
++/// cancel block becomes the engage block, and the cutter side swaps
++/// back (the mirror swapped it once).
++fn reverse_comp(c: &CompSpan, index: &[Option<usize>]) -> Result<CompSpan, TransformError> {
++    let (Some(Some(f)), Some(Some(l))) = (index.get(c.first), index.get(c.last)) else {
++        return refuse("a compensated span reaches outside its planar cut");
++    };
++    if c.last.checked_sub(c.first).and_then(|n| l.checked_add(n)) != Some(*f) {
++        return refuse("a compensated span spans two passes");
++    }
++    let programmed = c.programmed.iter().rev().map(reversed).collect();
++    Ok(CompSpan { side: swap_side(c.side), first: *l, last: *f, programmed, ..c.clone() })
++}
+diff --git a/crates/cl/src/cl/transform_mirror.rs b/crates/cl/src/cl/transform_mirror.rs
+new file mode 100644
+index 000000000..6f2c1a6a0
+--- /dev/null
++++ b/crates/cl/src/cl/transform_mirror.rs
+@@ -0,0 +1,124 @@
++//! Mirror a path across a vertical plane (#3011).
++//!
++//! Provenance: the reflection `p -> p - 2 ((p - P) . n) n`; the
++//! G2 <-> G3 and G41 <-> G42 swap is the RS-274 / ISO 6983 direction
++//! rule, the one `post::invert` and `post::wcs_flip` apply. Climb and
++//! conventional milling are general machining practice. Our own model;
++//! no vendor material consulted.
++//!
++//! A reflection turns every climb cut into a conventional cut.
++//! [`MirrorMode::GeometricMirror`] accepts that: the exact mirror image.
++//! [`MirrorMode::PreserveClimb`] then walks each cutting pass backwards
++//! (`transform_climb.rs`), which restores the original turning sense
++//! and the original cutter side. A horizontal plane is refused for the
++//! reason `post::wcs_flip` refuses a flipped Z; a tilted plane, a tilted
++//! move and a plasma statement are refused too.
++
++use crate::geometry::Point3;
++
++use super::super::path::Toolpath;
++use super::super::pose::is_vertical;
++use super::{climb, map_path, refuse_records, Rigid, TransformError};
++
++/// A plane through `point` with the normal `normal` (any length). Only
++/// a vertical plane (`normal` with no Z part) mirrors.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MirrorPlane {
++    pub point: Point3,
++    pub normal: [f64; 3],
++}
++
++/// What the mirror keeps.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum MirrorMode {
++    /// The exact mirror image: G2 <-> G3, G41 <-> G42, climb becomes
++    /// conventional.
++    GeometricMirror,
++    /// The mirror image cut in the original sense: each pass reversed
++    /// between its entry and its retract. Only the families that
++    /// [`PassFamily::reversible`] names.
++    PreserveClimb(PassFamily),
++}
++
++/// The kind of path the caller mirrors: the cl layer cannot read the
++/// operation from the moves, so the caller states it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PassFamily {
++    /// A 2D contour.
++    Contour,
++    /// A profile (outside or inside the part).
++    Profile,
++    /// A chamfer or deburr pass.
++    Chamfer,
++    /// A path that enters on a helical ramp.
++    HelicalRamp,
++    /// Adaptive clearing.
++    Adaptive,
++    /// Multi-pass roughing (pocket or face clearing).
++    MultiPassRoughing,
++    /// Anything else.
++    Other,
++}
++
++impl PassFamily {
++    /// The refusal for a family whose passes cannot reverse safely, or
++    /// None for a family that can.
++    #[must_use]
++    pub fn reversible(self) -> Option<&'static str> {
++        match self {
++            PassFamily::Contour | PassFamily::Profile | PassFamily::Chamfer => None,
++            PassFamily::HelicalRamp => Some("a helical ramp entry cannot run backwards"),
++            PassFamily::Adaptive => Some("adaptive clearing engagement changes when it runs backwards"),
++            PassFamily::MultiPassRoughing => Some("multi-pass roughing changes its engagement when it runs backwards"),
++            PassFamily::Other => Some("only a 2D contour, profile or chamfer path reverses"),
++        }
++    }
++}
++
++/// Mirror the path across `plane` in `mode`.
++pub fn mirror_plane(tp: &Toolpath, plane: MirrorPlane, mode: MirrorMode) -> Result<Toolpath, TransformError> {
++    let n = vertical_normal(plane)?;
++    if let MirrorMode::PreserveClimb(f) = mode
++        && let Some(why) = f.reversible()
++    {
++        return Err(TransformError::NotReversible(why.into()));
++    }
++    refuse_records(tp)?;
++    if tp.moves.iter().any(|m| m.axis.is_some_and(|a| !is_vertical(&a))) {
++        return Err(TransformError::TiltedMove);
++    }
++    if tp.plasma.is_some() {
++        return Err(TransformError::PlasmaCut);
++    }
++    // m = I - 2 n n^T, t = 2 (P . n) n: exact for an axis-aligned plane.
++    let m: [[f64; 3]; 3] =
++        std::array::from_fn(|i| std::array::from_fn(|j| f64::from(u8::from(i == j)) - 2.0 * n[i] * n[j]));
++    let k = 2.0 * (plane.point.x * n[0] + plane.point.y * n[1]);
++    let mirrored = map_path(tp, &Rigid { m, t: [k * n[0], k * n[1], 0.0] })?;
++    match mode {
++        MirrorMode::GeometricMirror => Ok(mirrored),
++        MirrorMode::PreserveClimb(_) => climb::reverse_passes(mirrored),
++    }
++}
++
++/// The unit normal of a vertical plane, or the refusal by name.
++fn vertical_normal(plane: MirrorPlane) -> Result<[f64; 3], TransformError> {
++    let [x, y, z] = plane.normal;
++    if !plane.point.is_finite() || ![x, y, z].iter().all(|v| v.is_finite()) {
++        return Err(TransformError::BadInput("the mirror plane"));
++    }
++    let len = (x * x + y * y + z * z).sqrt();
++    if !len.is_finite() || len < 1e-12 {
++        return Err(TransformError::BadInput("the mirror plane normal"));
++    }
++    let (x, y, z) = (x / len, y / len, z / len);
++    if z.abs() > 1e-12 {
++        return Err(if x.hypot(y) <= 1e-12 {
++            TransformError::HorizontalMirrorPlane
++        } else {
++            TransformError::TiltedMirrorPlane
++        });
++    }
++    let h = x.hypot(y);
++    Ok([x / h, y / h, 0.0])
++}
+diff --git a/crates/cl/src/cl/transform_mirror_tests.rs b/crates/cl/src/cl/transform_mirror_tests.rs
+new file mode 100644
+index 000000000..55e00cc7c
+--- /dev/null
++++ b/crates/cl/src/cl/transform_mirror_tests.rs
+@@ -0,0 +1,175 @@
++//! The vertical-plane mirror's laws (#3011): G2 <-> G3 and G41 <-> G42
++//! under `GeometricMirror`, a safe pass reversal under `PreserveClimb`,
++//! and the planes, poses and paths it refuses by name.
++
++use super::tests::{contour, near, p};
++use super::*;
++use crate::cl::{CompSide, MoveKind, PathBuilder};
++
++/// The plane X = 5: (x, y, z) -> (10 - x, y, z).
++fn x5() -> MirrorPlane {
++    MirrorPlane { point: p(5.0, 0.0, 0.0), normal: [1.0, 0.0, 0.0] }
++}
++
++/// The signed area of the loop the planar cutting moves walk (shoelace
++/// over their chords): positive is counter-clockwise.
++fn signed_area(t: &Toolpath) -> f64 {
++    t.moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Feed && m.from.z == m.to.z && m.from.z == -2.0)
++        .flat_map(|m| m.chords(0.001))
++        .map(|(a, b)| a.x * b.y - b.x * a.y)
++        .sum::<f64>()
++        / 2.0
++}
++
++#[test]
++fn geometric_mirror_swaps_g2_g3_and_g41_g42() {
++    let src = contour();
++    let out = mirror_plane(&src, x5(), MirrorMode::GeometricMirror).expect("a vertical plane mirrors");
++    assert!(out.is_chained());
++    for (a, b) in src.moves.iter().zip(&out.moves) {
++        assert_eq!((b.from, b.to), (p(10.0 - a.from.x, a.from.y, a.from.z), p(10.0 - a.to.x, a.to.y, a.to.z)));
++    }
++    let arc = out.moves[5].arc.expect("the arc stays an arc");
++    assert_eq!((arc.center.x, arc.center.y, arc.ccw), (0.0, 5.0, false), "G3 becomes G2");
++    assert_eq!(out.comps[0].side, CompSide::Right, "G41 becomes G42");
++    assert!(out.comps[0].is_sane(&out.moves));
++    assert!(out.comps[0].programmed.iter().any(|m| m.arc.is_some_and(|a| !a.ccw)));
++    assert!(signed_area(&src) > 0.0 && signed_area(&out) < 0.0, "the loop now runs the other way");
++}
++
++#[test]
++fn geometric_mirror_on_a_diagonal_plane_is_micron_accurate() {
++    // The plane through the origin with normal (1, 1, 0) swaps X and Y.
++    let plane = MirrorPlane { point: p(0.0, 0.0, 0.0), normal: [1.0, 1.0, 0.0] };
++    let out = mirror_plane(&contour(), plane, MirrorMode::GeometricMirror).expect("mirrors");
++    for (a, b) in contour().moves.iter().zip(&out.moves) {
++        assert!(near(b.from, p(-a.from.y, -a.from.x, a.from.z)) && near(b.to, p(-a.to.y, -a.to.x, a.to.z)));
++    }
++    let arc = out.moves[5].arc.expect("arc");
++    assert_eq!((arc.center.x, arc.center.y, arc.ccw), (-5.0, -10.0, false));
++}
++
++#[test]
++fn mirror_refuses_horizontal_and_tilted_planes() {
++    let flat = MirrorPlane { point: p(0.0, 0.0, 0.0), normal: [0.0, 0.0, 1.0] };
++    assert_eq!(mirror_plane(&contour(), flat, MirrorMode::GeometricMirror), Err(TransformError::HorizontalMirrorPlane));
++    let leaning = MirrorPlane { point: p(0.0, 0.0, 0.0), normal: [1.0, 0.0, 1.0] };
++    assert_eq!(mirror_plane(&contour(), leaning, MirrorMode::GeometricMirror), Err(TransformError::TiltedMirrorPlane));
++    let none = MirrorPlane { point: p(0.0, 0.0, 0.0), normal: [0.0, 0.0, 0.0] };
++    assert!(matches!(mirror_plane(&contour(), none, MirrorMode::GeometricMirror), Err(TransformError::BadInput(_))));
++}
++
++#[test]
++fn mirror_refuses_tilted_moves() {
++    let mut t = contour();
++    t.moves[4] = t.moves[4].with_axis([0.0, 0.5, 1.0]);
++    assert_eq!(mirror_plane(&t, x5(), MirrorMode::GeometricMirror), Err(TransformError::TiltedMove));
++}
++
++#[test]
++fn preserve_climb_reverses_the_pass_between_entry_and_retract() {
++    let src = contour();
++    let out = mirror_plane(&src, x5(), MirrorMode::PreserveClimb(PassFamily::Contour)).expect("a contour reverses");
++    assert!(out.is_chained());
++    assert_eq!(out.moves.len(), src.moves.len());
++    // The approach now ends over the mirrored lead-out end, (10, -5).
++    assert_eq!((out.moves[0].from, out.moves[0].to), (p(30.0, -20.0, 20.0), p(10.0, -5.0, 20.0)));
++    // Same entry column as before - rapid to 5, plunge at 100 - at the new start.
++    assert_eq!((out.moves[1].kind, out.moves[1].to), (MoveKind::Rapid, p(10.0, -5.0, 5.0)));
++    assert_eq!((out.moves[2].kind, out.moves[2].feed, out.moves[2].to), (MoveKind::Plunge, Some(100.0), p(10.0, -5.0, -2.0)));
++    // The lead-out, walked backwards, is now the lead-in.
++    assert_eq!((out.moves[3].from, out.moves[3].to), (p(10.0, -5.0, -2.0), p(10.0, 0.0, -2.0)));
++    assert_eq!((out.moves[8].from, out.moves[8].to), (p(10.0, 0.0, -2.0), p(15.0, 0.0, -2.0)));
++    // Same exit column as before, at the mirrored lead-in start.
++    assert_eq!((out.moves[9].kind, out.moves[9].to), (MoveKind::Feed, p(15.0, 0.0, 5.0)));
++    assert_eq!((out.moves[10].kind, out.moves[10].to), (MoveKind::Rapid, p(15.0, 0.0, 20.0)));
++    assert_eq!(out.end(), Some(p(30.0, -20.0, 20.0)));
++    // Mirror and reversal cancel: the arc keeps G3, the span keeps G41.
++    let arc = out.moves.iter().find_map(|m| m.arc).expect("arc");
++    assert!(arc.ccw);
++    assert_eq!((arc.center.x, arc.center.y), (0.0, 5.0));
++    let c = &out.comps[0];
++    assert_eq!((c.side, c.first, c.last), (CompSide::Left, 3, 8));
++    assert!(c.is_sane(&out.moves));
++    assert!(signed_area(&out) > 0.0, "the loop keeps its turning sense: the cut stays a climb cut");
++}
++
++#[test]
++fn preserve_climb_refuses_a_helical_entry() {
++    let mut b = PathBuilder::new(p(0.0, 0.0, 20.0));
++    b.push(MoveKind::Rapid, p(5.0, 0.0, 20.0), None);
++    b.push(MoveKind::Rapid, p(5.0, 0.0, 2.0), None);
++    b.push_arc(MoveKind::Feed, p(-5.0, 0.0, 0.0), Some(300.0), Point2::new(0.0, 0.0), true);
++    b.push_arc(MoveKind::Feed, p(5.0, 0.0, -2.0), Some(300.0), Point2::new(0.0, 0.0), true);
++    b.push(MoveKind::Feed, p(5.0, 5.0, -2.0), Some(500.0));
++    b.push(MoveKind::Rapid, p(5.0, 5.0, 20.0), None);
++    let t = b.finish();
++    let got = mirror_plane(&t, x5(), MirrorMode::PreserveClimb(PassFamily::Contour));
++    assert!(matches!(got, Err(TransformError::NotReversible(ref why)) if why.contains("ramp or helical")), "{got:?}");
++}
++
++#[test]
++fn preserve_climb_refuses_clearing_families_by_name() {
++    for (family, word) in [
++        (PassFamily::Adaptive, "adaptive"),
++        (PassFamily::MultiPassRoughing, "roughing"),
++        (PassFamily::HelicalRamp, "helical"),
++    ] {
++        let got = mirror_plane(&contour(), x5(), MirrorMode::PreserveClimb(family));
++        assert!(matches!(got, Err(TransformError::NotReversible(ref why)) if why.contains(word)), "{got:?}");
++    }
++}
++
++/// One open pass along Y at X = 0, depth `z`, from y0 to y1.
++fn pass(b: &mut PathBuilder, z: f64, y0: f64, y1: f64) {
++    b.push(MoveKind::Rapid, p(0.0, y0, 20.0), None);
++    b.push(MoveKind::Rapid, p(0.0, y0, 2.0), None);
++    b.push(MoveKind::Plunge, p(0.0, y0, z), Some(100.0));
++    b.push(MoveKind::Feed, p(0.0, y1, z), Some(500.0));
++    b.push(MoveKind::Feed, p(0.0, y1, 2.0), Some(100.0));
++    b.push(MoveKind::Rapid, p(0.0, y1, 20.0), None);
++}
++
++#[test]
++fn preserve_climb_reverses_two_depths_linked_on_the_clearance_plane() {
++    let mut b = PathBuilder::new(p(-5.0, -5.0, 20.0));
++    pass(&mut b, -1.0, 0.0, 10.0);
++    pass(&mut b, -2.0, 0.0, 10.0);
++    let src = b.finish();
++    let out = mirror_plane(&src, x5(), MirrorMode::PreserveClimb(PassFamily::Profile)).expect("reverses");
++    assert!(out.is_chained());
++    let cuts: Vec<_> = out.moves.iter().filter(|m| m.kind == MoveKind::Feed && m.from.z == m.to.z).collect();
++    assert_eq!(cuts.len(), 2);
++    for (c, z) in cuts.iter().zip([-1.0, -2.0]) {
++        assert_eq!((c.from, c.to), (p(10.0, 10.0, z), p(10.0, 0.0, z)), "each depth runs backwards, in order");
++    }
++    // Every link between the passes stays on the clearance plane Z20.
++    for m in out.moves.iter().filter(|m| m.kind == MoveKind::Rapid && (m.from.x != m.to.x || m.from.y != m.to.y)) {
++        assert!(m.from.z == 20.0 && m.to.z == 20.0, "{m:?}");
++    }
++}
++
++#[test]
++fn preserve_climb_refuses_a_cut_before_the_first_pass() {
++    let mut b = PathBuilder::new(p(0.0, 0.0, 20.0));
++    b.push(MoveKind::Feed, p(3.0, 0.0, 15.0), Some(500.0));
++    b.push(MoveKind::Rapid, p(3.0, 0.0, 20.0), None);
++    pass(&mut b, -1.0, 0.0, 10.0);
++    let got = mirror_plane(&b.finish(), x5(), MirrorMode::PreserveClimb(PassFamily::Contour));
++    assert!(matches!(got, Err(TransformError::NotReversible(ref why)) if why.contains("before")), "{got:?}");
++}
++
++#[test]
++fn preserve_climb_refuses_a_level_change_without_a_retract() {
++    let mut b = PathBuilder::new(p(0.0, 0.0, 20.0));
++    b.push(MoveKind::Rapid, p(0.0, 0.0, 2.0), None);
++    b.push(MoveKind::Plunge, p(0.0, 0.0, -1.0), Some(100.0));
++    b.push(MoveKind::Feed, p(10.0, 0.0, -1.0), Some(500.0));
++    b.push(MoveKind::Plunge, p(10.0, 0.0, -2.0), Some(100.0));
++    b.push(MoveKind::Feed, p(0.0, 0.0, -2.0), Some(500.0));
++    b.push(MoveKind::Rapid, p(0.0, 0.0, 20.0), None);
++    let got = mirror_plane(&b.finish(), x5(), MirrorMode::PreserveClimb(PassFamily::Profile));
++    assert!(matches!(got, Err(TransformError::NotReversible(_))), "{got:?}");
++}
+diff --git a/crates/cl/src/cl/transform_rotary.rs b/crates/cl/src/cl/transform_rotary.rs
+new file mode 100644
+index 000000000..6fb3b348b
+--- /dev/null
++++ b/crates/cl/src/cl/transform_rotary.rs
+@@ -0,0 +1,91 @@
++//! Turn a path about the machine's A (X) or B (Y) axis (#3011).
++//!
++//! Provenance: right-handed rotations about X and Y, the RS-274 A / B
++//! sense that `pose.rs` composes (A tips +Z toward -Y, B toward +X).
++//! Our own model; no vendor material consulted.
++//!
++//! The tool turns with the work: every move states the turned axis
++//! (`Move::axis`, normalized by `pose.rs`), as a [`super::super::TiltedFrame`]
++//! path does. An arc does not keep its plane meaningfully under a tilt,
++//! so every arc is flattened to chords at `chord_tol` with exact
++//! endpoints. The move count then changes, so the records that index
++//! moves cannot follow: a canned cycle and a plasma statement are
++//! refused, a compensated span is dropped with a note (its cutter-centre
++//! moves still post, compensation in computer), as the tilted frame does.
++
++use crate::geometry::Point3;
++
++use super::super::path::Toolpath;
++use super::{checked, map_breaks, map_path, refuse_records, sin_cos_deg, Rigid, TransformError};
++
++/// The rotary axis to turn about: A turns about X, B about Y.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RotaryAxis {
++    A,
++    B,
++}
++
++/// Turn the path by `angle_deg` about the `axis` line through `origin`.
++/// A whole turn is the identity and keeps every record; any other angle
++/// flattens the arcs at `chord_tol` (mm, positive) and states the
++/// turned tool axis on each move.
++pub fn rotate_about_axis(
++    tp: &Toolpath,
++    axis: RotaryAxis,
++    origin: Point3,
++    angle_deg: f64,
++    chord_tol: f64,
++) -> Result<Toolpath, TransformError> {
++    if !angle_deg.is_finite() || !origin.is_finite() {
++        return Err(TransformError::BadInput("the rotary transform"));
++    }
++    if !chord_tol.is_finite() || chord_tol <= 0.0 {
++        return Err(TransformError::BadInput("the chord tolerance"));
++    }
++    refuse_records(tp)?;
++    let (s, c) = sin_cos_deg(angle_deg);
++    let m = match axis {
++        RotaryAxis::A => [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
++        RotaryAxis::B => [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
++    };
++    let o = [origin.x, origin.y, origin.z];
++    let r = Rigid { m, t: Rigid::pivot_offset(&m, o, [0.0; 3]) };
++    if r.keeps_up() {
++        return map_path(tp, &r);
++    }
++    if !tp.cycles.is_empty() {
++        return Err(TransformError::CannedCycleTilt);
++    }
++    if tp.plasma.is_some() {
++        return Err(TransformError::PlasmaCut);
++    }
++    let mut moves = Vec::with_capacity(tp.moves.len());
++    for m in &tp.moves {
++        if m.arc.is_none() {
++            moves.push(r.straight(m, m.from, m.to)?);
++            continue;
++        }
++        let chords = m.segments3(chord_tol);
++        let last = chords.len().saturating_sub(1);
++        for (i, (a, b)) in chords.into_iter().enumerate() {
++            // The run's own endpoints, never a re-derived Z: the chain
++            // into and out of the arc stays exact.
++            let a = if i == 0 { m.from } else { a };
++            let b = if i == last { m.to } else { b };
++            let chord = r.straight(m, a, b)?;
++            if chord.from != chord.to {
++                moves.push(chord);
++            }
++        }
++    }
++    let mut notes = tp.notes.clone();
++    if !tp.comps.is_empty() {
++        notes.push(
++            "compensation: control compensation does not ride a tilt - this path posts its cutter-centre moves (in computer)"
++                .into(),
++        );
++    }
++    let breaks = map_breaks(tp, &r, &mut notes);
++    checked(Toolpath { moves, notes, breaks, ..Toolpath::default() })
++}
++
+diff --git a/crates/cl/src/cl/transform_tests.rs b/crates/cl/src/cl/transform_tests.rs
+new file mode 100644
+index 000000000..c6e8d9436
+--- /dev/null
++++ b/crates/cl/src/cl/transform_tests.rs
+@@ -0,0 +1,224 @@
++//! The rigid transforms' laws (#3011): translation, the XY turn and
++//! the A / B turn land every record to the micron, and the records a
++//! rigid map cannot carry are refused by name.
++
++use super::*;
++use crate::cl::{
++    CompSide, CompSpan, Cycle, CycleKind, EdgeBreak, MoveKind, PathBuilder, ProbeTouch, ThreadCycle,
++};
++
++pub(super) fn p(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++pub(super) fn near(a: Point3, b: Point3) -> bool {
++    (a.x - b.x).abs() <= 1e-6 && (a.y - b.y).abs() <= 1e-6 && (a.z - b.z).abs() <= 1e-6
++}
++
++/// One 2D contour pass: a clearance-plane approach, a rapid then a
++/// plunge down at the lead-in start, a lead-in, a closed loop with one
++/// XY arc, a lead-out, a feed then a rapid up, a clearance-plane exit.
++/// Moves 3..=8 are a wear-mode compensated span.
++pub(super) fn contour() -> Toolpath {
++    let mut b = PathBuilder::new(p(-20.0, -20.0, 20.0));
++    b.push(MoveKind::Rapid, p(-5.0, 0.0, 20.0), None);
++    b.push(MoveKind::Rapid, p(-5.0, 0.0, 5.0), None);
++    b.push(MoveKind::Plunge, p(-5.0, 0.0, -2.0), Some(100.0));
++    b.push(MoveKind::Feed, p(0.0, 0.0, -2.0), Some(500.0));
++    b.push(MoveKind::Feed, p(10.0, 0.0, -2.0), Some(500.0));
++    b.push_arc(MoveKind::Feed, p(10.0, 10.0, -2.0), Some(500.0), Point2::new(10.0, 5.0), true);
++    b.push(MoveKind::Feed, p(0.0, 10.0, -2.0), Some(500.0));
++    b.push(MoveKind::Feed, p(0.0, 0.0, -2.0), Some(500.0));
++    b.push(MoveKind::Feed, p(0.0, -5.0, -2.0), Some(500.0));
++    b.push(MoveKind::Feed, p(0.0, -5.0, 5.0), Some(100.0));
++    b.push(MoveKind::Rapid, p(0.0, -5.0, 20.0), None);
++    b.push(MoveKind::Rapid, p(-20.0, -20.0, 20.0), None);
++    let mut t = b.finish();
++    t.comps.push(CompSpan {
++        side: CompSide::Left,
++        radius: 3.0,
++        wear: true,
++        first: 3,
++        last: 8,
++        programmed: t.moves[3..=8].to_vec(),
++    });
++    assert!(t.comps[0].is_sane(&t.moves));
++    t
++}
++
++fn drilled() -> Toolpath {
++    let mut t = Toolpath::new(vec![
++        Move::new(MoveKind::Rapid, p(0.0, 0.0, 10.0), p(4.0, 2.0, 10.0), None),
++        Move::new(MoveKind::Plunge, p(4.0, 2.0, 10.0), p(4.0, 2.0, -6.0), Some(80.0)),
++        Move::new(MoveKind::Rapid, p(4.0, 2.0, -6.0), p(4.0, 2.0, 10.0), None),
++    ]);
++    t.cycles.push(Cycle {
++        kind: CycleKind::Drill,
++        xy: Point2::new(4.0, 2.0),
++        r_z: 2.0,
++        bottom_z: -6.0,
++        entry_z: 0.0,
++        peck: 0.0,
++        dwell: 0.0,
++        first_move: 0,
++    });
++    t.breaks.push(EdgeBreak { edge: vec![p(0.0, 0.0, 0.0), p(5.0, 0.0, 0.0)], depth: 0.5, slope: 1.0, volume: None });
++    t
++}
++
++#[test]
++fn translate_shifts_every_record_to_the_micron() {
++    let d = [1.5, -2.25, 0.125];
++    let shift = |q: Point3| p(q.x + d[0], q.y + d[1], q.z + d[2]);
++    let src = contour();
++    let out = translate(&src, d).expect("a finite shift translates");
++    assert_eq!(out.moves.len(), src.moves.len());
++    assert!(out.is_chained());
++    for (a, b) in src.moves.iter().zip(&out.moves) {
++        assert!(near(b.from, shift(a.from)) && near(b.to, shift(a.to)), "{a:?} -> {b:?}");
++        assert_eq!(a.kind, b.kind);
++    }
++    let arc = out.moves[5].arc.expect("the arc stays an arc");
++    assert_eq!((arc.center.x, arc.center.y, arc.ccw), (11.5, 2.75, true));
++    let c = &out.comps[0];
++    assert_eq!(c.side, CompSide::Left);
++    assert!(c.is_sane(&out.moves));
++    let dr = translate(&drilled(), d).expect("a drilled path translates");
++    let cy = dr.cycles[0];
++    assert_eq!((cy.xy.x, cy.xy.y, cy.r_z, cy.bottom_z, cy.entry_z), (5.5, -0.25, 2.125, -5.875, 0.125));
++    assert!(near(dr.breaks[0].edge[1], p(6.5, -2.25, 0.125)));
++}
++
++#[test]
++fn translate_refuses_a_non_finite_offset() {
++    assert!(matches!(translate(&contour(), [f64::NAN, 0.0, 0.0]), Err(TransformError::BadInput(_))));
++    assert!(matches!(translate(&contour(), [f64::MAX, 0.0, 0.0]), Err(TransformError::BadInput(_))));
++}
++
++#[test]
++fn transform_xy_turns_a_quarter_about_the_pivot_then_shifts() {
++    // (x, y) -> pivot + R90 (p - pivot) + (tx, ty); R90 (x, y) = (-y, x).
++    let pivot = Point2::new(10.0, 0.0);
++    let map = |q: Point3| p(10.0 - q.y + 1.0, q.x - 10.0 + 2.0, q.z);
++    let src = contour();
++    let out = transform_xy(&src, 1.0, 2.0, 90.0, pivot).expect("an XY turn maps");
++    for (a, b) in src.moves.iter().zip(&out.moves) {
++        assert_eq!((b.from, b.to), (map(a.from), map(a.to)), "a quarter turn is exact");
++    }
++    let arc = out.moves[5].arc.expect("an XY arc stays an XY arc");
++    assert_eq!((arc.center.x, arc.center.y, arc.ccw), (6.0, 2.0, true));
++    assert_eq!(out.comps[0].side, CompSide::Left, "a turn keeps G41");
++    assert!(out.comps[0].is_sane(&out.moves));
++}
++
++#[test]
++fn transform_xy_at_thirty_degrees_is_micron_accurate() {
++    let (s, c) = 30f64.to_radians().sin_cos();
++    let map = |q: Point3| p(3.0 + (q.x - 3.0) * c - (q.y - 4.0) * s, 4.0 + (q.x - 3.0) * s + (q.y - 4.0) * c, q.z);
++    let src = contour();
++    let out = transform_xy(&src, 0.0, 0.0, 30.0, Point2::new(3.0, 4.0)).expect("maps");
++    assert!(out.is_chained());
++    for (a, b) in src.moves.iter().zip(&out.moves) {
++        assert!(near(b.from, map(a.from)) && near(b.to, map(a.to)));
++    }
++    let arc = out.moves[5].arc.expect("arc");
++    assert!(near(p(arc.center.x, arc.center.y, 0.0), map(p(10.0, 5.0, 0.0))));
++}
++
++#[test]
++fn transform_xy_refuses_a_vertical_arc_it_cannot_keep() {
++    let m = Move::new(MoveKind::Feed, p(0.0, 0.0, 0.0), p(10.0, 0.0, 10.0), Some(300.0))
++        .with_arc_in(Point2::new(10.0, 0.0), true, crate::cl::ArcPlane::Xz);
++    let t = Toolpath::new(vec![m]);
++    assert_eq!(transform_xy(&t, 0.0, 0.0, 90.0, Point2::new(0.0, 0.0)), Err(TransformError::VerticalArc));
++    // A pure shift keeps the plane, so the arc rides it.
++    let kept = transform_xy(&t, 5.0, 0.0, 0.0, Point2::new(0.0, 0.0)).expect("a shift keeps the plane");
++    assert_eq!(kept.moves[0].arc.map(|a| (a.center.x, a.center.y)), Some((15.0, 0.0)));
++}
++
++#[test]
++fn rotate_about_a_turns_the_point_and_states_the_axis() {
++    // Rx(90): (x, y, z) -> (x, -z, y); the tool axis +Z leans to -Y,
++    // which pose.rs reads back as A = 90.
++    let t = Toolpath::new(vec![Move::new(MoveKind::Feed, p(1.0, 2.0, 10.0), p(5.0, 2.0, 10.0), Some(400.0))]);
++    let out = rotate_about_axis(&t, RotaryAxis::A, p(0.0, 0.0, 0.0), 90.0, 0.01).expect("turns");
++    assert_eq!((out.moves[0].from, out.moves[0].to), (p(1.0, -10.0, 2.0), p(5.0, -10.0, 2.0)));
++    let axis = out.moves[0].axis.expect("a tilted move states its axis");
++    assert_eq!(crate::cl::axis_to_angles(axis)[0], 90.0);
++}
++
++#[test]
++fn rotate_about_b_flattens_arcs_within_the_chord_tolerance() {
++    let (s, c) = 30f64.to_radians().sin_cos();
++    let o = p(5.0, 0.0, -2.0);
++    let ry = |q: Point3| {
++        let (x, z) = (q.x - o.x, q.z - o.z);
++        p(o.x + x * c + z * s, q.y, o.z - x * s + z * c)
++    };
++    let mut src = contour();
++    src.comps.clear();
++    let out = rotate_about_axis(&src, RotaryAxis::B, o, 30.0, 0.01).expect("turns");
++    assert!(out.is_chained() && !out.has_arcs());
++    assert!(out.moves.len() > src.moves.len(), "the arc is now chords");
++    let centre = ry(p(10.0, 5.0, -2.0));
++    for m in &out.moves {
++        assert_eq!(m.axis.map(crate::cl::axis_to_angles).map(|a| (a[1] * 1e6).round() / 1e6), Some(30.0));
++        let r = |q: Point3| ((q.x - centre.x).powi(2) + (q.y - centre.y).powi(2) + (q.z - centre.z).powi(2)).sqrt();
++        if m.from.z != m.to.z && m.kind == MoveKind::Feed && r(m.from) < 5.01 && r(m.to) < 5.01 {
++            assert!((r(m.from) - 5.0).abs() < 2e-6 && (r(m.to) - 5.0).abs() < 2e-6);
++        }
++    }
++    assert!(near(out.moves[0].from, ry(src.moves[0].from)));
++    assert!(near(out.end().expect("end"), ry(src.end().expect("end"))));
++}
++
++#[test]
++fn rotate_about_an_axis_by_zero_is_the_identity() {
++    let src = contour();
++    let out = rotate_about_axis(&src, RotaryAxis::A, p(3.0, 3.0, 3.0), 360.0, 0.01).expect("identity");
++    assert_eq!(out, src);
++}
++
++#[test]
++fn rotate_about_an_axis_refuses_a_tilted_canned_cycle() {
++    assert_eq!(
++        rotate_about_axis(&drilled(), RotaryAxis::B, p(0.0, 0.0, 0.0), 15.0, 0.01),
++        Err(TransformError::CannedCycleTilt)
++    );
++}
++
++#[test]
++fn every_transform_refuses_thread_cycles_probe_touches_and_c_moves() {
++    let mut probed = contour();
++    probed.probes.push(ProbeTouch { index: 3, measure: None, target: p(1.0, 0.0, -2.0) });
++    assert_eq!(translate(&probed, [1.0, 0.0, 0.0]), Err(TransformError::ProbeTouch));
++    let mut c_live = contour();
++    c_live.moves[4] = c_live.moves[4].with_rotary(30.0);
++    assert_eq!(transform_xy(&c_live, 0.0, 0.0, 10.0, Point2::new(0.0, 0.0)), Err(TransformError::RotaryMove));
++    let mut threaded = contour();
++    threaded.threads.push(ThreadCycle {
++        start: p(0.0, 0.0, 0.0),
++        end: p(1.0, 0.0, -10.0),
++        major_diameter: 10.0,
++        minor_diameter: 8.0,
++        lead: 1.5,
++        height: 1.0,
++        first_depth: 0.3,
++        min_depth: 0.05,
++        finish_allowance: 0.05,
++        infeed_angle: 0.0,
++        spring_passes: 0,
++        alternating: false,
++        repeat_each_depth: false,
++        chip_break_dips: false,
++        pull_out: 0.0,
++        first: 0,
++        last: 1,
++        hand: crate::cl::ThreadHand::Right,
++        start_in_air: true,
++    });
++    assert_eq!(
++        rotate_about_axis(&threaded, RotaryAxis::A, p(0.0, 0.0, 0.0), 0.0, 0.01),
++        Err(TransformError::ThreadCycle)
++    );
++}
+diff --git a/docs/decisions/3011-cl-transforms.md b/docs/decisions/3011-cl-transforms.md
+new file mode 100644
+index 000000000..08abe29b5
+--- /dev/null
++++ b/docs/decisions/3011-cl-transforms.md
+@@ -0,0 +1,67 @@
++## #3011 - CL toolpath transforms: translate, XY turn, A/B turn, vertical mirror
++
++**What was decided.** `crates/cl/src/cl/transform.rs` (re-exported as
++`app::cl::transform`) adds `translate`, `transform_xy`,
++`rotate_about_axis` and `mirror_plane`. All four use one map,
++`p -> M p + t` with `M` orthogonal. An arc keeps its plane only when `M`
++maps the plane normal exactly onto plus or minus itself. Its turning sense
++flips when `det(M)` times that sign is negative. This one rule gives
++G2 <-> G3 under a mirror, keeps G2/G3 under a turn, and finds the XZ / YZ
++arcs that a transform cannot keep. A reflection swaps `CompSide`
++(G41 <-> G42). Quarter turns use exact sine and cosine, so a 90 degree
++map stays on the lattice bit for bit.
++
++- Moves, arc centres and cycles snap to the 1 um lattice. Edge-break
++  polylines do not snap: a snap would move a framed cap's frames off
++  orthonormal, and `EdgeBreak::is_sane` would then refuse the cap.
++- `transform_xy` refuses an XZ / YZ arc at every angle except a half or
++  a whole turn (`VerticalArc`). It does not flatten it: a flatten changes
++  the move count, and the index records (cycles, compensated spans, torch
++  spans) would then point at the wrong moves.
++- `rotate_about_axis` flattens every arc at `chord_tol` when the turn is
++  not the identity. A rotated vertical-plane arc can turn past a Z
++  extremum, and the builder's Z-monotone law for XZ / YZ arcs would then
++  be false. With a flatten, the index records cannot follow. So a canned
++  cycle and a plasma statement are refused, and a compensated span is
++  dropped with a note, as `TiltedFrame::world_path` does. A legacy
++  vertical chamfer cone is dropped with a note, as in a tilted frame. The
++  map is the same rotation that a `TiltedFrame` with those columns
++  applies; the axis goes through `pose::normalize_axis`.
++- `mirror_plane` refuses a horizontal plane (`HorizontalMirrorPlane`, the
++  reason that `post::wcs_flip` refuses a flipped Z) and a tilted plane
++  (`TiltedMirrorPlane`). It refuses tilted moves and plasma statements.
++  An XZ / YZ arc mirrors only across a plane whose normal is X or Y.
++- `MirrorMode::PreserveClimb(PassFamily)` mirrors, then walks each pass
++  backwards. The caller names the path family, because the cl layer
++  cannot read the operation from the moves. Contour, profile and
++  chamfer reverse. Helical ramp, adaptive, multi-pass roughing and other
++  are refused by name. The moves must also read as passes: an entry
++  column down, a planar cut at one Z, an exit column up to the same top
++  with the same rapid-to-feed height, and rapids on that one clearance
++  plane between the passes. The entry column moves to the old cut end
++  and the exit column to the old cut start. A compensated span inside a
++  cut reverses with it and keeps its original side. Every other shape (a
++  ramp or helical entry, a level change without a retract, a cut before
++  the first pass or after the last, a link off the clearance plane) is
++  refused by name.
++- Every transform refuses thread cycles, probe touches and C-axis moves,
++  and a non-finite input or result.
++
++**Why.** The issue asks for a pure module shared by patterns, mirror
++folders and nesting (#2166). One matrix rule is easier to prove than four
++special cases. Refusal is the Prime Directive answer where a record's
++meaning does not follow a rigid map.
++
++**Dropped.**
++- Flatten of vertical arcs in `transform_xy`: it would need an index
++  remap of every index record. A refusal is safe and named.
++- Keeping vertical-plane arcs under an A/B turn when the plane is kept:
++  the Z-monotone law would need a re-split through `PathBuilder`.
++- Reading the path family from the moves: no safe test separates a
++  contour from a single-level pocket. The caller states it.
++- Moving probe touches: a probe writes a work offset, and a moved touch
++  changes what it measures.
++
++**Cost to change.** Local to `crates/cl/src/cl/transform*.rs`. No caller
++exists yet. A later caller that needs vertical arcs under an XY turn can
++add a flatten with an index remap behind the same function.
+
+From defb39c9c512312df3ee4723476bc284237b6e33 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Sun, 22 Nov 2026 17:54:59 +0100
+Subject: [PATCH 2/3] fix(cl): refuse rotary arcs beyond chord tolerance
+
+Bound the sampled arc error and coordinate rounding before returning a rotary transform. Pin capped sampling, midpoint accuracy and rounding refusals.
+
+Refs #3011
+---
+ crates/cl/src/cl/transform.rs        |   3 +
+ crates/cl/src/cl/transform_rotary.rs |  49 +++++++++++--
+ crates/cl/src/cl/transform_tests.rs  | 101 +++++++++++++++++++++++++++
+ docs/decisions/3011-cl-transforms.md |   8 +++
+ 4 files changed, 156 insertions(+), 5 deletions(-)
+
+diff --git a/crates/cl/src/cl/transform.rs b/crates/cl/src/cl/transform.rs
+index 24cd4f6c0..e75286880 100644
+--- a/crates/cl/src/cl/transform.rs
++++ b/crates/cl/src/cl/transform.rs
+@@ -60,6 +60,8 @@ pub enum TransformError {
+     VerticalArc,
+     /// A canned drilling cycle turned off the Z axis.
+     CannedCycleTilt,
++    /// Arc subdivision and coordinate rounding cannot meet `chord_tol`.
++    ArcChordTolerance,
+     /// A mirror plane that flips Z.
+     HorizontalMirrorPlane,
+     /// A mirror plane that is neither vertical nor horizontal.
+@@ -80,6 +82,7 @@ impl fmt::Display for TransformError {
+             TransformError::PlasmaCut => "a plasma cut's kerf side and torch spans do not follow a mirror or a tilt",
+             TransformError::VerticalArc => "an XZ / YZ arc does not keep its plane under this transform",
+             TransformError::CannedCycleTilt => "a canned drilling cycle cannot turn off the Z axis",
++            TransformError::ArcChordTolerance => "the arc subdivision limit or coordinate rounding cannot meet the chord tolerance",
+             TransformError::HorizontalMirrorPlane => {
+                 "a horizontal mirror plane flips Z: the tool would stand on the wrong side of its tip"
+             }
+diff --git a/crates/cl/src/cl/transform_rotary.rs b/crates/cl/src/cl/transform_rotary.rs
+index 6fb3b348b..0476df21a 100644
+--- a/crates/cl/src/cl/transform_rotary.rs
++++ b/crates/cl/src/cl/transform_rotary.rs
+@@ -15,8 +15,9 @@
+ 
+ use crate::geometry::Point3;
+ 
++use super::super::moves::{ArcMove, Move};
+ use super::super::path::Toolpath;
+-use super::{checked, map_breaks, map_path, refuse_records, sin_cos_deg, Rigid, TransformError};
++use super::{Rigid, TransformError, checked, map_breaks, map_path, refuse_records, sin_cos_deg};
+ 
+ /// The rotary axis to turn about: A turns about X, B about Y.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -28,7 +29,8 @@ pub enum RotaryAxis {
+ /// Turn the path by `angle_deg` about the `axis` line through `origin`.
+ /// A whole turn is the identity and keeps every record; any other angle
+ /// flattens the arcs at `chord_tol` (mm, positive) and states the
+-/// turned tool axis on each move.
++/// turned tool axis on each move. Refuses an arc when the bounded
++/// subdivision or coordinate rounding cannot meet that tolerance.
+ pub fn rotate_about_axis(
+     tp: &Toolpath,
+     axis: RotaryAxis,
+@@ -61,11 +63,14 @@ pub fn rotate_about_axis(
+     }
+     let mut moves = Vec::with_capacity(tp.moves.len());
+     for m in &tp.moves {
+-        if m.arc.is_none() {
++        let Some(arc) = m.arc else {
+             moves.push(r.straight(m, m.from, m.to)?);
+             continue;
+-        }
+-        let chords = m.segments3(chord_tol);
++        };
++        // Leave room for coordinate rounding. The sampler caps its count,
++        // so its requested tolerance alone does not prove its actual error.
++        let chords = m.segments3(chord_tol * 0.5);
++        let curve_error = chord_error_bound(m, arc, chords.len());
+         let last = chords.len().saturating_sub(1);
+         for (i, (a, b)) in chords.into_iter().enumerate() {
+             // The run's own endpoints, never a re-derived Z: the chain
+@@ -73,6 +78,13 @@ pub fn rotate_about_axis(
+             let a = if i == 0 { m.from } else { a };
+             let b = if i == last { m.to } else { b };
+             let chord = r.straight(m, a, b)?;
++            // Rotation preserves the curve error. Linear interpolation of
++            // rounded endpoints adds at most their largest displacement.
++            let rounding = distance(r.raw(a), chord.from).max(distance(r.raw(b), chord.to));
++            let error = curve_error + rounding;
++            if !error.is_finite() || error > chord_tol {
++                return Err(TransformError::ArcChordTolerance);
++            }
+             if chord.from != chord.to {
+                 moves.push(chord);
+             }
+@@ -89,3 +101,30 @@ pub fn rotate_about_axis(
+     checked(Toolpath { moves, notes, breaks, ..Toolpath::default() })
+ }
+ 
++fn distance(a: Point3, b: Point3) -> f64 {
++    (a.x - b.x).hypot(a.y - b.y).hypot(a.z - b.z)
++}
++
++/// The same circular/radius-ramp curve that `Move::segments3` samples.
++/// The normal coordinate is linear, so it contributes no chord error.
++fn chord_error_bound(m: &Move, arc: ArcMove, count: usize) -> f64 {
++    let (au, av, _) = arc.plane.uvw(m.from);
++    let (bu, bv, _) = arc.plane.uvw(m.to);
++    let (cu, cv) = arc.plane.center_uv(arc.center);
++    let ra = (au - cu).hypot(av - cv);
++    let rb = (bu - cu).hypot(bv - cv);
++    let start = (av - cv).atan2(au - cu);
++    let end = (bv - cv).atan2(bu - cu);
++    let sweep = if arc.ccw { end - start } else { start - end }.rem_euclid(std::f64::consts::TAU);
++    // Treat a shared ray conservatively as a full turn, including when
++    // the sampler falls back to a single chord for degenerate input.
++    let sweep = if sweep == 0.0 { std::f64::consts::TAU } else { sweep };
++    let step = sweep / count.max(1) as f64;
++    if ra == rb {
++        let s = (step * 0.25).sin();
++        ra * (2.0 * s * s)
++    } else {
++        // For radius linear in angle: |p''| <= hypot(r, 2*|dr/dtheta|).
++        ra.max(rb).hypot(2.0 * (rb - ra).abs() / sweep) * step * step / 8.0
++    }
++}
+diff --git a/crates/cl/src/cl/transform_tests.rs b/crates/cl/src/cl/transform_tests.rs
+index c6e8d9436..14e86d80f 100644
+--- a/crates/cl/src/cl/transform_tests.rs
++++ b/crates/cl/src/cl/transform_tests.rs
+@@ -172,6 +172,107 @@ fn rotate_about_b_flattens_arcs_within_the_chord_tolerance() {
+     assert!(near(out.end().expect("end"), ry(src.end().expect("end"))));
+ }
+ 
++#[test]
++fn rotate_about_a_refuses_an_arc_beyond_the_chord_budget() {
++    let m = Move::new(
++        MoveKind::Feed,
++        p(1000.0, 0.0, 0.0),
++        p(-1000.0, 0.0, 0.0),
++        Some(400.0),
++    )
++    .with_arc(Point2::new(0.0, 0.0), true);
++    let src = Toolpath::new(vec![m]);
++    assert_eq!(
++        rotate_about_axis(&src, RotaryAxis::A, p(0.0, 0.0, 0.0), 90.0, 0.0001),
++        Err(TransformError::ArcChordTolerance)
++    );
++    // At a looser tolerance the capped sampler is sufficient. Measure
++    // actual chord midpoints, which lie inside the original circle.
++    let tol = 0.002;
++    let out =
++        rotate_about_axis(&src, RotaryAxis::A, p(0.0, 0.0, 0.0), 90.0, tol).expect("budget fits");
++    assert!(!out.moves.is_empty() && !out.has_arcs());
++    let mut max_error: f64 = 0.0;
++    for m in &out.moves {
++        let x = (m.from.x + m.to.x) * 0.5;
++        let z = (m.from.z + m.to.z) * 0.5;
++        max_error = max_error.max((1000.0 - x.hypot(z)).abs());
++    }
++    assert!(
++        max_error > 0.001,
++        "the pin measures sagitta, not just endpoints"
++    );
++    assert!(
++        max_error <= tol,
++        "chord midpoint error {max_error} exceeds {tol}"
++    );
++}
++
++#[test]
++fn rotate_about_b_bounds_arc_midpoints_in_each_plane() {
++    use crate::cl::ArcPlane;
++    let tol = 0.001;
++    let (s, c) = 30f64.to_radians().sin_cos();
++    let turn = |q: Point3| p(q.x * c + q.z * s, q.y, -q.x * s + q.z * c);
++    for plane in [ArcPlane::Xy, ArcPlane::Xz, ArcPlane::Yz] {
++        for (radius_end, ccw) in [(10.0, true), (12.0, true), (12.0, false)] {
++            let direction = if ccw { 1.0 } else { -1.0 };
++            let m = Move::new(
++                MoveKind::Feed,
++                plane.point(10.0, 0.0, 0.0),
++                plane.point(0.0, direction * radius_end, 2.0),
++                Some(400.0),
++            )
++            .with_arc_in(Point2::new(0.0, 0.0), ccw, plane);
++            let src = Toolpath::new(vec![m]);
++            let out = rotate_about_axis(&src, RotaryAxis::B, p(0.0, 0.0, 0.0), 30.0, tol)
++                .expect("budget fits");
++            assert!(!out.moves.is_empty() && !out.has_arcs() && out.is_chained());
++            let count = out.moves.len() as f64;
++            for (i, chord) in out.moves.iter().enumerate() {
++                let f = (i as f64 + 0.5) / count;
++                let angle = direction * std::f64::consts::FRAC_PI_2 * f;
++                let radius = 10.0 + (radius_end - 10.0) * f;
++                let exact = turn(plane.point(radius * angle.cos(), radius * angle.sin(), 2.0 * f));
++                let midpoint = p(
++                    (chord.from.x + chord.to.x) * 0.5,
++                    (chord.from.y + chord.to.y) * 0.5,
++                    (chord.from.z + chord.to.z) * 0.5,
++                );
++                let error = (midpoint.x - exact.x)
++                    .hypot(midpoint.y - exact.y)
++                    .hypot(midpoint.z - exact.z);
++                assert!(
++                    error <= tol,
++                    "{plane:?}, radius {radius_end}, ccw {ccw}: {error} > {tol}"
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn rotate_about_a_refuses_rounding_beyond_the_chord_tolerance() {
++    let offset = 0.00000049;
++    let m = Move::new(
++        MoveKind::Feed,
++        p(0.0001 + offset, offset, 0.0),
++        p(-0.0001 + offset, offset, 0.0),
++        Some(400.0),
++    )
++    .with_arc(Point2::new(offset, offset), true);
++    assert_eq!(
++        rotate_about_axis(
++            &Toolpath::new(vec![m]),
++            RotaryAxis::A,
++            p(0.0, 0.0, 0.0),
++            90.0,
++            0.0000001
++        ),
++        Err(TransformError::ArcChordTolerance)
++    );
++}
++
+ #[test]
+ fn rotate_about_an_axis_by_zero_is_the_identity() {
+     let src = contour();
+diff --git a/docs/decisions/3011-cl-transforms.md b/docs/decisions/3011-cl-transforms.md
+index 08abe29b5..4ac95d1fd 100644
+--- a/docs/decisions/3011-cl-transforms.md
++++ b/docs/decisions/3011-cl-transforms.md
+@@ -46,6 +46,14 @@ map stays on the lattice bit for bit.
+   refused by name.
+ - Every transform refuses thread cycles, probe touches and C-axis moves,
+   and a non-finite input or result.
++- Review #3308: rotary arc transforms retain the bounded 1,024-chord
++  sampler. They sample at half the requested tolerance, then check the
++  curve error bound for the actual count and the endpoint rounding error.
++  `ArcChordTolerance` refuses a result that cannot meet `chord_tol`.
++  Circular arcs use their sagitta. Radius ramps use the sampler's second
++  derivative bound. This keeps the work bounded and includes coordinate
++  rounding in the requested tolerance. Increasing the sampler budget was
++  dropped because a named refusal meets the contract without more work.
+ 
+ **Why.** The issue asks for a pure module shared by patterns, mirror
+ folders and nesting (#2166). One matrix rule is easier to prove than four
+
+From 91cd4fe1a54a2aae98b95241bbcbbdf563f54c05 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Mon, 23 Nov 2026 02:11:16 +0100
+Subject: [PATCH 3/3] fix(cl): preserve rotary pose changes on collapsed arcs
+
+Keep a standing-tip chord when its tool axis differs from the prior emitted pose. Pin the reviewed case, straight feed control, and same-pose omission.
+
+Refs #3011
+---
+ crates/cl/src/cl/transform_rotary.rs |  3 ++-
+ crates/cl/src/cl/transform_tests.rs  | 38 ++++++++++++++++++++++++++++
+ docs/decisions/3011-cl-transforms.md |  8 ++++++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/crates/cl/src/cl/transform_rotary.rs b/crates/cl/src/cl/transform_rotary.rs
+index 0476df21a..e74508f1d 100644
+--- a/crates/cl/src/cl/transform_rotary.rs
++++ b/crates/cl/src/cl/transform_rotary.rs
+@@ -85,7 +85,8 @@ pub fn rotate_about_axis(
+             if !error.is_finite() || error > chord_tol {
+                 return Err(TransformError::ArcChordTolerance);
+             }
+-            if chord.from != chord.to {
++            // A standing tip still moves when the tool axis changes.
++            if chord.from != chord.to || moves.last().and_then(|m| m.axis) != chord.axis {
+                 moves.push(chord);
+             }
+         }
+diff --git a/crates/cl/src/cl/transform_tests.rs b/crates/cl/src/cl/transform_tests.rs
+index 14e86d80f..5d3713bde 100644
+--- a/crates/cl/src/cl/transform_tests.rs
++++ b/crates/cl/src/cl/transform_tests.rs
+@@ -273,6 +273,44 @@ fn rotate_about_a_refuses_rounding_beyond_the_chord_tolerance() {
+     );
+ }
+ 
++#[test]
++fn rotate_about_a_preserves_the_axis_when_an_arc_collapses() {
++    let angle = 1e-7_f64;
++    let endpoint = p(angle.cos(), angle.sin(), 0.0);
++    for use_arc in [false, true] {
++        let mut b = PathBuilder::new(p(1.0, 0.0, 1.0));
++        b.set_axis(Some([1.0, 0.0, 0.0]));
++        b.push(MoveKind::Rapid, p(1.0, 0.0, 0.0), None);
++        b.set_axis(Some([0.0, 0.0, 1.0]));
++        if use_arc {
++            b.push_arc(MoveKind::Feed, endpoint, Some(100.0), Point2::new(0.0, 0.0), true);
++        } else {
++            b.push(MoveKind::Feed, endpoint, Some(100.0));
++        }
++        let src = b.finish();
++        assert_eq!(src.has_arcs(), use_arc);
++        let out = rotate_about_axis(&src, RotaryAxis::A, p(0.0, 0.0, 0.0), 90.0, 0.01)
++            .expect("finite transform");
++        assert!(out.is_chained() && !out.has_arcs());
++        assert_eq!(out.moves.len(), 2, "arc={use_arc}: the pose change is real motion");
++        assert_eq!(out.moves[0].axis, Some([1.0, 0.0, 0.0]));
++        let last = out.moves.last().expect("the pose change remains");
++        assert_eq!((last.from, last.to), (p(1.0, 0.0, 0.0), p(1.0, 0.0, 0.0)));
++        assert_eq!(last.axis, Some([0.0, -1.0, 0.0]));
++        assert_eq!((last.kind, last.feed), (MoveKind::Feed, Some(100.0)));
++    }
++
++    // A collapsed chord at an unchanged pose remains redundant.
++    let mut b = PathBuilder::new(p(1.0, 0.0, 1.0));
++    b.set_axis(Some([0.0, 0.0, 1.0]));
++    b.push(MoveKind::Rapid, p(1.0, 0.0, 0.0), None);
++    b.push_arc(MoveKind::Feed, endpoint, Some(100.0), Point2::new(0.0, 0.0), true);
++    let out = rotate_about_axis(&b.finish(), RotaryAxis::A, p(0.0, 0.0, 0.0), 90.0, 0.01)
++        .expect("finite transform");
++    assert_eq!(out.moves.len(), 1, "an unchanged pose adds no motion");
++    assert_eq!(out.moves[0].axis, Some([0.0, -1.0, 0.0]));
++}
++
+ #[test]
+ fn rotate_about_an_axis_by_zero_is_the_identity() {
+     let src = contour();
+diff --git a/docs/decisions/3011-cl-transforms.md b/docs/decisions/3011-cl-transforms.md
+index 4ac95d1fd..3065f25be 100644
+--- a/docs/decisions/3011-cl-transforms.md
++++ b/docs/decisions/3011-cl-transforms.md
+@@ -54,6 +54,14 @@ map stays on the lattice bit for bit.
+   derivative bound. This keeps the work bounded and includes coordinate
+   rounding in the requested tolerance. Increasing the sampler budget was
+   dropped because a named refusal meets the contract without more work.
++- Review #3308, collapsed arcs: a rotary chord with equal rounded
++  endpoints is dropped only when its tool axis matches the last emitted
++  pose. A changed pose is retained as a straight move at the standing
++  tip, with its feed and move kind. A distance tolerance cannot permit
++  removal of a required rotation. A named refusal was considered and
++  dropped because the existing no-motion law permits this pose change.
++  Changing this choice later is local to the rotary chord filter and
++  its regression test; the public API does not change.
+ 
+ **Why.** The issue asks for a pure module shared by patterns, mirror
+ folders and nesting (#2166). One matrix rule is easier to prove than four

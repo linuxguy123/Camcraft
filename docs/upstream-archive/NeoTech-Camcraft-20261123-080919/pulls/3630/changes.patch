@@ -1,0 +1,2124 @@
+From e992b0a729d8dcb0e94e4ad32293056b5559c65c Mon Sep 17 00:00:00 2001
+From: tbrasselle <tbrasselle@gmail.com>
+Date: Mon, 23 Nov 2026 00:22:37 -0500
+Subject: [PATCH] feat(multiaxis): Rotary Flow kernel - flow lines between
+ picked helical guide chains
+
+The first slice of #2804 (issue #2824): a 4-axis cylindrical
+flow-line finishing kernel in `multiaxis::rotary_flow`. The caller
+picks the guide chains and states the rotation axis (the #2772
+seam - the axis is a parameter, never fitted here).
+
+- `rotary_flow_unwrap.rs`: each chain unwound to a continuous
+  (theta, v) track about the stated axis (the radian twin of
+  `cl::unwrap_near`), each adjacent pair aligned by the nearest
+  whole turn, the band developed `(s = R_ref * theta, v)` and its
+  cross width read at matched arc length.
+- `rotary_flow_pass.rs`: iso-parametric flow curves between the
+  aligned pair, each station's ball center pushed out along its
+  radial until the `closest_pt_tri` oracle clears every facet, the
+  curve chorded within min(ARC_FIT_TOL, tolerance) over the union
+  of the two chains' arc-length knots.
+- `rotary_flow_emit.rs`: tips via the pivot law, cut poses through
+  the lean law on the radial, links rebuilt radially on the retract
+  cylinders (`rotary_links`' law), the program opening on the
+  clearance pose (M13.8).
+
+Refused by name: a tool that is not a ball-nose, fewer than two
+chains, a non-finite or off-model chain point, a chain point on
+the axis line, chains wound in opposite senses, a band with no
+width, a stepover or tolerance at the scallop ceiling, a station
+the push-out cannot clear, a pass count over the ceiling, a
+clearance that does not clear the work.
+
+The decisions taken unattended are recorded in
+`docs/decisions/2824-rotary-flow-kernel.md`.
+
+Refs #2824
+---
+ crates/motion/src/multiaxis/mod.rs            |   5 +
+ crates/motion/src/multiaxis/rotary_flow.rs    | 361 +++++++++++++++
+ .../rotary_flow/rotary_flow_tests.rs          | 288 ++++++++++++
+ .../motion/src/multiaxis/rotary_flow_emit.rs  | 277 ++++++++++++
+ .../motion/src/multiaxis/rotary_flow_pass.rs  | 294 ++++++++++++
+ .../src/multiaxis/rotary_flow_unwrap.rs       | 320 +++++++++++++
+ crates/motion/tests/rotary_flow.rs            | 422 ++++++++++++++++++
+ docs/decisions/2824-rotary-flow-kernel.md     |  42 ++
+ 8 files changed, 2009 insertions(+)
+ create mode 100644 crates/motion/src/multiaxis/rotary_flow.rs
+ create mode 100644 crates/motion/src/multiaxis/rotary_flow/rotary_flow_tests.rs
+ create mode 100644 crates/motion/src/multiaxis/rotary_flow_emit.rs
+ create mode 100644 crates/motion/src/multiaxis/rotary_flow_pass.rs
+ create mode 100644 crates/motion/src/multiaxis/rotary_flow_unwrap.rs
+ create mode 100644 crates/motion/tests/rotary_flow.rs
+ create mode 100644 docs/decisions/2824-rotary-flow-kernel.md
+
+diff --git a/crates/motion/src/multiaxis/mod.rs b/crates/motion/src/multiaxis/mod.rs
+index 5009c5a1d..1d5ed4fcb 100644
+--- a/crates/motion/src/multiaxis/mod.rs
++++ b/crates/motion/src/multiaxis/mod.rs
+@@ -55,6 +55,10 @@ mod rotary_seam_angle;
+ mod rotary_sheet;
+ pub mod rotary_bar;
+ mod rotary_ends;
++mod rotary_flow;
++mod rotary_flow_emit;
++mod rotary_flow_pass;
++mod rotary_flow_unwrap;
+ mod rotary_links;
+ pub mod rotary_pick;
+ mod wrap_exit;
+@@ -72,6 +76,7 @@ pub use parallel5d::parallel5d;
+ pub use rough::{multiaxis_rough, multiaxis_rough_prev};
+ pub use rotary::{rotary_contour, rotary_parallel, rotary_parallel_in, rotary_parallel_over};
+ pub use rotary_bar::revolved_bar;
++pub use rotary_flow::{rotary_flow, RotaryFlowParams};
+ pub use rotary_offset::{rotary_offset, rotary_offset_developed, rotary_offset_in};
+ pub use stamp_link::{guard_turns, link_swings, LINK_TURN_DEG};
+ pub use swarf::{swarf5d, swarf5d_advanced};
+diff --git a/crates/motion/src/multiaxis/rotary_flow.rs b/crates/motion/src/multiaxis/rotary_flow.rs
+new file mode 100644
+index 000000000..9530eeb92
+--- /dev/null
++++ b/crates/motion/src/multiaxis/rotary_flow.rs
+@@ -0,0 +1,361 @@
++//! Rotary Flow (issue #2824, the first slice of #2804): the
++//! 4-axis cylindrical flow-line finishing kind. The caller PICKS
++//! the guide chains - the edges of a helical band on a rotor - and
++//! states the rotation axis (the #2772 seam: the axis is a
++//! PARAMETER here, never fitted from the mesh, so a helical model
++//! no fit could answer still machines). The kernel unwraps each
++//! chain to a continuous cylindrical track about the axis
++//! (`rotary_flow_unwrap`), aligns each adjacent pair by the nearest
++//! whole turn, develops the band `(s = R_ref * theta, v)`, chooses
++//! the pass count from the stepover or the scallop law, blends
++//! iso-parametric flow curves between the pair, pushes every
++//! station's ball center out along its radial until the
++//! closest-point oracle clears the whole mesh (`rotary_flow_pass`),
++//! and poses and links the passes radially on the retract cylinders
++//! (`rotary_flow_emit`) - ball-center ladders, tool tips out.
++//!
++//! This first slice needs at least two chains and a ball-nose tool;
++//! empty, off-model, on-axis, reversed and degenerate picks are
++//! refused by name, never guessed past.
++//!
++//! Provenance: cylindrical unwrapping and iso-parametric flow-line
++//! CAM on developed rotary surfaces from published 4-axis machining
++//! literature; the scallop, lean and pivot laws are this codebase's
++//! own. No vendor material consulted.
++
++use crate::cl::Toolpath;
++use crate::finishing3d::scallop_stepover;
++use crate::geometry::{Point3, Triangle};
++use crate::machining2d::{GenError, ARC_FIT_TOL};
++use crate::tools::{Tool, ToolKind};
++
++use super::axis::Axis;
++use super::retip::radial_at;
++use super::rotary_flow_emit::Emitter;
++use super::rotary_flow_pass::{boxes_of, flow_pass};
++use super::rotary_flow_unwrap::{self, Basis, Unwrapped};
++use super::tilt::AxisControl;
++
++#[cfg(test)]
++mod rotary_flow_tests;
++
++/// The corner-lattice step for chain points (the drive-curve walk's
++/// own DUST law, curve.rs): two reads of one CAD vertex differ by
++/// float dust, never by a facet's breadth.
++const DUST: f64 = 1e-6;
++/// Matched-place samples that read a band's width and alignment.
++const BAND_SAMPLES: usize = 33;
++/// Most flow passes one band may take: a band that needs more is a
++/// wrong pick or a wrong stepover, refused by name.
++pub const MAX_PASSES: usize = 4096;
++
++/// The pass's numbers. Heights read as BALL-CENTER radii about the
++/// stated axis - the retract cylinders the links ride - never as
++/// world Z: a rotor may stand or lie, and only a radius about the
++/// axis names a safe place the same way for both.
++pub struct RotaryFlowParams<'a> {
++    /// The cutting tool. Rotary Flow is a ball law: the pass spacing,
++    /// the push-out and the tip all ride a ball of `tool.diameter`;
++    /// a tool of any other kind is refused by name.
++    pub tool: &'a Tool,
++    /// Developed stepover between flow passes, mm, read at the
++    /// band's outermost radius (ground inside it gets finer, never
++    /// coarser). `None` uses the scallop law
++    /// [`scallop_stepover`]`(ball_r, tolerance)`.
++    pub stepover: Option<f64>,
++    /// Scallop height and chord budget, mm.
++    pub tolerance: f64,
++    /// Ball-center radius of the clearance cylinder: the program
++    /// opens, hops bands and exits there.
++    pub clearance: f64,
++    /// Ball-center radius of the pass-link cylinder; `None` links at
++    /// clearance.
++    pub retract: Option<f64>,
++    pub feed: f64,
++    pub plunge_feed: f64,
++    /// `true` walks each band as picked; `false` reverses each
++    /// pass's travel (the drive-curve walk's own climb law).
++    pub climb: bool,
++}
++
++/// The Rotary Flow program: the picked guide chains of one helical
++/// band (or several bands, one per adjacent chain pair), machined
++/// by flow lines between each pair.
++///
++/// The chains are 3D polylines ON the model - the picked edge
++/// chains of the selection, each running ALONG the band (a helix of
++/// the rotor). Two chains span one band; three or more machine one
++/// band per adjacent pair (a shared chain is walked once per band
++/// that uses it).
++pub fn rotary_flow(
++    chains: &[Vec<Point3>],
++    facets: &[Triangle],
++    ax: &Axis,
++    p: &RotaryFlowParams<'_>,
++    c: &AxisControl,
++) -> Result<Toolpath, GenError> {
++    let r = validate_numbers(p)?;
++    validate_axis(ax)?;
++    if facets.is_empty() {
++        return Err(GenError::Empty(
++            "Rotary Flow found no model to read the band from".into(),
++        ));
++    }
++    if chains.len() < 2 {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow needs at least two picked guide chains to span a band; got {} - pick \
++             the two edges of the helical band",
++            chains.len()
++        )));
++    }
++    let basis: Basis = rotary_flow_unwrap::basis(ax)?;
++    let boxes = boxes_of(facets);
++    let rho_mesh = rotary_flow_unwrap::mesh_radius(ax, facets);
++    let hop = p.retract.unwrap_or(p.clearance);
++    for (name, v) in [("clearance", p.clearance), ("retract", hop)] {
++        if !(v.is_finite() && v > rho_mesh + r + ARC_FIT_TOL) {
++            // #677's own words, a radius this time: no spot is named.
++            return Err(GenError::Invalid(format!(
++                "Rotary Flow reads its {name} height as a ball-center radius about the stated \
++                 axis: {v:.3} mm does not clear the work's {rho_mesh:.3} mm radius plus the \
++                 {r:.3} mm ball - raise it"
++            )));
++        }
++    }
++    let diag = rotary_flow_unwrap::extent(facets);
++    let cell = (diag * DUST).max(1e-9);
++    let eps2 = (4.0 * cell) * (4.0 * cell);
++    let mut tracks: Vec<Unwrapped> = Vec::with_capacity(chains.len());
++    for (ci, ch) in chains.iter().enumerate() {
++        let pts = rotary_flow_unwrap::clean_chain(ch, ci, eps2)?;
++        for (j, q) in pts.iter().enumerate() {
++            if !rotary_flow_unwrap::on_model(*q, facets, &boxes, eps2) {
++                return Err(GenError::invalid_at(
++                    format!(
++                        "Rotary Flow: guide chain {} point {} stands off the model surface - \
++                         re-pick it, or project it onto the part",
++                        ci + 1,
++                        j + 1
++                    ),
++                    *q,
++                ));
++            }
++            if radial_at(ax, *q).is_none() {
++                return Err(GenError::invalid_at(
++                    format!(
++                        "Rotary Flow: guide chain {} point {} stands on the rotation axis line \
++                         - it has no azimuth to unwrap",
++                        ci + 1,
++                        j + 1
++                    ),
++                    *q,
++                ));
++            }
++        }
++        tracks.push(rotary_flow_unwrap::unwrap(ax, &basis, &pts));
++    }
++    // The passes: one band per adjacent chain pair, hop-linked inside
++    // a band, clearance-linked between bands.
++    let step = match p.stepover {
++        Some(s) => s,
++        None => scallop_stepover(r, p.tolerance),
++    };
++    let tol_chord = ARC_FIT_TOL.min(p.tolerance);
++    let mut emit = Emitter::new(ax, &basis, c, r, p.clearance, p.feed, p.plunge_feed);
++    let mut notes: Vec<String> = Vec::new();
++    let mut opened = false;
++    let mut prev_last: Option<Point3> = None;
++    for k in 0..tracks.len() - 1 {
++        let a = &tracks[k];
++        let mut b = tracks[k + 1].clone();
++        if rotary_flow_unwrap::opposite_sense(a, &b) {
++            return Err(GenError::Invalid(format!(
++                "Rotary Flow: guide chains {} and {} advance about the axis in opposite senses \
++                 - reverse one pick so both run the same way along the band",
++                k + 1,
++                k + 2
++            )));
++        }
++        let shift = rotary_flow_unwrap::align_pair(a, &mut b, BAND_SAMPLES);
++        let r_ref = a
++            .rho
++            .iter()
++            .chain(b.rho.iter())
++            .fold(0.0f64, |m, &x| m.max(x));
++        let width = rotary_flow_unwrap::cross_width(a, &b, r_ref, BAND_SAMPLES);
++        if !(width.is_finite() && width > 0.0) {
++            return Err(GenError::Invalid(format!(
++                "Rotary Flow: guide chains {} and {} lie on top of each other - the band has no \
++                 width to machine",
++                k + 1,
++                k + 2
++            )));
++        }
++        let count = pass_count(width, step)?;
++        let mut band: Vec<Vec<Point3>> = Vec::with_capacity(count);
++        let mut capped = false;
++        for i in 0..count {
++            let t = i as f64 / (count - 1) as f64;
++            let out = flow_pass(ax, &basis, facets, &boxes, a, &b, t, r, tol_chord)?;
++            capped |= out.depth_capped;
++            let mut centers = out.centers;
++            if !p.climb {
++                centers.reverse();
++            }
++            band.push(centers);
++        }
++        if capped {
++            notes.push(format!(
++                "Rotary Flow: a pass of band {} reached the chord depth cap at tolerance \
++                 {tol_chord} mm - check the picks",
++                k + 1
++            ));
++        }
++        for (i, centers) in band.iter().enumerate() {
++            let Some(first) = centers.first().copied() else { continue };
++            if !opened {
++                emit.open(first)?;
++                opened = true;
++            } else if i == 0 {
++                // Between bands the hop is the clearance cylinder.
++                let last = prev_last.ok_or_else(|| {
++                    GenError::Invalid("Rotary Flow lost the last pass's end".into())
++                })?;
++                emit.exit(last)?;
++                emit.link(last, first, p.clearance)?;
++            } else {
++                let last = prev_last.ok_or_else(|| {
++                    GenError::Invalid("Rotary Flow lost the last pass's end".into())
++                })?;
++                emit.retract(last, hop)?;
++                emit.link(last, first, hop)?;
++            }
++            emit.pass(centers)?;
++            prev_last = centers.last().copied();
++        }
++        let span = if shift.abs() > 1e-9 {
++            format!("{shift:.2} rad of whole-turn alignment")
++        } else {
++            "no whole-turn alignment".into()
++        };
++        notes.push(format!(
++            "Rotary Flow: band {} spans {width:.3} mm developed at R {r_ref:.3} mm; {count} \
++             flow passes at a {step:.3} mm stepover, {span}",
++            k + 1
++        ));
++    }
++    if let Some(last) = prev_last {
++        emit.exit(last)?;
++    }
++    emit.finish(notes)
++}
++
++/// The tool and the numbers, or the refusal that names them.
++fn validate_numbers(p: &RotaryFlowParams) -> Result<f64, GenError> {
++    if p.tool.kind != ToolKind::BallNose {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow cuts with a ball-nose tool; the setup's tool is a {} - mount a \
++             ball-nose tool, or finish the band with a kind that takes it",
++            p.tool.kind
++        )));
++    }
++    let r = p.tool.diameter * 0.5;
++    if !(r.is_finite() && r > 0.0) {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow needs a finite positive ball diameter; the tool states {} mm",
++            p.tool.diameter
++        )));
++    }
++    for (name, v) in [("feed", p.feed), ("plunge feed", p.plunge_feed)] {
++        if !v.is_finite() {
++            return Err(GenError::Invalid(format!(
++                "Rotary Flow needs a finite {name}, not {v}"
++            )));
++        }
++    }
++    if !(p.clearance.is_finite() && p.retract.is_none_or(f64::is_finite)) {
++        return Err(GenError::Invalid(
++            "Rotary Flow needs finite clearance and retract radii".into(),
++        ));
++    }
++    if let Some(s) = p.stepover
++        && !(s.is_finite() && s > 0.0)
++    {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow needs a positive finite stepover, not {s} mm"
++        )));
++    }
++    if !(p.tolerance.is_finite() && p.tolerance > 0.0) {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow needs a positive finite tolerance, not {} mm",
++            p.tolerance
++        )));
++    }
++    // The scallop ceiling, the finishing kinds' own law (params.rs): a
++    // stepover a ball diameter apart leaves uncut ground, and the auto
++    // law reaches a full diameter at half the ball radius.
++    if let Some(s) = p.stepover
++        && s >= p.tool.diameter
++    {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow stepover {s} mm reaches the scallop ceiling: passes a ball diameter \
++             ({} mm) apart leave uncut ground, not a cusp",
++            p.tool.diameter
++        )));
++    }
++    if p.tolerance >= r / 2.0 {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow tolerance {} mm reaches the scallop ceiling: at half the ball radius \
++             ({:.3} mm) the scallop stepover is a full ball diameter",
++            p.tolerance,
++            r / 2.0
++        )));
++    }
++    Ok(r)
++}
++
++/// The stated axis, or the refusal that names what is wrong with it.
++fn validate_axis(ax: &Axis) -> Result<(), GenError> {
++    if !ax.origin.is_finite() || !ax.dir.is_finite() {
++        return Err(GenError::Invalid(
++            "the stated rotation axis carries a non-finite point or direction".into(),
++        ));
++    }
++    let l = ax.dir.dot(ax.dir).sqrt();
++    if (l - 1.0).abs() > 1e-6 {
++        return Err(GenError::Invalid(format!(
++            "the stated rotation axis direction is not unit length ({l:.6}) - the stated-axis \
++             resolver or the caller must normalize it"
++        )));
++    }
++    Ok(())
++}
++
++/// The pass count a band's developed width needs at `step`: one pass
++/// at each edge, one per `step` in between; the ceiling is the
++/// runaway guard, refused by name.
++fn pass_count(width: f64, step: f64) -> Result<usize, GenError> {
++    if !(step.is_finite() && step > 0.0) {
++        return Err(GenError::Invalid(
++            "Rotary Flow: the scallop law collapsed to a zero stepover - check the tolerance"
++                .into(),
++        ));
++    }
++    // CEILING: the last span may be short, never long - a pass a
++    // stepover and a half wide is a broken promise.
++    let spans = (width / step).ceil();
++    if !spans.is_finite() || spans < 0.0 {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow: the band's developed width {width:.3} mm does not divide at a \
++             {step:.3} mm stepover"
++        )));
++    }
++    if spans + 1.0 > MAX_PASSES as f64 {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow: the band needs {} passes at a {step:.3} mm stepover - more than the \
++             {MAX_PASSES} pass ceiling; widen the stepover, or pick a narrower band",
++            spans + 1.0
++        )));
++    }
++    Ok((spans as usize + 1).max(2))
++}
+diff --git a/crates/motion/src/multiaxis/rotary_flow/rotary_flow_tests.rs b/crates/motion/src/multiaxis/rotary_flow/rotary_flow_tests.rs
+new file mode 100644
+index 000000000..7bf55f36b
+--- /dev/null
++++ b/crates/motion/src/multiaxis/rotary_flow/rotary_flow_tests.rs
+@@ -0,0 +1,288 @@
++//! Unit law tests of the Rotary Flow kernel (#2824): every refusal
++//! names its input, the pass count divides the band, and a small
++//! on-model band poses and clears without gouge. The rotor fixtures
++//! live in the integration binary (`tests/rotary_flow.rs`).
++
++use super::*;
++use crate::cl::MoveKind;
++use crate::finishing3d::closest_pt_tri;
++use crate::geometry::{cube, Point3, Triangle};
++
++use super::super::rotary_flow_unwrap::{align_pair, Unwrapped};
++
++const TAU: f64 = std::f64::consts::TAU;
++
++fn p3(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++/// The ball the kernel demands (the drilling tests' own tool shape,
++/// kind swapped to the ball law).
++fn ball(d: f64) -> Tool {
++    Tool {
++        kind: ToolKind::BallNose,
++        diameter: d,
++        corner_r: d * 0.5,
++        tip_angle: 0.0,
++        pitch: 0.0,
++        pitch_min: 0.0,
++        thread_hand: Default::default(),
++        nose_radius: 0.0,
++        width: 0.0,
++        flute_len: 30.0,
++        shank_d: d,
++        shank_len: 30.0,
++        holder_d: 20.0,
++        holder_len: 20.0,
++        material_group: "aluminum".into(),
++        center_cutting: true,
++        rpm: 10_000.0,
++        feed: 500.0,
++        tool_material: None,
++        flutes: None,
++        orientation: None,
++        catalog: camcraft_tools::catalog_fields::ToolCatalog::default(),
++        cutting: Vec::new(),
++        outline: Vec::new(),
++        turning: None,
++    }
++}
++
++fn boxy() -> Vec<Triangle> {
++    cube(Point3::ZERO, Point3::new(40.0, 40.0, 15.0)).facets.to_vec()
++}
++
++/// The stated axis of the box fixture: world Z through the top face.
++fn axis() -> Axis {
++    Axis {
++        origin: p3(20.0, 20.0, 0.0),
++        dir: p3(0.0, 0.0, 1.0),
++    }
++}
++
++fn params<'a>(tool: &'a Tool) -> RotaryFlowParams<'a> {
++    RotaryFlowParams {
++        tool,
++        stepover: Some(2.0),
++        tolerance: 0.05,
++        clearance: 35.0,
++        retract: None,
++        feed: 500.0,
++        plunge_feed: 100.0,
++        climb: true,
++    }
++}
++
++/// The box's top-front edge (a convex edge, on the model).
++fn front() -> Vec<Point3> {
++    vec![p3(5.0, 0.0, 15.0), p3(20.0, 0.0, 15.0), p3(35.0, 0.0, 15.0)]
++}
++
++/// A chain on the top face, in from the edge, winding the same way.
++fn inner() -> Vec<Point3> {
++    vec![p3(5.0, 5.0, 15.0), p3(20.0, 5.0, 15.0), p3(35.0, 5.0, 15.0)]
++}
++
++#[test]
++fn a_tool_that_is_not_a_ball_is_refused_by_name() {
++    let mut t = ball(6.0);
++    t.kind = ToolKind::EndMill;
++    t.corner_r = 0.6;
++    let e = rotary_flow(
++        &[front(), inner()],
++        &boxy(),
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap_err();
++    assert!(format!("{e}").contains("ball-nose"), "{e}");
++}
++
++#[test]
++fn fewer_than_two_chains_are_refused_by_name() {
++    let t = ball(6.0);
++    let none: &[Vec<Point3>] = &[];
++    let one: &[Vec<Point3>] = &[front()];
++    for (got, chains) in [("0", none), ("1", one)] {
++        let e = rotary_flow(chains, &boxy(), &axis(), &params(&t), &AxisControl::default())
++            .unwrap_err();
++        assert!(
++            format!("{e}").contains("at least two picked guide chains") && format!("{e}").contains(got),
++            "got {got}: {e}"
++        );
++    }
++}
++
++#[test]
++fn an_empty_model_is_refused_by_name() {
++    let t = ball(6.0);
++    let e = rotary_flow(&[front(), inner()], &[], &axis(), &params(&t), &AxisControl::default())
++        .unwrap_err();
++    assert!(format!("{e}").contains("no model"), "{e}");
++}
++
++#[test]
++fn an_off_model_chain_is_refused_by_name_at_its_spot() {
++    let t = ball(6.0);
++    let floating = vec![p3(5.0, 0.0, 40.0), p3(20.0, 0.0, 40.0), p3(35.0, 0.0, 40.0)];
++    let e = rotary_flow(
++        &[floating, inner()],
++        &boxy(),
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap_err();
++    assert!(format!("{e}").contains("stands off the model surface"), "{e}");
++    assert_eq!(e.location(), Some(p3(5.0, 0.0, 40.0)));
++}
++
++#[test]
++fn a_chain_point_on_the_axis_line_is_refused_by_name() {
++    let t = ball(6.0);
++    let through = vec![p3(5.0, 0.0, 15.0), p3(20.0, 20.0, 15.0), p3(35.0, 0.0, 15.0)];
++    let e = rotary_flow(
++        &[through, inner()],
++        &boxy(),
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap_err();
++    assert!(format!("{e}").contains("stands on the rotation axis line"), "{e}");
++}
++
++#[test]
++fn a_degenerate_band_is_refused_by_name() {
++    let t = ball(6.0);
++    let e = rotary_flow(
++        &[front(), front()],
++        &boxy(),
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap_err();
++    assert!(format!("{e}").contains("no width to machine"), "{e}");
++}
++
++#[test]
++fn chains_wound_in_opposite_senses_are_refused_by_name() {
++    let t = ball(6.0);
++    let mut back = front();
++    back.reverse();
++    let e = rotary_flow(
++        &[front(), back],
++        &boxy(),
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap_err();
++    assert!(format!("{e}").contains("opposite senses"), "{e}");
++}
++
++#[test]
++fn a_stepover_at_the_scallop_ceiling_is_refused_by_name() {
++    let t = ball(6.0);
++    let mut q = params(&t);
++    q.stepover = Some(6.0);
++    let e = rotary_flow(&[], &[], &axis(), &q, &AxisControl::default()).unwrap_err();
++    assert!(format!("{e}").contains("scallop ceiling"), "{e}");
++}
++
++#[test]
++fn a_tolerance_at_the_scallop_ceiling_is_refused_by_name() {
++    let t = ball(6.0);
++    let mut q = params(&t);
++    q.tolerance = 3.0; // the ball radius: half of it is the ceiling
++    let e = rotary_flow(&[], &[], &axis(), &q, &AxisControl::default()).unwrap_err();
++    assert!(format!("{e}").contains("scallop ceiling"), "{e}");
++}
++
++#[test]
++fn a_clearance_below_the_work_is_refused_by_name() {
++    let t = ball(6.0);
++    let mut q = params(&t);
++    q.clearance = 20.0; // the box corner stands 28.28 mm out
++    let e = rotary_flow(&[front(), inner()], &boxy(), &axis(), &q, &AxisControl::default())
++        .unwrap_err();
++    assert!(format!("{e}").contains("does not clear"), "{e}");
++}
++
++#[test]
++fn the_pass_count_divides_the_band_and_holds_its_ceiling() {
++    assert_eq!(pass_count(10.0, 3.0), Ok(5));
++    assert_eq!(pass_count(9.0, 3.0), Ok(4));
++    assert_eq!(pass_count(0.1, 5.0), Ok(2));
++    let e = pass_count(1e9, 1.0).unwrap_err();
++    assert!(format!("{e}").contains("pass ceiling"), "{e}");
++    let e = pass_count(1.0, 0.0).unwrap_err();
++    assert!(format!("{e}").contains("collapsed"), "{e}");
++}
++
++#[test]
++fn align_pair_takes_the_nearest_whole_turn() {
++    // B answers for +0.3 rad and for +0.3 - TAU alike; the band the
++    // user picked is the one under half a turn wide.
++    let track = |dth: f64| Unwrapped {
++        th: (0..5).map(|i| i as f64 + dth).collect(),
++        v: vec![0.0; 5],
++        rho: vec![8.0; 5],
++        u: (0..5).map(|i| i as f64 / 4.0).collect(),
++    };
++    let a = track(0.0);
++    let mut b = track(0.3 - TAU);
++    let shift = align_pair(&a, &mut b, 17);
++    assert!((shift - TAU).abs() < 1e-9, "{shift}");
++    assert!((b.th[0] - 0.3).abs() < 1e-9, "{:?}", b.th);
++}
++
++#[test]
++fn a_small_band_poses_clears_and_opens_at_clearance() {
++    let facets = boxy();
++    let t = ball(6.0);
++    let path = rotary_flow(
++        &[front(), inner()],
++        &facets,
++        &axis(),
++        &params(&t),
++        &AxisControl::default(),
++    )
++    .unwrap();
++    assert!(path.is_chained());
++    assert!(path.all_finite());
++    assert!(!path.moves.is_empty());
++    // The program opens ON the clearance pose (M13.8): the first
++    // record states the pose where it stands.
++    let m0 = &path.moves[0];
++    assert!(m0.kind == MoveKind::Rapid && m0.from == m0.to, "{m0:?}");
++    let a0 = m0.axis.expect("the opening record states a pose");
++    let c0 = p3(m0.to.x + a0[0] * 3.0, m0.to.y + a0[1] * 3.0, m0.to.z + a0[2] * 3.0);
++    let d = c0 - axis().origin;
++    let s = d.dot(axis().dir);
++    let w = d - p3(0.0, 0.0, s);
++    assert!(
++        (w.dot(w).sqrt() - 35.0).abs() < 1e-6,
++        "the opening center rides {w:?}, not the 35 mm clearance cylinder"
++    );
++    // The pin: every cut station's ball keeps its radius off the part.
++    for m in path.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++        let a = m.axis.expect("a cut station poses");
++        let c = p3(m.to.x + a[0] * 3.0, m.to.y + a[1] * 3.0, m.to.z + a[2] * 3.0);
++        for f in &facets {
++            let d = c - closest_pt_tri(c, &[f.a, f.b, f.c]);
++            assert!(
++                d.dot(d).sqrt() >= 3.0 - 1e-6,
++                "a station's ball at {c:?} gouges the part by {:e}",
++                3.0 - d.dot(d).sqrt()
++            );
++        }
++    }
++    assert!(
++        path.notes.iter().any(|n| n.contains("band 1 spans")),
++        "the notes do not state the band: {:?}",
++        path.notes
++    );
++}
+diff --git a/crates/motion/src/multiaxis/rotary_flow_emit.rs b/crates/motion/src/multiaxis/rotary_flow_emit.rs
+new file mode 100644
+index 000000000..43c9089d8
+--- /dev/null
++++ b/crates/motion/src/multiaxis/rotary_flow_emit.rs
+@@ -0,0 +1,277 @@
++//! The world exit of the Rotary Flow kernel (#2824): the ball-center
++//! passes the pass module chorded, posed and emitted as the stream's
++//! records. Every point is a TOOL TIP (the pivot law, `retip`: a
++//! pose turned about the tip carries the ball off the skin it was
++//! planned against), every cut move is posed by the lean law on the
++//! radial at its own ball center (`tilt`, the rotary twins' own
++//! law), rapids travel under the radial they inherit (the post keeps
++//! the tilt modal), and the links are rebuilt radially like the
++//! rotary twins' (`rotary_links`): a feed retract along the radial to
++//! the hop cylinder, an index chorded on that cylinder the short way
++//! round, a plunge along the next pass's own radial. The program
++//! opens on the clearance pose above its first cut (M13.8) and exits
++//! the same way.
++//!
++//! The cylinders are named in BALL-CENTER radii about the stated
++//! axis (the hop and clearance of the params): every link point is
++//! a center pushed straight out along its own radial, so the tool
++//! never swings sideways through the band it just cut.
++//!
++//! Provenance: radial retract / angular index / radial infeed
++//! linking of 4-axis rotary milling from general machining practice
++//! (`rotary_links` states the star-shaped argument); our own
++//! composition. No vendor material consulted.
++
++use crate::cl::{MoveKind, PathBuilder, Toolpath};
++use crate::geometry::Point3;
++use crate::machining2d::{GenError, ARC_FIT_TOL};
++
++use super::axis::Axis;
++use super::retip::{radial_at, tip_of};
++use super::rotary_flow_pass::{cyl_of, station};
++use super::rotary_flow_unwrap::{Basis, TAU};
++use super::tilt::{command_axis, AxisControl};
++
++/// Chord cap of one cylinder index (`rotary_links`' own clamp).
++const INDEX_CHORDS: usize = 8192;
++/// Half of the short-way unwrapping constant, spelled once.
++const PI: f64 = std::f64::consts::PI;
++
++/// The kernel's builder state: one program, opened once, linked
++/// through every band.
++pub(super) struct Emitter<'a> {
++    ax: &'a Axis,
++    basis: &'a Basis,
++    c: &'a AxisControl,
++    r: f64,
++    /// Ball-center radius of the clearance cylinder.
++    clear: f64,
++    feed: f64,
++    plunge_feed: f64,
++    builder: Option<PathBuilder>,
++    held: Option<[f64; 3]>,
++}
++
++impl<'a> Emitter<'a> {
++    #[allow(clippy::too_many_arguments)] // one emitter's flat read
++    pub(super) fn new(
++        ax: &'a Axis,
++        basis: &'a Basis,
++        c: &'a AxisControl,
++        r: f64,
++        clear: f64,
++        feed: f64,
++        plunge_feed: f64,
++    ) -> Self {
++        Emitter {
++            ax,
++            basis,
++            c,
++            r,
++            clear,
++            feed,
++            plunge_feed,
++            builder: None,
++            held: None,
++        }
++    }
++
++    /// The builder, once opened - a private invariant the kernel
++    /// keeps by calling [`open`](Self::open) before anything else.
++    fn b(&mut self) -> Result<&mut PathBuilder, GenError> {
++        self.builder
++            .as_mut()
++            .ok_or_else(|| GenError::Invalid("Rotary Flow: the emitter was not opened".into()))
++    }
++
++    /// The cut pose at ball center `w` travelling `t`: the radial
++    /// through the lean law (rotary.rs's own cut_pose, refused by
++    /// name where no pose can be framed, never guessed).
++    fn cut_pose(&self, w: Point3, t: Point3) -> Result<[f64; 3], GenError> {
++        let Some(n3) = radial_at(self.ax, w) else {
++            return Err(GenError::invalid_at(
++                "Rotary Flow: a cut station stands on the axis line - no radial to pose",
++                w,
++            ));
++        };
++        let n = Point3::new(n3[0], n3[1], n3[2]);
++        let l = t.dot(t).sqrt();
++        if !(l.is_finite() && l > 1e-12) {
++            return Ok(n3); // nowhere to lead: hold the radial
++        }
++        let a = command_axis(n, Point3::new(t.x / l, t.y / l, t.z / l), self.c).ok_or_else(|| {
++            GenError::invalid_at(
++                "Rotary Flow: the lean law cannot frame a pose at this station - the axis \
++                 control's angles are not usable",
++                w,
++            )
++        })?;
++        Ok([a.x, a.y, a.z])
++    }
++
++    /// A rapid's pose: the radial at its own ball center, held where
++    /// none exists (`retip`'s law, said never silent).
++    fn air_pose(&mut self, w: Point3) -> Option<[f64; 3]> {
++        let p = radial_at(self.ax, w).or(self.held);
++        if p.is_none() {
++            tracing::warn!("multiaxis: a Rotary Flow rapid at {w:?} stands on the axis; it holds the last pose");
++        }
++        p
++    }
++
++    /// The program's opening (M13.8): the clearance pose over the
++    /// first cut - the pose-stating record first, then the plunge
++    /// into the first station along its own radial.
++    pub(super) fn open(&mut self, first: Point3) -> Result<(), GenError> {
++        let (v, th, _) = cyl_of(self.ax, self.basis, first);
++        let top = station(self.ax, self.basis, th, v, self.clear);
++        let Some(rad) = radial_at(self.ax, top) else {
++            return Err(GenError::invalid_at(
++                "Rotary Flow: the opening station stands on the axis line - no radial to hold",
++                top,
++            ));
++        };
++        let t0 = tip_of(top, Some(rad), self.r);
++        let mut b = PathBuilder::new(t0);
++        b.set_axis(Some(rad));
++        b.push(MoveKind::Rapid, t0, None);
++        self.builder = Some(b);
++        self.held = Some(rad);
++        self.plunge_from(self.clear, first)
++    }
++
++    /// Plunge from the `cyl` cylinder above `into`, along `into`'s
++    /// own radial, at plunge feed.
++    fn plunge_from(&mut self, cyl: f64, into: Point3) -> Result<(), GenError> {
++        let (v, th, _) = cyl_of(self.ax, self.basis, into);
++        let above = station(self.ax, self.basis, th, v, cyl);
++        let pose = self.cut_pose(into, into - above)?;
++        let tip = tip_of(into, Some(pose), self.r);
++        let feed = self.plunge_feed;
++        {
++            let b = self.b()?;
++            b.set_axis(Some(pose));
++            b.push(MoveKind::Plunge, tip, Some(feed));
++        }
++        self.held = Some(pose);
++        Ok(())
++    }
++
++    /// One pass's cut moves: ball centers in, tips out, every move
++    /// posed by the lean law on its own travel.
++    pub(super) fn pass(&mut self, centers: &[Point3]) -> Result<(), GenError> {
++        if centers.len() < 2 {
++            return Err(GenError::Invalid(
++                "Rotary Flow: a flow pass holds fewer than two stations".into(),
++            ));
++        }
++        let feed = self.feed;
++        for k in 1..centers.len() {
++            let travel = centers[k] - centers[k - 1];
++            let pose = self.cut_pose(centers[k], travel)?;
++            let tip = tip_of(centers[k], Some(pose), self.r);
++            {
++                let b = self.b()?;
++                b.set_axis(Some(pose));
++                b.push(MoveKind::Feed, tip, Some(feed));
++            }
++            self.held = Some(pose);
++        }
++        Ok(())
++    }
++
++    /// Leave one pass's last center: a feed retract along its radial
++    /// to the `cyl` cylinder (`rotary_links`' cut-feed exit off a
++    /// pass, on this kernel's ball-center radius).
++    pub(super) fn retract(&mut self, last: Point3, cyl: f64) -> Result<(), GenError> {
++        let (v, th, _) = cyl_of(self.ax, self.basis, last);
++        let top = station(self.ax, self.basis, th, v, cyl);
++        let pose = self.cut_pose(top, top - last)?;
++        let tip = tip_of(top, Some(pose), self.r);
++        let feed = self.feed;
++        {
++            let b = self.b()?;
++            b.set_axis(Some(pose));
++            b.push(MoveKind::Feed, tip, Some(feed));
++        }
++        self.held = Some(pose);
++        Ok(())
++    }
++
++    /// The index onto the `cyl` cylinder over `next`, from wherever
++    /// the same cylinder already holds the tool (`rotary_links`' law:
++    /// short way round, chorded at `ARC_FIT_TOL`), then the plunge
++    /// into `next` along its own radial.
++    pub(super) fn link(&mut self, last: Point3, next: Point3, cyl: f64) -> Result<(), GenError> {
++        let (v0, th0, _) = cyl_of(self.ax, self.basis, last);
++        let (v1, th1, _) = cyl_of(self.ax, self.basis, next);
++        let dphi = (th1 - th0 + PI).rem_euclid(TAU) - PI;
++        let cap = 2.0 * (1.0 - (ARC_FIT_TOL / cyl).min(2.0)).clamp(-1.0, 1.0).acos();
++        let n = if cap > 1e-12 {
++            (dphi.abs() / cap).ceil() as usize
++        } else {
++            1
++        };
++        let n = n.clamp(1, INDEX_CHORDS);
++        let mut at = station(self.ax, self.basis, th0, v0, cyl);
++        for j in 1..=n {
++            let t = j as f64 / n as f64;
++            let to = if j == n {
++                station(self.ax, self.basis, th1, v1, cyl)
++            } else {
++                let (x, ph) = (v0 + (v1 - v0) * t, th0 + dphi * t);
++                station(self.ax, self.basis, ph, x, cyl)
++            };
++            if to != at {
++                let pose = self.air_pose(to);
++                let tip = tip_of(to, pose, self.r);
++                {
++                    let b = self.b()?;
++                    b.set_axis(pose);
++                    b.push(MoveKind::Rapid, tip, None);
++                }
++                self.held = pose.or(self.held);
++                at = to;
++            }
++        }
++        self.plunge_from(cyl, next)
++    }
++
++    /// The program's exit off a band: rapid out along the last radial
++    /// to the clearance cylinder (`rotary_links`' exit law).
++    pub(super) fn exit(&mut self, last: Point3) -> Result<(), GenError> {
++        let (v, th, _) = cyl_of(self.ax, self.basis, last);
++        let top = station(self.ax, self.basis, th, v, self.clear);
++        let pose = self.air_pose(top);
++        let tip = tip_of(top, pose, self.r);
++        {
++            let b = self.b()?;
++            b.set_axis(pose);
++            b.push(MoveKind::Rapid, tip, None);
++        }
++        self.held = pose.or(self.held);
++        Ok(())
++    }
++
++    /// The finished program; `notes` ride the path to the status
++    /// line, the kernel's own statements of what it did.
++    pub(super) fn finish(mut self, notes: Vec<String>) -> Result<Toolpath, GenError> {
++        let b = self
++            .builder
++            .take()
++            .ok_or_else(|| GenError::Empty("Rotary Flow planned no moves - no band survived the picks".into()))?;
++        let mut out = b.finish();
++        if out.moves.is_empty() {
++            return Err(GenError::Empty(
++                "Rotary Flow planned no moves - no band survived the picks".into(),
++            ));
++        }
++        if !out.all_finite() {
++            return Err(GenError::Invalid(
++                "a Rotary Flow path left the finite horizon".into(),
++            ));
++        }
++        out.notes = notes;
++        Ok(out)
++    }
++}
+diff --git a/crates/motion/src/multiaxis/rotary_flow_pass.rs b/crates/motion/src/multiaxis/rotary_flow_pass.rs
+new file mode 100644
+index 000000000..13d18afcc
+--- /dev/null
++++ b/crates/motion/src/multiaxis/rotary_flow_pass.rs
+@@ -0,0 +1,294 @@
++//! One flow pass of the Rotary Flow kernel (#2824): the
++//! iso-parametric curve between an ALIGNED pair of unwrapped guide
++//! chains. At each normalized arc-length place the pass blends the
++//! pair's cylindrical coordinates (theta, v, rho) - the blend the
++//! unwrap exists for: a straight blend of two helices in the
++//! development is a helix on the flank, while a straight blend of
++//! their 3D points is a chord that cuts the flank - pushes the
++//! station's ball center out along its radial until every facet
++//! keeps one ball radius of clear (the `closest_pt_tri` oracle, so
++//! steep helical flanks never gouge), and chords the pushed-out
++//! curve within the tolerance.
++//!
++//! The push-out MARCHES before it bisects: the clearance along a
++//! radial is monotone on a star-shaped band, but a neighbouring
++//! flute can overhang, so the first clear radius the march finds
++//! wins and the bisection only refines inside its step. A station
++//! the ball cannot clear within five radii of room is refused by
++//! name, at the station's own spot - never posted.
++//!
++//! Provenance: iso-parametric flow-line machining on developed
++//! cylindrical surfaces and gouge-free radial ball offsets are
++//! published 4-axis CAM practice; the closest-point oracle is the
++//! codebase's own finishing law. No vendor material consulted.
++
++use crate::finishing3d::closest_pt_tri;
++use crate::geometry::{Point3, Triangle};
++use crate::machining2d::GenError;
++
++use super::axis::Axis;
++use super::rotary_flow_unwrap::{lerp_at, Basis, Unwrapped};
++
++/// The oracle's float allowance - the finishing kinds' own TOUCH_EPS.
++pub(super) const TOUCH: f64 = 1e-7;
++/// The farthest a station may be pushed out along its radial, in
++/// ball radii, before the pass is refused.
++pub(super) const PUSH_CAP: f64 = 5.0;
++/// Bisection depth of the chord walk: 2^12 spans inside one knot
++/// span is beyond any honest tessellation; past it the span is
++/// accepted and said in the notes, never silently.
++const CHORD_DEPTH: u32 = 12;
++/// Most chord stations one pass may state.
++pub(super) const CHORD_CAP: usize = 16384;
++
++/// One pass's answer: the chorded ball centers, and whether the walk
++/// had to accept a span at the depth cap.
++pub(super) struct PassOut {
++    pub centers: Vec<Point3>,
++    pub depth_capped: bool,
++}
++
++/// The world point of a cylindrical station about the axis.
++pub(super) fn station(ax: &Axis, b: &Basis, th: f64, v: f64, rho: f64) -> Point3 {
++    let (s, c) = th.sin_cos();
++    let rad = Point3::new(
++        b.e1.x * c + b.e2.x * s,
++        b.e1.y * c + b.e2.y * s,
++        b.e1.z * c + b.e2.z * s,
++    );
++    Point3::new(
++        ax.origin.x + rad.x * rho + ax.dir.x * v,
++        ax.origin.y + rad.y * rho + ax.dir.y * v,
++        ax.origin.z + rad.z * rho + ax.dir.z * v,
++    )
++}
++
++/// The (station, azimuth, radius) of a world point about the axis;
++/// the radius is `None` on the axis line itself.
++pub(super) fn cyl_of(ax: &Axis, b: &Basis, q: Point3) -> (f64, f64, Option<f64>) {
++    let d = q - ax.origin;
++    let v = d.dot(ax.dir);
++    let w = d - Point3::new(ax.dir.x * v, ax.dir.y * v, ax.dir.z * v);
++    let rho = w.dot(w).sqrt();
++    (
++        v,
++        w.dot(b.e2).atan2(w.dot(b.e1)),
++        (rho > 1e-12).then_some(rho),
++    )
++}
++
++/// Each facet's axis-aligned box: the cheap reach screen of the
++/// drive-curve walk (curve.rs's own law), spelled for the push-out's
++/// swept corridor.
++pub(super) fn boxes_of(facets: &[Triangle]) -> Vec<[f64; 6]> {
++    facets
++        .iter()
++        .map(|f| {
++            [
++                f.a.x.min(f.b.x.min(f.c.x)),
++                f.a.y.min(f.b.y.min(f.c.y)),
++                f.a.z.min(f.b.z.min(f.c.z)),
++                f.a.x.max(f.b.x.max(f.c.x)),
++                f.a.y.max(f.b.y.max(f.c.y)),
++                f.a.z.max(f.b.z.max(f.c.z)),
++            ]
++        })
++        .collect()
++}
++
++/// The facet indices whose boxes come within `reach` of the corridor
++/// between world points `lo` and `hi` (the ball's whole push range).
++fn near(boxes: &[[f64; 6]], lo: Point3, hi: Point3, reach: f64) -> Vec<usize> {
++    let (x0, x1) = (lo.x.min(hi.x) - reach, lo.x.max(hi.x) + reach);
++    let (y0, y1) = (lo.y.min(hi.y) - reach, lo.y.max(hi.y) + reach);
++    let (z0, z1) = (lo.z.min(hi.z) - reach, lo.z.max(hi.z) + reach);
++    boxes
++        .iter()
++        .enumerate()
++        .filter(|(_, b)| x1 >= b[0] && x0 <= b[3] && y1 >= b[1] && y0 <= b[4] && z1 >= b[2] && z0 <= b[5])
++        .map(|(i, _)| i)
++        .collect()
++}
++
++/// The smallest distance from `q` to the mesh over the screened set
++/// `idx` (infinite in empty air - an air station is clear by default).
++fn mesh_dist(q: Point3, facets: &[Triangle], idx: &[usize]) -> f64 {
++    idx.iter()
++        .filter_map(|&i| facets.get(i))
++        .map(|f| {
++            let d = q - closest_pt_tri(q, &[f.a, f.b, f.c]);
++            d.dot(d).sqrt()
++        })
++        .fold(f64::INFINITY, f64::min)
++}
++
++/// The ball center at station `(th, v, rho)` pushed out along its
++/// radial until every facet keeps `r` of ball around it. `None` when
++/// no radius within [`PUSH_CAP`] radii of the blended one clears -
++/// the caller refuses by name at the station's own spot.
++#[allow(clippy::too_many_arguments)] // one push-out's flat read
++pub(super) fn ball_center(
++    ax: &Axis,
++    b: &Basis,
++    facets: &[Triangle],
++    boxes: &[[f64; 6]],
++    th: f64,
++    v: f64,
++    rho: f64,
++    r: f64,
++) -> Option<Point3> {
++    let cap = rho + PUSH_CAP * r;
++    // The screen is the ball's whole push corridor: any facet that
++    // can come within `r` of a center on it has a box within `r` of
++    // the corridor's bounds.
++    let idx = near(
++        boxes,
++        station(ax, b, th, v, rho),
++        station(ax, b, th, v, cap),
++        r + 1e-6,
++    );
++    let clear = |rr: f64| -> bool {
++        let q = station(ax, b, th, v, rr);
++        mesh_dist(q, facets, &idx) >= r - TOUCH
++    };
++    if clear(rho) {
++        return Some(station(ax, b, th, v, rho));
++    }
++    // March outward in quarter-radius steps to the cap: the FIRST
++    // clear radius wins, then the bisection refines inside its step.
++    let step = 0.25 * r;
++    let mut lo = rho;
++    let mut hi = None;
++    while lo < cap {
++        let x = (lo + step).min(cap);
++        if clear(x) {
++            hi = Some(x);
++            break;
++        }
++        lo = x;
++    }
++    let mut hi = hi?;
++    for _ in 0..24 {
++        let mid = 0.5 * (lo + hi);
++        if clear(mid) {
++            hi = mid;
++        } else {
++            lo = mid;
++        }
++    }
++    Some(station(ax, b, th, v, hi))
++}
++
++/// The blended cylindrical coordinates at cross fraction `t` and
++/// normalized place `x` between the aligned pair.
++fn blend_track(a: &Unwrapped, b: &Unwrapped, t: f64, x: f64) -> (f64, f64, f64) {
++    let one = |ya: &[f64], ua: &[f64], yb: &[f64], ub: &[f64]| -> f64 {
++        let va = lerp_at(ua, ya, x);
++        let vb = lerp_at(ub, yb, x);
++        va + (vb - va) * t
++    };
++    (
++        one(&a.th, &a.u, &b.th, &b.u),
++        one(&a.v, &a.u, &b.v, &b.u),
++        one(&a.rho, &a.u, &b.rho, &b.u),
++    )
++}
++/// The pass at cross fraction `t` between the ALIGNED pair `(a, b)`:
++/// iso-parametric stations blended in the development, each pushed
++/// out until the oracle clears, chorded so consecutive centers stay
++/// within `tol` of the curve between them. The union of the two
++/// chains' arc-length knots seeds the walk, so every blend kink is a
++/// chord endpoint. Refuses, by name and at the station's own spot, a
++/// station the push-out cannot clear, and a curve that outruns the
++/// chord cap.
++#[allow(clippy::too_many_arguments)] // one pass's flat read
++pub(super) fn flow_pass(
++    ax: &Axis,
++    basis: &Basis,
++    facets: &[Triangle],
++    boxes: &[[f64; 6]],
++    a: &Unwrapped,
++    b: &Unwrapped,
++    t: f64,
++    r: f64,
++    tol: f64,
++) -> Result<PassOut, GenError> {
++    let at = |x: f64| -> Result<Point3, GenError> {
++        let (th, v, rho) = blend_track(a, b, t, x);
++        ball_center(ax, basis, facets, boxes, th, v, rho, r).ok_or_else(|| {
++            GenError::invalid_at(
++                format!(
++                    "Rotary Flow: the ball cannot clear the part within {} radii of the flow \
++                     station at cross {:.2} - the band is narrower than the tool there; pick flow \
++                     lines on exposed ground, or use a smaller ball",
++                    PUSH_CAP, t
++                ),
++                station(ax, basis, th, v, rho),
++            )
++        })
++    };
++    // The knot union: every place either chain states a vertex.
++    let mut knots: Vec<f64> = a.u.iter().chain(b.u.iter()).copied().collect();
++    knots.sort_by(|x, y| x.total_cmp(y));
++    knots.dedup_by(|x, y| (*x - *y).abs() < 1e-12);
++    let mut first = Vec::with_capacity(knots.len());
++    for &x in &knots {
++        first.push(at(x)?);
++    }
++    let Some(&p0) = first.first() else {
++        return Err(GenError::Empty(
++            "Rotary Flow: a guide pair left no arc-length knot to walk".into(),
++        ));
++    };
++    let mut out = PassOut {
++        centers: vec![p0],
++        depth_capped: false,
++    };
++    for span in 0..knots.len() - 1 {
++        flatten(
++            &at, knots[span], first[span], knots[span + 1], first[span + 1], tol, 0, &mut out,
++        )?;
++    }
++    Ok(out)
++}
++
++/// Walk one span: accept its endpoint when the midpoint station sits
++/// within `tol` of the chord, else bisect. At the depth cap the span
++/// is accepted and flagged - said in the notes, never silently.
++#[allow(clippy::too_many_arguments)] // one span's flat read
++fn flatten(
++    at: &dyn Fn(f64) -> Result<Point3, GenError>,
++    x0: f64,
++    p0: Point3,
++    x1: f64,
++    p1: Point3,
++    tol: f64,
++    depth: u32,
++    out: &mut PassOut,
++) -> Result<(), GenError> {
++    if out.centers.len() >= CHORD_CAP {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow: a flow pass needs more than {CHORD_CAP} chord stations - the picks or \
++             the tolerance are wrong for this band"
++        )));
++    }
++    if depth >= CHORD_DEPTH {
++        out.depth_capped = true;
++        out.centers.push(p1);
++        return Ok(());
++    }
++    let xm = 0.5 * (x0 + x1);
++    let pm = at(xm)?;
++    let mid = Point3::new(
++        0.5 * (p0.x + p1.x),
++        0.5 * (p0.y + p1.y),
++        0.5 * (p0.z + p1.z),
++    );
++    let d = pm - mid;
++    if d.dot(d).sqrt() <= tol {
++        out.centers.push(p1);
++        return Ok(());
++    }
++    flatten(at, x0, p0, xm, pm, tol, depth + 1, out)?;
++    flatten(at, xm, pm, x1, p1, tol, depth + 1, out)
++}
+diff --git a/crates/motion/src/multiaxis/rotary_flow_unwrap.rs b/crates/motion/src/multiaxis/rotary_flow_unwrap.rs
+new file mode 100644
+index 000000000..00965e3ac
+--- /dev/null
++++ b/crates/motion/src/multiaxis/rotary_flow_unwrap.rs
+@@ -0,0 +1,320 @@
++//! The cylindrical unwrap of the Rotary Flow kernel (#2824, the
++//! first #2804 slice). Each picked guide chain, read about the STATED
++//! axis (the #2772 seam - never fitted here), becomes one continuous
++//! cylindrical track: the axial station `v`, the radius `rho`, and
++//! the azimuth `th` UNWOUND against the previous point, so a
++//! multi-turn helix reads 0, 90, ... 1080 degrees on, never a jump
++//! back. The unwinder is the radian twin of the spindle C law's
++//! `cl::rotary::unwrap_near` (which speaks degrees of a 360-turn,
++//! issue #33); the law is one line either way, and each twin stays
++//! with its own units.
++//!
++//! A pair of tracks is then ALIGNED by the nearest whole turn. The
++//! unwrap makes each chain continuous on its own, but the branch the
++//! second chain started on is arbitrary: the same two helices answer
++//! for a flute's own width and for that width plus a full lap. The
++//! band the user picked is the one under half a turn wide, so the
++//! second chain is shifted by the whole turn that lands the matched
++//! arc-length offset nearest zero - and the development (s =
++//! `R_ref` * theta) reads the flute's own width.
++//!
++//! Provenance: cylindrical unwrapping of rotary toolpaths (developed
++//! surfaces, iso-parametric flow lines) is published 4-axis CAM
++//! practice; written from those sources and our own design notes -
++//! no vendor material consulted.
++
++use crate::finishing3d::closest_pt_tri;
++use crate::geometry::{Point3, Triangle};
++use crate::machining2d::GenError;
++
++use super::axis::Axis;
++
++/// One full turn, in radians: the unwrap's period.
++pub(super) const TAU: f64 = std::f64::consts::TAU;
++
++/// World up, spelled once (Point3::new is not a const fn).
++const UP: Point3 = Point3 {
++    x: 0.0,
++    y: 0.0,
++    z: 1.0,
++};
++
++/// The azimuth basis about the stated axis: the axis.rs basis law,
++/// verbatim (any vector off the axis, then the right-handed pair it
++/// completes), spelled for a GIVEN axis rather than a fitted one.
++pub(super) struct Basis {
++    pub e1: Point3,
++    pub e2: Point3,
++}
++
++/// The basis about `ax`; refused by name when the axis direction is
++/// too degenerate to complete a frame (the caller already refused a
++/// non-finite or non-unit one).
++pub(super) fn basis(ax: &Axis) -> Result<Basis, GenError> {
++    let u = ax.dir;
++    let any = if u.z.abs() < 0.9 {
++        UP
++    } else {
++        Point3::new(1.0, 0.0, 0.0)
++    };
++    let Some(e1) = super::linalg::unit(u.cross(any)) else {
++        return Err(GenError::Invalid(
++            "the stated axis is not a direction - no frame can be unwrapped about it".into(),
++        ));
++    };
++    Ok(Basis { e1, e2: u.cross(e1) })
++}
++
++/// `c` moved by whole turns to the value nearest `prev` - the radian
++/// twin of `cl::unwrap_near` (issue #33's degree law). Documented
++/// against it; kept local because the cl twin speaks degrees.
++pub(super) fn unwrap_near(c: f64, prev: f64) -> f64 {
++    c + TAU * ((prev - c) / TAU).round()
++}
++
++/// One guide chain as a cylindrical track about the axis: each
++/// point's azimuth `th` (CONTINUOUS - unwound against the previous
++/// point), axial station `v`, radius `rho`, and its place `u` in the
++/// chain's normalized chord length.
++#[derive(Clone)]
++pub(super) struct Unwrapped {
++    pub th: Vec<f64>,
++    pub v: Vec<f64>,
++    pub rho: Vec<f64>,
++    pub u: Vec<f64>,
++}
++
++/// The chain `pts` (validated finite, distinct and off the axis) as
++/// one continuous track about the stated axis.
++pub(super) fn unwrap(ax: &Axis, b: &Basis, pts: &[Point3]) -> Unwrapped {
++    let mut th = Vec::with_capacity(pts.len());
++    let mut v = Vec::with_capacity(pts.len());
++    let mut rho = Vec::with_capacity(pts.len());
++    let mut u = Vec::with_capacity(pts.len());
++    let mut walk = 0.0f64;
++    let mut total = 0.0f64;
++    for w in pts.windows(2) {
++        let d = w[0] - w[1];
++        total += d.dot(d).sqrt();
++    }
++    let mut prev: Option<f64> = None;
++    for (k, q) in pts.iter().enumerate() {
++        if k > 0 {
++            let d = *q - pts[k - 1];
++            walk += d.dot(d).sqrt();
++        }
++        let d = *q - ax.origin;
++        let s = d.dot(ax.dir);
++        let w = d - Point3::new(ax.dir.x * s, ax.dir.y * s, ax.dir.z * s);
++        let raw = w.dot(b.e2).atan2(w.dot(b.e1));
++        let t = prev.map_or(raw, |p| unwrap_near(raw, p));
++        prev = Some(t);
++        th.push(t);
++        v.push(s);
++        rho.push(w.dot(w).sqrt());
++        u.push(if total > 0.0 {
++            walk / total
++        } else {
++            k as f64 / (pts.len().max(2) - 1) as f64
++        });
++    }
++    Unwrapped { th, v, rho, u }
++}
++
++/// A linear read of the track `y` at the normalized place `x`,
++/// between its own `knots` (ascending, in `[0, 1]`; empty tracks
++/// never reach here - the caller validated two distinct points).
++pub(super) fn lerp_at(knots: &[f64], y: &[f64], x: f64) -> f64 {
++    let n = knots.len().min(y.len());
++    if n == 0 {
++        return 0.0;
++    }
++    if x <= knots[0] {
++        return y[0];
++    }
++    for i in 1..n {
++        if x <= knots[i] {
++            let span = knots[i] - knots[i - 1];
++            let f = if span > 0.0 {
++                ((x - knots[i - 1]) / span).clamp(0.0, 1.0)
++            } else {
++                0.0
++            };
++            return y[i - 1] + (y[i] - y[i - 1]) * f;
++        }
++    }
++    y[n - 1]
++}
++
++/// Align `b` to `a` by the nearest whole turn: the mean matched-place
++/// offset decides the shift, and the band is the one under half a
++/// turn wide. Returns the shift applied (a whole multiple of `TAU`).
++pub(super) fn align_pair(a: &Unwrapped, b: &mut Unwrapped, samples: usize) -> f64 {
++    let n = samples.max(2);
++    let mut mean = 0.0f64;
++    for i in 0..n {
++        let x = i as f64 / (n - 1) as f64;
++        mean += lerp_at(&b.u, &b.th, x) - lerp_at(&a.u, &a.th, x);
++    }
++    mean /= n as f64;
++    let k = -(mean / TAU).round();
++    if k != 0.0 {
++        for th in &mut b.th {
++            *th += k * TAU;
++        }
++    }
++    k * TAU
++}
++
++/// The largest developed cross width between the aligned pair at
++/// matched places: the offset vector `(R_ref * dtheta, dv)` whose
++/// length the flow passes divide. `R_ref` is the band's outermost
++/// radius, where a developed stepover reads widest - ground inside it
++/// gets finer, never coarser.
++pub(super) fn cross_width(a: &Unwrapped, b: &Unwrapped, r_ref: f64, samples: usize) -> f64 {
++    let n = samples.max(2);
++    let mut w = 0.0f64;
++    for i in 0..n {
++        let x = i as f64 / (n - 1) as f64;
++        let (dth, dv) = (
++            lerp_at(&b.u, &b.th, x) - lerp_at(&a.u, &a.th, x),
++            lerp_at(&b.u, &b.v, x) - lerp_at(&a.u, &a.v, x),
++        );
++        w = w.max((r_ref * dth).hypot(dv));
++    }
++    w
++}
++
++/// Do the two chains advance about the axis in OPPOSITE senses? Both
++/// tracks must wind the same way for an iso-parametric blend to span
++/// a band instead of folding it through itself. Tracks that barely
++/// wind (under half a radian end to end) are exempt: their sense is
++/// noise, and a near-axial band blends fine either way.
++pub(super) fn opposite_sense(a: &Unwrapped, b: &Unwrapped) -> bool {
++    let span = |t: &Unwrapped| match (t.th.first(), t.th.last()) {
++        (Some(&f), Some(&l)) => l - f,
++        _ => 0.0,
++    };
++    let (da, db) = (span(a), span(b));
++    da.abs() > 0.5 && db.abs() > 0.5 && da * db < 0.0
++}
++
++/// The largest vertex radius of `facets` about the stated axis (0.0
++/// for a mesh that sits on the line - the chain checks refuse such
++/// picks before this matters).
++pub(super) fn mesh_radius(ax: &Axis, facets: &[Triangle]) -> f64 {
++    let mut rho = 0.0f64;
++    for t in facets {
++        for q in [t.a, t.b, t.c] {
++            let d = q - ax.origin;
++            let s = d.dot(ax.dir);
++            let w = d - Point3::new(ax.dir.x * s, ax.dir.y * s, ax.dir.z * s);
++            let rr = w.dot(w).sqrt();
++            if rr.is_finite() {
++                rho = rho.max(rr);
++            }
++        }
++    }
++    rho
++}
++
++/// The mesh's bounding diagonal - cheap and finite-safe (the
++/// drive-curve walk's own law, curve.rs's own numbers).
++pub(super) fn extent(facets: &[Triangle]) -> f64 {
++    let mut d = 0.0f64;
++    for f in facets {
++        for (a, b) in [(f.a, f.b), (f.b, f.c), (f.c, f.a)] {
++            let e = a - b;
++            let l = e.dot(e);
++            if l.is_finite() {
++                d = d.max(l);
++            }
++        }
++    }
++    d.sqrt()
++}
++
++/// One chain as the walkable points it claims: finite, its
++/// coincidental repeats collapsed, its closing duplicate dropped
++/// when the ends meet (a closed lap is one legal guide chain).
++pub(super) fn clean_chain(ch: &[Point3], ci: usize, eps2: f64) -> Result<Vec<Point3>, GenError> {
++    if !ch.iter().all(|q| q.is_finite()) {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow: guide chain {} carries a non-finite point",
++            ci + 1
++        )));
++    }
++    let mut pts: Vec<Point3> = Vec::with_capacity(ch.len());
++    for q in ch {
++        if pts.last().is_none_or(|l| {
++            let d = *l - *q;
++            d.dot(d) > eps2
++        }) {
++            pts.push(*q);
++        }
++    }
++    let ring = match (pts.first(), pts.last()) {
++        (Some(&f), Some(&l)) => {
++            let d = f - l;
++            pts.len() >= 4 && d.dot(d) <= eps2
++        }
++        _ => false,
++    };
++    if ring {
++        pts.pop();
++    }
++    if pts.len() < 2 {
++        return Err(GenError::Invalid(format!(
++            "Rotary Flow: guide chain {} stands on fewer than two distinct points - nothing to \
++             walk",
++            ci + 1
++        )));
++    }
++    Ok(pts)
++}
++
++/// Does the point lie ON the model (within the corner-lattice
++/// dust)? The box screen first - a facet whose bounds stand farther
++/// away cannot own the point.
++pub(super) fn on_model(q: Point3, facets: &[Triangle], boxes: &[[f64; 6]], eps2: f64) -> bool {
++    for (i, b) in boxes.iter().enumerate() {
++        let (dx, dy, dz) = (
++            (b[0] - q.x).max(q.x - b[3]).max(0.0),
++            (b[1] - q.y).max(q.y - b[4]).max(0.0),
++            (b[2] - q.z).max(q.z - b[5]).max(0.0),
++        );
++        if dx * dx + dy * dy + dz * dz > eps2 {
++            continue;
++        }
++        let f = &facets[i];
++        let d = q - closest_pt_tri(q, &[f.a, f.b, f.c]);
++        if d.dot(d) <= eps2 {
++            return true;
++        }
++    }
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn unwrap_near_keeps_a_multi_turn_track_continuous() {
++        // The radian twin of the spindle C law (cl::unwrap_near
++        // speaks degrees): 0.75 turns unwound against -0.5 turns
++        // reads -0.25 turns, never a jump back.
++        let th = unwrap_near(0.75 * TAU, -0.5 * TAU);
++        assert!((th - (-0.25 * TAU)).abs() < 1e-12, "{th}");
++    }
++
++    #[test]
++    fn lerp_at_reads_between_its_own_knots() {
++        let knots = [0.0, 0.4, 1.0];
++        let y = [2.0, 4.0, 10.0];
++        assert!((lerp_at(&knots, &y, 0.2) - 3.0).abs() < 1e-12);
++        assert!((lerp_at(&knots, &y, 0.7) - 7.0).abs() < 1e-12);
++        assert!((lerp_at(&knots, &y, -1.0) - 2.0).abs() < 1e-12);
++        assert!((lerp_at(&knots, &y, 2.0) - 10.0).abs() < 1e-12);
++    }
++}
+diff --git a/crates/motion/tests/rotary_flow.rs b/crates/motion/tests/rotary_flow.rs
+new file mode 100644
+index 000000000..a63164657
+--- /dev/null
++++ b/crates/motion/tests/rotary_flow.rs
+@@ -0,0 +1,422 @@
++//! Issue #2824, the Rotary Flow kernel: flow lines between picked
++//! helical guide chains on a rotor, unwrapped about a STATED axis
++//! (the #2772 seam - the axis is a parameter, never fitted), aligned
++//! by the nearest whole turn, pushed out radially until the
++//! closest-point oracle clears, and linked on the retract cylinders.
++//!
++//! The rotor fixture is a helical groove in a cylinder (a rotor's
++//! flute): the groove's width runs AXIALLY - its two root edge
++//! helices answer for `v = k*phi` and `v = k*phi + W_v` at the same
++//! azimuth - with the steep helical flanks rising radially at the
++//! two v-edges. That is the ground a radially posed ball can ride:
++//! a groove whose edges were screw-shifted copies of one helix
++//! would be one ramp, not a band.
++//!
++//! Gate map (M4.4): covers camcraft_motion::multiaxis (rotary_flow,
++//! the #2824 kernel) on this crate's own fixtures.
++//! Lane shape (M4.4): the default tests run in seconds; the rotor
++//! envelope scan rides the heavy lane.
++
++use camcraft_motion::cl::{Move, MoveKind, Toolpath};
++use camcraft_motion::geometry::{Point3, Triangle};
++use camcraft_motion::multiaxis::axis::Axis;
++use camcraft_motion::multiaxis::{rotary_flow, AxisControl, RotaryFlowParams};
++use camcraft_motion::tools::{Tool, ToolKind};
++use camcraft_sim::stock_sim::dist_seg_tri;
++
++const TAU: f64 = std::f64::consts::TAU;
++/// The groove's rim radius.
++const R_OUT: f64 = 10.0;
++/// The groove's floor radius.
++const R_ROOT: f64 = 8.0;
++/// The advance of one full turn.
++const PITCH: f64 = 12.0;
++/// The turns the default groove winds.
++const TURNS: usize = 3;
++/// Floor vertices per turn of the default groove.
++const N_CIRC: usize = 72;
++/// The groove's width, in axial stations (the developed width).
++const W_V: f64 = 4.0;
++
++fn p3(x: f64, y: f64, z: f64) -> Point3 {
++    Point3::new(x, y, z)
++}
++
++/// The groove's own law: the near edge rides `v = PITCH * th / TAU`.
++fn law(th: f64) -> f64 {
++    PITCH * th / TAU
++}
++
++/// The rotor's stated axis: world Z through the origin - a
++/// parameter, never fitted from the mesh.
++fn stated_axis() -> Axis {
++    Axis {
++        origin: Point3::ZERO,
++        dir: p3(0.0, 0.0, 1.0),
++    }
++}
++
++/// A point of the groove at radius `r`, base azimuth `th`, axial
++/// station `v` - the groove's own law is `v = PITCH * th / TAU` at
++/// the near edge, `+ W_V` at the far edge.
++fn gp(r: f64, th: f64, v: f64) -> Point3 {
++    p3(r * th.cos(), r * th.sin(), v)
++}
++
++/// The helical groove: a floor strip on the `R_ROOT` cylinder
++/// between the two root edge helices (`W_V` of axial width,
++/// subdivided across it), and a radial wall on each v-edge rising
++/// to the rim - a helicoid, the steep flank the issue's gouge law
++/// exists for. An open channel by design: the kernel reads facets
++/// as the gouge oracle and the chain ground, never as a wrap.
++fn groove(n_circ: usize, turns: usize, phase: f64) -> Vec<Triangle> {
++    const FLOOR_COLS: usize = 8;
++    let step = TAU / n_circ as f64;
++    let mut t = Vec::new();
++    for j in 0..n_circ * turns {
++        let (th, thn) = (phase + step * j as f64, phase + step * (j + 1) as f64);
++        // the floor: root edge A to root edge B, `FLOOR_COLS` v-strips wide
++        for jc in 0..FLOOR_COLS {
++            let (v0, v1) = (
++                law(th) + W_V * jc as f64 / FLOOR_COLS as f64,
++                law(th) + W_V * (jc + 1) as f64 / FLOOR_COLS as f64,
++            );
++            let (v0n, v1n) = (law(thn) + v0 - law(th), law(thn) + v1 - law(th));
++            let (a0, b0) = (gp(R_ROOT, th, v0), gp(R_ROOT, th, v1));
++            let (a1, b1) = (gp(R_ROOT, thn, v0n), gp(R_ROOT, thn, v1n));
++            t.push(Triangle::new(a0, b0, b1));
++            t.push(Triangle::new(a0, b1, a1));
++        }
++        // the walls: root edge up to the rim, at each v-edge
++        for base in [0.0, W_V] {
++            let (v, vn) = (law(th) + base, law(thn) + base);
++            let (r0, r1) = (gp(R_ROOT, th, v), gp(R_OUT, th, v));
++            let (r0n, r1n) = (gp(R_ROOT, thn, vn), gp(R_OUT, thn, vn));
++            t.push(Triangle::new(r0, r1, r1n));
++            t.push(Triangle::new(r0, r1n, r0n));
++        }
++    }
++    t
++}
++
++/// The groove's two root edge helices - the picked guide chains,
++/// exact mesh vertices (points ON the model by construction).
++fn root_pair(n_circ: usize, turns: usize, phase: f64) -> Vec<Vec<Point3>> {
++    let step = TAU / n_circ as f64;
++    let mut a = Vec::with_capacity(n_circ * turns + 1);
++    let mut b = Vec::with_capacity(n_circ * turns + 1);
++    for j in 0..=n_circ * turns {
++        let th = phase + step * j as f64;
++        a.push(gp(R_ROOT, th, law(th)));
++        b.push(gp(R_ROOT, th, law(th) + W_V));
++    }
++    vec![a, b]
++}
++
++/// An oblique band for the alignment law: two helices at the same
++/// radius, separated `wb` in azimuth and `PITCH * wb / TAU + W_V`
++/// in station, spanned by one ruled strip - a legal (s, v) band
++/// whose pair DIFFERS in azimuth, so the whole-turn ambiguity is
++/// real. No walls: the band is its own ground.
++fn ruled_band(wb: f64, n: usize, phase: f64) -> Vec<Triangle> {
++    let step = TAU / n as f64;
++    let a = |th: f64| gp(R_ROOT, th, law(th));
++    let b = |th: f64| gp(R_ROOT, th + wb, law(th + wb) + W_V);
++    let mut t = Vec::new();
++    for j in 0..n {
++        let (th, thn) = (phase + step * j as f64, phase + step * (j + 1) as f64);
++        t.push(Triangle::new(a(th), b(th), b(thn)));
++        t.push(Triangle::new(a(th), b(thn), a(thn)));
++    }
++    t
++}
++
++/// The ruled band's two edge chains.
++fn band_pair(wb: f64, n: usize, phase: f64) -> Vec<Vec<Point3>> {
++    let step = TAU / n as f64;
++    let mut a = Vec::with_capacity(n + 1);
++    let mut b = Vec::with_capacity(n + 1);
++    for j in 0..=n {
++        let th = phase + step * j as f64;
++        a.push(gp(R_ROOT, th, law(th)));
++        b.push(gp(R_ROOT, th + wb, law(th + wb) + W_V));
++    }
++    vec![a, b]
++}
++
++fn ball(d: f64) -> Tool {
++    Tool {
++        kind: ToolKind::BallNose,
++        diameter: d,
++        corner_r: d * 0.5,
++        tip_angle: 0.0,
++        pitch: 0.0,
++        pitch_min: 0.0,
++        thread_hand: Default::default(),
++        nose_radius: 0.0,
++        width: 0.0,
++        flute_len: 30.0,
++        shank_d: d,
++        shank_len: 30.0,
++        holder_d: 20.0,
++        holder_len: 20.0,
++        material_group: "aluminum".into(),
++        center_cutting: true,
++        rpm: 10_000.0,
++        feed: 400.0,
++        tool_material: None,
++        flutes: None,
++        orientation: None,
++        catalog: camcraft_tools::catalog_fields::ToolCatalog::default(),
++        cutting: Vec::new(),
++        outline: Vec::new(),
++        turning: None,
++    }
++}
++
++fn params<'a>(tool: &'a Tool, stepover: Option<f64>) -> RotaryFlowParams<'a> {
++    RotaryFlowParams {
++        tool,
++        stepover,
++        tolerance: 0.05,
++        clearance: 14.0,
++        retract: None,
++        feed: 400.0,
++        plunge_feed: 100.0,
++        climb: true,
++    }
++}
++
++/// The ball center a cut move's tip and pose state (the pivot law:
++/// the tip is the center backed off `r` along its own pose).
++fn center_of(m: &Move, r: f64) -> Option<Point3> {
++    let a = m.axis?;
++    Some(p3(m.to.x + a[0] * r, m.to.y + a[1] * r, m.to.z + a[2] * r))
++}
++
++/// The (azimuth, radius) of a world point about the stated axis.
++fn cyl(q: Point3) -> (f64, f64) {
++    (q.y.atan2(q.x), (q.x * q.x + q.y * q.y).sqrt())
++}
++
++/// The smallest distance from `q` to the mesh - the sim's own exact
++/// point-to-triangle law, independent of the kernel's oracle.
++fn mesh_dist(q: Point3, facets: &[Triangle]) -> f64 {
++    facets
++        .iter()
++        .map(|f| dist_seg_tri(q, q, f))
++        .fold(f64::INFINITY, f64::min)
++}
++
++/// The pin: every cut station's ball keeps its radius off the part,
++/// and the path is chained and finite.
++fn no_gouge(path: &Toolpath, facets: &[Triangle], r: f64) {
++    assert!(path.is_chained());
++    assert!(path.all_finite());
++    for m in path.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++        let Some(c) = center_of(m, r) else {
++            panic!("a cut move states no pose: {m:?}");
++        };
++        assert!(
++            mesh_dist(c, facets) >= r - 1e-6,
++            "a station's ball at {c:?} stands {:e} inside the part",
++            r - mesh_dist(c, facets)
++        );
++    }
++}
++
++/// The first pass's ball centers: the plunge's landing station and
++/// every feed station after it, up to the retract onto the `clear`
++/// cylinder.
++fn first_pass_centers(path: &Toolpath, clear: f64, r: f64) -> Vec<Point3> {
++    let mut out = Vec::new();
++    for m in path.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++        let Some(c) = center_of(m, r) else { continue };
++        if cyl(c).1 > clear - 2.0 {
++            break; // the retract onto the link cylinder
++        }
++        out.push(c);
++    }
++    out
++}
++
++#[test]
++fn a_rotor_floor_band_flows_multi_turn_without_gouge() {
++    let facets = groove(N_CIRC, TURNS, 0.0);
++    let chains = root_pair(N_CIRC, TURNS, 0.0);
++    let tool = ball(2.0);
++    // 0.9 mm keeps the count clear of 1-ulp ceiling dust at a whole
++    // number of spans (4.0 / 0.9 = 4.44 spans: 6 passes).
++    let path = rotary_flow(
++        &chains,
++        &facets,
++        &stated_axis(),
++        &params(&tool, Some(0.9)),
++        &AxisControl::default(),
++    )
++    .unwrap();
++    no_gouge(&path, &facets, 1.0);
++    // The developed band is the groove's 4.0 mm axial width: 6
++    // passes at 0.9 mm.
++    let plunges = path
++        .moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Plunge)
++        .count();
++    assert_eq!(plunges, 6, "the band did not divide into 6 passes: {:?}", path.notes);
++    assert!(
++        path.notes.iter().any(|n| n.contains("6 flow passes")),
++        "the notes do not state the band: {:?}",
++        path.notes
++    );
++    // The passes run MULTI-TURN: the first pass's centers wind the
++    // groove's whole three turns about the stated axis.
++    let centers = first_pass_centers(&path, 14.0, 1.0);
++    assert!(
++        centers.len() > 10,
++        "the first pass states {} stations",
++        centers.len()
++    );
++    let mut prev: Option<f64> = None;
++    let mut span = 0.0f64;
++    for c in &centers {
++        let th = cyl(*c).0;
++        if let Some(p) = prev {
++            let d = th - p;
++            span += if d.abs() > std::f64::consts::PI {
++                d - d.signum() * TAU
++            } else {
++                d
++            };
++        }
++        prev = Some(th);
++    }
++    assert!(
++        (span - TAU * TURNS as f64).abs() < 0.3,
++        "the first pass winds {span:.3} rad, not the groove's {:.3}",
++        TAU * TURNS as f64
++    );
++    // The first pass is the WALL-ADJACENT one: its picked edge lies
++    // IN a wall plane, so the radial push-out carries it up the
++    // steep flank (the issue's own law). An interior pass rides the
++    // floor a ball radius off it, untouched by any wall.
++    let (_, rho0) = cyl(centers[0]);
++    assert!(
++        rho0 > R_ROOT + 0.5,
++        "the wall-adjacent pass rides at {rho0:.3}, not pushed out"
++    );
++    let floors = path
++        .moves
++        .iter()
++        .filter(|m| m.kind != MoveKind::Rapid)
++        .filter_map(|m| center_of(m, 1.0))
++        .filter(|c| {
++            let (_, rho) = cyl(*c);
++            rho > R_ROOT + 0.5 && rho < R_ROOT + 1.2
++        })
++        .count();
++    assert!(floors > 10, "no pass rides the floor: {floors} stations");
++}
++
++#[test]
++fn a_pair_straddling_the_branch_aligns_by_a_whole_turn() {
++    // The oblique band, phased so the second chain's raw azimuth
++    // straddles the kernel basis' own branch: without the
++    // whole-turn alignment the pair would read its width plus a
++    // full lap. The pass count is the unshifted band's own.
++    let (wb, n) = (0.4f64, 72usize);
++    let width = (R_ROOT * wb).hypot(PITCH * wb / TAU + W_V);
++    let step = 1.0;
++    let want = (width / step).ceil() as usize + 1;
++    let straight = {
++        let facets = ruled_band(wb, n, 0.0);
++        let chains = band_pair(wb, n, 0.0);
++        let tool = ball(2.0);
++        rotary_flow(&chains, &facets, &stated_axis(), &params(&tool, Some(step)), &AxisControl::default())
++            .unwrap()
++    };
++    let straddle = {
++        let phase = 4.5; // B's raw azimuth crosses the kernel basis' own branch
++        let facets = ruled_band(wb, n, phase);
++        let chains = band_pair(wb, n, phase);
++        let tool = ball(2.0);
++        let path = rotary_flow(&chains, &facets, &stated_axis(), &params(&tool, Some(step)), &AxisControl::default())
++            .unwrap();
++        no_gouge(&path, &facets, 1.0);
++        path
++    };
++    let count = |p: &Toolpath| p.moves.iter().filter(|m| m.kind == MoveKind::Plunge).count();
++    assert_eq!(count(&straight), want, "the straight band divided wrong");
++    assert_eq!(
++        count(&straddle),
++        want,
++        "the straddling pair did not align: {} passes, not {want}",
++        count(&straddle)
++    );
++    assert!(
++        straddle.notes.iter().any(|n| n.contains("of whole-turn alignment")),
++        "the notes do not state the alignment: {:?}",
++        straddle.notes
++    );
++}
++
++#[test]
++fn climb_reverses_each_pass() {
++    // The same band walked backwards: the same stations, the same
++    // clearance, the travel reversed - a reversed pass opens at the
++    // forward pass's end.
++    let facets = groove(N_CIRC, TURNS, 0.0);
++    let chains = root_pair(N_CIRC, TURNS, 0.0);
++    let tool = ball(2.0);
++    let mut q = params(&tool, Some(1.0));
++    q.climb = false;
++    let back = rotary_flow(&chains, &facets, &stated_axis(), &q, &AxisControl::default()).unwrap();
++    let fwd = rotary_flow(
++        &chains,
++        &facets,
++        &stated_axis(),
++        &params(&tool, Some(1.0)),
++        &AxisControl::default(),
++    )
++    .unwrap();
++    no_gouge(&back, &facets, 1.0);
++    let f = first_pass_centers(&fwd, 14.0, 1.0);
++    let b = first_pass_centers(&back, 14.0, 1.0);
++    let (Some(x), Some(y)) = (b.first().copied(), f.last().copied()) else {
++        panic!("a pass stated no station");
++    };
++    assert!(
++        (x.x - y.x).abs() < 0.2 && (x.y - y.y).abs() < 0.2,
++        "the reversed pass opens at {x:?}, not the forward pass's end {y:?}"
++    );
++}
++
++/// The full-envelope scan: a finer, longer rotor at the scallop
++/// law's own stepover, every station judged against every facet.
++#[test]
++#[ignore = "heavy lane: release --ignored (the 4-turn fine rotor envelope scanned station by station, minutes in debug)"]
++fn the_rotor_envelope_stays_gouge_free_at_the_scallop_law() {
++    let (n_circ, turns) = (120usize, 4usize);
++    let facets = groove(n_circ, turns, 0.0);
++    let chains = root_pair(n_circ, turns, 0.0);
++    let tool = ball(2.0);
++    let path = rotary_flow(
++        &chains,
++        &facets,
++        &stated_axis(),
++        &params(&tool, None),
++        &AxisControl::default(),
++    )
++    .unwrap();
++    no_gouge(&path, &facets, 1.0);
++    // The scallop law's own count: sqrt(8 * r * tol) = 0.63 mm over
++    // the 4.0 mm band, ceilinged to whole spans.
++    let plunges = path
++        .moves
++        .iter()
++        .filter(|m| m.kind == MoveKind::Plunge)
++        .count();
++    let step = (8.0 * 1.0 * 0.05f64).sqrt();
++    let want = (W_V / step).ceil() as usize + 1;
++    assert_eq!(plunges, want, "the scallop law did not divide the band");
++}
+diff --git a/docs/decisions/2824-rotary-flow-kernel.md b/docs/decisions/2824-rotary-flow-kernel.md
+new file mode 100644
+index 000000000..ace280d7a
+--- /dev/null
++++ b/docs/decisions/2824-rotary-flow-kernel.md
+@@ -0,0 +1,42 @@
++# Decision record - issue #2824
++
++## #2824 - Rotary Flow kernel: surface and law choices taken unattended
++
++**Decided:** the kernel's public surface is
++`rotary_flow(chains: &[Vec<Point3>], facets: &[Triangle], ax: &Axis,
++p: &RotaryFlowParams, c: &AxisControl) -> Result<Toolpath, GenError>`
++with `RotaryFlowParams` carrying the `Tool` itself (the drilling
++`CycleParams` precedent), so the ball-nose requirement is refused by
++name from the tool's own kind. Three laws have a named constant
++reading: the clearance and retract read as BALL-CENTER radii about
++the stated axis (never world Z - a rotor may stand or lie); the
++development's arc-length radius `R_ref` is the band's OUTERMOST chain
++radius (a developed stepover then reads widest at the rim, and
++ground inside it gets finer, never coarser); and one band per
++ADJACENT chain pair is machined, both edges included (a shared
++middle chain is walked once per band that uses it - the re-cut is
++the same geometry at the same depth, safe and simple).
++
++**Why:** the issue names the axis parameter (the #2772 seam), the
++ball requirement and the nearest-whole-turn alignment but leaves
++these readings open. The `Tool`-carrying params follow the only
++in-crate precedent for a kind-refusing generator (drilling); the
++ball-center radius reading is the only one that names a safe place
++the same way for a standing and a lying rotor; the outermost-radius
++development keeps the stepover promise one-sided (never coarser
++than asked); adjacent pairs generalise the two-chain slice without
++a second law.
++
++**Considered and dropped:** carrying only `tool_diameter` and
++refusing nothing (the issue asks for the non-ball refusal by
++name); clearance as a world-Z height (wrong for a lying axis);
++developing at the mesh's largest radius as `rotary_offset` does
++(its ladder wraps the whole work, while a flow band's own radius
++is where the passes run); skipping the shared edge pass between
++bands (saved one pass, cost a second alignment law and a special
++first pass per band).
++
++**Cost to change:** the cylinder readings and the pair law live in
++`rotary_flow.rs` and the emit module's doc header; the app wiring
++sub-issue of #2804 will translate its own heights into these radii,
++and a later change only touches that seam.
