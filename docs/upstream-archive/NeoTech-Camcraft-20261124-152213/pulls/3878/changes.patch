@@ -1,0 +1,1188 @@
+From f24271f105d728d5de0f5f3b369a33d04db0ad1c Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Tue, 24 Nov 2026 11:31:35 +0100
+Subject: [PATCH] perf(gpu): cut the stock onto a keyframe layer on the GPU
+ (S3a)
+
+The S2 kernel cut only from the empty floor, so a playback could not
+continue from a keyframe on the GPU. Add the incremental start:
+
+- cut.wgsl cs_encode turns a layer back into ordered keys in place;
+- CutKernel::cut_into cuts into a caller buffer with no read-back (the
+  viewport cut buffer, for S3c); CutKernel::run_onto reads it back;
+- cut_cpu_onto is the CPU law (bit-exact to the one-batch cut);
+- cut_onto_or_cpu(_on) takes the fallback rule of cut_or_cpu: the
+  CAMCRAFT_GPU_COMPUTE=off switch, no adapter, a lost device, a kernel
+  error or a failed spot check give the CPU law with the reason;
+- a base layer with a wrong size or a non-finite value is refused.
+
+cut_gpu.rs is split along the buffer seam into cut_buf.rs (400 lines).
+Pinned by crates/gpu/tests/cut_onto.rs; it uses only the shared device
+(#3589) and runs the switch and device-loss cases in a child process.
+
+Refs #2629
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpu/src/cut.rs               |  31 +++
+ crates/gpu/src/cut.wgsl             |  24 ++-
+ crates/gpu/src/cut_buf.rs           | 178 +++++++++++++++++
+ crates/gpu/src/cut_gpu.rs           | 292 ++++++++++++----------------
+ crates/gpu/src/cut_run.rs           |  90 +++++++--
+ crates/gpu/src/lib.rs               |  11 +-
+ crates/gpu/tests/cut_onto.rs        | 247 +++++++++++++++++++++++
+ docs/decisions/2629-gpu-cut-onto.md |  58 ++++++
+ 8 files changed, 734 insertions(+), 197 deletions(-)
+ create mode 100644 crates/gpu/src/cut_buf.rs
+ create mode 100644 crates/gpu/tests/cut_onto.rs
+ create mode 100644 docs/decisions/2629-gpu-cut-onto.md
+
+diff --git a/crates/gpu/src/cut.rs b/crates/gpu/src/cut.rs
+index c80aef75c..13d910583 100644
+--- a/crates/gpu/src/cut.rs
++++ b/crates/gpu/src/cut.rs
+@@ -187,6 +187,37 @@ pub fn cut_cpu(input: &CutInput) -> Result<Vec<f32>, String> {
+     let mut keys = Vec::new();
+     keys.try_reserve_exact(n).map_err(|e| bad(format!("no memory for {n} texels: {e}")))?;
+     keys.resize(n, input.grid.floor_key());
++    fold(input, keys)
++}
++
++/// The incremental CPU run (#2629, GPU stock sim S3a): cut `input` onto
++/// an earlier layer `base` of the same lattice (a playback keyframe)
++/// instead of the empty floor. The max law makes it exact: cutting A,
++/// then B onto it, gives the bits of cutting A and B in one batch.
++pub fn cut_cpu_onto(input: &CutInput, base: &[f32]) -> Result<Vec<f32>, String> {
++    let n = input.check()?;
++    check_base(base, n)?;
++    let mut keys = Vec::new();
++    keys.try_reserve_exact(n).map_err(|e| bad(format!("no memory for {n} texels: {e}")))?;
++    keys.extend(base.iter().map(|v| ordered_bits(*v)));
++    fold(input, keys)
++}
++
++/// A base layer must match the lattice and hold finite values only (the
++/// key order of a NaN is not a cut depth).
++pub(crate) fn check_base(base: &[f32], n: usize) -> Result<(), String> {
++    if base.len() != n {
++        return Err(bad(format!("the base layer has {} texels, the lattice {n}", base.len())));
++    }
++    match base.iter().position(|v| !v.is_finite()) {
++        Some(at) => Err(bad(format!("the base layer texel {at} is not finite"))),
++        None => Ok(()),
++    }
++}
++
++/// Fold every item's claims into `keys` (one key for each texel) with the
++/// max law, and decode the keys into the layer.
++fn fold(input: &CutInput, mut keys: Vec<u32>) -> Result<Vec<f32>, String> {
+     for it in &input.items {
+         for z in it.lo[2]..=it.hi[2] {
+             for y in it.lo[1]..=it.hi[1] {
+diff --git a/crates/gpu/src/cut.wgsl b/crates/gpu/src/cut.wgsl
+index a94b2a4dd..d06421c21 100644
+--- a/crates/gpu/src/cut.wgsl
++++ b/crates/gpu/src/cut.wgsl
+@@ -2,9 +2,10 @@
+ // each work item (one chord against one 8^3 brick), one invocation for
+ // each (x, y) column of the brick, the eight z cells in a loop. A claim
+ // folds into the lattice with atomicMax on the order-preserving key, so
+-// the result does not depend on the order of the items. Three entry
+-// points: cs_fill writes the -4 cap floor key, cs_cut claims, cs_decode
+-// turns each key into the bits of its f32 (the pack_cut layout).
++// the result does not depend on the order of the items. Four entry
++// points: cs_fill writes the -4 cap floor key, cs_encode turns an
++// earlier layer into keys (#2629), cs_cut claims, cs_decode turns each
++// key into the bits of its f32 (the pack_cut layout).
+ // The math is the CPU law of cut.rs, operation for operation.
+ // Provenance: the swept-solid distance laws of camcraft-sim's f32 twin
+ // (#2626): capsule closed form, upright flat cylinder in the (rho, z)
+@@ -59,6 +60,23 @@ fn cs_fill(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
+     }
+ }
+ 
++// #2629 (S3a): the incremental start. The buffer holds a layer (f32
++// bits, the cs_decode output); turn each into its ordered key, so the
++// cut folds onto the earlier layer instead of the floor.
++@compute @workgroup_size(64)
++fn cs_encode(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
++    let i = texel(wg, li);
++    if (i >= params.n_tex) {
++        return;
++    }
++    let b = atomicLoad(&keys[i]);
++    var key = b | SIGN;
++    if ((b & SIGN) != 0u) {
++        key = ~b;
++    }
++    atomicStore(&keys[i], key);
++}
++
+ @compute @workgroup_size(64)
+ fn cs_decode(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+     let i = texel(wg, li);
+diff --git a/crates/gpu/src/cut_buf.rs b/crates/gpu/src/cut_buf.rs
+new file mode 100644
+index 000000000..b61c0bb50
+--- /dev/null
++++ b/crates/gpu/src/cut_buf.rs
+@@ -0,0 +1,178 @@
++//! The buffers of the stock removal kernel (#2627, GPU stock sim S2; the
++//! incremental start of #2629): the batch plan checked against the device
++//! limits, the byte form of the items and of a layer, and the read-back
++//! with a time bound. Split from `cut_gpu.rs` (the 400-line law).
++//! Provenance: our own buffer plan over wgpu's public compute API.
++
++use std::sync::mpsc;
++use std::time::Duration;
++
++use crate::cut::{CutInput, CutItem};
++use crate::cut_gpu::{CutError, CUT_WAIT, ITEMS_PER_DISPATCH};
++use crate::probe::Compute;
++
++/// Bytes of one `Item` in `cut.wgsl` (five 16-byte rows).
++const ITEM_BYTES: u64 = 80;
++
++/// Bytes of `Params` in `cut.wgsl`.
++pub(crate) const PARAMS_BYTES: u64 = 48;
++
++/// The buffer plan of one batch, checked against the device limits.
++pub(crate) struct Layout {
++    pub(crate) params: Vec<u8>,
++    pub(crate) params_bytes: u64,
++    stride: u64,
++    pub(crate) item_bytes: u64,
++    pub(crate) out_bytes: u64,
++    pub(crate) tex_groups: [u32; 2],
++    pub(crate) chunks: Vec<u32>,
++}
++
++impl Layout {
++    pub(crate) fn of(device: &wgpu::Device, compute: &Compute, input: &CutInput, n_tex: usize) -> Result<Layout, String> {
++        let limit = compute.max_storage_buffer_binding_size.min(compute.max_buffer_size);
++        let over = |what: &str, bytes: u64| format!("stock cut kernel: the {what} need {bytes} bytes, over the device limit {limit}");
++        let out_bytes = (n_tex as u64).saturating_mul(4);
++        let n_items = input.items.len() as u64;
++        // an empty batch still binds a one-item buffer
++        let item_bytes = n_items.max(1).saturating_mul(ITEM_BYTES);
++        if out_bytes > limit {
++            return Err(over("texels", out_bytes));
++        }
++        if item_bytes > limit {
++            return Err(over("work items", item_bytes));
++        }
++        let max_dim = compute.max_compute_workgroups_per_dimension.max(1);
++        let groups = u32::try_from(n_tex.div_ceil(64)).map_err(|_| "stock cut kernel: too many texel groups".to_string())?;
++        let row = groups.min(max_dim);
++        let rows = groups.div_ceil(row.max(1));
++        if rows > max_dim {
++            return Err(format!("stock cut kernel: {groups} texel groups pass the dispatch limit {max_dim}"));
++        }
++        let mut chunks = Vec::new();
++        let n = u32::try_from(n_items).map_err(|_| "stock cut kernel: too many work items".to_string())?;
++        let mut first = 0u32;
++        while first < n {
++            chunks.push((n - first).min(ITEMS_PER_DISPATCH));
++            first = first.saturating_add(ITEMS_PER_DISPATCH);
++        }
++        let stride = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(PARAMS_BYTES).next_multiple_of(16);
++        let blocks = chunks.len().max(1);
++        let params_bytes = stride.saturating_mul(blocks as u64);
++        let mut params = Vec::new();
++        params.try_reserve_exact(params_bytes as usize).map_err(|e| format!("stock cut kernel: no host memory: {e}"))?;
++        params.resize(params_bytes as usize, 0);
++        let g = &input.grid;
++        let n_tex32 = u32::try_from(n_tex).map_err(|_| "stock cut kernel: too many texels".to_string())?;
++        for (k, block) in params.chunks_exact_mut(stride as usize).enumerate() {
++            let count = chunks.get(k).copied().unwrap_or(0);
++            let first = u32::try_from(k).unwrap_or(u32::MAX).saturating_mul(ITEMS_PER_DISPATCH);
++            let words = [g.dims[0], g.dims[1], g.dims[2], n_tex32, first, count, row, g.floor_key(), g.cell.to_bits(), g.cap.to_bits()];
++            for (dst, w) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
++                dst.copy_from_slice(&w.to_le_bytes());
++            }
++        }
++        Ok(Layout { params, params_bytes, stride, item_bytes, out_bytes, tex_groups: [row, rows], chunks })
++    }
++
++    pub(crate) fn offset(&self, k: usize) -> Result<u32, String> {
++        u32::try_from(self.stride.saturating_mul(k as u64)).map_err(|_| "stock cut kernel: the uniform offset overflows".into())
++    }
++}
++
++pub(crate) fn item_bytes(items: &[CutItem], bytes: u64) -> Result<Vec<u8>, String> {
++    let mut v = Vec::new();
++    v.try_reserve_exact(bytes as usize).map_err(|e| format!("stock cut kernel: no host memory: {e}"))?;
++    for it in items {
++        let row = |xyz: [u32; 3], w: u32| [xyz[0], xyz[1], xyz[2], w];
++        let f = |p: [f32; 3]| p.map(f32::to_bits);
++        let words = [
++            row(f(it.a), it.r.to_bits()),
++            row(f(it.b), it.flank.to_bits()),
++            row(it.base.map(|v| v as u32), u32::from(it.ball)),
++            row(it.lo, it.margin.to_bits()),
++            row(it.hi, 0),
++        ];
++        for w in words.iter().flatten() {
++            v.extend_from_slice(&w.to_le_bytes());
++        }
++    }
++    v.resize(bytes as usize, 0);
++    Ok(v)
++}
++
++/// The little-endian bytes of a layer (the `cs_decode` form), for the
++/// upload of a base layer (#2629).
++pub(crate) fn layer_bytes(layer: &[f32]) -> Result<Vec<u8>, String> {
++    let mut v = Vec::new();
++    v.try_reserve_exact(layer.len().saturating_mul(4)).map_err(|e| format!("stock cut kernel: no host memory: {e}"))?;
++    for x in layer {
++        v.extend_from_slice(&x.to_le_bytes());
++    }
++    Ok(v)
++}
++
++/// Map the read buffer and wait at most [`CUT_WAIT`] for it.
++pub(crate) fn read_back(
++    device: &wgpu::Device,
++    read: &wgpu::Buffer,
++    at: wgpu::SubmissionIndex,
++    out_bytes: u64,
++) -> Result<Vec<f32>, CutError> {
++    let (tx, rx) = mpsc::channel();
++    read.slice(..).map_async(wgpu::MapMode::Read, move |r| {
++        let _ = tx.send(r);
++    });
++    device
++        .poll(wgpu::PollType::Wait { submission_index: Some(at), timeout: Some(CUT_WAIT) })
++        .map_err(|e| CutError::no_answer(format!("stock cut kernel: the GPU did not answer within {CUT_WAIT:?}: {e}")))?;
++    map_wait_end(rx.recv_timeout(Duration::from_millis(100)))?;
++    let out = {
++        let view = read
++            .get_mapped_range(..)
++            .map_err(|e| CutError::other(format!("stock cut kernel: the read-back range failed: {e:?}")))?;
++        if view.len() as u64 != out_bytes {
++            return Err(CutError::other(format!("stock cut kernel: the read-back has {} bytes, not {out_bytes}", view.len())));
++        }
++        let mut out = Vec::new();
++        out.try_reserve_exact(view.len() / 4).map_err(|e| CutError::other(format!("stock cut kernel: no host memory: {e}")))?;
++        out.extend(view.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
++        out
++    };
++    read.unmap();
++    Ok(out)
++}
++
++/// Classify the read-back map wait: a wait that ends without the map is
++/// a device that did not answer (the kind that the latch reads), while a
++/// map that fails with an error is not a stalled device.
++pub(crate) fn map_wait_end(wait: Result<Result<(), wgpu::BufferAsyncError>, mpsc::RecvTimeoutError>) -> Result<(), CutError> {
++    match wait {
++        Ok(Ok(())) => Ok(()),
++        Ok(Err(e)) => Err(CutError::other(format!("stock cut kernel: the read-back map failed: {e}"))),
++        Err(_) => Err(CutError::no_answer("stock cut kernel: the read-back map did not complete")),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::cut_gpu::CutErrorKind;
++
++    #[test]
++    fn the_read_back_wait_that_ends_is_a_no_answer() {
++        // The map wait that ends is the same kind as the poll wait: the
++        // latch must fire for its text, not only for "did not answer".
++        let ended = map_wait_end(Err(mpsc::RecvTimeoutError::Timeout));
++        assert_eq!(ended.expect_err("the map wait ended").kind, CutErrorKind::NoAnswer);
++        assert!(map_wait_end(Ok(Ok(()))).is_ok(), "a map that completed is not a failure");
++    }
++
++    #[test]
++    fn a_layer_uploads_as_its_little_endian_bits() {
++        let bytes = layer_bytes(&[1.0, -0.5]).expect("two texels");
++        assert_eq!(bytes.len(), 8);
++        assert_eq!(&bytes[..4], &1.0f32.to_le_bytes());
++        assert_eq!(&bytes[4..], &(-0.5f32).to_le_bytes());
++    }
++}
+diff --git a/crates/gpu/src/cut_gpu.rs b/crates/gpu/src/cut_gpu.rs
+index 1540dbd90..b80acfd68 100644
+--- a/crates/gpu/src/cut_gpu.rs
++++ b/crates/gpu/src/cut_gpu.rs
+@@ -1,15 +1,18 @@
+ //! The GPU half of the stock removal kernel (#2627, GPU stock sim S2):
+ //! the pipelines of `cut.wgsl`, the upload of a checked batch, the
+-//! fill / cut / decode passes, and a read-back with a time bound. Every
+-//! failure (a limit, a validation, internal or out-of-memory error, a
+-//! failed map, a poll past its time bound) is an `Err` with the reason;
+-//! the caller then takes the CPU law (`cut_run::cut_or_cpu`).
++//! fill (or encode) / cut / decode passes, and a read-back with a time
++//! bound. #2629 (S3a) adds the incremental start: a batch cut onto an
++//! earlier layer, read back (`run_onto`) or left in a buffer of the
++//! caller (`cut_into`). Every failure (a limit, a validation, internal or
++//! out-of-memory error, a failed map, a poll past its time bound) is an
++//! `Err` with the reason; the caller then takes the CPU law
++//! (`cut_run::cut_or_cpu`).
+ //! Provenance: our own dispatch over wgpu's public compute API.
+ 
+-use std::sync::mpsc;
+ use std::time::Duration;
+ 
+-use crate::cut::{CutInput, CutItem};
++use crate::cut::{check_base, CutInput};
++use crate::cut_buf::{item_bytes, layer_bytes, read_back, Layout, PARAMS_BYTES};
+ use crate::probe::Compute;
+ 
+ const SHADER: &str = include_str!("cut.wgsl");
+@@ -74,20 +77,23 @@ impl std::fmt::Display for CutError {
+     }
+ }
+ 
+-/// Bytes of one `Item` in `cut.wgsl` (five 16-byte rows).
+-const ITEM_BYTES: u64 = 80;
+-
+-/// Bytes of `Params` in `cut.wgsl`.
+-const PARAMS_BYTES: u64 = 48;
+-
+ /// The compiled kernel for one device: build it one time, run it often.
+ pub struct CutKernel {
+     bgl: wgpu::BindGroupLayout,
+     fill: wgpu::ComputePipeline,
++    encode: wgpu::ComputePipeline,
+     cut: wgpu::ComputePipeline,
+     decode: wgpu::ComputePipeline,
+ }
+ 
++/// How a batch starts: from the empty `-4 cap` floor, or from the layer
++/// that the target buffer already holds (#2629, a playback keyframe).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Start {
++    Floor,
++    Layer,
++}
++
+ /// The error class of a wgpu error, for the fallback reason.
+ pub(crate) fn gpu_error(err: wgpu::Error) -> String {
+     let kind = match &err {
+@@ -125,8 +131,12 @@ fn entry(binding: u32, ty: wgpu::BufferBindingType, dynamic: bool) -> wgpu::Bind
+     }
+ }
+ 
++fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
++    device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
++}
++
+ impl CutKernel {
+-    /// Compile the three pipelines on `device`.
++    /// Compile the four pipelines on `device`.
+     pub fn new(device: &wgpu::Device) -> Result<CutKernel, String> {
+         scoped(device, || {
+             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+@@ -157,7 +167,13 @@ impl CutKernel {
+                     cache: None,
+                 })
+             };
+-            Ok(CutKernel { fill: pipe("cs_fill"), cut: pipe("cs_cut"), decode: pipe("cs_decode"), bgl })
++            Ok(CutKernel {
++                fill: pipe("cs_fill"),
++                encode: pipe("cs_encode"),
++                cut: pipe("cs_cut"),
++                decode: pipe("cs_decode"),
++                bgl,
++            })
+         })
+     }
+ 
+@@ -174,49 +190,106 @@ impl CutKernel {
+         let n_tex = input.check()?;
+         let plan = Layout::of(device, compute, input, n_tex)?;
+         scoped(device, || {
+-            let (read, at) = self.submit(device, queue, input, &plan)?;
+-            read_back(device, &read, at, plan.out_bytes)
++            use wgpu::BufferUsages as U;
++            let keys = buffer(device, "stock cut keys", plan.out_bytes, U::STORAGE | U::COPY_SRC);
++            let enc = self.record(device, queue, input, &plan, &keys, Start::Floor)?;
++            read_after(device, queue, enc, &keys, plan.out_bytes)
++        })
++    }
++
++    /// The incremental cut (#2629, S3a), read back: cut `input` onto the
++    /// earlier layer `base` (the layout of `cut_cpu`). It answers what
++    /// `cut_cpu_onto` answers on the same values. Blocks for at most
++    /// about [`CUT_WAIT`].
++    pub fn run_onto(
++        &self,
++        device: &wgpu::Device,
++        queue: &wgpu::Queue,
++        compute: &Compute,
++        input: &CutInput,
++        base: &[f32],
++    ) -> Result<Vec<f32>, CutError> {
++        let n_tex = input.check()?;
++        check_base(base, n_tex)?;
++        let plan = Layout::of(device, compute, input, n_tex)?;
++        let bytes = layer_bytes(base)?;
++        scoped(device, || {
++            use wgpu::BufferUsages as U;
++            let keys = buffer(device, "stock cut layer", plan.out_bytes, U::STORAGE | U::COPY_SRC | U::COPY_DST);
++            queue.write_buffer(&keys, 0, &bytes);
++            let enc = self.record(device, queue, input, &plan, &keys, Start::Layer)?;
++            read_after(device, queue, enc, &keys, plan.out_bytes)
++        })
++    }
++
++    /// The incremental cut (#2629, S3a) into a buffer of the caller, with
++    /// no read-back. `target` holds a layer in the `cut_cpu` layout (a
++    /// display buffer, such as the viewport's cut buffer); afterwards it
++    /// holds that layer with `input` cut into it. It needs `STORAGE` usage
++    /// and four bytes for each texel. The caller polls the returned
++    /// submission. A NaN in `target` stays a NaN (display only). Errors
++    /// are caught by error scopes on the calling thread.
++    pub fn cut_into(
++        &self,
++        device: &wgpu::Device,
++        queue: &wgpu::Queue,
++        compute: &Compute,
++        input: &CutInput,
++        target: &wgpu::Buffer,
++    ) -> Result<wgpu::SubmissionIndex, CutError> {
++        let n_tex = input.check()?;
++        let plan = Layout::of(device, compute, input, n_tex)?;
++        if !target.usage().contains(wgpu::BufferUsages::STORAGE) {
++            return Err(CutError::other("stock cut kernel: the target buffer has no STORAGE usage"));
++        }
++        if target.size() < plan.out_bytes {
++            return Err(CutError::other(format!(
++                "stock cut kernel: the target buffer has {} bytes, the lattice needs {}",
++                target.size(),
++                plan.out_bytes
++            )));
++        }
++        scoped(device, || {
++            let enc = self.record(device, queue, input, &plan, target, Start::Layer)?;
++            Ok(queue.submit([enc.finish()]))
+         })
+     }
+ 
+-    fn submit(
++    /// Upload the batch and record the passes on `target`: the start
++    /// (fill or encode), the chunked cut, the decode.
++    fn record(
+         &self,
+         device: &wgpu::Device,
+         queue: &wgpu::Queue,
+         input: &CutInput,
+         p: &Layout,
+-    ) -> Result<(wgpu::Buffer, wgpu::SubmissionIndex), String> {
++        target: &wgpu::Buffer,
++        start: Start,
++    ) -> Result<wgpu::CommandEncoder, String> {
+         use wgpu::BufferUsages as U;
+-        let buf = |label, size, usage| {
+-            device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+-        };
+-        let params = buf("stock cut params", p.params_bytes, U::UNIFORM | U::COPY_DST);
+-        let items = buf("stock cut items", p.item_bytes, U::STORAGE | U::COPY_DST);
+-        let keys = buf("stock cut keys", p.out_bytes, U::STORAGE | U::COPY_SRC);
+-        let read = buf("stock cut read", p.out_bytes, U::MAP_READ | U::COPY_DST);
++        let params = buffer(device, "stock cut params", p.params_bytes, U::UNIFORM | U::COPY_DST);
++        let items = buffer(device, "stock cut items", p.item_bytes, U::STORAGE | U::COPY_DST);
+         queue.write_buffer(&params, 0, &p.params);
+         queue.write_buffer(&items, 0, &item_bytes(&input.items, p.item_bytes)?);
++        let sized = |buffer, size| wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size });
+         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+             label: Some("camcraft-gpu stock cut"),
+             layout: &self.bgl,
+             entries: &[
+-                wgpu::BindGroupEntry {
+-                    binding: 0,
+-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+-                        buffer: &params,
+-                        offset: 0,
+-                        size: wgpu::BufferSize::new(PARAMS_BYTES),
+-                    }),
+-                },
++                wgpu::BindGroupEntry { binding: 0, resource: sized(&params, wgpu::BufferSize::new(PARAMS_BYTES)) },
+                 wgpu::BindGroupEntry { binding: 1, resource: items.as_entire_binding() },
+-                wgpu::BindGroupEntry { binding: 2, resource: keys.as_entire_binding() },
++                // the lattice bytes only: a larger caller buffer can pass the binding limit
++                wgpu::BindGroupEntry { binding: 2, resource: sized(target, wgpu::BufferSize::new(p.out_bytes)) },
+             ],
+         });
+         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stock cut") });
+         {
+             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("stock cut"), timestamp_writes: None });
+             pass.set_bind_group(0, &group, &[0]);
+-            pass.set_pipeline(&self.fill);
++            pass.set_pipeline(match start {
++                Start::Floor => &self.fill,
++                Start::Layer => &self.encode,
++            });
+             pass.dispatch_workgroups(p.tex_groups[0], p.tex_groups[1], 1);
+             pass.set_pipeline(&self.cut);
+             for (k, count) in p.chunks.iter().enumerate() {
+@@ -227,148 +300,21 @@ impl CutKernel {
+             pass.set_pipeline(&self.decode);
+             pass.dispatch_workgroups(p.tex_groups[0], p.tex_groups[1], 1);
+         }
+-        enc.copy_buffer_to_buffer(&keys, 0, &read, 0, p.out_bytes);
+-        let at = queue.submit([enc.finish()]);
+-        Ok((read, at))
+-    }
+-}
+-
+-/// The buffer plan of one batch, checked against the device limits.
+-struct Layout {
+-    params: Vec<u8>,
+-    params_bytes: u64,
+-    stride: u64,
+-    item_bytes: u64,
+-    out_bytes: u64,
+-    tex_groups: [u32; 2],
+-    chunks: Vec<u32>,
+-}
+-
+-impl Layout {
+-    fn of(device: &wgpu::Device, compute: &Compute, input: &CutInput, n_tex: usize) -> Result<Layout, String> {
+-        let limit = compute.max_storage_buffer_binding_size.min(compute.max_buffer_size);
+-        let over = |what: &str, bytes: u64| format!("stock cut kernel: the {what} need {bytes} bytes, over the device limit {limit}");
+-        let out_bytes = (n_tex as u64).saturating_mul(4);
+-        let n_items = input.items.len() as u64;
+-        // an empty batch still binds a one-item buffer
+-        let item_bytes = n_items.max(1).saturating_mul(ITEM_BYTES);
+-        if out_bytes > limit {
+-            return Err(over("texels", out_bytes));
+-        }
+-        if item_bytes > limit {
+-            return Err(over("work items", item_bytes));
+-        }
+-        let max_dim = compute.max_compute_workgroups_per_dimension.max(1);
+-        let groups = u32::try_from(n_tex.div_ceil(64)).map_err(|_| "stock cut kernel: too many texel groups".to_string())?;
+-        let row = groups.min(max_dim);
+-        let rows = groups.div_ceil(row.max(1));
+-        if rows > max_dim {
+-            return Err(format!("stock cut kernel: {groups} texel groups pass the dispatch limit {max_dim}"));
+-        }
+-        let mut chunks = Vec::new();
+-        let n = u32::try_from(n_items).map_err(|_| "stock cut kernel: too many work items".to_string())?;
+-        let mut first = 0u32;
+-        while first < n {
+-            chunks.push((n - first).min(ITEMS_PER_DISPATCH));
+-            first += ITEMS_PER_DISPATCH;
+-        }
+-        let stride = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(PARAMS_BYTES).next_multiple_of(16);
+-        let blocks = chunks.len().max(1);
+-        let params_bytes = stride.saturating_mul(blocks as u64);
+-        let mut params = Vec::new();
+-        params.try_reserve_exact(params_bytes as usize).map_err(|e| format!("stock cut kernel: no host memory: {e}"))?;
+-        params.resize(params_bytes as usize, 0);
+-        let g = &input.grid;
+-        let n_tex32 = u32::try_from(n_tex).map_err(|_| "stock cut kernel: too many texels".to_string())?;
+-        for (k, block) in params.chunks_exact_mut(stride as usize).enumerate() {
+-            let count = chunks.get(k).copied().unwrap_or(0);
+-            let first = u32::try_from(k).unwrap_or(u32::MAX).saturating_mul(ITEMS_PER_DISPATCH);
+-            let words = [g.dims[0], g.dims[1], g.dims[2], n_tex32, first, count, row, g.floor_key(), g.cell.to_bits(), g.cap.to_bits()];
+-            for (dst, w) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+-                dst.copy_from_slice(&w.to_le_bytes());
+-            }
+-        }
+-        Ok(Layout { params, params_bytes, stride, item_bytes, out_bytes, tex_groups: [row, rows], chunks })
++        Ok(enc)
+     }
+-
+-    fn offset(&self, k: usize) -> Result<u32, String> {
+-        u32::try_from(self.stride.saturating_mul(k as u64)).map_err(|_| "stock cut kernel: the uniform offset overflows".into())
+-    }
+-}
+-
+-fn item_bytes(items: &[CutItem], bytes: u64) -> Result<Vec<u8>, String> {
+-    let mut v = Vec::new();
+-    v.try_reserve_exact(bytes as usize).map_err(|e| format!("stock cut kernel: no host memory: {e}"))?;
+-    for it in items {
+-        let row = |xyz: [u32; 3], w: u32| [xyz[0], xyz[1], xyz[2], w];
+-        let f = |p: [f32; 3]| p.map(f32::to_bits);
+-        let words = [
+-            row(f(it.a), it.r.to_bits()),
+-            row(f(it.b), it.flank.to_bits()),
+-            row(it.base.map(|v| v as u32), u32::from(it.ball)),
+-            row(it.lo, it.margin.to_bits()),
+-            row(it.hi, 0),
+-        ];
+-        for w in words.iter().flatten() {
+-            v.extend_from_slice(&w.to_le_bytes());
+-        }
+-    }
+-    v.resize(bytes as usize, 0);
+-    Ok(v)
+ }
+ 
+-/// Map the read buffer and wait at most [`CUT_WAIT`] for it.
+-fn read_back(
++/// Copy `keys` out after the recorded passes, submit, and read it back.
++fn read_after(
+     device: &wgpu::Device,
+-    read: &wgpu::Buffer,
+-    at: wgpu::SubmissionIndex,
++    queue: &wgpu::Queue,
++    mut enc: wgpu::CommandEncoder,
++    keys: &wgpu::Buffer,
+     out_bytes: u64,
+ ) -> Result<Vec<f32>, CutError> {
+-    let (tx, rx) = mpsc::channel();
+-    read.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+-        let _ = tx.send(r);
+-    });
+-    device
+-        .poll(wgpu::PollType::Wait { submission_index: Some(at), timeout: Some(CUT_WAIT) })
+-        .map_err(|e| CutError::no_answer(format!("stock cut kernel: the GPU did not answer within {CUT_WAIT:?}: {e}")))?;
+-    map_wait_end(rx.recv_timeout(Duration::from_millis(100)))?;
+-    let out = {
+-        let view = read
+-            .get_mapped_range(..)
+-            .map_err(|e| CutError::other(format!("stock cut kernel: the read-back range failed: {e:?}")))?;
+-        if view.len() as u64 != out_bytes {
+-            return Err(CutError::other(format!("stock cut kernel: the read-back has {} bytes, not {out_bytes}", view.len())));
+-        }
+-        let mut out = Vec::new();
+-        out.try_reserve_exact(view.len() / 4).map_err(|e| CutError::other(format!("stock cut kernel: no host memory: {e}")))?;
+-        out.extend(view.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
+-        out
+-    };
+-    read.unmap();
+-    Ok(out)
+-}
+-
+-/// Classify the read-back map wait: a wait that ends without the map is
+-/// a device that did not answer (the kind that the latch reads), while a
+-/// map that fails with an error is not a stalled device.
+-fn map_wait_end(wait: Result<Result<(), wgpu::BufferAsyncError>, mpsc::RecvTimeoutError>) -> Result<(), CutError> {
+-    match wait {
+-        Ok(Ok(())) => Ok(()),
+-        Ok(Err(e)) => Err(CutError::other(format!("stock cut kernel: the read-back map failed: {e}"))),
+-        Err(_) => Err(CutError::no_answer("stock cut kernel: the read-back map did not complete")),
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn the_read_back_wait_that_ends_is_a_no_answer() {
+-        // The map wait that ends is the same kind as the poll wait: the
+-        // latch must fire for its text, not only for "did not answer".
+-        let ended = map_wait_end(Err(mpsc::RecvTimeoutError::Timeout));
+-        assert_eq!(ended.expect_err("the map wait ended").kind, CutErrorKind::NoAnswer);
+-        assert!(map_wait_end(Ok(Ok(()))).is_ok(), "a map that completed is not a failure");
+-    }
++    use wgpu::BufferUsages as U;
++    let read = buffer(device, "stock cut read", out_bytes, U::MAP_READ | U::COPY_DST);
++    enc.copy_buffer_to_buffer(keys, 0, &read, 0, out_bytes);
++    let at = queue.submit([enc.finish()]);
++    read_back(device, &read, at, out_bytes)
+ }
+diff --git a/crates/gpu/src/cut_run.rs b/crates/gpu/src/cut_run.rs
+index 2329273df..358369ea9 100644
+--- a/crates/gpu/src/cut_run.rs
++++ b/crates/gpu/src/cut_run.rs
+@@ -2,13 +2,14 @@
+ //! S2): the GPU answers only when its device, its kernel and a spot
+ //! check against the CPU law all agree; otherwise the CPU law answers
+ //! and the reason is logged one time. A timed-out batch or a failed
+-//! spot check turns the GPU path off for the rest of the process.
++//! spot check turns the GPU path off for the rest of the process. The
++//! incremental cut onto an earlier layer (#2629, S3a) takes the same rule.
+ //! Provenance: our own rule (decision 2627).
+ 
+ use std::sync::OnceLock;
+ 
+ use crate::adapter::HeadlessGpu;
+-use crate::cut::{cell_cut, cut_cpu, slot, CutGrid, CutInput, CutItem};
++use crate::cut::{cell_cut, check_base, cut_cpu, cut_cpu_onto, slot, CutGrid, CutInput, CutItem};
+ use crate::cut_gpu::CutKernel;
+ use crate::shared::shared_device;
+ use crate::switch::log_fallback_once;
+@@ -60,22 +61,58 @@ pub fn cut_or_cpu(input: &CutInput) -> Result<CutOutput, String> {
+ /// there is none): the GPU result when it passes the spot check, else
+ /// the CPU law.
+ pub fn cut_or_cpu_on(gpu: Result<(&HeadlessGpu, &CutKernel), String>, input: &CutInput) -> Result<CutOutput, String> {
++    answer(gpu, input, None)
++}
++
++/// The incremental cut (#2629, GPU stock sim S3a): cut `input` onto the
++/// earlier layer `base` on the process's shared device, or by the CPU law
++/// (`cut_cpu_onto`) with the reason. The run-time choice is the one of
++/// [`cut_or_cpu`]: the off switch, no adapter, no compute, a lost device
++/// and a failed spot check all give the CPU law. `Err` only for an input
++/// or a base layer that neither law can cut.
++pub fn cut_onto_or_cpu(input: &CutInput, base: &[f32]) -> Result<CutOutput, String> {
+     input.check()?;
++    let gpu = shared_device().and_then(|gpu| {
++        let kernel = KERNEL.get_or_init(|| CutKernel::new(&gpu.device));
++        kernel.as_ref().map(|k| (gpu, k)).map_err(Clone::clone)
++    });
++    cut_onto_or_cpu_on(gpu, input, base)
++}
++
++/// [`cut_onto_or_cpu`] on a given device and kernel, or on the reason
++/// that there is none.
++pub fn cut_onto_or_cpu_on(
++    gpu: Result<(&HeadlessGpu, &CutKernel), String>,
++    input: &CutInput,
++    base: &[f32],
++) -> Result<CutOutput, String> {
++    answer(gpu, input, Some(base))
++}
++
++/// The one fallback rule of both entries: `base` is `None` for a cut
++/// from the floor.
++fn answer(gpu: Result<(&HeadlessGpu, &CutKernel), String>, input: &CutInput, base: Option<&[f32]>) -> Result<CutOutput, String> {
++    let n = input.check()?;
++    if let Some(base) = base {
++        check_base(base, n)?;
++    }
+     let run = || -> Result<CutOutput, String> {
+         if let Some(why) = OFF.get() {
+             return Err(why.clone());
+         }
+         let (gpu, kernel) = gpu?;
+         let compute = gpu.compute.as_ref().map_err(Clone::clone)?;
+-        let values = kernel
+-            .run(&gpu.device, &gpu.queue, compute, input)
+-            .inspect_err(|e| {
+-                if let Some(why) = e.off_reason() {
+-                    let _ = OFF.set(why);
+-                }
+-            })
+-            .map_err(|e| e.message)?;
+-        spot_check(input, &values).inspect_err(|e| {
++        let values = match base {
++            None => kernel.run(&gpu.device, &gpu.queue, compute, input),
++            Some(base) => kernel.run_onto(&gpu.device, &gpu.queue, compute, input, base),
++        }
++        .inspect_err(|e| {
++            if let Some(why) = e.off_reason() {
++                let _ = OFF.set(why);
++            }
++        })
++        .map_err(|e| e.message)?;
++        check_against(input, base, &values).inspect_err(|e| {
+             let _ = OFF.set(format!("{e}; the GPU stock cut is off for this process"));
+         })?;
+         Ok(CutOutput { values, path: CutPath::Gpu { adapter: gpu.name.clone() } })
+@@ -84,7 +121,11 @@ pub fn cut_or_cpu_on(gpu: Result<(&HeadlessGpu, &CutKernel), String>, input: &Cu
+         Ok(out) => Ok(out),
+         Err(reason) => {
+             log_fallback_once(&reason);
+-            Ok(CutOutput { values: cut_cpu(input)?, path: CutPath::Cpu { reason } })
++            let values = match base {
++                None => cut_cpu(input)?,
++                Some(base) => cut_cpu_onto(input, base)?,
++            };
++            Ok(CutOutput { values, path: CutPath::Cpu { reason } })
+         }
+     }
+ }
+@@ -94,13 +135,27 @@ pub fn cut_or_cpu_on(gpu: Result<(&HeadlessGpu, &CutKernel), String>, input: &Cu
+ /// fixed places across the lattice, each evaluated over every item that
+ /// covers it. Values below `-cap` never show and compare clamped there.
+ pub fn spot_check(input: &CutInput, gpu: &[f32]) -> Result<(), String> {
++    check_against(input, None, gpu)
++}
++
++/// [`spot_check`] for an incremental cut (#2629): the CPU law at each
++/// probe starts from the `base` layer's value there.
++pub fn spot_check_onto(input: &CutInput, base: &[f32], gpu: &[f32]) -> Result<(), String> {
++    check_against(input, Some(base), gpu)
++}
++
++fn check_against(input: &CutInput, base: Option<&[f32]>, gpu: &[f32]) -> Result<(), String> {
+     let n = input.check()?;
+     if gpu.len() != n {
+         return Err(format!("stock cut kernel: the GPU gave {} texels, not {n}", gpu.len()));
+     }
++    if let Some(base) = base {
++        check_base(base, n)?;
++    }
+     let g = &input.grid;
+     for at in spot_probes(input)? {
+-        let (want, margin) = want_at(input, cell_of_slot(at, g.dims));
++        let start = base.and_then(|b| b.get(at).copied()).unwrap_or(-4.0 * g.cap);
++        let (want, margin) = want_at(input, start, cell_of_slot(at, g.dims));
+         let got = gpu.get(at).copied().unwrap_or(f32::NAN);
+         let (w, h) = (want.max(-g.cap), got.max(-g.cap));
+         let bound = (margin * SPOT_MARGIN_FRACTION).max(f32::EPSILON * g.cap);
+@@ -163,11 +218,12 @@ fn deepest_local(item: &CutItem, grid: &CutGrid) -> Option<[u32; 3]> {
+     at
+ }
+ 
+-/// The CPU cut at absolute cell `at`, and the claim margin of the item
+-/// that makes it.
+-fn want_at(input: &CutInput, at: [u32; 3]) -> (f32, f32) {
++/// The CPU cut at absolute cell `at` from the layer value `start`, and
++/// the claim margin of the item that makes it (`0` when no item cuts
++/// deeper than `start`).
++fn want_at(input: &CutInput, start: f32, at: [u32; 3]) -> (f32, f32) {
+     let g = &input.grid;
+-    let (mut want, mut margin) = (-4.0 * g.cap, 0.0f32);
++    let (mut want, mut margin) = (start, 0.0f32);
+     for item in &input.items {
+         let l: [i64; 3] = std::array::from_fn(|a| i64::from(at[a]) - i64::from(item.base[a]));
+         let inside = (0..3).all(|a| i64::from(item.lo[a]) <= l[a] && l[a] <= i64::from(item.hi[a]));
+diff --git a/crates/gpu/src/lib.rs b/crates/gpu/src/lib.rs
+index d9ad0e223..83e558010 100644
+--- a/crates/gpu/src/lib.rs
++++ b/crates/gpu/src/lib.rs
+@@ -1,7 +1,8 @@
+ //! camcraft-gpu: the headless GPU compute seam (#2620). One windowless
+ //! device for each process, a capability probe, the off switch and the
+ //! CPU fallback rule, and the kernels: conservative facet binning, and
+-//! the stock removal cut (#2627, display only).
++//! the stock removal cut (#2627, display only) and its incremental start
++//! onto an earlier layer (#2629).
+ //! Provenance: our own seam over wgpu's public API; the binning law is
+ //! uniform-grid partitioning from C. Ericson, "Real-Time Collision
+ //! Detection" (2005), ch. 7.
+@@ -19,6 +20,8 @@ mod binning_gpu;
+ // #2627: the stock removal kernel (ball and flat, linear moves).
+ pub mod cut;
+ #[cfg(not(target_arch = "wasm32"))]
++mod cut_buf;
++#[cfg(not(target_arch = "wasm32"))]
+ mod cut_gpu;
+ #[cfg(not(target_arch = "wasm32"))]
+ mod cut_run;
+@@ -33,13 +36,13 @@ pub use adapter::{device, device_for_test};
+ pub use binning::{bin_twin, pad_boxes, plan, CellLists, GridSpec, PaddedBoxes, Plan};
+ #[cfg(not(target_arch = "wasm32"))]
+ pub use binning_gpu::{bin_facets, bin_on};
+-pub use cut::{cut_cpu, CutGrid, CutInput, CutItem, CUT_BRICK, MAX_CUT_TEXELS};
++pub use cut::{cut_cpu, cut_cpu_onto, CutGrid, CutInput, CutItem, CUT_BRICK, MAX_CUT_TEXELS};
+ #[cfg(not(target_arch = "wasm32"))]
+ pub use cut_gpu::{CutError, CutErrorKind, CutKernel, CUT_WAIT, ITEMS_PER_DISPATCH};
+ #[cfg(not(target_arch = "wasm32"))]
+ pub use cut_run::{
+-    cut_or_cpu, cut_or_cpu_on, spot_check, spot_probes, CutOutput, CutPath, SPOT_LATTICE_TEXELS, SPOT_MARGIN_FRACTION,
+-    SPOT_TEXELS,
++    cut_onto_or_cpu, cut_onto_or_cpu_on, cut_or_cpu, cut_or_cpu_on, spot_check, spot_check_onto, spot_probes, CutOutput,
++    CutPath, SPOT_LATTICE_TEXELS, SPOT_MARGIN_FRACTION, SPOT_TEXELS,
+ };
+ pub use probe::{probe, Compute};
+ #[cfg(not(target_arch = "wasm32"))]
+diff --git a/crates/gpu/tests/cut_onto.rs b/crates/gpu/tests/cut_onto.rs
+new file mode 100644
+index 000000000..a75a9ed7d
+--- /dev/null
++++ b/crates/gpu/tests/cut_onto.rs
+@@ -0,0 +1,247 @@
++//! The incremental stock cut (#2629, GPU stock sim S3a): a batch cut onto
++//! an earlier layer (a playback keyframe), on the GPU or by the CPU law.
++//! Pins: GPU and CPU agree within the claim tolerance (or the test skips
++//! by name when no adapter exists); the off switch takes the CPU law; a
++//! lost device takes the CPU law and never crashes.
++//! #3589: this binary touches the one shared device of its process only
++//! (`shared_device`), never a second `wgpu` instance. The switch and the
++//! device-loss cases run in a child process of this binary, because each
++//! leaves the shared device off for the rest of its process.
++//! Gate map: covers camcraft_gpu::cut, camcraft_gpu::cut_gpu,
++//! camcraft_gpu::cut_buf, camcraft_gpu::cut_run. Our own tests.
++
++use camcraft_gpu::{
++    cut_cpu, cut_cpu_onto, cut_onto_or_cpu, cut_onto_or_cpu_on, gpu_required, shared_device, spot_check_onto, CutGrid,
++    CutInput, CutItem, CutKernel, CutPath, COMPUTE_ENV, SPOT_MARGIN_FRACTION,
++};
++
++/// The child-process mode of the switch and device-loss pins.
++const CHILD_ENV: &str = "CAMCRAFT_TEST_CUT_ONTO_CHILD";
++
++/// The claim margin of every fixture item; the GPU and the CPU law may
++/// differ by [`SPOT_MARGIN_FRACTION`] of it (the cell tolerance of S2).
++const MARGIN: f32 = 1e-4;
++
++const GRID: CutGrid = CutGrid { dims: [32, 32, 16], cell: 0.5, cap: 1.0 };
++
++/// One chord (absolute mm) as one item for each brick of the lattice.
++fn chord(a: [f32; 3], b: [f32; 3], r: f32, flank: f32) -> Vec<CutItem> {
++    let mut items = Vec::new();
++    for bz in 0..GRID.dims[2] / 8 {
++        for by in 0..GRID.dims[1] / 8 {
++            for bx in 0..GRID.dims[0] / 8 {
++                let base = [bx, by, bz].map(|v| (v * 8) as i32);
++                let o = base.map(|v| v as f32 * GRID.cell);
++                let rel = |p: [f32; 3]| [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
++                items.push(CutItem {
++                    a: rel(a),
++                    b: rel(b),
++                    r,
++                    flank,
++                    margin: MARGIN,
++                    ball: flank == 0.0,
++                    base,
++                    lo: [0; 3],
++                    hi: [7; 3],
++                });
++            }
++        }
++    }
++    items
++}
++
++/// Keyframe moves (`earlier`) and the moves after it (`later`): a ball
++/// chord first, then a tilted flat chord (the golden section) and a
++/// level flat chord (the closed form).
++fn fixture() -> (CutInput, CutInput) {
++    let earlier = CutInput { grid: GRID, items: chord([2.0, 3.0, 6.0], [13.0, 11.0, 4.0], 2.0, 0.0) };
++    let mut later = chord([3.0, 12.0, 5.0], [14.0, 4.0, 6.5], 1.5, 6.0);
++    later.extend(chord([1.0, 8.0, 3.5], [15.0, 8.0, 3.5], 1.0, 6.0));
++    (earlier, CutInput { grid: GRID, items: later })
++}
++
++fn same_bits(a: &[f32], b: &[f32]) -> bool {
++    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
++}
++
++/// The largest |a - b| of two layers, both clamped at `-cap` (a value
++/// under it never shows).
++fn max_gap(a: &[f32], b: &[f32]) -> f32 {
++    a.iter().zip(b).map(|(x, y)| (x.max(-GRID.cap) - y.max(-GRID.cap)).abs()).fold(0.0, f32::max)
++}
++
++#[test]
++fn the_incremental_cpu_law_is_the_one_batch_cut_bit_for_bit() {
++    let (earlier, later) = fixture();
++    let key = cut_cpu(&earlier).expect("the keyframe cut");
++    let onto = cut_cpu_onto(&later, &key).expect("the cut onto the keyframe");
++    let mut all = earlier.clone();
++    all.items.extend(later.items.iter().copied());
++    let one = cut_cpu(&all).expect("the one batch");
++    let claimed = |l: &[f32]| l.iter().filter(|v| **v > -GRID.cap).count();
++    assert!(claimed(&key) > 100 && claimed(&one) > claimed(&key), "the fixture cuts too little");
++    assert!(same_bits(&onto, &one), "the cut onto a keyframe must equal the one batch cut");
++    let floor = vec![-4.0 * GRID.cap; key.len()];
++    assert!(same_bits(&cut_cpu_onto(&earlier, &floor).expect("onto the floor"), &key), "the floor start is cut_cpu");
++}
++
++#[test]
++fn a_bad_base_layer_is_refused_by_name() {
++    let (_, later) = fixture();
++    let n = later.grid.texels().expect("the fixture lattice");
++    let err = cut_cpu_onto(&later, &vec![0.0; n - 1]).expect_err("a short base");
++    assert!(err.contains("base layer has"), "{err}");
++    let mut nan = vec![-4.0; n];
++    nan[7] = f32::NAN;
++    for (name, base) in [("NaN", nan), ("infinity", vec![f32::NEG_INFINITY; n])] {
++        let err = cut_cpu_onto(&later, &base).expect_err(name);
++        assert!(err.contains("is not finite"), "{name}: {err}");
++        let err = cut_onto_or_cpu_on(Err("no device".into()), &later, &base).expect_err(name);
++        assert!(err.contains("is not finite"), "{name}: the fallback rule refuses too: {err}");
++    }
++}
++
++#[test]
++fn the_gpu_cut_onto_a_keyframe_matches_the_cpu_law_or_skips_by_name() {
++    let (earlier, later) = fixture();
++    let key = cut_cpu(&earlier).expect("the keyframe cut");
++    let want = cut_cpu_onto(&later, &key).expect("the CPU law");
++    let gpu = match shared_device() {
++        Ok(gpu) => gpu,
++        Err(why) => {
++            assert!(!gpu_required() || why.contains("off"), "CAMCRAFT_REQUIRE_GPU=1 but {why}");
++            eprintln!("*** cut_onto: GPU parity SKIPPED - NOT a pass: {why} ***");
++            let out = cut_onto_or_cpu(&later, &key).expect("the CPU law answers");
++            assert!(matches!(out.path, CutPath::Cpu { .. }), "no device: the CPU law must answer");
++            assert!(same_bits(&out.values, &want));
++            return;
++        }
++    };
++    let compute = gpu.compute.as_ref().expect("shared_device has compute");
++    let kernel = CutKernel::new(&gpu.device).unwrap_or_else(|e| panic!("the kernel builds on {}: {e}", gpu.name));
++    let got = kernel.run_onto(&gpu.device, &gpu.queue, compute, &later, &key).unwrap_or_else(|e| panic!("{}: {e}", gpu.name));
++    let gap = max_gap(&got, &want);
++    assert!(gap <= SPOT_MARGIN_FRACTION * MARGIN, "max |GPU - CPU law| {gap:e} on {}", gpu.name);
++    spot_check_onto(&later, &key, &got).unwrap_or_else(|e| panic!("{e}"));
++
++    // The display path: the same cut into a caller buffer, no read-back
++    // by the kernel. The test reads the buffer back to compare.
++    use wgpu::BufferUsages as U;
++    let bytes: Vec<u8> = key.iter().flat_map(|v| v.to_le_bytes()).collect();
++    let size = bytes.len() as u64 + 64; // a larger buffer than the lattice
++    let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++        label: Some("cut_onto test target"),
++        size,
++        usage: U::STORAGE | U::COPY_SRC | U::COPY_DST,
++        mapped_at_creation: false,
++    });
++    gpu.queue.write_buffer(&target, 0, &bytes);
++    kernel.cut_into(&gpu.device, &gpu.queue, compute, &later, &target).unwrap_or_else(|e| panic!("{e}"));
++    let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++        label: Some("cut_onto test read"),
++        size: bytes.len() as u64,
++        usage: U::MAP_READ | U::COPY_DST,
++        mapped_at_creation: false,
++    });
++    let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
++    enc.copy_buffer_to_buffer(&target, 0, &read, 0, bytes.len() as u64);
++    gpu.queue.submit([enc.finish()]);
++    read.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("the test map"));
++    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("the test poll");
++    let into: Vec<f32> =
++        read.slice(..).get_mapped_range().expect("the test range").as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
++    assert!(same_bits(&into, &got), "cut_into and run_onto differ on {}", gpu.name);
++
++    let small = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++        label: Some("cut_onto test small"),
++        size: 16,
++        usage: U::STORAGE,
++        mapped_at_creation: false,
++    });
++    let err = kernel.cut_into(&gpu.device, &gpu.queue, compute, &later, &small).expect_err("a short target");
++    assert!(err.message.contains("target buffer has 16 bytes"), "{err}");
++
++    let via = cut_onto_or_cpu(&later, &key).expect("the shared path answers");
++    assert_eq!(via.path, CutPath::Gpu { adapter: gpu.name.clone() }, "the shared path fell back");
++    assert!(same_bits(&via.values, &got), "the shared and the direct runs differ");
++    eprintln!("cut_onto: GPU parity on {}: max |GPU - CPU law| {gap:e}", gpu.name);
++}
++
++/// Run this test again in a child process with `CHILD_ENV=<mode>`.
++fn in_child(test: &str, mode: &str, compute: &str) {
++    let exe = std::env::current_exe().expect("the test executable");
++    let out = std::process::Command::new(exe)
++        .args(["--exact", test, "--nocapture"])
++        .env(CHILD_ENV, mode)
++        .env(COMPUTE_ENV, compute)
++        .output()
++        .expect("start the child test");
++    eprint!("{}", String::from_utf8_lossy(&out.stderr));
++    let text = String::from_utf8_lossy(&out.stdout);
++    assert!(out.status.success(), "the {mode} child failed:\n{text}");
++    assert!(text.contains("1 passed"), "the {mode} child ran no test:\n{text}");
++}
++
++#[test]
++fn the_off_switch_takes_the_cpu_law_by_name() {
++    let Ok(mode) = std::env::var(CHILD_ENV) else {
++        return in_child("the_off_switch_takes_the_cpu_law_by_name", "off", "off");
++    };
++    assert_eq!(mode, "off");
++    let (earlier, later) = fixture();
++    let key = cut_cpu(&earlier).expect("the keyframe cut");
++    let out = cut_onto_or_cpu(&later, &key).expect("the CPU law answers");
++    match &out.path {
++        CutPath::Cpu { reason } => assert!(reason.contains(COMPUTE_ENV), "the reason must name the switch: {reason}"),
++        CutPath::Gpu { adapter } => panic!("{COMPUTE_ENV}=off but the GPU on {adapter} answered"),
++    }
++    assert!(same_bits(&out.values, &cut_cpu_onto(&later, &key).expect("the CPU law")));
++}
++
++#[test]
++fn a_lost_device_takes_the_cpu_law_and_never_crashes() {
++    let Ok(mode) = std::env::var(CHILD_ENV) else {
++        return in_child("a_lost_device_takes_the_cpu_law_and_never_crashes", "lost", "on");
++    };
++    assert_eq!(mode, "lost");
++    let (earlier, later) = fixture();
++    let key = cut_cpu(&earlier).expect("the keyframe cut");
++    let want = cut_cpu_onto(&later, &key).expect("the CPU law");
++    let gpu = match shared_device() {
++        Ok(gpu) => gpu,
++        Err(why) => {
++            assert!(!gpu_required(), "CAMCRAFT_REQUIRE_GPU=1 but {why}");
++            eprintln!("*** cut_onto: device loss SKIPPED - NOT a pass: {why} ***");
++            return;
++        }
++    };
++    let compute = gpu.compute.as_ref().expect("shared_device has compute");
++    let kernel = CutKernel::new(&gpu.device).unwrap_or_else(|e| panic!("the kernel builds on {}: {e}", gpu.name));
++    // Destroy fires wgpu's real device-lost callback.
++    gpu.device.destroy();
++    let _ = gpu.device.poll(wgpu::PollType::Poll);
++
++    // The kernel itself on the lost device: an error, never a panic.
++    let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
++        label: Some("cut_onto lost target"),
++        size: (want.len() * 4) as u64,
++        usage: wgpu::BufferUsages::STORAGE,
++        mapped_at_creation: false,
++    });
++    let direct = kernel.run_onto(&gpu.device, &gpu.queue, compute, &later, &key);
++    assert!(direct.is_err(), "a lost device must not give a layer");
++    let _ = kernel.cut_into(&gpu.device, &gpu.queue, compute, &later, &target);
++
++    // The fallback rule on that device and kernel: the CPU law.
++    let out = cut_onto_or_cpu_on(Ok((gpu, &kernel)), &later, &key).expect("the CPU law answers");
++    assert!(matches!(out.path, CutPath::Cpu { .. }), "a lost device must take the CPU law");
++    assert!(same_bits(&out.values, &want));
++    // The shared path names the loss.
++    let out = cut_onto_or_cpu(&later, &key).expect("the CPU law answers");
++    match &out.path {
++        CutPath::Cpu { reason } => assert!(reason.contains("lost"), "the reason must name the loss: {reason}"),
++        CutPath::Gpu { adapter } => panic!("the lost device on {adapter} answered"),
++    }
++    assert!(same_bits(&out.values, &want));
++    eprintln!("cut_onto: device loss exercised on {}", gpu.name);
++}
+diff --git a/docs/decisions/2629-gpu-cut-onto.md b/docs/decisions/2629-gpu-cut-onto.md
+new file mode 100644
+index 000000000..dd0538a66
+--- /dev/null
++++ b/docs/decisions/2629-gpu-cut-onto.md
+@@ -0,0 +1,58 @@
++## #2629 - GPU stock sim S3a: the incremental cut onto a keyframe layer
++
++**Decided.** #2629 (S3) is too large for one PR (the escalation comment of
++2026-11-22 lists five gaps). This PR is slice S3a only: the kernel and the
++CPU law can cut a batch onto an earlier layer (a playback keyframe), not
++only from the empty floor.
++
++- `cut.wgsl` gets a fourth entry point, `cs_encode`. It turns a layer (the
++  f32 bits that `cs_decode` writes) back into order-preserving keys, in
++  place. A batch then runs encode, cut, decode on the same buffer.
++- `CutKernel::cut_into` runs that on a buffer of the caller (for S3c: the
++  viewport's `Scene.cut` buffer on the render device) and returns the
++  submission. It reads nothing back. `CutKernel::run_onto` does the same on
++  its own buffer and reads the layer back (tests, and the fallback rule).
++- `cut_cpu_onto` is the CPU law of the same cut. With the max law it is
++  exact: a cut onto the keyframe of A gives the bits of A and B in one batch.
++- `cut_onto_or_cpu` / `cut_onto_or_cpu_on` take the existing fallback rule
++  of `cut_or_cpu`: the `CAMCRAFT_GPU_COMPUTE=off` switch, no adapter, no
++  compute, a lost device, a kernel error or a failed spot check give the
++  CPU law, with the reason, logged one time. `spot_check_onto` starts the
++  CPU law at each probe from the base value.
++- A base layer must have the lattice's texel count and finite values only.
++  A NaN or an infinity is refused by name (the key order of a NaN is not a
++  depth). `cut_into` cannot check a GPU buffer; a NaN there stays a NaN and
++  shows only on the display.
++- `cut_gpu.rs` was split along the buffer seam (`cut_buf.rs`: the batch
++  plan, the byte forms, the read-back) to keep both files under 400 lines.
++
++**Why.** The escalation named the incremental mode as the first gap: the
++S2 kernel always cut from the floor, so a playback could not continue from
++a keyframe on the GPU. This is the part that S3b (the worker protocol) and
++S3c (the UI dispatch on the render device, the keyframe store) both need.
++It changes no posted output and no verdict: the f64 engines still judge.
++
++**#3589.** The new test binary (`crates/gpu/tests/cut_onto.rs`) touches
++only `shared_device` (one `wgpu` instance in its process). The off-switch
++and device-loss pins run in a child process of the same binary, because
++each leaves the shared device off for the rest of its process.
++
++**Dropped.**
++- Running `CutKernel::run` on each frame and uploading the result with
++  `write_cut`: it keeps the CPU cut in the worker, so playback is not
++  faster (the escalation comment says the same).
++- A persistent key buffer instead of `cs_encode`: the display buffer must
++  hold f32 bits for `trace.wgsl` between frames, so an encode pass on the
++  same buffer is one buffer less and one pass more (a pass over the texels,
++  cheap against the cut).
++
++**Remains (S3b, S3c).** The worker protocol in `camcraft-app` (send the
++twin work for each frame on the GPU path, keep CPU checkpoints for the
++fallback and the operations the twin refuses), the UI side in
++`crates/ui/src/trace/` (dispatch off the UI thread on the render device,
++the keyframe store in a VRAM budget, a fall back to the CPU frames on any
++error), the choice by batch size and adapter kind from hardware timings,
++and the parity proof on a hardware adapter (this PR ran on WARP only).
++
++**Cost to change.** Low: the new entries are additive; `run` and
++`cut_or_cpu` keep their behaviour and their tests.

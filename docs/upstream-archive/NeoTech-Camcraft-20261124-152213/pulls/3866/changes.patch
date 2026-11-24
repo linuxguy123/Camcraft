@@ -1,0 +1,1708 @@
+From fa510fae5e886a12b62a92acb48c136b0ae04b95 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 23 Nov 2026 22:57:40 -0800
+Subject: [PATCH 1/5] fix(2d): peck a contour dive deeper than one stepdown
+ below the cut floor
+
+A tabbed level of a 2D Contour entered each later tab window (and, with
+the stay-down ramp preset, window 0 too) by one plunge from the retract
+plane to the level. The levels above cut that lead-in start only at the
+ring start, so the plunge went up to 18 mm into uncut stock.
+
+The new contour_peck module reads the floor that the posted cuts (feeds
+at one height and straight plunge columns) left under the full tool
+disc. Below a ring's first level, the wall-side graze dive and the dive
+past a tab peck one stepdown at a time where they would go deeper than
+one stepdown below that floor. One note says it.
+
+contour_tab_entry.rs counts plunge columns in its floor oracle, asserts
+every descent of the four presets, and pins the new window readings.
+
+Fixes #3678
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/motion/src/machining2d/contour.rs      |   8 +-
+ crates/motion/src/machining2d/contour_peck.rs | 178 ++++++++++++++++++
+ crates/motion/src/machining2d/contour_step.rs |  17 +-
+ crates/motion/src/machining2d/mod.rs          |   1 +
+ crates/motion/tests/contour_tab_entry.rs      |  60 +++++-
+ docs/decisions/3678-tab-window-dive.md        |  32 ++++
+ 6 files changed, 278 insertions(+), 18 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/contour_peck.rs
+ create mode 100644 docs/decisions/3678-tab-window-dive.md
+
+diff --git a/crates/motion/src/machining2d/contour.rs b/crates/motion/src/machining2d/contour.rs
+index c769ddc2c..9220d83e7 100644
+--- a/crates/motion/src/machining2d/contour.rs
++++ b/crates/motion/src/machining2d/contour.rs
+@@ -14,6 +14,7 @@ use super::contour_depth::Ladder;
+ use super::contour_entry::{Engage, crosses, flatten, say, seam_leads, wall_arc, wall_arc_top};
+ use super::contour_comp::{self, SpanCtx};
+ use super::contour_link::{plan_links, push_stay, ring_link};
++use super::contour_peck::{dive, uncut_floor};
+ use super::contour_step::{Said, Step, engage_level};
+ use super::levels::{Cert, Motion};
+ use super::ring::Ring;
+@@ -297,7 +298,7 @@ pub(super) fn emit_band(
+                 // #2004: the column of this descent is open down to prev_z
+                 // when the descent one level up was the same arm.
+                 let opened = rzi >= 2 || (rzi == 1 && arm == p.entry);
+-                let step = Step { arm, e2, z, prev_z, first: first_entry, opened, inside, tabbed, lead_top };
++                let step = Step { arm, e2, z, prev_z, first: first_entry, opened, inside, tabbed, lead_top, uncut: uncut_floor(p, rz, rzi) };
+                 if let Some(d) = engage_level(b, &eng, &step, &lead, &walk, said) {
+                     if dives.0.to_bits() != z.to_bits() {
+                         dives = (z, Vec::new());
+@@ -305,12 +306,13 @@ pub(super) fn emit_band(
+                     dives.1.push(vec![d, e2]);
+                 }
+             } else {
+-                // Tab window to tab window: up over the tab, across, down.
++                // Tab window to tab window: up over the tab, across, down (pecked, #3678).
+                 let cur = b.at();
+                 b.push(MoveKind::Feed, Point3::new(cur.x, cur.y, hop_z), Some(p.feed));
+                 b.push(MoveKind::Rapid, Point3::new(e2.x, e2.y, hop_z), None);
+                 super::contour_link::guard(b, p, e2, lead_top, p.entry_top(), "the dive past a tab");
+-                b.push(MoveKind::Plunge, Point3::new(e2.x, e2.y, lead_top), Some(p.plunge_feed));
++                let (pf, uncut) = (p.plunge_feed, uncut_floor(p, rz, rzi));
++                dive(b, p, e2, lead_top, uncut, hop_z, pf, |b, d| b.push(MoveKind::Plunge, Point3::new(e2.x, e2.y, d), Some(pf)));
+             }
+             first_entry = false;
+             let at = b.at();
+diff --git a/crates/motion/src/machining2d/contour_peck.rs b/crates/motion/src/machining2d/contour_peck.rs
+new file mode 100644
+index 000000000..be702f109
+--- /dev/null
++++ b/crates/motion/src/machining2d/contour_peck.rs
+@@ -0,0 +1,178 @@
++//! A contour dive below the levels above (#3678): the floor that the
++//! posted cuts left under the full tool disc, and the peck that keeps
++//! each feed down to one stepdown below it.
++//!
++//! Provenance: the peck (step) plunge of public G-code manuals (the G83
++//! deep-hole cycle of RS-274 / ISO 6983: feed one step, retract, feed the
++//! next) and the stepdown rule of machining handbooks; the floor reading
++//! is this crate's own geometry. No vendor material consulted.
++
++use crate::cl::{Move, MoveKind, PathBuilder};
++use crate::geo2d::Point2;
++use crate::geometry::Point3;
++
++use super::contour_params::ContourParams;
++
++/// Height slack: a cut on the dive's own plane counts as at its depth.
++const Z_EPS: f64 = 1e-6;
++/// Chord tolerance the floor reads arcs at (mm).
++const CHORD_TOL: f64 = 0.001;
++/// Rings and points per ring the disc is sampled at, out to the rim.
++const RINGS: u32 = 6;
++const PER_RING: u32 = 72;
++/// At most this many pecks: a dive that needs more is a bad stepdown.
++const MAX_PECKS: usize = 4096;
++
++/// The highest floor under the tool disc of radius `r` at `xy`: at each
++/// sample point the lowest Z of a posted cut whose swept disc holds it -
++/// a feed at one height, or a straight plunge column - else `uncut`.
++#[must_use]
++pub(super) fn disc_floor(moves: &[Move], xy: Point2, r: f64, uncut: f64) -> f64 {
++    if !(r.is_finite() && r > 0.0) {
++        return uncut;
++    }
++    // Only the cuts within reach of the disc can hold a point of it.
++    let near: Vec<(f64, Vec<(Point2, Point2)>)> = moves
++        .iter()
++        .filter(|m| m.kind != MoveKind::Rapid && m.to.z < uncut - Z_EPS)
++        .filter_map(|m| {
++            let flat = (m.from.z - m.to.z).abs() <= Z_EPS;
++            let column = m.from.x == m.to.x && m.from.y == m.to.y && m.to.z < m.from.z;
++            let chords = if flat {
++                m.chords(CHORD_TOL)
++            } else if column {
++                let c = Point2::new(m.to.x, m.to.y);
++                vec![(c, c)]
++            } else {
++                return None;
++            };
++            chords.iter().any(|&(a, b)| seg_dist(xy, a, b) <= 2.0 * r + Z_EPS).then_some((m.to.z, chords))
++        })
++        .collect();
++    let floor = |q: Point2| {
++        near.iter()
++            .filter(|(_, ch)| ch.iter().any(|&(a, b)| seg_dist(q, a, b) <= r + Z_EPS))
++            .map(|(z, _)| *z)
++            .fold(uncut, f64::min)
++    };
++    let mut top = floor(xy);
++    for ring in 1..=RINGS {
++        let rr = r * f64::from(ring) / f64::from(RINGS) * 0.999;
++        for k in 0..PER_RING {
++            let t = std::f64::consts::TAU * f64::from(k) / f64::from(PER_RING);
++            top = top.max(floor(Point2::new(xy.x + rr * t.cos(), xy.y + rr * t.sin())));
++        }
++    }
++    top
++}
++
++/// The depths a dive at `xy` down to `z` stops at: one stepdown apart
++/// below the disc floor, the last one `z`. A dive within one stepdown of
++/// the floor (or with no `uncut` floor: a ring's first level) is `[z]`.
++#[must_use]
++pub(super) fn peck_depths(moves: &[Move], xy: Point2, z: f64, r: f64, step: f64, uncut: Option<f64>) -> Vec<f64> {
++    let Some(uncut) = uncut else { return vec![z] };
++    if !(step.is_finite() && step > 0.0 && z.is_finite()) {
++        return vec![z];
++    }
++    let floor = disc_floor(moves, xy, r, uncut);
++    let mut out = Vec::new();
++    let mut d = floor - step;
++    while d > z + Z_EPS && out.len() < MAX_PECKS {
++        out.push(d);
++        d -= step;
++    }
++    out.push(z);
++    out
++}
++
++/// The floor with no cut under the disc, for a dive on level `rzi` of a
++/// ring whose levels are `rz`: the material's top, or one stepdown over
++/// the ring's first level where that is lower (a shelf band). `None` on
++/// the ring's first level: that dive never pecks.
++#[must_use]
++pub(super) fn uncut_floor(p: &ContourParams, rz: &[f64], rzi: usize) -> Option<f64> {
++    let first = *rz.first()?;
++    (rzi > 0).then(|| p.entry_top().min(first + p.stepdown))
++}
++
++/// Where the tool waits between pecks: the plunge height over the
++/// material, held under the retract plane (`feed_down`'s own rapid plane).
++#[must_use]
++fn retract_plane(p: &ContourParams, hop_z: f64) -> f64 {
++    let top = p.entry_top();
++    (top + p.links.approach.plunge_height.max(0.0)).min(hop_z.max(top))
++}
++
++/// The dive the tool stands over at `xy`: the first feed down by `first`
++/// (the caller's plunge to the depth it is given), then the pecks to `z`.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn dive(
++    b: &mut PathBuilder,
++    p: &ContourParams,
++    xy: Point2,
++    z: f64,
++    uncut: Option<f64>,
++    hop_z: f64,
++    feed: f64,
++    first: impl FnOnce(&mut PathBuilder, f64),
++) {
++    let depths = peck_depths(b.moves(), xy, z, p.tool_diameter * 0.5, p.stepdown, uncut);
++    first(b, depths.first().copied().unwrap_or(z));
++    push_pecks(b, xy, &depths, retract_plane(p, hop_z), p.links.approach.plunge_height, feed);
++}
++
++/// The pecks after the first feed down (`depths[0]`, already posted): up
++/// to `retract` - air over the material - by rapid, down by rapid to the
++/// plunge height over the last depth, then the feed one stepdown deeper.
++/// A pecked dive is said in one note for the path.
++fn push_pecks(b: &mut PathBuilder, xy: Point2, depths: &[f64], retract: f64, h: f64, feed: f64) {
++    let Some((&first, rest)) = depths.split_first() else { return };
++    let mut last = first;
++    for &d in rest {
++        b.push(MoveKind::Rapid, Point3::new(xy.x, xy.y, retract), None);
++        let back = last + h.max(0.0);
++        if h > 0.0 && back < retract {
++            b.push(MoveKind::Rapid, Point3::new(xy.x, xy.y, back), None);
++        }
++        b.push(MoveKind::Plunge, Point3::new(xy.x, xy.y, d), Some(feed));
++        last = d;
++    }
++    if !rest.is_empty() {
++        const SAID: &str = "entry: a dive more than one stepdown below the floor that the levels above left under the tool disc";
++        if !b.notes().iter().any(|n| n.starts_with(SAID)) {
++            b.note(format!(
++                "{SAID} is pecked one stepdown at a time (first at ({:.3}, {:.3}) to Z {:.3}, {} pecks)",
++                xy.x,
++                xy.y,
++                depths[depths.len() - 1],
++                depths.len()
++            ));
++        }
++    }
++}
++
++/// Distance from `p` to the segment `a -> b`.
++fn seg_dist(p: Point2, a: Point2, b: Point2) -> f64 {
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let dd = dx * dx + dy * dy;
++    let t = if dd > 0.0 && dd.is_finite() { (((p.x - a.x) * dx + (p.y - a.y) * dy) / dd).clamp(0.0, 1.0) } else { 0.0 };
++    (p.x - a.x - t * dx).hypot(p.y - a.y - t * dy)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_dive_within_one_stepdown_or_on_a_first_level_does_not_peck() {
++        assert_eq!(peck_depths(&[], Point2::new(0.0, 0.0), -4.5, 3.0, 4.5, Some(0.0)), vec![-4.5]);
++        assert_eq!(peck_depths(&[], Point2::new(0.0, 0.0), -18.0, 3.0, 4.5, None), vec![-18.0]);
++    }
++
++    #[test]
++    fn a_dive_into_uncut_stock_pecks_one_stepdown_at_a_time() {
++        let d = peck_depths(&[], Point2::new(0.0, 0.0), -18.0, 3.0, 4.5, Some(0.0));
++        assert_eq!(d, vec![-4.5, -9.0, -13.5, -18.0]);
++    }
++}
+diff --git a/crates/motion/src/machining2d/contour_step.rs b/crates/motion/src/machining2d/contour_step.rs
+index 08a877cbb..a6269e279 100644
+--- a/crates/motion/src/machining2d/contour_step.rs
++++ b/crates/motion/src/machining2d/contour_step.rs
+@@ -21,6 +21,7 @@ use crate::approach::CENTER_CUT_REFUSAL;
+ use super::contour_bore::{BoreStep, bore_entry};
+ use super::contour_entry::Engage;
+ use super::contour_params::Lead;
++use super::contour_peck;
+ use super::descent::feed_down;
+ 
+ /// What one level's engagement reads beyond the shared [`Engage`].
+@@ -44,6 +45,10 @@ pub(super) struct Step {
+     /// or the vertical lead-in's height over it (M11.3 C) - the lead then
+     /// descends along itself.
+     pub lead_top: f64,
++    /// #3678: the floor with no cut under the disc on a level below the
++    /// ring's first (`contour_peck::uncut_floor`); the dive pecks where it
++    /// would go more than one stepdown below the floor under the disc.
++    pub uncut: Option<f64>,
+ }
+ 
+ /// Structural refusals, each said once per path.
+@@ -99,7 +104,7 @@ pub(super) fn engage_level(b: &mut PathBuilder, eng: &Engage, s: &Step, lead: &[
+         }
+         let cur = b.at();
+         b.push(MoveKind::Rapid, Point3::new(e2.x, e2.y, cur.z), None);
+-        graze(b, eng, e2, s.lead_top, s.arm);
++        graze(b, eng, e2, s.lead_top, s.arm, s.uncut);
+         None
+     } else if s.inside {
+         // The bore side: the eroded region states the bounded air
+@@ -127,7 +132,7 @@ pub(super) fn engage_level(b: &mut PathBuilder, eng: &Engage, s: &Step, lead: &[
+         }
+         let cur = b.at();
+         b.push(MoveKind::Rapid, Point3::new(e2.x, e2.y, cur.z), None);
+-        graze(b, eng, e2, s.lead_top, s.arm);
++        graze(b, eng, e2, s.lead_top, s.arm, s.uncut);
+         None
+     }
+ }
+@@ -137,8 +142,9 @@ pub(super) fn engage_level(b: &mut PathBuilder, eng: &Engage, s: &Step, lead: &[
+ /// generator's contract, nothing is engaged above it (M11.3) - then feed.
+ /// A tool that is not centre-cutting may not plunge here (the stock
+ /// beside the wall is not proved cleared): the operation is refused by
+-/// name.
+-fn graze(b: &mut PathBuilder, eng: &Engage, e2: Point2, z: f64, arm: Entry3D) {
++/// name. Below a ring's first level the dive pecks where it would go more
++/// than one stepdown below the floor under the disc (#3678).
++fn graze(b: &mut PathBuilder, eng: &Engage, e2: Point2, z: f64, arm: Entry3D, uncut: Option<f64>) {
+     let p = eng.p;
+     let a = &p.links.approach;
+     if !a.center_cutting {
+@@ -149,7 +155,8 @@ fn graze(b: &mut PathBuilder, eng: &Engage, e2: Point2, z: f64, arm: Entry3D) {
+             graze_hint(arm, p.lead == Lead::None)
+         ));
+     }
+-    feed_down(b, e2, z, p.entry_top(), eng.m, a.plunge(p.plunge_feed));
++    let feed = a.plunge(p.plunge_feed);
++    contour_peck::dive(b, p, e2, z, uncut, eng.m.hop_z, feed, |b, d| feed_down(b, e2, d, p.entry_top(), eng.m, feed));
+ }
+ 
+ /// What the user can change to lift the refusal. The Arc entry is already
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 05e1d0936..5bed467e9 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -55,6 +55,7 @@ mod contour_depth;
+ mod contour_entry;
+ mod contour_link;
+ mod contour_params;
++mod contour_peck;
+ mod contour_run_side;
+ mod contour_run_stock;
+ mod contour_start;
+diff --git a/crates/motion/tests/contour_tab_entry.rs b/crates/motion/tests/contour_tab_entry.rs
+index da0cec9e4..61bd09b7f 100644
+--- a/crates/motion/tests/contour_tab_entry.rs
++++ b/crates/motion/tests/contour_tab_entry.rs
+@@ -1,12 +1,12 @@
+ //! 2D Contour tab entry (#3453): the first tabbed level of an Outside
+ //! contour on a sheet enters at the start the untabbed levels entered at,
+ //! one stepdown at most below the floor that they left under the FULL tool
+-//! disc - not only the tool centre. The later tab windows are pinned as
+-//! they are (#3678 owns their dives). The oracle is the posted path alone:
+-//! the floor at a point is the lowest level pass (a feed at one height)
+-//! whose swept disc holds it, else the top of the stock.
++//! disc - not only the tool centre. #3678: every dive is one stepdown at
++//! most below that floor, a deeper one pecks. The oracle is the posted path
++//! alone: the floor at a point is the lowest cut (a feed at one height, or
++//! a straight plunge column) whose swept disc holds it, else the stock top.
+ //!
+-//! Gate map (M4.4): covers camcraft_motion::machining2d (contour, contour_start, contour_step, contour_link).
++//! Gate map (M4.4): covers camcraft_motion::machining2d (contour, contour_start, contour_step, contour_link, contour_peck).
+ 
+ use camcraft_motion::cl::{MoveKind, Toolpath};
+ use camcraft_motion::entry::Entry3D;
+@@ -122,6 +122,13 @@ fn descents(t: &Toolpath) -> Vec<Descent> {
+         if flat && m.kind == MoveKind::Feed {
+             cuts.push((m.to.z, m.chords(0.001)));
+         }
++        // #3678: a straight plunge cuts the column under its disc to its
++        // depth (a peck stands on the one before it).
++        let vertical = m.from.x == m.to.x && m.from.y == m.to.y && m.to.z < m.from.z;
++        if vertical {
++            let c = Point2::new(m.to.x, m.to.y);
++            cuts.push((m.to.z, vec![(c, c)]));
++        }
+     }
+     out
+ }
+@@ -198,20 +205,53 @@ fn the_first_tabbed_window_enters_where_the_levels_above_cut_its_lead_in() {
+     assert!(same_xy(ds[0].at, first), "{name}: window 0 enters at {:?}, not at the untabbed start {first:?}", ds[0].at);
+     assert!((ds[0].from_z - 2.0).abs() < 1e-9, "{name}: the dive starts at the plunge height");
+     // Windows 1 to 3: their lead-in starts stand 3 mm outside the ring,
+-    // with a 2.5 mm crescent of the disc in stock that no level above cut:
+-    // an 18 mm plunge (#3678 owns it; these readings change with its fix).
+-    assert_readings(name, &readings(&ds), &[(2.7, 0.0), (18.0, 2.501), (18.0, 2.501), (18.0, 2.501)]);
++    // with a 2.5 mm crescent of the disc in stock that no level above cut.
++    // On origin/main that was an 18 mm plunge; #3678 pecks it one stepdown
++    // at a time, so the last peck is 4.5 mm below the one before it.
++    assert_readings(name, &readings(&ds), &[(2.7, 0.0), (4.5, 2.501), (4.5, 2.501), (4.5, 2.501)]);
+     assert!(ds[0].to_z >= ds[0].floor_disc - STEP - 1e-6, "{name}: window 0 is one stepdown at most below the disc floor");
+ }
+ 
+ #[test]
+ fn the_first_tabbed_window_of_the_stay_down_ramp_enters_at_the_untabbed_start() {
+     // The stay-down levels cut the lead-in only on the first level: the
+-    // disc floor at the start is -4.5 (#3678 owns the 13.5 mm plunge).
++    // disc floor at the start is -4.5. On origin/main window 0 plunged
++    // 13.5 mm below it; #3678 pecks it (and windows 1 to 3) one stepdown
++    // at a time.
+     let name = "keep-down ramp, arc lead";
+     let (first, ds) = tabbed_entries(name, keep_down_ramp(), Lead::Arc { radius: 3.0 });
+     assert!(same_xy(ds[0].at, first), "{name}: window 0 enters at {:?}, not at the untabbed start {first:?}", ds[0].at);
+-    assert_readings(name, &readings(&ds), &[(13.5, 2.501), (18.0, 2.501), (18.0, 2.501), (18.0, 2.501)]);
++    assert_readings(name, &readings(&ds), &[(4.5, 2.501), (4.5, 2.501), (4.5, 2.501), (4.5, 2.501)]);
++}
++
++#[test]
++fn no_contour_descent_goes_more_than_one_stepdown_below_the_disc_floor() {
++    // #3678: every feed down of the three presets (and Lead None) stands
++    // at most one stepdown below the floor that the cuts before it left
++    // under the full tool disc. A deeper dive pecks, and says so once.
++    let presets = [
++        ("plunge, arc lead", Links::PLANAR, Lead::Arc { radius: 3.0 }),
++        ("keep-down ramp, arc lead", keep_down_ramp(), Lead::Arc { radius: 3.0 }),
++        ("plunge, no lead", Links::PLANAR, Lead::None),
++        ("keep-down ramp, no lead", keep_down_ramp(), Lead::None),
++    ];
++    for (name, links, lead) in presets {
++        let t = contour(&l_shape(), &params(lead, links)).unwrap();
++        for d in report(name, &t) {
++            assert!(
++                d.to_z >= d.floor_disc - STEP - 1e-6,
++                "{name}: the descent at ({:.3}, {:.3}) Z {:.3} -> {:.3} is {:.3} mm below the disc floor {:.3}",
++                d.at.x,
++                d.at.y,
++                d.from_z,
++                d.to_z,
++                d.floor_disc - d.to_z,
++                d.floor_disc
++            );
++        }
++        let pecked = t.notes.iter().filter(|n| n.contains("pecked")).count();
++        assert!(pecked <= 1, "{name}: the peck is said once, not {pecked} times");
++    }
+ }
+ 
+ #[test]
+diff --git a/docs/decisions/3678-tab-window-dive.md b/docs/decisions/3678-tab-window-dive.md
+new file mode 100644
+index 000000000..2deadfc80
+--- /dev/null
++++ b/docs/decisions/3678-tab-window-dive.md
+@@ -0,0 +1,32 @@
++## #3678 - A contour dive below the levels above pecks one stepdown at a time
++
++**Decided.** A 2D Contour dive on a level below its ring's first level
++reads the floor that the posted cuts left under the full tool disc. The
++cuts are the feeds at one height and the straight plunge columns. If the
++dive goes more than one stepdown below that floor, it pecks: a feed down
++one stepdown, a rapid up to the plunge height over the material, a rapid
++down to the plunge height over the last depth, the next feed. One note
++for each path says it. The guard is on the wall-side graze dive (and the
++tabbed bore dive, the same function) and on the dive past a tab.
++
++The floor with no cut is the material top, or one stepdown over the
++ring's first level where that is lower (a shelf band). A ring's first
++level never pecks.
++
++**Why.** The issue's proposed fix. It is local to the two dive sites. It
++changes no XY path: the tab layout, the leads and the level order stay.
++The posted path is the only input, so the guard sees the same floor that
++the test oracle sees.
++
++**Dropped.** Cut the window lead-ins on the levels above. That changes the
++untabbed levels of every tabbed contour (more XY travel at each level) and
++the stay-down descents. It also leaves the 13.5 mm dive of the stay-down
++preset, whose untabbed levels do not leave the ring. The peck covers that
++case too.
++
++**Not changed.** The lead-in arc after a tab window still feeds at the
++level through the 2.5 mm crescent of the disc that the levels above did
++not cut. The issue's "Expected" is about the plunge only.
++
++**Cost to change.** Small: the guard is `contour_peck::dive`, called at two
++sites.
+
+From 252928f3253d803c987681c031152c63e6f45598 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 00:37:52 -0800
+Subject: [PATCH 2/5] test(2d): regenerate the contour-tabs case and the router
+ demo for the pecked tab dives
+
+Refs #3678
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../2d/contour-tabs/contour-tabs.camproj      | 247 +++++++++++++++++-
+ .../catalog/2d/contour-tabs/contour-tabs.nc   |  18 ++
+ examples/first-router-part.camproj            | 245 ++++++++++++++++-
+ 3 files changed, 507 insertions(+), 3 deletions(-)
+
+diff --git a/examples/catalog/2d/contour-tabs/contour-tabs.camproj b/examples/catalog/2d/contour-tabs/contour-tabs.camproj
+index daffef47d..2c3890f4a 100644
+--- a/examples/catalog/2d/contour-tabs/contour-tabs.camproj
++++ b/examples/catalog/2d/contour-tabs/contour-tabs.camproj
+@@ -1,5 +1,5 @@
+ {
+-  "version": 77,
++  "version": 78,
+   "entities": [
+     {
+       "name": "2D Contour1",
+@@ -1029,6 +1029,86 @@
+                 -31.0,
+                 11.0
+               ],
++              "to": [
++                -6.51496,
++                -31.0,
++                4.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -6.51496,
++                -31.0,
++                4.0
++              ],
++              "to": [
++                -6.51496,
++                -31.0,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -6.51496,
++                -31.0,
++                8.0
++              ],
++              "to": [
++                -6.51496,
++                -31.0,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -6.51496,
++                -31.0,
++                6.0
++              ],
++              "to": [
++                -6.51496,
++                -31.0,
++                2.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -6.51496,
++                -31.0,
++                2.0
++              ],
++              "to": [
++                -6.51496,
++                -31.0,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -6.51496,
++                -31.0,
++                8.0
++              ],
++              "to": [
++                -6.51496,
++                -31.0,
++                4.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -6.51496,
++                -31.0,
++                4.0
++              ],
+               "to": [
+                 -6.51496,
+                 -31.0,
+@@ -1189,6 +1269,86 @@
+                 6.51496,
+                 11.0
+               ],
++              "to": [
++                -51.0,
++                6.51496,
++                4.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -51.0,
++                6.51496,
++                4.0
++              ],
++              "to": [
++                -51.0,
++                6.51496,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -51.0,
++                6.51496,
++                8.0
++              ],
++              "to": [
++                -51.0,
++                6.51496,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -51.0,
++                6.51496,
++                6.0
++              ],
++              "to": [
++                -51.0,
++                6.51496,
++                2.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -51.0,
++                6.51496,
++                2.0
++              ],
++              "to": [
++                -51.0,
++                6.51496,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -51.0,
++                6.51496,
++                8.0
++              ],
++              "to": [
++                -51.0,
++                6.51496,
++                4.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -51.0,
++                6.51496,
++                4.0
++              ],
+               "to": [
+                 -51.0,
+                 6.51496,
+@@ -1349,6 +1509,86 @@
+                 31.0,
+                 11.0
+               ],
++              "to": [
++                6.51496,
++                31.0,
++                4.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                6.51496,
++                31.0,
++                4.0
++              ],
++              "to": [
++                6.51496,
++                31.0,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                6.51496,
++                31.0,
++                8.0
++              ],
++              "to": [
++                6.51496,
++                31.0,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                6.51496,
++                31.0,
++                6.0
++              ],
++              "to": [
++                6.51496,
++                31.0,
++                2.0
++              ],
++              "feed": 300.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                6.51496,
++                31.0,
++                2.0
++              ],
++              "to": [
++                6.51496,
++                31.0,
++                8.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                6.51496,
++                31.0,
++                8.0
++              ],
++              "to": [
++                6.51496,
++                31.0,
++                4.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                6.51496,
++                31.0,
++                4.0
++              ],
+               "to": [
+                 6.51496,
+                 31.0,
+@@ -1489,7 +1729,10 @@
+               ]
+             }
+           ],
+-          "warnings": []
++          "warnings": [],
++          "notes": [
++            "entry: a dive more than one stepdown below the floor that the levels above left under the tool disc is pecked one stepdown at a time (first at (-6.515, -31.000) to Z 0.000, 3 pecks)"
++          ]
+         }
+       }
+     },
+diff --git a/examples/catalog/2d/contour-tabs/contour-tabs.nc b/examples/catalog/2d/contour-tabs/contour-tabs.nc
+index 71964ba49..b09eb8f31 100644
+--- a/examples/catalog/2d/contour-tabs/contour-tabs.nc
++++ b/examples/catalog/2d/contour-tabs/contour-tabs.nc
+@@ -67,6 +67,12 @@ G01 X11.355 Y-28. Z0. F1200.
+ G01 X7.355 Y-28. Z0. F1200.
+ G01 X7.355 Y-28. Z11. F1200.
+ G00 X-6.515 Y-31. Z11.
++G01 X-6.515 Y-31. Z4. F300.
++G00 X-6.515 Y-31. Z8.
++G00 X-6.515 Y-31. Z6.
++G01 X-6.515 Y-31. Z2. F300.
++G00 X-6.515 Y-31. Z8.
++G00 X-6.515 Y-31. Z4.
+ G01 X-6.515 Y-31. Z0. F300.
+ G03 X-9.515 Y-28. Z0. I-3. J0. F1200.
+ G01 X-35. Y-28. Z0. F1200.
+@@ -77,6 +83,12 @@ G01 X-48. Y-11.355 Z0. F1200.
+ G01 X-48. Y-7.355 Z0. F1200.
+ G01 X-48. Y-7.355 Z11. F1200.
+ G00 X-51. Y6.515 Z11.
++G01 X-51. Y6.515 Z4. F300.
++G00 X-51. Y6.515 Z8.
++G00 X-51. Y6.515 Z6.
++G01 X-51. Y6.515 Z2. F300.
++G00 X-51. Y6.515 Z8.
++G00 X-51. Y6.515 Z4.
+ G01 X-51. Y6.515 Z0. F300.
+ G03 X-48. Y9.515 Z0. I0. J3. F1200.
+ G01 X-48. Y15. Z0. F1200.
+@@ -87,6 +99,12 @@ G01 X-11.355 Y28. Z0. F1200.
+ G01 X-7.355 Y28. Z0. F1200.
+ G01 X-7.355 Y28. Z11. F1200.
+ G00 X6.515 Y31. Z11.
++G01 X6.515 Y31. Z4. F300.
++G00 X6.515 Y31. Z8.
++G00 X6.515 Y31. Z6.
++G01 X6.515 Y31. Z2. F300.
++G00 X6.515 Y31. Z8.
++G00 X6.515 Y31. Z4.
+ G01 X6.515 Y31. Z0. F300.
+ G03 X9.515 Y28. Z0. I3. J0. F1200.
+ G01 X35. Y28. Z0. F1200.
+diff --git a/examples/first-router-part.camproj b/examples/first-router-part.camproj
+index f24322ce9..a9b123617 100644
+--- a/examples/first-router-part.camproj
++++ b/examples/first-router-part.camproj
+@@ -1067,6 +1067,86 @@
+                 -56.0,
+                 17.0
+               ],
++              "to": [
++                0.991344,
++                -56.0,
++                8.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                0.991344,
++                -56.0,
++                8.0
++              ],
++              "to": [
++                0.991344,
++                -56.0,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                0.991344,
++                -56.0,
++                14.0
++              ],
++              "to": [
++                0.991344,
++                -56.0,
++                10.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                0.991344,
++                -56.0,
++                10.0
++              ],
++              "to": [
++                0.991344,
++                -56.0,
++                4.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                0.991344,
++                -56.0,
++                4.0
++              ],
++              "to": [
++                0.991344,
++                -56.0,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                0.991344,
++                -56.0,
++                14.0
++              ],
++              "to": [
++                0.991344,
++                -56.0,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                0.991344,
++                -56.0,
++                6.0
++              ],
+               "to": [
+                 0.991344,
+                 -56.0,
+@@ -1199,6 +1279,86 @@
+                 -0.991344,
+                 17.0
+               ],
++              "to": [
++                -76.0,
++                -0.991344,
++                8.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -76.0,
++                -0.991344,
++                8.0
++              ],
++              "to": [
++                -76.0,
++                -0.991344,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -76.0,
++                -0.991344,
++                14.0
++              ],
++              "to": [
++                -76.0,
++                -0.991344,
++                10.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -76.0,
++                -0.991344,
++                10.0
++              ],
++              "to": [
++                -76.0,
++                -0.991344,
++                4.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -76.0,
++                -0.991344,
++                4.0
++              ],
++              "to": [
++                -76.0,
++                -0.991344,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -76.0,
++                -0.991344,
++                14.0
++              ],
++              "to": [
++                -76.0,
++                -0.991344,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -76.0,
++                -0.991344,
++                6.0
++              ],
+               "to": [
+                 -76.0,
+                 -0.991344,
+@@ -1331,6 +1491,86 @@
+                 56.0,
+                 17.0
+               ],
++              "to": [
++                -0.991344,
++                56.0,
++                8.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -0.991344,
++                56.0,
++                8.0
++              ],
++              "to": [
++                -0.991344,
++                56.0,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -0.991344,
++                56.0,
++                14.0
++              ],
++              "to": [
++                -0.991344,
++                56.0,
++                10.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -0.991344,
++                56.0,
++                10.0
++              ],
++              "to": [
++                -0.991344,
++                56.0,
++                4.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -0.991344,
++                56.0,
++                4.0
++              ],
++              "to": [
++                -0.991344,
++                56.0,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                -0.991344,
++                56.0,
++                14.0
++              ],
++              "to": [
++                -0.991344,
++                56.0,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                -0.991344,
++                56.0,
++                6.0
++              ],
+               "to": [
+                 -0.991344,
+                 56.0,
+@@ -1443,7 +1683,10 @@
+               ]
+             }
+           ],
+-          "warnings": []
++          "warnings": [],
++          "notes": [
++            "entry: a dive more than one stepdown below the floor that the levels above left under the tool disc is pecked one stepdown at a time (first at (0.991, -56.000) to Z 0.000, 3 pecks)"
++          ]
+         },
+         "coolant": "off"
+       }
+
+From 3d1564e10ade3f895b3242fc0c4aee0deec19ea3 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 01:33:08 -0800
+Subject: [PATCH 3/5] test(2d): count the contour-tabs peck retracts apart from
+ the lifts
+
+The tab windows 1 to 3 of the contour-tabs case now peck their dive.
+The lift count keeps the lead-out lifts and pins the six peck retracts.
+
+Refs #3678
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/example_catalog.rs        | 12 +++++++++---
+ examples/catalog/2d/contour-tabs/README.md |  1 +
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/crates/app/tests/example_catalog.rs b/crates/app/tests/example_catalog.rs
+index be58efbcf..e75282013 100644
+--- a/crates/app/tests/example_catalog.rs
++++ b/crates/app/tests/example_catalog.rs
+@@ -346,9 +346,15 @@ fn contour_tabs_case_posts_the_lead_moves_and_the_tab_lifts() {
+     assert_eq!(lead_ins(0.0), 4, "one lead-in arc for each run between two tabs at Z0");
+ 
+     // A lift goes from a cut level to a height above the stock top (Z6).
+-    // The block before it is the end of the linear lead-out.
+-    let lifts: Vec<usize> =
+-        (1..blocks.len()).filter(|&i| blocks[i - 1].1 <= 4.0 && blocks[i].1 > 6.0).collect();
++    // The block before it is the end of the linear lead-out. #3678: a rise
++    // after a G01 that went down is a peck retract, not a lift. Tab windows
++    // 1 to 3 start where the levels above left stock under the disc, so
++    // each dive pecks Z4, Z2, Z0: two retracts each.
++    let rises: Vec<usize> =
++        (2..blocks.len()).filter(|&i| blocks[i - 1].1 <= 4.0 && blocks[i].1 > 6.0).collect();
++    let peck = |i: usize| blocks[i - 1].0 == "G01" && blocks[i - 2].1 > blocks[i - 1].1;
++    let (pecks, lifts): (Vec<usize>, Vec<usize>) = rises.into_iter().partition(|&i| peck(i));
++    assert_eq!(pecks.len(), 6, "tab windows 1 to 3 each peck to Z0 with two retracts");
+     assert_eq!(lifts.len(), 6, "two whole rings and four tab runs each end with a lift");
+     for &i in &lifts {
+         assert_eq!(blocks[i - 1].0, "G01", "the block before lift {i} is the linear lead-out");
+diff --git a/examples/catalog/2d/contour-tabs/README.md b/examples/catalog/2d/contour-tabs/README.md
+index bf9063b6a..b9094120b 100644
+--- a/examples/catalog/2d/contour-tabs/README.md
++++ b/examples/catalog/2d/contour-tabs/README.md
+@@ -13,6 +13,7 @@ A 90 x 50 x 6 mm clean-room plate with four 10 mm corner chamfers. One 2D Contou
+ 
+ - In `contour-tabs.nc`, the levels `Z4` and `Z2` each have one `G03` lead-in and one lift.
+ - The level `Z0` has four `G03` lead-ins and four lifts. The first three lifts are `G01` moves to the retract height `Z11`. The last lift is the `G00` move to the clearance height `Z21`.
++- The last three `Z0` runs start where the levels above did not cut under the full tool. Each dive there pecks: `G01` to `Z4`, `Z2`, then `Z0`, with a `G00` retract to `Z8` between the pecks.
+ - The gap between two `Z0` runs is larger than the tab width plus the tool diameter (14 mm). The tab fit moves the runs apart until the two lead moves leave the full 8 mm of the tab.
+ - The outline corners are `G02` arcs of 3 mm radius: the tool centre rolls around each sharp corner of the plate.
+ - `build.camscript` sets `lead` with `linear: null`. `add_operation` applies `params` as a merge patch on the seeded linear lead, and a lead holds one shape only (#2876).
+
+From 78433e49e31c06a6ef77f526bdfdaae7ffefe317 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 04:12:44 -0800
+Subject: [PATCH 4/5] fix(2d): prove full-disc clearance and preserve every
+ peck
+
+Treat uncertain swept-disc coverage as uncut material. Preserve the stepdown beyond 4096 pecks and regenerate the router program. Add independent rim and peck-count pins.
+
+Fixes #3678
+---
+ crates/motion/src/machining2d/contour_peck.rs | 148 +++++++++++-------
+ crates/motion/tests/contour_tab_entry.rs      |  59 +++++--
+ docs/decisions/3678-tab-window-dive.md        |  19 ++-
+ examples/first-router-part.nc                 |  18 +++
+ 4 files changed, 179 insertions(+), 65 deletions(-)
+
+diff --git a/crates/motion/src/machining2d/contour_peck.rs b/crates/motion/src/machining2d/contour_peck.rs
+index be702f109..d53755f48 100644
+--- a/crates/motion/src/machining2d/contour_peck.rs
++++ b/crates/motion/src/machining2d/contour_peck.rs
+@@ -15,72 +15,73 @@ use super::contour_params::ContourParams;
+ 
+ /// Height slack: a cut on the dive's own plane counts as at its depth.
+ const Z_EPS: f64 = 1e-6;
+-/// Chord tolerance the floor reads arcs at (mm).
+-const CHORD_TOL: f64 = 0.001;
+-/// Rings and points per ring the disc is sampled at, out to the rim.
+-const RINGS: u32 = 6;
+-const PER_RING: u32 = 72;
+-/// At most this many pecks: a dive that needs more is a bad stepdown.
+-const MAX_PECKS: usize = 4096;
+-
+-/// The highest floor under the tool disc of radius `r` at `xy`: at each
+-/// sample point the lowest Z of a posted cut whose swept disc holds it -
+-/// a feed at one height, or a straight plunge column - else `uncut`.
++/// A conservative floor under the complete tool disc of radius `r`.
++/// A previous cut proves clearance only if its centreline contains `xy`
++/// exactly. Then the disc swept at that centre contains the entire new
++/// disc, including its rim. Unknown coverage stays at `uncut`; samples
++/// and arc chords cannot prove that a thin crescent is clear.
+ #[must_use]
+ pub(super) fn disc_floor(moves: &[Move], xy: Point2, r: f64, uncut: f64) -> f64 {
+     if !(r.is_finite() && r > 0.0) {
+         return uncut;
+     }
+-    // Only the cuts within reach of the disc can hold a point of it.
+-    let near: Vec<(f64, Vec<(Point2, Point2)>)> = moves
++    moves
+         .iter()
+         .filter(|m| m.kind != MoveKind::Rapid && m.to.z < uncut - Z_EPS)
+-        .filter_map(|m| {
+-            let flat = (m.from.z - m.to.z).abs() <= Z_EPS;
+-            let column = m.from.x == m.to.x && m.from.y == m.to.y && m.to.z < m.from.z;
+-            let chords = if flat {
+-                m.chords(CHORD_TOL)
+-            } else if column {
+-                let c = Point2::new(m.to.x, m.to.y);
+-                vec![(c, c)]
+-            } else {
+-                return None;
+-            };
+-            chords.iter().any(|&(a, b)| seg_dist(xy, a, b) <= 2.0 * r + Z_EPS).then_some((m.to.z, chords))
++        .filter(|m| {
++            let from = Point2::new(m.from.x, m.from.y);
++            let to = Point2::new(m.to.x, m.to.y);
++            let at_from = xy.x == from.x && xy.y == from.y;
++            let at_to = xy.x == to.x && xy.y == to.y;
++            let column = from == to && m.to.z < m.from.z;
++            let flat = m.from.z == m.to.z;
++            // Endpoints are on both straight and circular centreline paths.
++            // For an interior point, certify only axis-aligned straight
++            // feeds: a rounded orientation test could hide a rim crescent.
++            let on_straight = m.kind == MoveKind::Feed
++                && m.arc.is_none()
++                && ((from.x == to.x && xy.x == from.x && between(xy.y, from.y, to.y))
++                    || (from.y == to.y && xy.y == from.y && between(xy.x, from.x, to.x)));
++            (column && at_to) || (flat && (at_from || at_to || on_straight))
+         })
+-        .collect();
+-    let floor = |q: Point2| {
+-        near.iter()
+-            .filter(|(_, ch)| ch.iter().any(|&(a, b)| seg_dist(q, a, b) <= r + Z_EPS))
+-            .map(|(z, _)| *z)
+-            .fold(uncut, f64::min)
+-    };
+-    let mut top = floor(xy);
+-    for ring in 1..=RINGS {
+-        let rr = r * f64::from(ring) / f64::from(RINGS) * 0.999;
+-        for k in 0..PER_RING {
+-            let t = std::f64::consts::TAU * f64::from(k) / f64::from(PER_RING);
+-            top = top.max(floor(Point2::new(xy.x + rr * t.cos(), xy.y + rr * t.sin())));
+-        }
+-    }
+-    top
++        .map(|m| m.to.z)
++        .fold(uncut, f64::min)
++}
++
++fn between(x: f64, a: f64, b: f64) -> bool {
++    x >= a.min(b) && x <= a.max(b)
+ }
+ 
+ /// The depths a dive at `xy` down to `z` stops at: one stepdown apart
+ /// below the disc floor, the last one `z`. A dive within one stepdown of
+ /// the floor (or with no `uncut` floor: a ring's first level) is `[z]`.
+ #[must_use]
+-pub(super) fn peck_depths(moves: &[Move], xy: Point2, z: f64, r: f64, step: f64, uncut: Option<f64>) -> Vec<f64> {
++pub(super) fn peck_depths(
++    moves: &[Move],
++    xy: Point2,
++    z: f64,
++    r: f64,
++    step: f64,
++    uncut: Option<f64>,
++) -> Vec<f64> {
+     let Some(uncut) = uncut else { return vec![z] };
+     if !(step.is_finite() && step > 0.0 && z.is_finite()) {
+         return vec![z];
+     }
+     let floor = disc_floor(moves, xy, r, uncut);
+     let mut out = Vec::new();
+-    let mut d = floor - step;
+-    while d > z + Z_EPS && out.len() < MAX_PECKS {
++    // The contour's level budget already bounds this span to 100,000
++    // stepdowns. Do not truncate it: an appended target after a cap can
++    // turn the last peck into a cut thousands of stepdowns deep.
++    // Compute each depth from the floor to avoid accumulated subtraction.
++    let mut index = 1_u32;
++    loop {
++        let d = floor - f64::from(index) * step;
++        if d <= z + Z_EPS {
++            break;
++        }
+         out.push(d);
+-        d -= step;
++        index += 1;
+     }
+     out.push(z);
+     out
+@@ -152,14 +153,6 @@ fn push_pecks(b: &mut PathBuilder, xy: Point2, depths: &[f64], retract: f64, h:
+     }
+ }
+ 
+-/// Distance from `p` to the segment `a -> b`.
+-fn seg_dist(p: Point2, a: Point2, b: Point2) -> f64 {
+-    let (dx, dy) = (b.x - a.x, b.y - a.y);
+-    let dd = dx * dx + dy * dy;
+-    let t = if dd > 0.0 && dd.is_finite() { (((p.x - a.x) * dx + (p.y - a.y) * dy) / dd).clamp(0.0, 1.0) } else { 0.0 };
+-    (p.x - a.x - t * dx).hypot(p.y - a.y - t * dy)
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -175,4 +168,53 @@ mod tests {
+         let d = peck_depths(&[], Point2::new(0.0, 0.0), -18.0, 3.0, 4.5, Some(0.0));
+         assert_eq!(d, vec![-4.5, -9.0, -13.5, -18.0]);
+     }
++    #[test]
++    fn an_offset_column_leaves_an_uncut_rim() {
++        // At x=-3 the new disc lies 3.002 mm from the prior column's
++        // centre. Its actual 3 mm radius cannot clear that rim point.
++        let prior = Move::new(
++            MoveKind::Plunge,
++            Point3::new(0.002, 0.0, 0.0),
++            Point3::new(0.002, 0.0, -18.0),
++            Some(100.0),
++        );
++        let xy = Point2::new(0.0, 0.0);
++        assert_eq!(disc_floor(&[prior], xy, 3.0, 0.0), 0.0);
++        assert_eq!(
++            peck_depths(&[prior], xy, -18.0, 3.0, 4.5, Some(0.0)),
++            vec![-4.5, -9.0, -13.5, -18.0]
++        );
++    }
++
++    #[test]
++    fn an_offset_straight_cut_does_not_prove_full_disc_coverage() {
++        let prior = Move::new(
++            MoveKind::Feed,
++            Point3::new(-5.0, 0.002, -18.0),
++            Point3::new(5.0, 0.002, -18.0),
++            Some(100.0),
++        );
++        // The analytic distance of (0,-3) to the segment is 3.002 mm.
++        assert_eq!(disc_floor(&[prior], Point2::new(0.0, 0.0), 3.0, 0.0), 0.0);
++        // A centre exactly on this straight cut proves the whole disc.
++        assert_eq!(
++            disc_floor(&[prior], Point2::new(0.0, 0.002), 3.0, 0.0),
++            -18.0
++        );
++    }
++
++    #[test]
++    fn a_dive_beyond_4096_pecks_preserves_every_stepdown() {
++        let depths = peck_depths(&[], Point2::new(0.0, 0.0), -50.0, 3.0, 0.01, Some(0.0));
++        assert_eq!(depths.len(), 5000);
++        let mut previous = 0.0;
++        for depth in depths {
++            assert!(
++                previous - depth <= 0.01 + 1e-10,
++                "unsafe final cut: {previous} -> {depth}"
++            );
++            previous = depth;
++        }
++        assert_eq!(previous, -50.0);
++    }
+ }
+diff --git a/crates/motion/tests/contour_tab_entry.rs b/crates/motion/tests/contour_tab_entry.rs
+index 61bd09b7f..c34a164e9 100644
+--- a/crates/motion/tests/contour_tab_entry.rs
++++ b/crates/motion/tests/contour_tab_entry.rs
+@@ -8,7 +8,7 @@
+ //!
+ //! Gate map (M4.4): covers camcraft_motion::machining2d (contour, contour_start, contour_step, contour_link, contour_peck).
+ 
+-use camcraft_motion::cl::{MoveKind, Toolpath};
++use camcraft_motion::cl::{Move, MoveKind, Toolpath};
+ use camcraft_motion::entry::Entry3D;
+ use camcraft_motion::geo2d::{Loop, Point2, Region};
+ use camcraft_motion::links::{Link, Links};
+@@ -64,11 +64,31 @@ fn seg_dist(p: Point2, a: Point2, b: Point2) -> f64 {
+     (p.x - (a.x + t * dx)).hypot(p.y - (a.y + t * dy))
+ }
+ 
++/// Distance to the actual flat cut, including the circular sweep.
++/// Inscribed arc chords leave artificial gaps at the cutter's full rim.
++fn cut_distance(q: Point2, m: &Move) -> f64 {
++    let a = Point2::new(m.from.x, m.from.y);
++    let b = Point2::new(m.to.x, m.to.y);
++    let Some(arc) = m.arc else { return seg_dist(q, a, b) };
++    let angle = |p: Point2| (p.y - arc.center.y).atan2(p.x - arc.center.x);
++    let directed = |from: f64, to: f64| {
++        (if arc.ccw { to - from } else { from - to }).rem_euclid(std::f64::consts::TAU)
++    };
++    let endpoints = (q.x - a.x).hypot(q.y - a.y).min((q.x - b.x).hypot(q.y - b.y));
++    if directed(angle(a), angle(q)) <= directed(angle(a), angle(b)) {
++        let radius = (a.x - arc.center.x).hypot(a.y - arc.center.y);
++        let radial = (q.x - arc.center.x).hypot(q.y - arc.center.y);
++        endpoints.min((radial - radius).abs())
++    } else {
++        endpoints
++    }
++}
++
+ /// Points of the tool disc at `c`: the centre and rings out to the rim.
+ fn disc(c: Point2) -> Vec<Point2> {
+     let mut out = vec![c];
+     for ring in 1..=6 {
+-        let rr = R * f64::from(ring) / 6.0 * 0.999;
++        let rr = R * f64::from(ring) / 6.0;
+         for k in 0..72 {
+             let t = std::f64::consts::TAU * f64::from(k) / 72.0;
+             out.push(Point2::new(c.x + rr * t.cos(), c.y + rr * t.sin()));
+@@ -94,7 +114,7 @@ struct Descent {
+ 
+ /// Every feed move that descends, with the floors before it.
+ fn descents(t: &Toolpath) -> Vec<Descent> {
+-    let mut cuts: Vec<(f64, Vec<(Point2, Point2)>)> = Vec::new();
++    let mut cuts: Vec<Move> = Vec::new();
+     let mut out = Vec::new();
+     for m in &t.moves {
+         let flat = (m.from.z - m.to.z).abs() < 1e-12;
+@@ -105,8 +125,8 @@ fn descents(t: &Toolpath) -> Vec<Descent> {
+             let at = Point2::new(m.to.x, m.to.y);
+             let floor = |q: Point2| {
+                 cuts.iter()
+-                    .filter(|(_, ch)| ch.iter().any(|&(a, b)| seg_dist(q, a, b) <= R + 1e-6))
+-                    .map(|(z, _)| *z)
++                    .filter(|cut| cut_distance(q, cut) <= R + 1e-6)
++                    .map(|cut| cut.to.z)
+                     .fold(TOP, f64::min)
+             };
+             let fc = floor(at);
+@@ -120,14 +140,13 @@ fn descents(t: &Toolpath) -> Vec<Descent> {
+             out.push(Descent { at, from_z: m.from.z, to_z: m.to.z, floor_centre: fc, floor_disc: fd, crescent });
+         }
+         if flat && m.kind == MoveKind::Feed {
+-            cuts.push((m.to.z, m.chords(0.001)));
++            cuts.push(*m);
+         }
+         // #3678: a straight plunge cuts the column under its disc to its
+         // depth (a peck stands on the one before it).
+         let vertical = m.from.x == m.to.x && m.from.y == m.to.y && m.to.z < m.from.z;
+         if vertical {
+-            let c = Point2::new(m.to.x, m.to.y);
+-            cuts.push((m.to.z, vec![(c, c)]));
++            cuts.push(*m);
+         }
+     }
+     out
+@@ -208,7 +227,7 @@ fn the_first_tabbed_window_enters_where_the_levels_above_cut_its_lead_in() {
+     // with a 2.5 mm crescent of the disc in stock that no level above cut.
+     // On origin/main that was an 18 mm plunge; #3678 pecks it one stepdown
+     // at a time, so the last peck is 4.5 mm below the one before it.
+-    assert_readings(name, &readings(&ds), &[(2.7, 0.0), (4.5, 2.501), (4.5, 2.501), (4.5, 2.501)]);
++    assert_readings(name, &readings(&ds), &[(2.7, 0.0), (4.5, 2.5), (4.5, 2.5), (4.5, 2.5)]);
+     assert!(ds[0].to_z >= ds[0].floor_disc - STEP - 1e-6, "{name}: window 0 is one stepdown at most below the disc floor");
+ }
+ 
+@@ -221,7 +240,7 @@ fn the_first_tabbed_window_of_the_stay_down_ramp_enters_at_the_untabbed_start()
+     let name = "keep-down ramp, arc lead";
+     let (first, ds) = tabbed_entries(name, keep_down_ramp(), Lead::Arc { radius: 3.0 });
+     assert!(same_xy(ds[0].at, first), "{name}: window 0 enters at {:?}, not at the untabbed start {first:?}", ds[0].at);
+-    assert_readings(name, &readings(&ds), &[(4.5, 2.501), (4.5, 2.501), (4.5, 2.501), (4.5, 2.501)]);
++    assert_readings(name, &readings(&ds), &[(4.5, 2.5), (4.5, 2.5), (4.5, 2.5), (4.5, 2.5)]);
+ }
+ 
+ #[test]
+@@ -264,3 +283,23 @@ fn a_tabbed_level_without_a_lead_enters_in_the_kerf_of_the_level_above() {
+         assert_readings(name, &readings(&ds), &[(2.7, 0.0); 4]);
+     }
+ }
++
++/// The full rim at Y-6.002 stands outside the earlier Y-6 kerf.
++/// The old 0.999-radius oracle missed this 0.002 mm crescent.
++#[test]
++fn a_short_perpendicular_lead_pecks_below_the_uncut_rim() {
++    let mut p = params(Lead::Perpendicular { length: 0.002 }, Links::PLANAR);
++    p.tolerance = 0.0001;
++    let path = contour(&l_shape(), &p).unwrap();
++    let ds = descents(&path);
++    assert!(ds.iter().any(|d| d.at.y < -3.001 && d.to_z < -4.5));
++    for d in ds {
++        assert!(
++            d.to_z >= d.floor_disc - STEP - 1e-6,
++            "the full rim at {:?} has floor {}, but the descent reaches {}",
++            d.at,
++            d.floor_disc,
++            d.to_z
++        );
++    }
++}
+diff --git a/docs/decisions/3678-tab-window-dive.md b/docs/decisions/3678-tab-window-dive.md
+index 2deadfc80..be15a3298 100644
+--- a/docs/decisions/3678-tab-window-dive.md
++++ b/docs/decisions/3678-tab-window-dive.md
+@@ -15,8 +15,8 @@ level never pecks.
+ 
+ **Why.** The issue's proposed fix. It is local to the two dive sites. It
+ changes no XY path: the tab layout, the leads and the level order stay.
+-The posted path is the only input, so the guard sees the same floor that
+-the test oracle sees.
++The posted path is the only input. The guard uses a conservative proof;
++the independent test oracle checks the actual rim of the tool disc.
+ 
+ **Dropped.** Cut the window lead-ins on the levels above. That changes the
+ untabbed levels of every tabbed contour (more XY travel at each level) and
+@@ -28,5 +28,20 @@ case too.
+ level through the 2.5 mm crescent of the disc that the levels above did
+ not cut. The issue's "Expected" is about the plunge only.
+ 
++**Review decisions.** Replace the sampled floor with a conservative
++coverage proof. An earlier cut must contain the entire target disc. An
++exact matching endpoint or plunge column proves coverage. An axis-aligned
++straight feed also proves coverage when the target centre lies on its
++centreline. Treat all uncertain coverage as uncut material. This can add
++pecks where several earlier sweeps jointly cleared the disc.
++
++The shortened sample radius and additional rim samples were dropped.
++Finite samples cannot prove coverage between the samples. Arc chords
++were also dropped as proof: they approximate the actual sweep.
++
++Preserve every stepdown past the old 4,096-peck cap. The existing contour
++depth limit bounds the operation. Appending the final depth after that
++cap was dropped because it could produce a cut deeper than one stepdown.
++
+ **Cost to change.** Small: the guard is `contour_peck::dive`, called at two
+ sites.
+diff --git a/examples/first-router-part.nc b/examples/first-router-part.nc
+index 273581249..3640c8dd7 100644
+--- a/examples/first-router-part.nc
++++ b/examples/first-router-part.nc
+@@ -137,6 +137,12 @@ G1 X117.991 Y27 Z-12 F1800
+ G3 X114.991 Y24 Z-12 I0 J-3 F1800
+ G1 X114.991 Y24 Z5 F1800
+ G0 X100.991 Y24 Z5
++G1 X100.991 Y24 Z-4 F400
++G0 X100.991 Y24 Z2
++G0 X100.991 Y24 Z-2
++G1 X100.991 Y24 Z-8 F400
++G0 X100.991 Y24 Z2
++G0 X100.991 Y24 Z-6
+ G1 X100.991 Y24 Z-12 F400
+ G3 X97.991 Y27 Z-12 I-3 J0 F1800
+ G1 X30 Y27 Z-12 F1800
+@@ -145,6 +151,12 @@ G1 X27 Y62.009 Z-12 F1800
+ G3 X24 Y65.009 Z-12 I-3 J0 F1800
+ G1 X24 Y65.009 Z5 F1800
+ G0 X24 Y79.009 Z5
++G1 X24 Y79.009 Z-4 F400
++G0 X24 Y79.009 Z2
++G0 X24 Y79.009 Z-2
++G1 X24 Y79.009 Z-8 F400
++G0 X24 Y79.009 Z2
++G0 X24 Y79.009 Z-6
+ G1 X24 Y79.009 Z-12 F400
+ G3 X27 Y82.009 Z-12 I0 J3 F1800
+ G1 X27 Y130 Z-12 F1800
+@@ -153,6 +165,12 @@ G1 X82.009 Y133 Z-12 F1800
+ G3 X85.009 Y136 Z-12 I0 J3 F1800
+ G1 X85.009 Y136 Z5 F1800
+ G0 X99.009 Y136 Z5
++G1 X99.009 Y136 Z-4 F400
++G0 X99.009 Y136 Z2
++G0 X99.009 Y136 Z-2
++G1 X99.009 Y136 Z-8 F400
++G0 X99.009 Y136 Z2
++G0 X99.009 Y136 Z-6
+ G1 X99.009 Y136 Z-12 F400
+ G3 X102.009 Y133 Z-12 I3 J0 F1800
+ G1 X170 Y133 Z-12 F1800
+
+From 250592fb756370115d7472412d6fe5a2c1de07d5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 05:22:32 -0800
+Subject: [PATCH 5/5] test(2d): distinguish pecks and refresh the router
+ program
+
+Keep the six contour-entry assertion and pin four conservative pecks separately. Regenerate the router project and NC file from the full-disc clearance proof.
+
+Fixes #3678
+---
+ crates/motion/tests/machining2d.rs | 15 +++++-
+ examples/first-router-part.camproj | 82 +++++++++++++++++++++++++++++-
+ examples/first-router-part.nc      |  6 +++
+ 3 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/crates/motion/tests/machining2d.rs b/crates/motion/tests/machining2d.rs
+index 3da2a4d95..5a8a1dfa1 100644
+--- a/crates/motion/tests/machining2d.rs
++++ b/crates/motion/tests/machining2d.rs
+@@ -752,7 +752,20 @@ fn tabs_hold_the_part_until_the_floor() {
+     let t = contour(&rect(0.0, 0.0, 20.0, 20.0), &p).expect("valid");
+     // Levels -3 and -4 (the tab top, #2579) run a full ring, -6 runs
+     // four subpaths between tabs (#2004: no air level at Top Z 0).
+-    assert_eq!(plunge_xy(&t).len(), 6);
++    // An entry ends with a plunge followed by the in-plane cut. An
++    // intermediate peck instead retracts by rapid before the next peck.
++    let entries = t.moves.windows(2).filter(|pair| {
++        pair[0].kind == MoveKind::Plunge && pair[1].kind == MoveKind::Feed && pair[1].from.z == pair[1].to.z
++    }).count();
++    assert_eq!(entries, 6);
++    assert_eq!(t.moves.iter().filter(|m| m.kind == MoveKind::Plunge && m.to.z == -6.0).count(), 4);
++    // The four window starts are inside corner arcs. Unknown full-disc
++    // coverage conservatively adds one peck at -3 before each -6 entry.
++    let pecks: Vec<_> = t.moves.windows(2).filter(|pair| {
++        pair[0].kind == MoveKind::Plunge && pair[1].kind == MoveKind::Rapid
++    }).collect();
++    assert_eq!(pecks.len(), 4);
++    assert!(pecks.iter().all(|pair| pair[0].to.z == -3.0));
+     // Hop motion only at the tabbed level: three retract feeds + rapids.
+     let up = t
+         .moves
+diff --git a/examples/first-router-part.camproj b/examples/first-router-part.camproj
+index a9b123617..d60884af4 100644
+--- a/examples/first-router-part.camproj
++++ b/examples/first-router-part.camproj
+@@ -935,6 +935,86 @@
+                 0.991344,
+                 14.0
+               ],
++              "to": [
++                76.0,
++                0.991344,
++                8.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                76.0,
++                0.991344,
++                8.0
++              ],
++              "to": [
++                76.0,
++                0.991344,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                76.0,
++                0.991344,
++                14.0
++              ],
++              "to": [
++                76.0,
++                0.991344,
++                10.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                76.0,
++                0.991344,
++                10.0
++              ],
++              "to": [
++                76.0,
++                0.991344,
++                4.0
++              ],
++              "feed": 400.0
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                76.0,
++                0.991344,
++                4.0
++              ],
++              "to": [
++                76.0,
++                0.991344,
++                14.0
++              ]
++            },
++            {
++              "kind": "rapid",
++              "from": [
++                76.0,
++                0.991344,
++                14.0
++              ],
++              "to": [
++                76.0,
++                0.991344,
++                6.0
++              ]
++            },
++            {
++              "kind": "plunge",
++              "from": [
++                76.0,
++                0.991344,
++                6.0
++              ],
+               "to": [
+                 76.0,
+                 0.991344,
+@@ -1685,7 +1765,7 @@
+           ],
+           "warnings": [],
+           "notes": [
+-            "entry: a dive more than one stepdown below the floor that the levels above left under the tool disc is pecked one stepdown at a time (first at (0.991, -56.000) to Z 0.000, 3 pecks)"
++            "entry: a dive more than one stepdown below the floor that the levels above left under the tool disc is pecked one stepdown at a time (first at (76.000, 0.991) to Z 0.000, 3 pecks)"
+           ]
+         },
+         "coolant": "off"
+diff --git a/examples/first-router-part.nc b/examples/first-router-part.nc
+index 3640c8dd7..a6a1afd9a 100644
+--- a/examples/first-router-part.nc
++++ b/examples/first-router-part.nc
+@@ -129,6 +129,12 @@ G3 X176 Y74.991 Z-9 I3 J0 F1800
+ G0 X176 Y74.991 Z15
+ G0 X176 Y80.991 Z15
+ G0 X176 Y80.991 Z2
++G1 X176 Y80.991 Z-4 F400
++G0 X176 Y80.991 Z2
++G0 X176 Y80.991 Z-2
++G1 X176 Y80.991 Z-8 F400
++G0 X176 Y80.991 Z2
++G0 X176 Y80.991 Z-6
+ G1 X176 Y80.991 Z-12 F400
+ G3 X173 Y77.991 Z-12 I0 J-3 F1800
+ G1 X173 Y30 Z-12 F1800

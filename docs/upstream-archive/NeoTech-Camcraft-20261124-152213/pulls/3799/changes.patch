@@ -1,0 +1,1301 @@
+From fd3a9a130137221081b9b5e204964a08e962477a Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 01:20:06 +0100
+Subject: [PATCH 1/4] fix(ai): use installed local models and current cloud
+ defaults
+
+Discover installed Ollama models before the first automatic Send.
+Probe tool support and refuse unusable discovery replies with named diagnostics.
+Keep explicit model names and each preset's fallback mode.
+Share the cloud defaults and reject retired defaults in the catalog test.
+
+Co-Authored-By: Codex <noreply@openai.com>
+
+Fixes #3782
+---
+ crates/app/src/ai/http.rs                     |  55 +++++-
+ crates/app/src/ai/presets.rs                  |  26 +++
+ crates/app/src/ai/probe.rs                    |  17 ++
+ crates/app/tests/ai_http.rs                   |  15 ++
+ crates/ui/src/egui_app/ai_chat/panel.rs       |   4 +
+ crates/ui/src/egui_app/ai_chat/transport.rs   |  14 +-
+ .../ui/src/egui_app/ai_chat/transport_http.rs |  17 +-
+ .../egui_app/ai_chat/transport_http_tests.rs  | 159 +++++++++++++++++-
+ docs/decisions/3782-model-defaults.md         |  19 +++
+ 9 files changed, 305 insertions(+), 21 deletions(-)
+ create mode 100644 docs/decisions/3782-model-defaults.md
+
+diff --git a/crates/app/src/ai/http.rs b/crates/app/src/ai/http.rs
+index 79f7346ba..16282f4cc 100644
+--- a/crates/app/src/ai/http.rs
++++ b/crates/app/src/ai/http.rs
+@@ -80,6 +80,28 @@ impl Client {
+         auth: Option<(&'static str, String)>,
+         body: &Value,
+         cancel: &AtomicBool,
++    ) -> Result<Value, String> {
++        self.request_json_cancellable(ep, path, headers, auth, Some(body), cancel)
++    }
++
++    /// GET JSON with the same endpoint, cancellation, and diagnostic policies as POST.
++    pub fn get_json_cancellable(
++        &self,
++        ep: &Endpoint,
++        path: &str,
++        cancel: &AtomicBool,
++    ) -> Result<Value, String> {
++        self.request_json_cancellable(ep, path, &[], None, None, cancel)
++    }
++
++    fn request_json_cancellable(
++        &self,
++        ep: &Endpoint,
++        path: &str,
++        headers: &[(String, String)],
++        auth: Option<(&'static str, String)>,
++        body: Option<&Value>,
++        cancel: &AtomicBool,
+     ) -> Result<Value, String> {
+         endpoint::admit(ep, self.offline_only)?;
+         if cancel.load(Ordering::Relaxed) {
+@@ -90,7 +112,7 @@ impl Client {
+             .build()
+             .map_err(|e| format!("HTTP runtime unavailable: {e}"))?;
+         runtime.block_on(async {
+-            let request = self.post_async(ep, path, headers, auth.as_ref(), body);
++            let request = self.request_async(ep, path, headers, auth.as_ref(), body);
+             tokio::select! {
+                 result = request => result,
+                 () = async {
+@@ -102,13 +124,13 @@ impl Client {
+         })
+     }
+ 
+-    async fn post_async(
++    async fn request_async(
+         &self,
+         ep: &Endpoint,
+         path: &str,
+         headers: &[(String, String)],
+         auth: Option<&(&'static str, String)>,
+-        body: &Value,
++        body: Option<&Value>,
+     ) -> Result<Value, String> {
+         let client = reqwest::Client::builder()
+             .redirect(reqwest::redirect::Policy::none())
+@@ -121,9 +143,12 @@ impl Client {
+             .user_agent(concat!("camcraft/", env!("CARGO_PKG_VERSION")))
+             .build()
+             .map_err(|_| "HTTP client unavailable".to_owned())?;
+-        let mut req = client
+-            .post(ep.url(path))
+-            .header("content-type", "application/json");
++        let mut req = match body {
++            Some(body) => client.post(ep.url(path))
++                .header("content-type", "application/json")
++                .body(body.to_string()),
++            None => client.get(ep.url(path)),
++        };
+         for (name, value) in headers {
+             req = req.header(name, value);
+         }
+@@ -132,7 +157,6 @@ impl Client {
+         }
+         // Do not expose transport diagnostics: they can include header values.
+         let resp = req
+-            .body(body.to_string())
+             .send()
+             .await
+             .map_err(|_| format!("{} could not be reached", ep.host))?;
+@@ -253,3 +277,20 @@ pub fn probe_ollama_cancellable(
+     )?;
+     probe::parse_show(&answer)
+ }
++
++/// Choose the first installed model that advertises native tool calls.
++/// Discovery stays on the chat endpoint's host and uses its offline policy.
++pub fn discover_ollama_cancellable(
++    client: &Client,
++    ep: &Endpoint,
++    cancel: &AtomicBool,
++) -> Result<String, String> {
++    let answer = client.get_json_cancellable(&ep.with_base_path(""), "/api/tags", cancel)?;
++    for model in probe::parse_tags(&answer)? {
++        if probe_ollama_cancellable(client, ep, &model, cancel)?.tools {
++            return Ok(model);
++        }
++    }
++    Err("Ollama has no installed model that can call tools. Run `ollama pull qwen3:8b`, \
++         then send again. Get models at https://ollama.com/library".into())
++}
+diff --git a/crates/app/src/ai/presets.rs b/crates/app/src/ai/presets.rs
+index 6a0fd88eb..4ac482e6f 100644
+--- a/crates/app/src/ai/presets.rs
++++ b/crates/app/src/ai/presets.rs
+@@ -11,6 +11,32 @@ use crate::mcp::provider::Provider;
+ 
+ use super::secret::KeyName;
+ 
++/// Cloud defaults verified against the providers' model catalogs on 2026-11-24.
++/// Mark a row retired when its provider retires it; the catalog test then fails.
++/// Sources: https://platform.claude.com/docs/en/models/overview,
++/// https://developers.openai.com/api/docs/models,
++/// https://aistudio.google.com/docs/models.
++#[derive(Clone, Copy, Debug)]
++pub struct CloudDefault {
++    pub provider: Provider,
++    pub model: &'static str,
++    pub retired: bool,
++}
++
++pub const CLOUD_DEFAULTS: &[CloudDefault] = &[
++    CloudDefault { provider: Provider::Anthropic, model: "claude-sonnet-5-5", retired: false },
++    CloudDefault { provider: Provider::OpenAiChat, model: "gpt-6.2-sol", retired: false },
++    CloudDefault { provider: Provider::OpenAiResponses, model: "gpt-6.2-sol", retired: false },
++    CloudDefault { provider: Provider::Gemini, model: "gemini-4-hydrogen", retired: false },
++];
++
++/// The one maintained default for this cloud wire format.
++#[must_use]
++pub fn default_model(provider: Provider) -> &'static str {
++    CLOUD_DEFAULTS.iter().find(|entry| entry.provider == provider)
++        .map_or("", |entry| entry.model)
++}
++
+ /// One selectable endpoint: its wire format, default base URL, and the
+ /// key it needs (cloud) or the capability probe it offers (Ollama).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+diff --git a/crates/app/src/ai/probe.rs b/crates/app/src/ai/probe.rs
+index 120dc8229..6853be910 100644
+--- a/crates/app/src/ai/probe.rs
++++ b/crates/app/src/ai/probe.rs
+@@ -25,6 +25,23 @@ pub fn show_request(model: &str) -> Value {
+     json!({ "model": model })
+ }
+ 
++/// Read installed names in server order from `GET /api/tags`.
++pub fn parse_tags(answer: &Value) -> Result<Vec<String>, String> {
++    let models = answer.get("models").and_then(Value::as_array)
++        .ok_or_else(|| "Ollama /api/tags did not answer a models list".to_owned())?;
++    let mut names = Vec::new();
++    for entry in models {
++        let name = entry.get("name").and_then(Value::as_str)
++            .ok_or_else(|| "Ollama /api/tags contains a model without a name".to_owned())?;
++        super::wire::check_model(name)
++            .map_err(|e| format!("Ollama /api/tags contains an invalid model name: {e}"))?;
++        if !names.iter().any(|n| n == name) {
++            names.push(name.to_owned());
++        }
++    }
++    Ok(names)
++}
++
+ /// Read an `/api/show` answer.
+ pub fn parse_show(answer: &Value) -> Result<Capabilities, String> {
+     if !answer.is_object() {
+diff --git a/crates/app/tests/ai_http.rs b/crates/app/tests/ai_http.rs
+index 7fb85555e..940d88688 100644
+--- a/crates/app/tests/ai_http.rs
++++ b/crates/app/tests/ai_http.rs
+@@ -25,6 +25,21 @@ use serde_json::{Value, json};
+ 
+ const PLACEHOLDER: &str = "placeholder-not-a-real-key";
+ 
++#[test]
++fn cloud_default_catalog_has_one_active_model_per_provider() {
++    use camcraft_app::ai::presets::{CLOUD_DEFAULTS, default_model};
++
++    for endpoint in ENDPOINTS.iter().filter(|e| e.key.is_some()) {
++        let rows: Vec<_> = CLOUD_DEFAULTS.iter()
++            .filter(|entry| entry.provider == endpoint.provider).collect();
++        assert_eq!(rows.len(), 1, "{} needs exactly one default", endpoint.id);
++        let row = rows[0];
++        assert!(!row.retired, "{} default {} is retired", endpoint.id, row.model);
++        assert!(!row.model.is_empty(), "{} needs a model name", endpoint.id);
++        assert_eq!(default_model(endpoint.provider), row.model);
++    }
++}
++
+ /// One request as the fake server saw it.
+ struct Seen {
+     line: String,
+diff --git a/crates/ui/src/egui_app/ai_chat/panel.rs b/crates/ui/src/egui_app/ai_chat/panel.rs
+index b04e08e73..c37fb89e8 100644
+--- a/crates/ui/src/egui_app/ai_chat/panel.rs
++++ b/crates/ui/src/egui_app/ai_chat/panel.rs
+@@ -77,10 +77,14 @@ fn draw_header(ui: &mut Ui, state: &mut State, pal: &theme::Tokens) {
+         let model_lbl = ui.label("Model");
+         ui.add(
+             egui::TextEdit::singleline(&mut state.ai_chat.model_input)
++                .hint_text("Automatic: installed tool-capable model")
+                 .desired_width(f32::INFINITY),
+         )
+         .labelled_by(model_lbl.id);
+     });
++    if state.ai_chat.selected_preset().endpoint_kind == super::EndpointKind::Local {
++        ui.hyperlink_to("Get Ollama models", "https://ollama.com/library");
++    }
+ 
+     ui.horizontal_wrapped(|ui| {
+         // #1945: the switch is the person's policy - kept in prefs.json.
+diff --git a/crates/ui/src/egui_app/ai_chat/transport.rs b/crates/ui/src/egui_app/ai_chat/transport.rs
+index 977d7ef80..045b59ac2 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport.rs
+@@ -120,7 +120,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "Anthropic (Cloud)".to_owned(),
+             provider: Provider::Anthropic,
+             endpoint_kind: EndpointKind::Cloud,
+-            default_model: "claude-sonnet-4-20250514".to_owned(),
++            default_model: camcraft_app::ai::presets::default_model(Provider::Anthropic).to_owned(),
+             fallback_mode: FallbackMode::Native,
+         },
+         ProviderPreset {
+@@ -128,7 +128,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "OpenAI Responses (Cloud)".to_owned(),
+             provider: Provider::OpenAiResponses,
+             endpoint_kind: EndpointKind::Cloud,
+-            default_model: "gpt-4.1".to_owned(),
++            default_model: camcraft_app::ai::presets::default_model(Provider::OpenAiResponses).to_owned(),
+             fallback_mode: FallbackMode::Native,
+         },
+         ProviderPreset {
+@@ -136,7 +136,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "OpenAI Chat (Cloud)".to_owned(),
+             provider: Provider::OpenAiChat,
+             endpoint_kind: EndpointKind::Cloud,
+-            default_model: "gpt-4.1".to_owned(),
++            default_model: camcraft_app::ai::presets::default_model(Provider::OpenAiChat).to_owned(),
+             fallback_mode: FallbackMode::Native,
+         },
+         ProviderPreset {
+@@ -144,7 +144,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "Gemini (Cloud)".to_owned(),
+             provider: Provider::Gemini,
+             endpoint_kind: EndpointKind::Cloud,
+-            default_model: "gemini-2.5-flash".to_owned(),
++            default_model: camcraft_app::ai::presets::default_model(Provider::Gemini).to_owned(),
+             fallback_mode: FallbackMode::Native,
+         },
+         ProviderPreset {
+@@ -152,7 +152,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "Offline local (Ollama)".to_owned(),
+             provider: Provider::OpenAiChat,
+             endpoint_kind: EndpointKind::Local,
+-            default_model: "qwen2.5:14b".to_owned(),
++            default_model: String::new(),
+             fallback_mode: FallbackMode::Native,
+         },
+         ProviderPreset {
+@@ -160,7 +160,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "Local Prompt-JSON".to_owned(),
+             provider: Provider::OpenAiChat,
+             endpoint_kind: EndpointKind::Local,
+-            default_model: "qwen2.5:7b".to_owned(),
++            default_model: String::new(),
+             fallback_mode: FallbackMode::PromptJson,
+         },
+         ProviderPreset {
+@@ -168,7 +168,7 @@ pub(crate) fn default_presets() -> Vec<ProviderPreset> {
+             label: "Local Q&A (Read-Only)".to_owned(),
+             provider: Provider::OpenAiChat,
+             endpoint_kind: EndpointKind::Local,
+-            default_model: "llama3.2".to_owned(),
++            default_model: String::new(),
+             fallback_mode: FallbackMode::ReadOnly,
+         },
+     ]
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http.rs b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+index 344d1e713..c37bfe19b 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+@@ -9,7 +9,7 @@
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+-use camcraft_app::ai::http::{Client, probe_ollama_cancellable, send_chat};
++use camcraft_app::ai::http::{Client, discover_ollama_cancellable, probe_ollama_cancellable, send_chat};
+ use camcraft_app::ai::wire::{ChatMessage, ChatRequest, DEFAULT_MAX_TOKENS, Image, split_payload};
+ use camcraft_app::ai::{Endpoint, ProviderEndpoint, by_id, keychain, secret};
+ use camcraft_app::mcp::provider::FallbackMode;
+@@ -98,15 +98,22 @@ impl HttpTransport {
+         key: Option<&camcraft_app::ai::ApiKey>,
+     ) -> Result<TransportOutput, String> {
+         let client = Client::new(req.offline_only);
+-        if endpoint_for(&req.preset.id).is_some_and(|def| def.ollama_probe)
++        let ollama = endpoint_for(&req.preset.id).is_some_and(|def| def.ollama_probe);
++        let automatic = ollama && req.model.trim().is_empty();
++        let model = if automatic {
++            discover_ollama_cancellable(&client, ep, cancel)?
++        } else {
++            req.model.clone()
++        };
++        if ollama && !automatic
+             && req.fallback_mode == FallbackMode::Native
+         {
+-            let caps = probe_ollama_cancellable(&client, ep, &req.model, cancel)?;
++            let caps = probe_ollama_cancellable(&client, ep, &model, cancel)?;
+             if !caps.tools {
+                 return Err(format!(
+                     "model '{}' cannot call tools (Ollama lists no 'tools' capability) - \
+                      choose 'Local Prompt-JSON' or 'Local Q&A (Read-Only)' for it",
+-                    req.model
++                    model
+                 ));
+             }
+         }
+@@ -114,7 +121,7 @@ impl HttpTransport {
+         let messages: Vec<ChatMessage> = req.messages.iter().map(to_wire).collect();
+         let chat = ChatRequest {
+             provider: req.preset.provider,
+-            model: &req.model,
++            model: &model,
+             system,
+             messages: &messages,
+             tools: &tools,
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+index 354fec520..c51257fd9 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+@@ -14,7 +14,7 @@ use super::transport::{ChatTransport, TransportOutput, TransportRequest, default
+ use super::transport_http::HttpTransport;
+ use super::worker::{TurnInput, WorkerEvent, spawn_turn};
+ 
+-fn read_request(s: &mut TcpStream) {
++fn read_request(s: &mut TcpStream) -> String {
+     s.set_read_timeout(Some(Duration::from_secs(5)))
+         .expect("request timeout");
+     let mut received = Vec::new();
+@@ -34,12 +34,167 @@ fn read_request(s: &mut TcpStream) {
+                 })
+                 .unwrap_or(0);
+             if received.len() >= end + 4 + length {
+-                return;
++                return String::from_utf8(received).expect("UTF-8 request");
+             }
+         }
+     }
+ }
+ 
++fn recorded_ollama(
++    steps: Vec<(&'static str, Option<&'static str>, Value)>,
++) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
++    let (listener, ep) = listener();
++    listener.set_nonblocking(true).expect("nonblocking fixture");
++    let server = std::thread::spawn(move || {
++        let mut requests = Vec::new();
++        for (request_line, model, answer) in steps {
++            let start = Instant::now();
++            let mut stream = loop {
++                match listener.accept() {
++                    Ok((s, _)) => break s,
++                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
++                        if start.elapsed() > Duration::from_secs(3) {
++                            return requests;
++                        }
++                        std::thread::sleep(Duration::from_millis(5));
++                    }
++                    Err(e) => panic!("fixture accept: {e}"),
++                }
++            };
++            let request = read_request(&mut stream);
++            let matches_line = request.lines().next() == Some(request_line);
++            let matches_model = model.is_none_or(|model| {
++                let (_, body) = request.split_once("\r\n\r\n").expect("body separator");
++                let body: Value = serde_json::from_str(body).expect("request JSON");
++                body["model"] == model
++            });
++            requests.push(request);
++            let status = if matches_line && matches_model { "200 OK" } else { "404 Not Found" };
++            let body = if matches_line && matches_model {
++                answer.to_string()
++            } else {
++                json!({"error":"unexpected model or endpoint in recorded fixture"}).to_string()
++            };
++            write!(stream,
++                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
++                body.len()).expect("fixture answer");
++            if !matches_line || !matches_model {
++                return requests;
++            }
++        }
++        requests
++    });
++    (ep, server)
++}
++
++fn local_request(id: &str) -> TransportRequest {
++    let preset = default_presets().into_iter().find(|p| p.id == id).expect("local preset");
++    TransportRequest {
++        model: preset.default_model.clone(),
++        fallback_mode: preset.fallback_mode,
++        preset,
++        offline_only: true,
++        tools_payload: json!({"tools":[]}),
++        messages: vec![],
++    }
++}
++
++#[test]
++fn cloud_presets_use_current_shared_model_defaults() {
++    let presets = default_presets();
++    for (id, model) in [
++        ("anthropic", "claude-sonnet-5-5"),
++        ("openai-chat", "gpt-6.2-sol"),
++        ("openai-responses", "gpt-6.2-sol"),
++        ("gemini", "gemini-4-hydrogen"),
++    ] {
++        let preset = presets.iter().find(|p| p.id == id).expect("cloud preset");
++        assert_eq!(preset.default_model, model, "{id} must use its current default");
++    }
++}
++
++#[test]
++fn ollama_defaults_discover_installed_tool_model_before_first_send() {
++    for id in ["local-ollama", "local-prompt-json", "local-readonly"] {
++        let steps = vec![
++            ("GET /api/tags HTTP/1.1", None,
++                json!({"models":[{"name":"embed:latest"},{"name":"installed-tool:latest"}]})),
++            ("POST /api/show HTTP/1.1", Some("embed:latest"),
++                json!({"capabilities":["embedding"]})),
++            ("POST /api/show HTTP/1.1", Some("installed-tool:latest"),
++                json!({"capabilities":["completion","tools"]})),
++            ("POST /v1/chat/completions HTTP/1.1", Some("installed-tool:latest"),
++                json!({"choices":[{"message":{"content":"ready"}}]})),
++        ];
++        let (ep, server) = recorded_ollama(steps);
++        let result = HttpTransport.complete_at(&local_request(id), &AtomicBool::new(false), &ep, None);
++        let requests = server.join().expect("recorded server");
++        assert!(result.is_ok(), "{id} must use an installed tool-capable model: {result:?}");
++        assert_eq!(requests.len(), 4, "{id} must discover, probe, and send");
++        assert!(requests[0].starts_with("GET /api/tags HTTP/1.1\r\n"));
++    }
++}
++
++#[test]
++fn ollama_defaults_without_tool_models_give_install_guidance() {
++    for empty in [false, true] {
++        let mut steps = vec![("GET /api/tags HTTP/1.1", None,
++            if empty { json!({"models":[]}) }
++            else { json!({"models":[{"name":"embed:latest"}]}) })];
++        if !empty {
++            steps.push(("POST /api/show HTTP/1.1", Some("embed:latest"),
++                json!({"capabilities":["embedding"]})));
++        }
++        let count = steps.len();
++        let (ep, server) = recorded_ollama(steps);
++        let result = HttpTransport.complete_at(
++            &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++        let requests = server.join().expect("recorded server");
++        let message = result.expect_err("a model without tools must not receive chat");
++        assert!(message.contains("ollama pull "), "install command missing: {message}");
++        assert!(message.contains("https://ollama.com"), "model link missing: {message}");
++        assert_eq!(requests.len(), count);
++        assert!(requests.iter().all(|r| !r.starts_with("POST /v1/")));
++    }
++}
++
++#[test]
++fn ollama_malformed_tags_are_refused_before_show_or_chat() {
++    for (answer, reason) in [
++        (Value::Null, "models list"),
++        (json!({"models":"invalid"}), "models list"),
++        (json!({"models":[{}]}), "without a name"),
++        (json!({"models":[{"name":""}]}), "invalid model name"),
++    ] {
++        let (ep, server) = recorded_ollama(vec![("GET /api/tags HTTP/1.1", None, answer)]);
++        let result = HttpTransport.complete_at(
++            &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++        let requests = server.join().expect("recorded server");
++        let message = result.expect_err("malformed discovery must stop before probing");
++        assert!(message.contains("Ollama /api/tags"), "endpoint missing: {message}");
++        assert!(message.contains(reason), "refusal reason missing: {message}");
++        assert_eq!(requests.len(), 1);
++    }
++}
++
++#[test]
++fn ollama_explicit_model_is_not_replaced_by_discovery() {
++    let steps = vec![
++        ("POST /api/show HTTP/1.1", Some("chosen:latest"),
++            json!({"capabilities":["completion","tools"]})),
++        ("POST /v1/chat/completions HTTP/1.1", Some("chosen:latest"),
++            json!({"choices":[{"message":{"content":"ready"}}]})),
++    ];
++    let (ep, server) = recorded_ollama(steps);
++    let mut request = local_request("local-ollama");
++    request.model = "chosen:latest".into();
++    let result = HttpTransport.complete_at(&request, &AtomicBool::new(false), &ep, None);
++    let requests = server.join().expect("recorded server");
++    assert!(result.is_ok(), "explicit model must remain selected: {result:?}");
++    assert_eq!(requests.len(), 2);
++    assert!(requests.iter().all(|r| !r.starts_with("GET /api/tags")));
++}
++
+ struct LoopbackTransport(Endpoint);
+ 
+ impl ChatTransport for LoopbackTransport {
+diff --git a/docs/decisions/3782-model-defaults.md b/docs/decisions/3782-model-defaults.md
+new file mode 100644
+index 000000000..107c3ab38
+--- /dev/null
++++ b/docs/decisions/3782-model-defaults.md
+@@ -0,0 +1,19 @@
++## #3782 - Select installed local models and maintain cloud defaults
++
++**What was decided.** An empty local model field selects an installed model automatically. The transport reads `GET /api/tags`. It checks each candidate with `POST /api/show` and selects the first model with the `tools` capability. All local presets use this selection rule. Each preset keeps its existing fallback mode. A model name that the user enters stays explicit.
++
++If no installed model supports tools, the diagnostic gives `ollama pull qwen3:8b` and links to <https://ollama.com/library>.
++
++Cloud defaults live in one table in the app layer. The defaults are `claude-sonnet-5-5`, `gpt-6.2-sol` for both OpenAI endpoints, and `gemini-4-hydrogen`. These IDs were checked against the official model pages on 2026-11-24:
++
++- <https://platform.claude.com/docs/en/models/overview>
++- <https://developers.openai.com/api/docs/models/gpt-6.2-sol>
++- <https://aistudio.google.com/docs/models/gemini-4-hydrogen>
++
++Each row in the shared `CLOUD_DEFAULTS` table includes its retirement status. An offline test rejects a default when its row marks it as retired. The table and its status fields need maintenance when providers change model availability.
++
++**Why.** An installed model can work on the first Send without a model name that the user must enter. The capability probe excludes models that cannot call tools. One table prevents separate defaults from drifting between callers. Recorded responses keep the tests independent of installed models, provider accounts, and network access.
++
++**What was dropped.** The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
++
++**Cost to change later.** A different automatic selection policy changes the candidate selection and its recorded-response tests. Provider changes require an update to the shared defaults table or its retirement status fields. A provider wire-format change can also require transport work. These changes do not require a project format migration.
+
+From f172590ec1138b2f6157c77e7504e42dd7fc6608 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 05:14:04 +0100
+Subject: [PATCH 2/4] fix(ai): apply cloud defaults to empty model fields
+
+Show shared cloud defaults and keep automatic model hints local. Suggest the stronger reviewed Ollama model.
+
+Fixes #3782
+---
+ crates/app/src/ai/http.rs                     |  2 +-
+ crates/ui/src/egui_app/ai_chat/panel.rs       |  8 +++-
+ .../ui/src/egui_app/ai_chat/transport_http.rs |  4 ++
+ .../egui_app/ai_chat/transport_http_tests.rs  | 38 ++++++++++++++-
+ crates/ui/src/egui_app/tests/ai_chat/mod.rs   |  1 +
+ .../egui_app/tests/ai_chat/model_defaults.rs  | 46 +++++++++++++++++++
+ docs/decisions/3782-model-defaults.md         |  8 ++--
+ 7 files changed, 100 insertions(+), 7 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/tests/ai_chat/model_defaults.rs
+
+diff --git a/crates/app/src/ai/http.rs b/crates/app/src/ai/http.rs
+index 16282f4cc..741d3fa42 100644
+--- a/crates/app/src/ai/http.rs
++++ b/crates/app/src/ai/http.rs
+@@ -291,6 +291,6 @@ pub fn discover_ollama_cancellable(
+             return Ok(model);
+         }
+     }
+-    Err("Ollama has no installed model that can call tools. Run `ollama pull qwen3:8b`, \
++    Err("Ollama has no installed model that can call tools. Run `ollama pull ornith-1.5:35b`, \
+          then send again. Get models at https://ollama.com/library".into())
+ }
+diff --git a/crates/ui/src/egui_app/ai_chat/panel.rs b/crates/ui/src/egui_app/ai_chat/panel.rs
+index c37fb89e8..48450c324 100644
+--- a/crates/ui/src/egui_app/ai_chat/panel.rs
++++ b/crates/ui/src/egui_app/ai_chat/panel.rs
+@@ -73,11 +73,17 @@ fn draw_header(ui: &mut Ui, state: &mut State, pal: &theme::Tokens) {
+         state.ai_chat.select_preset(idx);
+     }
+ 
++    let model_hint = match state.ai_chat.selected_preset().endpoint_kind {
++        super::EndpointKind::Local => "Automatic: installed tool-capable model",
++        super::EndpointKind::Cloud => camcraft_app::ai::presets::default_model(
++            state.ai_chat.selected_preset().provider,
++        ),
++    };
+     ui.horizontal(|ui| {
+         let model_lbl = ui.label("Model");
+         ui.add(
+             egui::TextEdit::singleline(&mut state.ai_chat.model_input)
+-                .hint_text("Automatic: installed tool-capable model")
++                .hint_text(model_hint)
+                 .desired_width(f32::INFINITY),
+         )
+         .labelled_by(model_lbl.id);
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http.rs b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+index c37bfe19b..1ef5a7664 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+@@ -102,6 +102,10 @@ impl HttpTransport {
+         let automatic = ollama && req.model.trim().is_empty();
+         let model = if automatic {
+             discover_ollama_cancellable(&client, ep, cancel)?
++        } else if req.model.trim().is_empty()
++            && req.preset.endpoint_kind == super::EndpointKind::Cloud
++        {
++            camcraft_app::ai::presets::default_model(req.preset.provider).to_owned()
+         } else {
+             req.model.clone()
+         };
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+index c51257fd9..fe8f12f8c 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+@@ -113,6 +113,42 @@ fn cloud_presets_use_current_shared_model_defaults() {
+     }
+ }
+ 
++#[test]
++fn empty_cloud_request_uses_table_default_without_local_discovery() {
++    for input in ["", "   ", "explicit-cloud-model"] {
++        let preset = default_presets()
++            .into_iter()
++            .find(|p| p.id == "anthropic")
++            .expect("Anthropic preset");
++        let expected = if input.trim().is_empty() {
++            "claude-sonnet-5-5"
++        } else {
++            input
++        };
++        let (ep, server) = recorded_ollama(vec![(
++            "POST /v1/messages HTTP/1.1",
++            Some(expected),
++            json!({"content":[{"type":"text","text":"ready"}],"stop_reason":"end_turn"}),
++        )]);
++        let request = TransportRequest {
++            model: input.to_owned(),
++            fallback_mode: preset.fallback_mode,
++            preset,
++            offline_only: true,
++            tools_payload: json!({"tools":[]}),
++            messages: vec![],
++        };
++        let result = HttpTransport.complete_at(&request, &AtomicBool::new(false), &ep, None);
++        let requests = server.join().expect("cloud fixture");
++        assert!(result.is_ok(), "cloud model {input:?}: {result:?}");
++        assert_eq!(
++            requests.len(),
++            1,
++            "cloud requests must not discover local models"
++        );
++    }
++}
++
+ #[test]
+ fn ollama_defaults_discover_installed_tool_model_before_first_send() {
+     for id in ["local-ollama", "local-prompt-json", "local-readonly"] {
+@@ -151,7 +187,7 @@ fn ollama_defaults_without_tool_models_give_install_guidance() {
+             &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
+         let requests = server.join().expect("recorded server");
+         let message = result.expect_err("a model without tools must not receive chat");
+-        assert!(message.contains("ollama pull "), "install command missing: {message}");
++        assert!(message.contains("ollama pull ornith-1.5:35b"), "install command missing: {message}");
+         assert!(message.contains("https://ollama.com"), "model link missing: {message}");
+         assert_eq!(requests.len(), count);
+         assert!(requests.iter().all(|r| !r.starts_with("POST /v1/")));
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/mod.rs b/crates/ui/src/egui_app/tests/ai_chat/mod.rs
+index 28e7e0244..e3386ca76 100644
+--- a/crates/ui/src/egui_app/tests/ai_chat/mod.rs
++++ b/crates/ui/src/egui_app/tests/ai_chat/mod.rs
+@@ -4,6 +4,7 @@
+ mod basic;
+ mod budget;
+ mod delete_confirmation;
++mod model_defaults;
+ mod regressions;
+ mod safety;
+ 
+diff --git a/crates/ui/src/egui_app/tests/ai_chat/model_defaults.rs b/crates/ui/src/egui_app/tests/ai_chat/model_defaults.rs
+new file mode 100644
+index 000000000..fd5027778
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/ai_chat/model_defaults.rs
+@@ -0,0 +1,46 @@
++//! Empty-model provider hints use the same cloud defaults as the request transport.
++//! Provenance: our own structural UI tests over the public provider table.
++
++use super::super::structural;
++use super::{blank_harness, select_provider, toggle_ai_chat_via_view_door};
++
++#[test]
++fn empty_cloud_model_shows_table_default_and_local_hint_stays_local() {
++    let mut h = blank_harness();
++    h.run_steps(2);
++    toggle_ai_chat_via_view_door(&mut h);
++    for (label, model) in [
++        ("Anthropic (Cloud)", "claude-sonnet-5-5"),
++        ("OpenAI Chat (Cloud)", "gpt-6.2-sol"),
++        ("OpenAI Responses (Cloud)", "gpt-6.2-sol"),
++        ("Gemini (Cloud)", "gemini-4-hydrogen"),
++    ] {
++        select_provider(&mut h, label);
++        h.state_mut().state.ai_chat.model_input.clear();
++        h.run_steps(2);
++        let texts = structural::painted(&h);
++        assert!(
++            texts.iter().any(|(text, _)| text == model),
++            "{label} must display its effective cloud model: {texts:?}"
++        );
++        assert!(
++            !texts.iter().any(|(text, _)| text.contains("Automatic:")),
++            "{label} must not promise installed model discovery"
++        );
++    }
++    for label in [
++        "Offline local (Ollama)",
++        "Local Prompt-JSON",
++        "Local Q&A (Read-Only)",
++    ] {
++        select_provider(&mut h, label);
++        let texts = structural::painted(&h);
++        assert!(
++            texts
++                .iter()
++                .any(|(text, _)| text == "Automatic: installed tool-capable model"),
++            "{label} must show installed model discovery: {texts:?}"
++        );
++        assert!(h.state().state.ai_chat.model_input.is_empty());
++    }
++}
+diff --git a/docs/decisions/3782-model-defaults.md b/docs/decisions/3782-model-defaults.md
+index 107c3ab38..fb5aef039 100644
+--- a/docs/decisions/3782-model-defaults.md
++++ b/docs/decisions/3782-model-defaults.md
+@@ -2,9 +2,9 @@
+ 
+ **What was decided.** An empty local model field selects an installed model automatically. The transport reads `GET /api/tags`. It checks each candidate with `POST /api/show` and selects the first model with the `tools` capability. All local presets use this selection rule. Each preset keeps its existing fallback mode. A model name that the user enters stays explicit.
+ 
+-If no installed model supports tools, the diagnostic gives `ollama pull qwen3:8b` and links to <https://ollama.com/library>.
++If no installed model supports tools, the diagnostic gives `ollama pull ornith-1.5:35b` and links to <https://ollama.com/library>.
+ 
+-Cloud defaults live in one table in the app layer. The defaults are `claude-sonnet-5-5`, `gpt-6.2-sol` for both OpenAI endpoints, and `gemini-4-hydrogen`. These IDs were checked against the official model pages on 2026-11-24:
++An empty cloud Model field displays the provider default and uses that default for a request. The automatic-selection hint applies only to local providers. Cloud defaults live in one table in the app layer. The defaults are `claude-sonnet-5-5`, `gpt-6.2-sol` for both OpenAI endpoints, and `gemini-4-hydrogen`. These IDs were checked against the official model pages on 2026-11-24:
+ 
+ - <https://platform.claude.com/docs/en/models/overview>
+ - <https://developers.openai.com/api/docs/models/gpt-6.2-sol>
+@@ -12,8 +12,8 @@ Cloud defaults live in one table in the app layer. The defaults are `claude-sonn
+ 
+ Each row in the shared `CLOUD_DEFAULTS` table includes its retirement status. An offline test rejects a default when its row marks it as retired. The table and its status fields need maintenance when providers change model availability.
+ 
+-**Why.** An installed model can work on the first Send without a model name that the user must enter. The capability probe excludes models that cannot call tools. One table prevents separate defaults from drifting between callers. Recorded responses keep the tests independent of installed models, provider accounts, and network access.
++**Why.** The reporter found that an empty cloud Model showed the local hint and failed a request. The shared table supplies the displayed and effective cloud default. The install suggestion uses `ornith-1.5:35b` because the reporter's 2026-11-22 benchmark scored it 16/20 CamCraft tasks. The previous `qwen3:8b` suggestion scored 9/20. An installed model can work on the first Send without a model name that the user must enter. The capability probe excludes models that cannot call tools. One table prevents separate defaults from drifting between callers. Recorded responses keep the tests independent of installed models, provider accounts, and network access.
+ 
+-**What was dropped.** The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
++**What was dropped.** The local automatic-selection hint was dropped for cloud providers because cloud requests use the table default. The `qwen3:8b` suggestion was dropped because the reporter's benchmark showed unreliable project changes. The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
+ 
+ **Cost to change later.** A different automatic selection policy changes the candidate selection and its recorded-response tests. Provider changes require an update to the shared defaults table or its retirement status fields. A provider wire-format change can also require transport work. These changes do not require a project format migration.
+
+From 4fbbf7bdec4bd8ea3edca6083c387cc46791c578 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 23 Nov 2026 21:02:42 -0800
+Subject: [PATCH 3/4] fix(ai): bound the Ollama model selection and name each
+ failure cause
+
+The automatic selection stopped at the first failed /api/show probe and
+used the 300 s chat time limit for each request. Now a failed probe of
+one model does not stop the selection, each request has a 5 s limit and
+the whole selection has a 20 s limit. Each cause has its own message:
+the server did not answer its model list, no installed model can call
+tools, the probe failed for a named model, or the time limit ended. A
+chat failure after an automatic selection names the selected model.
+
+The loopback fixture sets its accepted socket to blocking mode. On
+macOS the socket inherited the nonblocking mode of the listener and the
+fixture failed at times.
+
+Refs #3782
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/app/src/ai/http.rs                     | 68 +++++++++++--
+ crates/ui/src/egui_app/ai_chat/mod.rs         |  2 +
+ .../ai_chat/transport_discovery_tests.rs      | 97 +++++++++++++++++++
+ .../ui/src/egui_app/ai_chat/transport_http.rs |  9 +-
+ .../egui_app/ai_chat/transport_http_tests.rs  |  8 +-
+ docs/decisions/3782-model-defaults.md         |  4 +-
+ 6 files changed, 177 insertions(+), 11 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
+
+diff --git a/crates/app/src/ai/http.rs b/crates/app/src/ai/http.rs
+index 741d3fa42..1fa8e896f 100644
+--- a/crates/app/src/ai/http.rs
++++ b/crates/app/src/ai/http.rs
+@@ -285,12 +285,68 @@ pub fn discover_ollama_cancellable(
+     ep: &Endpoint,
+     cancel: &AtomicBool,
+ ) -> Result<String, String> {
+-    let answer = client.get_json_cancellable(&ep.with_base_path(""), "/api/tags", cancel)?;
+-    for model in probe::parse_tags(&answer)? {
+-        if probe_ollama_cancellable(client, ep, &model, cancel)?.tools {
+-            return Ok(model);
++    discover_ollama_within(client, ep, cancel, DISCOVERY_TOTAL)
++}
++
++/// One discovery request (the list, or one `/api/show`) may take this long.
++const DISCOVERY_STEP: Duration = Duration::from_secs(5);
++/// The whole selection over all installed models may take this long.
++const DISCOVERY_TOTAL: Duration = Duration::from_secs(20);
++
++/// As `discover_ollama_cancellable`, with the time limit of the whole selection.
++/// Each cause has its own message: the server does not answer, no installed
++/// model can call tools, the probe of a named model failed, the time ended.
++/// A failed probe of one model does not stop the selection.
++pub fn discover_ollama_within(
++    client: &Client,
++    ep: &Endpoint,
++    cancel: &AtomicBool,
++    total: Duration,
++) -> Result<String, String> {
++    const ADVICE: &str = "Run `ollama pull ornith-1.5:35b`, then send again. \
++                          Get models at https://ollama.com/library";
++    let start = crate::clock::Instant::now();
++    let step = Client {
++        offline_only: client.offline_only,
++        timeouts: Timeouts {
++            connect: client.timeouts.connect.min(DISCOVERY_STEP),
++            total: client.timeouts.total.min(DISCOVERY_STEP),
++        },
++    };
++    let answer = step
++        .get_json_cancellable(&ep.with_base_path(""), "/api/tags", cancel)
++        .map_err(|e| {
++            if cancel.load(Ordering::Relaxed) {
++                e
++            } else {
++                format!("Ollama server did not answer its model list ({e}). \
++                         Start the Ollama app or run `ollama serve`, then send again.")
++            }
++        })?;
++    let models = probe::parse_tags(&answer)?;
++    let mut failed: Vec<(String, String)> = Vec::new();
++    for (checked, model) in models.iter().enumerate() {
++        if start.elapsed() >= total {
++            return Err(format!(
++                "Ollama model selection stopped after {} s: {checked} of {} installed models \
++                 checked, and none can call tools. Enter a model name in Model.",
++                total.as_secs(),
++                models.len()
++            ));
++        }
++        match probe_ollama_cancellable(&step, ep, model, cancel) {
++            Ok(caps) if caps.tools => return Ok(model.clone()),
++            Ok(_) => {}
++            Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
++            Err(e) => failed.push((model.clone(), e)),
+         }
+     }
+-    Err("Ollama has no installed model that can call tools. Run `ollama pull ornith-1.5:35b`, \
+-         then send again. Get models at https://ollama.com/library".into())
++    match failed.first() {
++        None => Err(format!("Ollama has no installed model that can call tools. {ADVICE}")),
++        Some((model, reason)) => Err(format!(
++            "Ollama capability probe failed for {} ({model}: {reason}), and no other installed \
++             model can call tools. Enter a model name in Model. {ADVICE}",
++            failed.iter().map(|(m, _)| format!("'{m}'")).collect::<Vec<_>>().join(", ")
++        )),
++    }
+ }
+diff --git a/crates/ui/src/egui_app/ai_chat/mod.rs b/crates/ui/src/egui_app/ai_chat/mod.rs
+index b09895bd7..02d57d5f3 100644
+--- a/crates/ui/src/egui_app/ai_chat/mod.rs
++++ b/crates/ui/src/egui_app/ai_chat/mod.rs
+@@ -26,3 +26,5 @@ pub(crate) use {
+ 
+ #[cfg(all(test, not(target_arch = "wasm32")))]
+ mod transport_http_tests;
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod transport_discovery_tests;
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
+new file mode 100644
+index 000000000..1da41d606
+--- /dev/null
++++ b/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
+@@ -0,0 +1,97 @@
++//! PR #3799 pins: the automatic Ollama model selection gives each cause its
++//! own message, continues after a failed probe, and has a time limit.
++//! Provenance: our own loopback fixtures; no external endpoint or key.
++
++use std::sync::atomic::AtomicBool;
++use std::time::Duration;
++
++use camcraft_app::ai::http::{Client, discover_ollama_within};
++use serde_json::json;
++
++use super::transport_http::HttpTransport;
++use super::transport_http_tests::{listener, local_request, recorded_ollama};
++
++#[test]
++fn ollama_discovery_continues_after_a_failed_probe() {
++    let steps = vec![
++        ("GET /api/tags HTTP/1.1", None,
++            json!({"models":[{"name":"broken:latest"},{"name":"installed-tool:latest"}]})),
++        ("POST /api/show HTTP/1.1", Some("broken:latest"),
++            json!({"error":"manifest is damaged"})),
++        ("POST /api/show HTTP/1.1", Some("installed-tool:latest"),
++            json!({"capabilities":["completion","tools"]})),
++        ("POST /v1/chat/completions HTTP/1.1", Some("installed-tool:latest"),
++            json!({"choices":[{"message":{"content":"ready"}}]})),
++    ];
++    let (ep, server) = recorded_ollama(steps);
++    let result = HttpTransport.complete_at(
++        &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++    let requests = server.join().expect("recorded server");
++    assert!(result.is_ok(), "one failed probe must not stop the selection: {result:?}");
++    assert_eq!(requests.len(), 4, "the next model must be probed and used");
++}
++
++#[test]
++fn ollama_discovery_names_the_model_whose_probe_failed() {
++    let steps = vec![
++        ("GET /api/tags HTTP/1.1", None,
++            json!({"models":[{"name":"broken:latest"},{"name":"embed:latest"}]})),
++        ("POST /api/show HTTP/1.1", Some("broken:latest"),
++            json!({"error":"manifest is damaged"})),
++        ("POST /api/show HTTP/1.1", Some("embed:latest"),
++            json!({"capabilities":["embedding"]})),
++    ];
++    let (ep, server) = recorded_ollama(steps);
++    let result = HttpTransport.complete_at(
++        &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++    let requests = server.join().expect("recorded server");
++    let message = result.expect_err("no model can call tools");
++    assert!(message.contains("probe failed for 'broken:latest'"), "model missing: {message}");
++    assert!(message.contains("manifest is damaged"), "reason missing: {message}");
++    assert!(!message.contains("embed:latest"), "a probed model is not a failed one: {message}");
++    assert!(!message.contains("did not answer"), "the server answered: {message}");
++    assert_eq!(requests.len(), 3, "each installed model must be probed");
++}
++
++#[test]
++fn ollama_discovery_says_when_the_server_does_not_answer() {
++    let (closed, ep) = listener();
++    drop(closed);
++    let result = HttpTransport.complete_at(
++        &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++    let message = result.expect_err("a closed port has no model list");
++    assert!(message.contains("did not answer its model list"), "cause missing: {message}");
++    assert!(message.contains("ollama serve"), "start instruction missing: {message}");
++    assert!(!message.contains("ollama pull"), "this is not a missing model: {message}");
++}
++
++#[test]
++fn ollama_discovery_stops_at_its_time_limit() {
++    let steps = vec![("GET /api/tags HTTP/1.1", None,
++        json!({"models":[{"name":"one:latest"},{"name":"two:latest"}]}))];
++    let (ep, server) = recorded_ollama(steps);
++    let result = discover_ollama_within(
++        &Client::new(true), &ep, &AtomicBool::new(false), Duration::ZERO);
++    let requests = server.join().expect("recorded server");
++    let message = result.expect_err("the time limit ended before a probe");
++    assert!(message.contains("stopped after 0 s"), "limit missing: {message}");
++    assert!(message.contains("0 of 2 installed models"), "progress missing: {message}");
++    assert_eq!(requests.len(), 1, "no probe starts after the limit");
++}
++
++#[test]
++fn ollama_chat_failure_names_the_automatic_model() {
++    let steps = vec![
++        ("GET /api/tags HTTP/1.1", None, json!({"models":[{"name":"installed-tool:latest"}]})),
++        ("POST /api/show HTTP/1.1", Some("installed-tool:latest"),
++            json!({"capabilities":["completion","tools"]})),
++        // The fixture answers HTTP 404 to a model that it does not expect.
++        ("POST /v1/chat/completions HTTP/1.1", Some("another-model"), json!({})),
++    ];
++    let (ep, server) = recorded_ollama(steps);
++    let result = HttpTransport.complete_at(
++        &local_request("local-ollama"), &AtomicBool::new(false), &ep, None);
++    server.join().expect("recorded server");
++    let message = result.expect_err("the chat request failed");
++    assert!(message.contains("automatic model 'installed-tool:latest'"), "model missing: {message}");
++}
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http.rs b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+index 1ef5a7664..8b489dcb8 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http.rs
+@@ -131,7 +131,14 @@ impl HttpTransport {
+             tools: &tools,
+             max_tokens: DEFAULT_MAX_TOKENS,
+         };
+-        let envelope = send_chat(&client, ep, &chat, key, cancel)?;
++        // The person did not type the automatic model: a failure names it.
++        let envelope = send_chat(&client, ep, &chat, key, cancel).map_err(|e| {
++            if automatic && !cancel.load(Ordering::Relaxed) {
++                format!("automatic model '{model}': {e}")
++            } else {
++                e
++            }
++        })?;
+         let text = extract_assistant_text(req.preset.provider, &envelope, "");
+         Ok(TransportOutput::AssistantResponse {
+             text,
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+index fe8f12f8c..8d6f6a4ad 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+@@ -40,7 +40,7 @@ fn read_request(s: &mut TcpStream) -> String {
+     }
+ }
+ 
+-fn recorded_ollama(
++pub(super) fn recorded_ollama(
+     steps: Vec<(&'static str, Option<&'static str>, Value)>,
+ ) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
+     let (listener, ep) = listener();
+@@ -61,6 +61,8 @@ fn recorded_ollama(
+                     Err(e) => panic!("fixture accept: {e}"),
+                 }
+             };
++            // On macOS an accepted socket inherits the listener's nonblocking mode.
++            stream.set_nonblocking(false).expect("blocking stream");
+             let request = read_request(&mut stream);
+             let matches_line = request.lines().next() == Some(request_line);
+             let matches_model = model.is_none_or(|model| {
+@@ -87,7 +89,7 @@ fn recorded_ollama(
+     (ep, server)
+ }
+ 
+-fn local_request(id: &str) -> TransportRequest {
++pub(super) fn local_request(id: &str) -> TransportRequest {
+     let preset = default_presets().into_iter().find(|p| p.id == id).expect("local preset");
+     TransportRequest {
+         model: preset.default_model.clone(),
+@@ -243,7 +245,7 @@ impl ChatTransport for LoopbackTransport {
+     }
+ }
+ 
+-fn listener() -> (TcpListener, Endpoint) {
++pub(super) fn listener() -> (TcpListener, Endpoint) {
+     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+     let ep = Endpoint::parse(&format!(
+         "http://{}/v1",
+diff --git a/docs/decisions/3782-model-defaults.md b/docs/decisions/3782-model-defaults.md
+index fb5aef039..c1f4681e1 100644
+--- a/docs/decisions/3782-model-defaults.md
++++ b/docs/decisions/3782-model-defaults.md
+@@ -4,6 +4,8 @@
+ 
+ If no installed model supports tools, the diagnostic gives `ollama pull ornith-1.5:35b` and links to <https://ollama.com/library>.
+ 
++The selection has a time limit: 5 s for each request and 20 s for the whole selection. A failed probe of one model does not stop the selection; the next model is checked. Each cause has its own message: the server did not answer its model list, no installed model can call tools, the probe failed for a named model, or the time limit ended. A chat failure after an automatic selection names the selected model.
++
+ An empty cloud Model field displays the provider default and uses that default for a request. The automatic-selection hint applies only to local providers. Cloud defaults live in one table in the app layer. The defaults are `claude-sonnet-5-5`, `gpt-6.2-sol` for both OpenAI endpoints, and `gemini-4-hydrogen`. These IDs were checked against the official model pages on 2026-11-24:
+ 
+ - <https://platform.claude.com/docs/en/models/overview>
+@@ -14,6 +16,6 @@ Each row in the shared `CLOUD_DEFAULTS` table includes its retirement status. An
+ 
+ **Why.** The reporter found that an empty cloud Model showed the local hint and failed a request. The shared table supplies the displayed and effective cloud default. The install suggestion uses `ornith-1.5:35b` because the reporter's 2026-11-22 benchmark scored it 16/20 CamCraft tasks. The previous `qwen3:8b` suggestion scored 9/20. An installed model can work on the first Send without a model name that the user must enter. The capability probe excludes models that cannot call tools. One table prevents separate defaults from drifting between callers. Recorded responses keep the tests independent of installed models, provider accounts, and network access.
+ 
+-**What was dropped.** The local automatic-selection hint was dropped for cloud providers because cloud requests use the table default. The `qwen3:8b` suggestion was dropped because the reporter's benchmark showed unreliable project changes. The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
++**What was dropped.** The first version stopped the selection at the first failed probe and used the 300 s chat time limit for each probe. The reporter's machine has about 30 installed models, so one damaged model or a slow server could block each Send. A display of the selected model after a successful Send was dropped from this PR: the panel status line is the work of #3798. The local automatic-selection hint was dropped for cloud providers because cloud requests use the table default. The `qwen3:8b` suggestion was dropped because the reporter's benchmark showed unreliable project changes. The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
+ 
+ **Cost to change later.** A different automatic selection policy changes the candidate selection and its recorded-response tests. Provider changes require an update to the shared defaults table or its retirement status fields. A provider wire-format change can also require transport work. These changes do not require a project format migration.
+
+From 94478ac2b6c353808d8a277120713265dfb52367 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Mon, 23 Nov 2026 21:38:39 -0800
+Subject: [PATCH 4/4] fix(ai): cap discovery requests by the remaining time
+
+Keep model-list and probe requests within the total discovery budget. Pin slow responses and the remaining-time cap.
+
+Refs #3782
+---
+ crates/app/src/ai/http.rs                     | 39 +++++++++------
+ .../ai_chat/transport_discovery_tests.rs      | 49 ++++++++++++++++---
+ .../egui_app/ai_chat/transport_http_tests.rs  | 19 +++++--
+ docs/decisions/3782-model-defaults.md         | 10 ++++
+ 4 files changed, 91 insertions(+), 26 deletions(-)
+
+diff --git a/crates/app/src/ai/http.rs b/crates/app/src/ai/http.rs
+index 1fa8e896f..37cc5565c 100644
+--- a/crates/app/src/ai/http.rs
++++ b/crates/app/src/ai/http.rs
+@@ -306,18 +306,26 @@ pub fn discover_ollama_within(
+     const ADVICE: &str = "Run `ollama pull ornith-1.5:35b`, then send again. \
+                           Get models at https://ollama.com/library";
+     let start = crate::clock::Instant::now();
+-    let step = Client {
+-        offline_only: client.offline_only,
+-        timeouts: Timeouts {
+-            connect: client.timeouts.connect.min(DISCOVERY_STEP),
+-            total: client.timeouts.total.min(DISCOVERY_STEP),
+-        },
++    let step = || {
++        let remaining = total.checked_sub(start.elapsed()).filter(|r| !r.is_zero())?;
++        Some(Client {
++            offline_only: client.offline_only,
++            timeouts: Timeouts {
++                connect: client.timeouts.connect.min(DISCOVERY_STEP).min(remaining),
++                total: client.timeouts.total.min(DISCOVERY_STEP).min(remaining),
++            },
++        })
+     };
+-    let answer = step
++    let list_limit = || format!(
++        "Ollama model selection stopped after {} s before reading installed models. \
++         Enter a model name in Model.", total.as_secs());
++    let answer = step().ok_or_else(list_limit)?
+         .get_json_cancellable(&ep.with_base_path(""), "/api/tags", cancel)
+         .map_err(|e| {
+             if cancel.load(Ordering::Relaxed) {
+                 e
++            } else if start.elapsed() >= total {
++                list_limit()
+             } else {
+                 format!("Ollama server did not answer its model list ({e}). \
+                          Start the Ollama app or run `ollama serve`, then send again.")
+@@ -325,16 +333,17 @@ pub fn discover_ollama_within(
+         })?;
+     let models = probe::parse_tags(&answer)?;
+     let mut failed: Vec<(String, String)> = Vec::new();
++    let limit = |checked| format!(
++        "Ollama model selection stopped after {} s: {checked} of {} installed models \
++         checked, and none can call tools. Enter a model name in Model.",
++        total.as_secs(), models.len());
+     for (checked, model) in models.iter().enumerate() {
+-        if start.elapsed() >= total {
+-            return Err(format!(
+-                "Ollama model selection stopped after {} s: {checked} of {} installed models \
+-                 checked, and none can call tools. Enter a model name in Model.",
+-                total.as_secs(),
+-                models.len()
+-            ));
++        let step = step().ok_or_else(|| limit(checked))?;
++        let result = probe_ollama_cancellable(&step, ep, model, cancel);
++        if !cancel.load(Ordering::Relaxed) && start.elapsed() >= total {
++            return Err(limit(checked + 1));
+         }
+-        match probe_ollama_cancellable(&step, ep, model, cancel) {
++        match result {
+             Ok(caps) if caps.tools => return Ok(model.clone()),
+             Ok(_) => {}
+             Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
+index 1da41d606..cccf86740 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_discovery_tests.rs
+@@ -3,13 +3,13 @@
+ //! Provenance: our own loopback fixtures; no external endpoint or key.
+ 
+ use std::sync::atomic::AtomicBool;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use camcraft_app::ai::http::{Client, discover_ollama_within};
+ use serde_json::json;
+ 
+ use super::transport_http::HttpTransport;
+-use super::transport_http_tests::{listener, local_request, recorded_ollama};
++use super::transport_http_tests::{listener, local_request, recorded_ollama, recorded_ollama_delayed};
+ 
+ #[test]
+ fn ollama_discovery_continues_after_a_failed_probe() {
+@@ -67,16 +67,49 @@ fn ollama_discovery_says_when_the_server_does_not_answer() {
+ 
+ #[test]
+ fn ollama_discovery_stops_at_its_time_limit() {
+-    let steps = vec![("GET /api/tags HTTP/1.1", None,
+-        json!({"models":[{"name":"one:latest"},{"name":"two:latest"}]}))];
+-    let (ep, server) = recorded_ollama(steps);
++    let (ep, server) = recorded_ollama(vec![]);
+     let result = discover_ollama_within(
+         &Client::new(true), &ep, &AtomicBool::new(false), Duration::ZERO);
+     let requests = server.join().expect("recorded server");
+-    let message = result.expect_err("the time limit ended before a probe");
++    let message = result.expect_err("the time limit ended before the model list");
+     assert!(message.contains("stopped after 0 s"), "limit missing: {message}");
+-    assert!(message.contains("0 of 2 installed models"), "progress missing: {message}");
+-    assert_eq!(requests.len(), 1, "no probe starts after the limit");
++    assert!(message.contains("before reading installed models"), "stage missing: {message}");
++    assert!(requests.is_empty(), "no request starts after the limit");
++}
++
++#[test]
++fn ollama_discovery_caps_the_model_list_by_the_total_time() {
++    let (ep, server) = recorded_ollama_delayed(vec![
++        ("GET /api/tags HTTP/1.1", None, json!({"models":[]}), Duration::from_secs(1)),
++    ]);
++    let start = Instant::now();
++    let result = discover_ollama_within(
++        &Client::new(true), &ep, &AtomicBool::new(false), Duration::from_millis(200));
++    let elapsed = start.elapsed();
++    server.join().expect("recorded server");
++    let message = result.expect_err("the slow model list exceeds the total time");
++    assert!(message.contains("before reading installed models"), "stage missing: {message}");
++    assert!(elapsed < Duration::from_millis(700), "model list exceeded the total time: {elapsed:?}");
++}
++
++#[test]
++fn ollama_discovery_caps_a_probe_by_the_remaining_total_time() {
++    let (ep, server) = recorded_ollama_delayed(vec![
++        ("GET /api/tags HTTP/1.1", None,
++            json!({"models":[{"name":"slow-tool:latest"}]}), Duration::from_millis(500)),
++        ("POST /api/show HTTP/1.1", Some("slow-tool:latest"),
++            json!({"capabilities":["tools"]}), Duration::from_secs(2)),
++    ]);
++    let start = Instant::now();
++    let result = discover_ollama_within(
++        &Client::new(true), &ep, &AtomicBool::new(false), Duration::from_secs(1));
++    let elapsed = start.elapsed();
++    let requests = server.join().expect("recorded server");
++    let message = result.expect_err("the slow probe exceeds the remaining total time");
++    assert!(message.contains("stopped after 1 s"), "limit missing: {message}");
++    assert!(message.contains("1 of 1 installed models"), "progress missing: {message}");
++    assert_eq!(requests.len(), 2, "the model list consumed part of the time before the probe");
++    assert!(elapsed < Duration::from_millis(1300), "probe exceeded the remaining time: {elapsed:?}");
+ }
+ 
+ #[test]
+diff --git a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+index 8d6f6a4ad..567ca361a 100644
+--- a/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
++++ b/crates/ui/src/egui_app/ai_chat/transport_http_tests.rs
+@@ -42,12 +42,20 @@ fn read_request(s: &mut TcpStream) -> String {
+ 
+ pub(super) fn recorded_ollama(
+     steps: Vec<(&'static str, Option<&'static str>, Value)>,
++) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
++    recorded_ollama_delayed(steps.into_iter().map(|(line, model, answer)| {
++        (line, model, answer, Duration::ZERO)
++    }).collect())
++}
++
++pub(super) fn recorded_ollama_delayed(
++    steps: Vec<(&'static str, Option<&'static str>, Value, Duration)>,
+ ) -> (Endpoint, std::thread::JoinHandle<Vec<String>>) {
+     let (listener, ep) = listener();
+     listener.set_nonblocking(true).expect("nonblocking fixture");
+     let server = std::thread::spawn(move || {
+         let mut requests = Vec::new();
+-        for (request_line, model, answer) in steps {
++        for (request_line, model, answer, delay) in steps {
+             let start = Instant::now();
+             let mut stream = loop {
+                 match listener.accept() {
+@@ -77,9 +85,14 @@ pub(super) fn recorded_ollama(
+             } else {
+                 json!({"error":"unexpected model or endpoint in recorded fixture"}).to_string()
+             };
+-            write!(stream,
++            std::thread::sleep(delay);
++            let written = write!(stream,
+                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+-                body.len()).expect("fixture answer");
++                body.len());
++            // A delayed answer can arrive after the client closes on its deadline.
++            if delay.is_zero() {
++                written.expect("fixture answer");
++            }
+             if !matches_line || !matches_model {
+                 return requests;
+             }
+diff --git a/docs/decisions/3782-model-defaults.md b/docs/decisions/3782-model-defaults.md
+index c1f4681e1..2b9738fc4 100644
+--- a/docs/decisions/3782-model-defaults.md
++++ b/docs/decisions/3782-model-defaults.md
+@@ -19,3 +19,13 @@ Each row in the shared `CLOUD_DEFAULTS` table includes its retirement status. An
+ **What was dropped.** The first version stopped the selection at the first failed probe and used the 300 s chat time limit for each probe. The reporter's machine has about 30 installed models, so one damaged model or a slow server could block each Send. A display of the selected model after a successful Send was dropped from this PR: the panel status line is the work of #3798. The local automatic-selection hint was dropped for cloud providers because cloud requests use the table default. The `qwen3:8b` suggestion was dropped because the reporter's benchmark showed unreliable project changes. The app does not download a model automatically. A download can consume substantial disk space and bandwidth. The app does not silently replace an explicit model name. That would hide the user's choice. A fixed local model name was dropped because the selected machine might not have that model. Live cloud checks were dropped because they require network access and can require API keys.
+ 
+ **Cost to change later.** A different automatic selection policy changes the candidate selection and its recorded-response tests. Provider changes require an update to the shared defaults table or its retirement status fields. A provider wire-format change can also require transport work. These changes do not require a project format migration.
++
++### PR #3799 review: enforce the total discovery time limit
++
++**What was decided.** The model list request and each model probe use the remaining total discovery time. Each request also keeps its 5 s maximum.
++
++**Why.** A check before each probe lets the last request exceed the total time limit. The request timeout must also use the remaining time.
++
++**What was dropped.** A fixed 5 s request timeout without the remaining total time was dropped. It can exceed the stated 20 s selection limit.
++
++**Cost to change later.** A different time limit requires an update to the discovery timeout policy and its slow-response tests.

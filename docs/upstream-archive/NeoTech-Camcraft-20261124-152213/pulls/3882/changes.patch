@@ -1,0 +1,1402 @@
+From 5522dfe96781efaf5f47d6e6af523450ebd1799b Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Tue, 24 Nov 2026 12:15:11 +0100
+Subject: [PATCH] perf(playback): cut the twin-able ops into a dense layer
+ (S3b)
+
+The playback worker gets an opt-in layer mode (PlayWorker::spawn_layered).
+Each plain op whose tool (ball, flat end mill) and moves (linear, upright)
+have an f32 twin is cut by a caller-given cutter into a dense cut layer
+on the packed frame's lattice; the f64 field cuts every other op. A frame
+is max(pack_cut(field), layer), always whole.
+
+- camcraft-sim: LayerPlay (the layer as a function of the move count,
+  its own keyframes, cut only for a picture), LayerCutter and the CPU
+  twin law cutter (run_twin_items_onto), layer_tool (the display cut's
+  tool law), twin_refusal, merge_max.
+- camcraft-app: FieldPlay::set_layer / layer_frame / drop_layer; the cut
+  dispatch moves to stock_play_cut.rs and the frame packing to
+  stock_play_worker_frame.rs (400-line law). A layer fault turns the mode
+  off and rebuilds the field with every op at the same position.
+- camcraft-gpu: the spot check takes the margin of every item that ties
+  with the result (a spring pass over a keyframe no longer refuses a good
+  GPU layer); the device-loss Err of cut_into is pinned.
+
+No caller turns the mode on yet (S3c: the GPU cutter on the render
+device), so the product picture does not change. No new crate edge:
+camcraft-app does not depend on camcraft-gpu (#3589, one wgpu instance).
+
+Refs #2629
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/stock_play.rs                |  39 +---
+ crates/app/src/stock_play_cut.rs            | 167 ++++++++++++++
+ crates/app/src/stock_play_head.rs           |   4 +
+ crates/app/src/stock_play_worker.rs         |  91 ++------
+ crates/app/src/stock_play_worker_frame.rs   | 103 +++++++++
+ crates/app/src/stock_play_worker_precalc.rs |   2 +-
+ crates/app/tests/stock_play_picture.rs      | 104 ++++++++-
+ crates/gpu/src/cut_run.rs                   |  36 +--
+ crates/gpu/tests/cut_onto.rs                |  25 ++-
+ crates/sim/src/stock_sim/cut_twin_work.rs   |  89 ++++++--
+ crates/sim/src/stock_sim/layer_play.rs      | 237 ++++++++++++++++++++
+ crates/sim/src/stock_sim/mod.rs             |   8 +-
+ crates/sim/tests/stock_cut_twin.rs          |  99 +++++++-
+ docs/decisions/2629-gpu-playback-layer.md   |  74 ++++++
+ 14 files changed, 932 insertions(+), 146 deletions(-)
+ create mode 100644 crates/app/src/stock_play_cut.rs
+ create mode 100644 crates/app/src/stock_play_worker_frame.rs
+ create mode 100644 crates/sim/src/stock_sim/layer_play.rs
+ create mode 100644 docs/decisions/2629-gpu-playback-layer.md
+
+diff --git a/crates/app/src/stock_play.rs b/crates/app/src/stock_play.rs
+index 44aad8654..293d64a71 100644
+--- a/crates/app/src/stock_play.rs
++++ b/crates/app/src/stock_play.rs
+@@ -35,7 +35,7 @@ use std::collections::HashSet;
+ use std::sync::Arc;
+ 
+ use crate::geometry::Triangle;
+-use crate::stock_sim::{Planned, SimOp, Stock};
++use crate::stock_sim::{Planned, Stock};
+ use crate::stock_view::{build_stock, build_target, display_inputs_of, FieldView, DEFAULT_TEXELS};
+ 
+ /// Snapshots kept at most - the backward seek's memory bound.
+@@ -178,6 +178,8 @@ pub struct FieldPlay {
+     ghost: HashSet<[i32; 3]>,
+     /// Moves cut since the build: the replay law's yardstick (#2181).
+     moves_cut: usize,
++    /// The layer mode (#2629, S3b): the twin-able ops' cut, off the field.
++    layer: Option<cut::LayerMode>,
+ }
+ 
+ impl FieldPlay {
+@@ -251,6 +253,7 @@ impl FieldPlay {
+             partial_bricks: HashSet::new(),
+             ghost: HashSet::new(),
+             moves_cut: 0,
++            layer: None,
+         })
+     }
+ 
+@@ -392,43 +395,15 @@ impl FieldPlay {
+             set
+         })
+     }
+-
+-    /// Subtract global moves `[from, to)` from the shown stock.
+-    fn cut(&mut self, from: usize, to: usize) -> Result<(), String> {
+-        for op in &self.ops {
+-            let end = op.start.saturating_add(op.moves.len());
+-            let (a, b) = (from.max(op.start), to.min(end));
+-            if a >= b {
+-                continue;
+-            }
+-            let moves = op.moves.get(a - op.start..b - op.start).ok_or("playback: a move range fell outside its op")?;
+-            let sim = SimOp { moves, radius: op.radius, ball: op.ball, cone: op.cone, corner: op.corner };
+-            // A rotary slice is chorded about the fitted axis, turning
+-            // from the pose the program held before it (M13.1).
+-            let cut = match (&op.rotary, &op.lathe, &op.undercut) {
+-                (_, _, Some((cutter, neck_len))) => self.cur.simulate_undercut(moves, cutter, *neck_len),
+-                (_, Some(l), None) => self.cur.simulate_lathe_profile(moves, &l.profile, &l.axis),
+-                (Some(ax), None, None) => {
+-                    let tol = crate::stock_sim::rotary_pose_tol(self.cur.cell());
+-                    crate::stock_sim::simulate_rotary_slice(&mut self.cur, &sim, &op.moves, a - op.start, ax, tol).map(|_| ())
+-                }
+-                (None, None, None) => if op.drill {
+-                    self.cur.simulate_drill_display(std::slice::from_ref(&sim))
+-                } else {
+-                    self.cur.simulate_display(std::slice::from_ref(&sim))
+-                },
+-            };
+-            cut.map_err(|e| format!("playback could not cut {}: {e}", op.name))?;
+-            self.moves_cut = self.moves_cut.saturating_add(b - a);
+-        }
+-        Ok(())
+-    }
+ }
+ 
+ #[path = "stock_play_head.rs"]
+ mod head;
+ pub use head::{progress, settle_frac, Progress};
+ 
++#[path = "stock_play_cut.rs"]
++mod cut;
++
+ #[path = "stock_play_precalc.rs"]
+ mod precalc;
+ pub use camcraft_sim::play_keys::{Keyframes, Precalc, MAX_KEYFRAMES, PRECALC_BUDGET};
+diff --git a/crates/app/src/stock_play_cut.rs b/crates/app/src/stock_play_cut.rs
+new file mode 100644
+index 000000000..e26378091
+--- /dev/null
++++ b/crates/app/src/stock_play_cut.rs
+@@ -0,0 +1,167 @@
++//! The cut dispatch of the playback (moved from `stock_play.rs`, the
++//! 400-line law) and its layer mode (#2629, GPU stock sim S3b): the ops
++//! that the f32 twin can cut leave the f64 field and are cut into a dense
++//! display layer by a caller-given cutter (a GPU kernel, or the CPU twin
++//! law); the picture is `max(pack_cut(field), layer)`.
++//! Provenance: our own design (decision 2629) over camcraft-sim's
++//! `layer_play`; nothing from vendor binaries.
++//!
++//! ## The laws here
++//!
++//! - **Each op has one owner.** The layer mode decides once, before the
++//!   first cut, which ops the layer cuts (a plain op whose tool and moves
++//!   have a twin); the field cuts every other op and never a layer op.
++//!   Every move is cut by exactly one of them, so the max-law picture is
++//!   the whole program's.
++//! - **Opt-in.** The mode is off unless the caller sets a cutter. The
++//!   field (`FieldView::stock`) does not hold the layer ops' cut, so only
++//!   a caller whose eye reads the packed frame alone may set one.
++//! - **A layer fault falls back to the field, never crashes.** When the
++//!   layer cannot cut (a window past the twin's ceiling, a cutter error),
++//!   the mode goes off, the reason is logged, and the field is rebuilt
++//!   from the uncut stock with every op: the CPU playback of before.
++
++use std::sync::Arc;
++
++use super::{FieldPlay, MAX_CHECKPOINTS};
++use crate::stock_sim::preview::LatticeMeta;
++use crate::stock_sim::{layer_tool, LayerCutter, LayerPlay, LayerSpan, SdfTool, SimOp};
++use camcraft_sim::play_keys::Keyframes;
++
++/// The layer mode's state: the layer and each op's twin tool (`None`:
++/// the field cuts that op).
++pub(super) struct LayerMode {
++    play: LayerPlay,
++    tools: Vec<Option<SdfTool>>,
++}
++
++impl LayerMode {
++    fn holds(&self, op: usize) -> bool {
++        self.tools.get(op).is_some_and(Option::is_some)
++    }
++}
++
++impl FieldPlay {
++    /// Turn the layer mode on (#2629): the ops that the twin can cut go
++    /// to `cutter` on `meta`'s lattice (the packed frame's), the rest stay
++    /// on the field. Answers the ops kept on the field, each with its
++    /// reason. Only before the first cut: the field's keyframes must not
++    /// hold a layer op's cut.
++    pub fn set_layer(&mut self, meta: LatticeMeta, cutter: Arc<LayerCutter>) -> Result<Vec<String>, String> {
++        if self.at != 0 || self.keys.len() > 1 || self.partial.is_some() || self.layer.is_some() {
++            return Err("layer playback: the layer is set before the first cut, one time".into());
++        }
++        let mut tools = Vec::with_capacity(self.ops.len());
++        let mut kept = Vec::new();
++        for op in &self.ops {
++            let plain = op.rotary.is_none() && op.lathe.is_none() && op.undercut.is_none() && !op.drill;
++            let sim = SimOp { moves: &op.moves, radius: op.radius, ball: op.ball, cone: op.cone, corner: op.corner };
++            let tool = if plain {
++                layer_tool(&sim, &self.cur).map_err(|e| e.to_string())
++            } else {
++                Err("a rotary, turning, undercut or drill op has no twin".to_string())
++            };
++            match tool {
++                Ok(t) => tools.push(Some(t)),
++                Err(why) => {
++                    kept.push(format!("{}: {why}", op.name));
++                    tools.push(None);
++                }
++            }
++        }
++        let play = LayerPlay::new(meta, cutter, self.keys.stride()).map_err(|e| e.to_string())?;
++        self.layer = Some(LayerMode { play, tools });
++        Ok(kept)
++    }
++
++    /// Whether the layer mode is on.
++    #[must_use]
++    pub const fn layer_on(&self) -> bool {
++        self.layer.is_some()
++    }
++
++    /// Whether the layer cuts the op of global move `k`.
++    pub(super) fn layer_holds_move(&self, k: usize) -> bool {
++        let Some(mode) = &self.layer else {
++            return false;
++        };
++        self.ops.iter().position(|o| k >= o.start && k - o.start < o.moves.len()).is_some_and(|i| mode.holds(i))
++    }
++
++    /// The layer at the shown position (`at` moves and the travelled
++    /// part of the move in flight), or `None` when the mode is off. A
++    /// layer fault turns the mode off and rebuilds the field with every
++    /// op (the module law); the answer is then `None`.
++    pub fn layer_frame(&mut self) -> Result<Option<Arc<Vec<f32>>>, String> {
++        let Some(LayerMode { play, tools }) = self.layer.as_mut() else {
++            return Ok(None);
++        };
++        let spans: Vec<LayerSpan<'_>> = tools
++            .iter()
++            .zip(&self.ops)
++            .filter_map(|(t, op)| t.as_ref().map(|tool| LayerSpan { start: op.start, moves: &op.moves, tool }))
++            .collect();
++        let frame = play.frame(self.at, self.frac, &spans);
++        drop(spans);
++        match frame {
++            Ok(layer) => Ok(Some(layer)),
++            Err(e) => {
++                self.drop_layer(&e.to_string())?;
++                Ok(None)
++            }
++        }
++    }
++
++    /// Turn the layer mode off and rebuild the field with every op, at
++    /// the same position. The keyframes start again from the uncut stock.
++    pub fn drop_layer(&mut self, why: &str) -> Result<(), String> {
++        if self.layer.take().is_none() {
++            return Ok(());
++        }
++        tracing::warn!(target: "camcraft::playback", "layer playback is off, the field cuts every op: {why}");
++        let uncut = self.keys.floor(0).ok_or("playback lost its uncut stock")?.1.clone();
++        let (at, frac) = (self.at, self.frac);
++        self.keys = Keyframes::new(uncut.clone(), self.keys.stride(), MAX_CHECKPOINTS);
++        self.drop_partial();
++        self.cur = uncut;
++        self.cur.set_dirty_tracking(!self.batched);
++        self.at = 0;
++        self.restored = true;
++        self.seek_to(at, frac)?;
++        Ok(())
++    }
++
++    /// Subtract global moves `[from, to)` from the shown stock (the
++    /// layer ops excepted, when the layer mode is on).
++    pub(super) fn cut(&mut self, from: usize, to: usize) -> Result<(), String> {
++        for (i, op) in self.ops.iter().enumerate() {
++            let end = op.start.saturating_add(op.moves.len());
++            let (a, b) = (from.max(op.start), to.min(end));
++            if a >= b || self.layer.as_ref().is_some_and(|m| m.holds(i)) {
++                continue;
++            }
++            let moves = op.moves.get(a - op.start..b - op.start).ok_or("playback: a move range fell outside its op")?;
++            let sim = SimOp { moves, radius: op.radius, ball: op.ball, cone: op.cone, corner: op.corner };
++            // A rotary slice is chorded about the fitted axis, turning
++            // from the pose the program held before it (M13.1).
++            let cut = match (&op.rotary, &op.lathe, &op.undercut) {
++                (_, _, Some((cutter, neck_len))) => self.cur.simulate_undercut(moves, cutter, *neck_len),
++                (_, Some(l), None) => self.cur.simulate_lathe_profile(moves, &l.profile, &l.axis),
++                (Some(ax), None, None) => {
++                    let tol = crate::stock_sim::rotary_pose_tol(self.cur.cell());
++                    crate::stock_sim::simulate_rotary_slice(&mut self.cur, &sim, &op.moves, a - op.start, ax, tol).map(|_| ())
++                }
++                (None, None, None) => {
++                    if op.drill {
++                        self.cur.simulate_drill_display(std::slice::from_ref(&sim))
++                    } else {
++                        self.cur.simulate_display(std::slice::from_ref(&sim))
++                    }
++                }
++            };
++            cut.map_err(|e| format!("playback could not cut {}: {e}", op.name))?;
++            self.moves_cut = self.moves_cut.saturating_add(b - a);
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/app/src/stock_play_head.rs b/crates/app/src/stock_play_head.rs
+index ec325c5be..e3a1de9aa 100644
+--- a/crates/app/src/stock_play_head.rs
++++ b/crates/app/src/stock_play_head.rs
+@@ -114,6 +114,10 @@ impl FieldPlay {
+             return Ok(());
+         }
+         let at = self.at;
++        // #2629: the layer cuts its own move in flight (`layer_frame`).
++        if self.layer_holds_move(at) {
++            return Ok(());
++        }
+         let Some(op) = self.ops.iter().find(|o| at >= o.start && at - o.start < o.moves.len()) else {
+             return Ok(());
+         };
+diff --git a/crates/app/src/stock_play_worker.rs b/crates/app/src/stock_play_worker.rs
+index 1284a728b..2aee9f046 100644
+--- a/crates/app/src/stock_play_worker.rs
++++ b/crates/app/src/stock_play_worker.rs
+@@ -43,7 +43,6 @@
+ //!   by name. Dropping the handle stops and joins the thread: no
+ //!   playback outlives its document.
+ 
+-use std::collections::HashSet;
+ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+ use std::thread::JoinHandle;
+@@ -56,8 +55,12 @@ use crate::stock_play::{settle_frac, FieldPlay, PlayIndex, PlaySeed, Precalc};
+ mod precalc;
+ use precalc::{precalc, refuse};
+ use camcraft_sim::play_precalc_mailbox::Mailbox;
+-use crate::stock_view::{CutLayer, FieldView, Packed, PackedBase};
+-use crate::stock_sim::preview::{pack_cut, pack_cut_patch, LatticeMeta};
++use crate::stock_view::{FieldView, PackedBase};
++use crate::stock_sim::LayerCutter;
++
++#[path = "stock_play_worker_frame.rs"]
++mod frame;
++use frame::{snapshot, Chain};
+ 
+ /// The publication floor: at most ~20 views a second while cutting.
+ pub const MIN_PUBLISH: Duration = Duration::from_millis(50);
+@@ -131,10 +134,18 @@ impl PlayWorker {
+     /// Start a worker over `seed` (the fields are built on the worker,
+     /// so the call returns at once). `Err` only when no thread spawns.
+     pub fn spawn(seed: PlaySeed) -> Result<Self, String> {
+-        Self::start(seed, None)
++        Self::start(seed, None, None)
++    }
++
++    /// `spawn` in the layer mode (#2629, GPU stock sim S3b): the ops that
++    /// the f32 twin can cut are cut by `cutter` into a dense layer, and
++    /// every frame is the whole packed layer. Only for an eye that reads
++    /// the packed frame alone (`FieldView::stock` lacks those ops' cut).
++    pub fn spawn_layered(seed: PlaySeed, cutter: Arc<LayerCutter>) -> Result<Self, String> {
++        Self::start(seed, None, Some(cutter))
+     }
+ 
+-    fn start(seed: PlaySeed, budget: Option<usize>) -> Result<Self, String> {
++    fn start(seed: PlaySeed, budget: Option<usize>, cutter: Option<Arc<LayerCutter>>) -> Result<Self, String> {
+         let index = seed.index();
+         let shared = Arc::new(Shared::default());
+         if budget.is_some() {
+@@ -143,7 +154,7 @@ impl PlayWorker {
+         let inner = Arc::clone(&shared);
+         let handle = std::thread::Builder::new()
+             .name("camcraft-playback".into())
+-            .spawn(move || run(&inner, seed, budget))
++            .spawn(move || run(&inner, seed, budget, cutter))
+             .map_err(|e| format!("playback worker would not start: {e}"))?;
+         Ok(PlayWorker { shared, index, handle: Some(handle), shown: AtomicUsize::new(usize::MAX), shown_frac: AtomicU64::new(0) })
+     }
+@@ -277,68 +288,7 @@ fn next_target(shared: &Shared, pos: (usize, f64), published: Option<(usize, f64
+     }
+ }
+ 
+-/// Cells in a brick (the field's 8^3): the patch-size yardstick.
+-const BRICK_TEXELS: usize = 512;
+-
+-/// What the worker last published: the patch base of the next frame.
+-#[derive(Default)]
+-struct Chain {
+-    seq: u64,
+-    last: Option<Last>,
+-}
+-
+-enum Last {
+-    Full,
+-    Patch { from: u64, set: HashSet<[i32; 3]> },
+-}
+-
+-fn texels(meta: &LatticeMeta) -> usize {
+-    meta.dims.iter().fold(1usize, |n, &d| n.saturating_mul(d as usize))
+-}
+-
+-/// This frame's cut layer relation: `Some((from, bricks))` for a patch
+-/// over frame `from`, `None` for the whole layer (the module law).
+-fn delta(
+-    dirty: Option<HashSet<[i32; 3]>>,
+-    last: Option<Last>,
+-    untaken: bool,
+-    seq: u64,
+-) -> Option<(u64, HashSet<[i32; 3]>)> {
+-    match (dirty?, last?) {
+-        // The frame before still sits untaken and this one replaces
+-        // it: the patch must also carry that frame's bricks.
+-        (d, Last::Patch { from, mut set }) if untaken => {
+-            set.extend(d);
+-            Some((from, set))
+-        }
+-        (_, Last::Full) if untaken => None,
+-        (d, _) => Some((seq.saturating_sub(1), d)),
+-    }
+-}
+-
+-fn snapshot(shared: &Shared, play: &mut FieldPlay, base: Option<&Arc<PackedBase>>, chain: &mut Chain) -> PlayFrame {
+-    let dirty = play.take_dirty();
+-    let mut view = play.view();
+-    if let (Some(base), Some(f)) = (base, view.stock.field()) {
+-        chain.seq = chain.seq.saturating_add(1);
+-        let seq = chain.seq;
+-        let untaken = lock(&shared.out).is_some_and(|g| matches!(g.latest, Some(Ok(_))));
+-        let d = delta(dirty, chain.last.take(), untaken, seq)
+-            .filter(|(_, set)| set.len().saturating_mul(BRICK_TEXELS) < texels(&base.meta));
+-        let (cut, last) = match d {
+-            Some((from, set)) => {
+-                let patch = Arc::new(pack_cut_patch(f, &base.meta, &set));
+-                (CutLayer::Patch { from, patch }, Last::Patch { from, set })
+-            }
+-            None => (CutLayer::Full(Arc::new(pack_cut(f, &base.meta))), Last::Full),
+-        };
+-        chain.last = Some(last);
+-        view.packed = Some(Packed { base: Arc::clone(base), seq, cut });
+-    }
+-    PlayFrame { at: play.at(), frac: play.frac(), view: Arc::new(view) }
+-}
+-
+-fn run(shared: &Shared, seed: PlaySeed, budget: Option<usize>) {
++fn run(shared: &Shared, seed: PlaySeed, budget: Option<usize>, cutter: Option<Arc<LayerCutter>>) {
+     let mut play = match FieldPlay::from_seed(seed) {
+         Ok(p) => p,
+         Err(e) => return refuse(shared, budget, e),
+@@ -348,6 +298,9 @@ fn run(shared: &Shared, seed: PlaySeed, budget: Option<usize>) {
+         let v = play.view();
+         PackedBase::of(&v.stock, v.target.as_deref()).map(|(b, _)| Arc::new(b))
+     };
++    if let (Some(cutter), Some(base)) = (cutter, base.as_ref()) {
++        frame::enable_layer(&mut play, base, cutter);
++    }
+     if let Some(budget) = budget
+         && !precalc(shared, &mut play, budget)
+     {
+@@ -398,7 +351,7 @@ fn run(shared: &Shared, seed: PlaySeed, budget: Option<usize>) {
+         let pos = (play.at(), play.frac());
+         let fresh = published.is_none_or(|p: (usize, f64)| (p.0, p.1.to_bits()) != (pos.0, pos.1.to_bits()));
+         if fresh && (landed || due) {
+-            publish(shared, Ok(snapshot(shared, &mut play, base.as_ref(), &mut chain)));
++            publish(shared, snapshot(shared, &mut play, base.as_ref(), &mut chain));
+             published = Some(pos);
+             last = Some(Instant::now());
+         }
+diff --git a/crates/app/src/stock_play_worker_frame.rs b/crates/app/src/stock_play_worker_frame.rs
+new file mode 100644
+index 000000000..bbc935ef3
+--- /dev/null
++++ b/crates/app/src/stock_play_worker_frame.rs
+@@ -0,0 +1,103 @@
++//! The packed frame of the playback worker (moved from
++//! `stock_play_worker.rs`, the 400-line law): the patch chain, the whole
++//! or patched cut layer of each picture, and the layer mode's merge
++//! (#2629, GPU stock sim S3b): `max(pack_cut(field), layer)`, always a
++//! whole layer, so no eye ever repacks a layer frame from the field.
++//! Provenance: our own publication law (the module law of the worker).
++
++use std::collections::HashSet;
++use std::sync::Arc;
++
++use super::{lock, PlayFrame, Shared};
++use crate::stock_play::FieldPlay;
++use crate::stock_sim::merge_max;
++use crate::stock_sim::preview::{pack_cut, pack_cut_patch, LatticeMeta};
++use crate::stock_sim::LayerCutter;
++use crate::stock_view::{CutLayer, Packed, PackedBase};
++
++/// Cells in a brick (the field's 8^3): the patch-size yardstick.
++const BRICK_TEXELS: usize = 512;
++
++/// What the worker last published: the patch base of the next frame.
++#[derive(Default)]
++pub(super) struct Chain {
++    seq: u64,
++    last: Option<Last>,
++}
++
++enum Last {
++    Full,
++    Patch { from: u64, set: HashSet<[i32; 3]> },
++}
++
++fn texels(meta: &LatticeMeta) -> usize {
++    meta.dims.iter().fold(1usize, |n, &d| n.saturating_mul(d as usize))
++}
++
++/// This frame's cut layer relation: `Some((from, bricks))` for a patch
++/// over frame `from`, `None` for the whole layer (the module law).
++fn delta(
++    dirty: Option<HashSet<[i32; 3]>>,
++    last: Option<Last>,
++    untaken: bool,
++    seq: u64,
++) -> Option<(u64, HashSet<[i32; 3]>)> {
++    match (dirty?, last?) {
++        // The frame before still sits untaken and this one replaces
++        // it: the patch must also carry that frame's bricks.
++        (d, Last::Patch { from, mut set }) if untaken => {
++            set.extend(d);
++            Some((from, set))
++        }
++        (_, Last::Full) if untaken => None,
++        (d, _) => Some((seq.saturating_sub(1), d)),
++    }
++}
++
++/// Turn the layer mode on for the worker's playback, on the packed
++/// frame's lattice; the ops kept on the field and a refusal are logged,
++/// and the playback goes on either way.
++pub(super) fn enable_layer(play: &mut FieldPlay, base: &PackedBase, cutter: Arc<LayerCutter>) {
++    match play.set_layer(base.meta.clone(), cutter) {
++        Ok(kept) => {
++            for why in kept {
++                tracing::info!(target: "camcraft::playback", "layer playback: the field cuts {why}");
++            }
++        }
++        Err(e) => tracing::warn!(target: "camcraft::playback", "layer playback is off: {e}"),
++    }
++}
++
++pub(super) fn snapshot(
++    shared: &Shared,
++    play: &mut FieldPlay,
++    base: Option<&Arc<PackedBase>>,
++    chain: &mut Chain,
++) -> Result<PlayFrame, String> {
++    // First: a layer fault rebuilds the field, which the view then shows.
++    let layer = play.layer_frame()?;
++    let dirty = play.take_dirty();
++    let mut view = play.view();
++    if let (Some(base), Some(f)) = (base, view.stock.field()) {
++        chain.seq = chain.seq.saturating_add(1);
++        let seq = chain.seq;
++        let untaken = lock(&shared.out).is_some_and(|g| matches!(g.latest, Some(Ok(_))));
++        let d = delta(dirty, chain.last.take(), untaken, seq)
++            .filter(|(_, set)| set.len().saturating_mul(BRICK_TEXELS) < texels(&base.meta));
++        let (cut, last) = match (layer, d) {
++            (Some(layer), _) => {
++                let mut whole = pack_cut(f, &base.meta);
++                merge_max(&mut whole, &layer).map_err(|e| e.to_string())?;
++                (CutLayer::Full(Arc::new(whole)), Last::Full)
++            }
++            (None, Some((from, set))) => {
++                let patch = Arc::new(pack_cut_patch(f, &base.meta, &set));
++                (CutLayer::Patch { from, patch }, Last::Patch { from, set })
++            }
++            (None, None) => (CutLayer::Full(Arc::new(pack_cut(f, &base.meta))), Last::Full),
++        };
++        chain.last = Some(last);
++        view.packed = Some(Packed { base: Arc::clone(base), seq, cut });
++    }
++    Ok(PlayFrame { at: play.at(), frac: play.frac(), view: Arc::new(view) })
++}
+diff --git a/crates/app/src/stock_play_worker_precalc.rs b/crates/app/src/stock_play_worker_precalc.rs
+index d11311e0a..8503d8d99 100644
+--- a/crates/app/src/stock_play_worker_precalc.rs
++++ b/crates/app/src/stock_play_worker_precalc.rs
+@@ -37,7 +37,7 @@ impl PlayWorker {
+     /// `spawn`, but the worker first calculates the whole removal with
+     /// keyframes held to `budget` bytes (the sim crate's law).
+     pub fn spawn_precalc(seed: PlaySeed, budget: usize) -> Result<Self, String> {
+-        Self::start(seed, Some(budget))
++        Self::start(seed, Some(budget), None)
+     }
+ }
+ 
+diff --git a/crates/app/tests/stock_play_picture.rs b/crates/app/tests/stock_play_picture.rs
+index c947052ee..bfbd805cd 100644
+--- a/crates/app/tests/stock_play_picture.rs
++++ b/crates/app/tests/stock_play_picture.rs
+@@ -8,7 +8,11 @@
+ //! Provenance: our own fixtures over the M7.1 field engine; nothing
+ //! from vendor binaries.
+ //!
+-//! Gate map (M4.4): covers app::stock_play, app::stock_play_worker, app::stock_play_worker_precalc, app::stock_view.
++//! #2629 (GPU stock sim S3b) at the end: the layer mode draws the field's
++//! picture within the twin's claim margin, and a layer fault falls back
++//! to the field picture.
++//!
++//! Gate map (M4.4): covers app::stock_play, app::stock_play_cut, app::stock_play_worker, app::stock_play_worker_frame, app::stock_play_worker_precalc, app::stock_view.
+ 
+ use std::time::{Duration, Instant};
+ 
+@@ -22,6 +26,7 @@ use camcraft_app::stock::StockShape;
+ use camcraft_app::stock_play::{FieldPlay, PlaySeed, Precalc, PRECALC_BUDGET};
+ use camcraft_app::stock_play_worker::{PlayFrame, PlayWorker};
+ use camcraft_app::stock_sim::preview::pack_cut;
++use camcraft_app::stock_sim::{cpu_layer_cutter, LayerCutter};
+ use camcraft_app::stock_view::{field_view_with, CutLayer, PackedBase};
+ use camcraft_app::tools::catalog;
+ use camcraft_app::world::new_world;
+@@ -171,3 +176,100 @@ fn the_drawn_stock_shows_the_removal_as_the_program_plays() {
+ fn the_drawn_stock_shows_the_removal_at_the_display_budget() {
+     check_playback(&faced_doc(24.0, 0.8, Some(2.5)), camcraft_app::stock_view::DEFAULT_TEXELS);
+ }
++
++/// The largest gap between two drawn layers, `max(mesh, cut)` clamped at
++/// `-cap` (under it nothing shows; in the air the mesh wins), and the
++/// largest amount by which `layer` draws more removal than `field`.
++fn gaps(mesh: &[f32], layer: &[f32], field: &[f32], cap: f32) -> (f32, f32) {
++    mesh.iter().zip(layer.iter().zip(field)).fold((0.0f32, 0.0f32), |(gap, over), (m, (l, f))| {
++        let (l, f) = (m.max(*l).max(-cap), m.max(*f).max(-cap));
++        (gap.max((l - f).abs()), over.max(l - f))
++    })
++}
++
++/// The twin's claim margin at this fixture's scale, with room: 32 f32
++/// epsilons of a tile scale under 100 mm, doubled, plus the flat's
++/// golden-section term (1e-6 of a move under 30 mm). Far under a cell.
++const TWIN_TOL: f32 = 4.0 * 32.0 * f32::EPSILON * 100.0 + 1e-4;
++
++#[test]
++fn the_layer_playback_draws_the_field_picture_within_the_twin_margin() {
++    let world = faced_doc(12.0, 1.5, Some(2.5));
++    let cells = 12.0 * 12.0 * 20.0;
++    let seed = || PlaySeed::gather(&world, false, cells).expect("seed");
++    let field = PlayWorker::spawn(seed()).expect("the field worker");
++    let layered = PlayWorker::spawn_layered(seed(), cpu_layer_cutter()).expect("the layer worker");
++    let total = field.index().total();
++    let step = (total / 12).max(1);
++    let mut positions: Vec<(usize, f64)> = (0..total).step_by(step).map(|k| (k, if k % 2 == 0 { 0.0 } else { 0.5 })).collect();
++    positions.extend([(total, 0.0), (step, 0.0)]); // the end, then a backward seek
++    let (mut fres, mut lres) = (None, None);
++    let mut differs = false;
++    for &(k, f) in &positions {
++        play_through(&field, &[(k, f)], &mut fres);
++        let landed = play_through(&layered, &[(k, f)], &mut lres);
++        let (_, frame) = landed.last().expect("the layer worker landed");
++        let packed = frame.view.packed.as_ref().expect("packed");
++        assert!(matches!(packed.cut, CutLayer::Full(_)), "move {k}+{f}: a layer frame is always whole");
++        let (fc, lc) = (&fres.as_ref().expect("field").cut, &lres.as_ref().expect("layer").cut);
++        let (gap, over) = gaps(&packed.base.mesh, lc, fc, packed.base.meta.cap as f32);
++        assert!(over <= 1e-6, "move {k}+{f}: the layer removes {over} mm more than the field");
++        assert!(gap <= TWIN_TOL, "move {k}+{f}: the layer lags the field by {gap} mm (bound {TWIN_TOL})");
++        let uncut = solid(&packed.base.mesh, &vec![f32::MIN; lc.len()]);
++        differs |= solid(&packed.base.mesh, lc) < uncut;
++    }
++    assert!(differs, "the layer playback shows a removal");
++}
++
++/// A cutter that answers `ok` batches, then fails (a GPU kernel that
++/// faults in the middle of the playback).
++fn failing_after(ok: usize) -> std::sync::Arc<LayerCutter> {
++    let cpu = cpu_layer_cutter();
++    let calls = std::sync::atomic::AtomicUsize::new(0);
++    std::sync::Arc::new(move |meta: &_, items: &_, base: &[f32]| {
++        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= ok {
++            return Err("test: the GPU device was lost".to_string());
++        }
++        cpu(meta, items, base)
++    })
++}
++
++#[test]
++fn a_layer_fault_falls_back_to_the_field_picture_bit_for_bit() {
++    let world = faced_doc(12.0, 1.5, Some(2.5));
++    let seed = || PlaySeed::gather(&world, false, 12.0 * 12.0 * 20.0).expect("seed");
++    let mut plain = FieldPlay::from_seed(seed()).expect("play");
++    let (base, _) = PackedBase::of(&plain.view().stock, None).expect("packs");
++    for ok in [0, 2] {
++        let mut play = FieldPlay::from_seed(seed()).expect("play");
++        let kept = play.set_layer(base.meta.clone(), failing_after(ok)).expect("the layer mode");
++        assert!(kept.is_empty(), "the face op is cut by the layer: {kept:?}");
++        let k = play.total() / 2;
++        // the first frame (and, for ok = 2, a second one) cuts on the layer
++        play.seek_to(k / 2, 0.0).expect("seek");
++        let first = play.layer_frame().expect("a frame");
++        assert_eq!(first.is_some(), ok > 0, "ok = {ok}: the layer answers until it faults");
++        play.seek_to(k, 0.5).expect("seek");
++        let late = play.layer_frame().expect("a fault is a fallback, not an error");
++        assert!(late.is_none() && !play.layer_on(), "ok = {ok}: the fault turns the layer mode off");
++        plain.seek_to(k, 0.5).expect("seek");
++        let f = |p: &FieldPlay| pack_cut(p.view().stock.field().expect("a field stock"), &base.meta);
++        let (got, want) = (f(&play), f(&plain));
++        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "ok = {ok}: the rebuilt field is the field picture");
++        assert_eq!(play.at(), k);
++    }
++}
++
++#[test]
++fn the_layer_mode_is_set_once_before_the_first_cut() {
++    let world = faced_doc(12.0, 1.5, Some(2.5));
++    let seed = || PlaySeed::gather(&world, false, 12.0 * 12.0 * 20.0).expect("seed");
++    let mut play = FieldPlay::from_seed(seed()).expect("play");
++    let (base, _) = PackedBase::of(&play.view().stock, None).expect("packs");
++    play.seek(3).expect("seek");
++    let err = play.set_layer(base.meta.clone(), cpu_layer_cutter()).expect_err("after a cut");
++    assert!(err.contains("before the first cut"), "{err}");
++    let mut fresh = FieldPlay::from_seed(seed()).expect("play");
++    fresh.set_layer(base.meta.clone(), cpu_layer_cutter()).expect("the first time");
++    assert!(fresh.set_layer(base.meta.clone(), cpu_layer_cutter()).is_err(), "a second time");
++}
+diff --git a/crates/gpu/src/cut_run.rs b/crates/gpu/src/cut_run.rs
+index 358369ea9..18e65d9b2 100644
+--- a/crates/gpu/src/cut_run.rs
++++ b/crates/gpu/src/cut_run.rs
+@@ -219,24 +219,28 @@ fn deepest_local(item: &CutItem, grid: &CutGrid) -> Option<[u32; 3]> {
+ }
+ 
+ /// The CPU cut at absolute cell `at` from the layer value `start`, and
+-/// the claim margin of the item that makes it (`0` when no item cuts
+-/// deeper than `start`).
++/// the claim margin that bounds the GPU value there: the largest margin
++/// of an item whose CPU value is within its own margin of the result.
++/// An item that ties with the winner (or with a base value that wins, for
++/// example a spring pass over a keyframe) can come out up to its bound
++/// deeper on the GPU, so its margin counts too (#2629, S3b); a tie must
++/// not refuse a good GPU layer and latch the GPU path off. `0` when no
++/// item comes near.
+ fn want_at(input: &CutInput, start: f32, at: [u32; 3]) -> (f32, f32) {
+     let g = &input.grid;
+-    let (mut want, mut margin) = (start, 0.0f32);
+-    for item in &input.items {
+-        let l: [i64; 3] = std::array::from_fn(|a| i64::from(at[a]) - i64::from(item.base[a]));
+-        let inside = (0..3).all(|a| i64::from(item.lo[a]) <= l[a] && l[a] <= i64::from(item.hi[a]));
+-        if !inside {
+-            continue;
+-        }
+-        let l = l.map(|v| u32::try_from(v).unwrap_or(0));
+-        if let Some(v) = cell_cut(item, l, g)
+-            && v > want
+-        {
+-            (want, margin) = (v, item.margin);
+-        }
+-    }
++    let claims = || {
++        input.items.iter().filter_map(move |item| {
++            let l: [i64; 3] = std::array::from_fn(|a| i64::from(at[a]) - i64::from(item.base[a]));
++            let inside = (0..3).all(|a| i64::from(item.lo[a]) <= l[a] && l[a] <= i64::from(item.hi[a]));
++            if !inside {
++                return None;
++            }
++            let l = l.map(|v| u32::try_from(v).unwrap_or(0));
++            cell_cut(item, l, g).map(|v| (v, item.margin))
++        })
++    };
++    let want = claims().fold(start, |w, (v, _)| w.max(v));
++    let margin = claims().filter(|(v, m)| want - v <= *m).fold(0.0f32, |acc, (_, m)| acc.max(m));
+     (want, margin)
+ }
+ 
+diff --git a/crates/gpu/tests/cut_onto.rs b/crates/gpu/tests/cut_onto.rs
+index a75a9ed7d..5353705f8 100644
+--- a/crates/gpu/tests/cut_onto.rs
++++ b/crates/gpu/tests/cut_onto.rs
+@@ -11,7 +11,7 @@
+ //! camcraft_gpu::cut_buf, camcraft_gpu::cut_run. Our own tests.
+ 
+ use camcraft_gpu::{
+-    cut_cpu, cut_cpu_onto, cut_onto_or_cpu, cut_onto_or_cpu_on, gpu_required, shared_device, spot_check_onto, CutGrid,
++    cut_cpu, cut_cpu_onto, cut_onto_or_cpu, cut_onto_or_cpu_on, gpu_required, shared_device, spot_check_onto, spot_probes, CutGrid,
+     CutInput, CutItem, CutKernel, CutPath, COMPUTE_ENV, SPOT_MARGIN_FRACTION,
+ };
+ 
+@@ -101,6 +101,26 @@ fn a_bad_base_layer_is_refused_by_name() {
+     }
+ }
+ 
++#[test]
++fn a_tie_with_the_keyframe_does_not_refuse_a_good_gpu_layer() {
++    // A later batch that repeats a chord of the keyframe (a spring pass)
++    // ties with the base layer. A GPU value a little deeper than the CPU
++    // base (as a hardware adapter can give) is inside the item's bound;
++    // the review of PR #3878 found that the check refused it at 1 ULP.
++    let (earlier, _) = fixture();
++    let key = cut_cpu(&earlier).expect("the keyframe cut");
++    let again = earlier.clone();
++    let cpu = cut_cpu_onto(&again, &key).expect("the spring pass");
++    assert!(same_bits(&cpu, &key), "a repeated chord cuts nothing new");
++    let at = *spot_probes(&again).expect("the probes").first().expect("an item probe");
++    let mut gpu = cpu.clone();
++    gpu[at] = cpu[at] + 0.25 * MARGIN;
++    spot_check_onto(&again, &key, &gpu).unwrap_or_else(|e| panic!("a tie inside the bound was refused: {e}"));
++    gpu[at] = cpu[at] + 2.0 * MARGIN;
++    let err = spot_check_onto(&again, &key, &gpu).expect_err("a value past the bound");
++    assert!(err.contains(&format!("texel {at}")), "{err}");
++}
++
+ #[test]
+ fn the_gpu_cut_onto_a_keyframe_matches_the_cpu_law_or_skips_by_name() {
+     let (earlier, later) = fixture();
+@@ -230,7 +250,8 @@ fn a_lost_device_takes_the_cpu_law_and_never_crashes() {
+     });
+     let direct = kernel.run_onto(&gpu.device, &gpu.queue, compute, &later, &key);
+     assert!(direct.is_err(), "a lost device must not give a layer");
+-    let _ = kernel.cut_into(&gpu.device, &gpu.queue, compute, &later, &target);
++    let into = kernel.cut_into(&gpu.device, &gpu.queue, compute, &later, &target);
++    assert!(into.is_err(), "cut_into on a lost device must be an Err, never a silent submission");
+ 
+     // The fallback rule on that device and kernel: the CPU law.
+     let out = cut_onto_or_cpu_on(Ok((gpu, &kernel)), &later, &key).expect("the CPU law answers");
+diff --git a/crates/sim/src/stock_sim/cut_twin_work.rs b/crates/sim/src/stock_sim/cut_twin_work.rs
+index d2621ef38..f030fdd61 100644
+--- a/crates/sim/src/stock_sim/cut_twin_work.rs
++++ b/crates/sim/src/stock_sim/cut_twin_work.rs
+@@ -104,6 +104,40 @@ fn lattice_box(meta: &LatticeMeta) -> Result<[(i32, i32); 3], StockError> {
+     Ok(out)
+ }
+ 
++/// Whether move `m` cuts on the twin (`false`: a rapid, which touches
++/// nothing), or its refusal by name.
++fn twin_move(m: &Move) -> Result<bool, StockError> {
++    if !m.is_finite() {
++        return Err(invalid("the move has a non-finite endpoint".into()));
++    }
++    if m.kind == MoveKind::Rapid {
++        return Ok(false);
++    }
++    if m.arc.is_some() {
++        return Err(invalid("an arc move has no twin; only linear moves cut here".into()));
++    }
++    if let Some(a) = m.axis
++        && !(a[0] == 0.0 && a[1] == 0.0 && a[2].is_finite() && a[2] > 0.0)
++    {
++        return Err(invalid(format!("the tool axis {a:?} is not upright; only +Z cuts here")));
++    }
++    if m.from == m.to {
++        return Err(invalid("a zero-length move has no swept solid".into()));
++    }
++    Ok(true)
++}
++
++/// The cheap precheck of a whole op (#2629, S3b): `Ok` when the tool and
++/// every move have a twin, else the first refusal by name. It builds no
++/// window; `twin_work` can still refuse a window over the cell ceiling.
++pub fn twin_refusal(moves: &[Move], tool: &SdfTool) -> Result<(), StockError> {
++    twin_tool(tool)?;
++    for m in moves {
++        twin_move(m)?;
++    }
++    Ok(())
++}
++
+ /// The chords of `moves` and the brick work list that their windows
+ /// touch inside `meta`'s lattice. Validates the whole batch first.
+ pub fn twin_work(moves: &[Move], tool: &SdfTool, meta: &LatticeMeta) -> Result<TwinWork, StockError> {
+@@ -114,23 +148,9 @@ pub fn twin_work(moves: &[Move], tool: &SdfTool, meta: &LatticeMeta) -> Result<T
+     let mut chords = Vec::new();
+     let mut items = Vec::new();
+     for m in moves {
+-        if !m.is_finite() {
+-            return Err(invalid("the move has a non-finite endpoint".into()));
+-        }
+-        if m.kind == MoveKind::Rapid {
++        if !twin_move(m)? {
+             continue;
+         }
+-        if m.arc.is_some() {
+-            return Err(invalid("an arc move has no twin; only linear moves cut here".into()));
+-        }
+-        if let Some(a) = m.axis
+-            && !(a[0] == 0.0 && a[1] == 0.0 && a[2].is_finite() && a[2] > 0.0)
+-        {
+-            return Err(invalid(format!("the tool axis {a:?} is not upright; only +Z cuts here")));
+-        }
+-        if m.from == m.to {
+-            return Err(invalid("a zero-length move has no swept solid".into()));
+-        }
+         let sw = chord_sweep(&kind, up, m.from, m.to)?;
+         let (a, b) = match tt {
+             TwinTool::Ball { r } => ([m.from.x, m.from.y, m.from.z + r], [m.to.x, m.to.y, m.to.z + r]),
+@@ -218,9 +238,36 @@ pub fn run_twin(work: &TwinWork, meta: &LatticeMeta) -> Result<Vec<f32>, StockEr
+     let items = twin_items(work, meta)?;
+     let dims = [meta.dims[0] as usize, meta.dims[1] as usize, meta.dims[2] as usize];
+     let floor = ordered_bits((-4.0 * meta.cap) as f32);
+-    let mut keys = vec![floor; dims[0] * dims[1] * dims[2]];
++    fold_items(&items, meta, vec![floor; dims[0] * dims[1] * dims[2]])
++}
++
++/// The incremental CPU law (#2629, S3b): the kernel items cut onto an
++/// earlier layer `base` of the same lattice (a playback keyframe). The
++/// max law makes it exact: the keyframe of A, then B onto it, is the
++/// one-batch cut of A and B, bit for bit. A base of the wrong size or
++/// with a non-finite value is refused by name.
++pub fn run_twin_items_onto(items: &[TwinItem], meta: &LatticeMeta, base: &[f32]) -> Result<Vec<f32>, StockError> {
++    let n = (meta.dims[0] as usize)
++        .checked_mul(meta.dims[1] as usize)
++        .and_then(|n| n.checked_mul(meta.dims[2] as usize))
++        .ok_or_else(|| invalid(format!("the lattice dims {:?} overflow", meta.dims)))?;
++    if base.len() != n {
++        return Err(invalid(format!("the base layer has {} texels, the lattice {n}", base.len())));
++    }
++    if let Some(at) = base.iter().position(|v| !v.is_finite()) {
++        return Err(invalid(format!("the base layer texel {at} is not finite")));
++    }
++    let mut keys = Vec::new();
++    keys.try_reserve_exact(n).map_err(|e| invalid(format!("no memory for {n} texels: {e}")))?;
++    keys.extend(base.iter().map(|v| ordered_bits(*v)));
++    fold_items(items, meta, keys)
++}
++
++/// Fold the claims of `items` into `keys` with the max law and decode.
++fn fold_items(items: &[TwinItem], meta: &LatticeMeta, mut keys: Vec<u32>) -> Result<Vec<f32>, StockError> {
++    let dims = [meta.dims[0] as usize, meta.dims[1] as usize, meta.dims[2] as usize];
+     let (cell32, cap32) = (meta.cell as f32, meta.cap as f32);
+-    for it in &items {
++    for it in items {
+         for k in it.lo[2]..=it.hi[2] {
+             for j in it.lo[1]..=it.hi[1] {
+                 for i in it.lo[0]..=it.hi[0] {
+@@ -229,10 +276,10 @@ pub fn run_twin(work: &TwinWork, meta: &LatticeMeta) -> Result<Vec<f32>, StockEr
+                     let Some(v) = cell_cut(&it.tile, q, cap32) else {
+                         continue;
+                     };
+-                    // twin_items keeps base + local inside 0..dims
+-                    let at: [usize; 3] = std::array::from_fn(|a| (i64::from(it.base[a]) + i64::from(local[a])) as usize);
+-                    let slot = (at[2] * dims[1] + at[1]) * dims[0] + at[0];
+-                    let Some(dst) = keys.get_mut(slot) else {
++                    let at: [i64; 3] = std::array::from_fn(|a| i64::from(it.base[a]) + i64::from(local[a]));
++                    let inside = (0..3).all(|a| at[a] >= 0 && at[a] < dims[a] as i64);
++                    let slot = inside.then(|| (at[2] as usize * dims[1] + at[1] as usize) * dims[0] + at[0] as usize);
++                    let Some(dst) = slot.and_then(|s| keys.get_mut(s)) else {
+                         return Err(invalid(format!("work item cell {local:?} lies outside the lattice")));
+                     };
+                     *dst = (*dst).max(ordered_bits(v));
+diff --git a/crates/sim/src/stock_sim/layer_play.rs b/crates/sim/src/stock_sim/layer_play.rs
+new file mode 100644
+index 000000000..e647f33f0
+--- /dev/null
++++ b/crates/sim/src/stock_sim/layer_play.rs
+@@ -0,0 +1,237 @@
++//! The layer playback (#2629, GPU stock sim S3b): the display cut of the
++//! ops that the f32 twin can cut, kept as a dense cut layer in the
++//! `pack_cut` layout instead of in the f64 field, with its own keyframes.
++//! A caller-given cutter cuts each batch onto the layer: the CPU twin law
++//! here, or a GPU kernel that the caller owns (camcraft-gpu's
++//! `cut_onto_or_cpu` on a device of the caller's choice). Display only:
++//! no verdict reads this layer.
++//! Provenance: our own design (decision 2629) over the twin work list of
++//! `cut_twin_work` and the keyframe store of `play_keys`.
++//!
++//! ## The laws here
++//!
++//! - **The layer at move k is a function of k.** It is the max-law fold
++//!   of the layer ops' moves before k onto the `-4 cap` floor, so any
++//!   keyframe at or before k plus the moves after it gives it, in any
++//!   batching. No other state rides along.
++//! - **Cut only for a picture.** A seek cuts from the nearest keyframe,
++//!   one batch per op and stride; a jump cuts the layer once, at the
++//!   picture, not at each stride on the way.
++//! - **The merge is the max law.** The picture is `max(pack_cut(field),
++//!   layer)`: the field holds the other ops' cuts, and a cut layer folds
++//!   with the max law (`preview::pack`).
++
++use std::sync::Arc;
++
++use super::cut::SimOp;
++use super::cut_twin_work::{run_twin_items_onto, twin_items, twin_refusal, twin_work, TwinItem};
++use super::field_cut::SdfTool;
++use super::kernel::StockError;
++use super::partial::partial_move;
++use super::preview::LatticeMeta;
++use super::Stock;
++use crate::cl::Move;
++use crate::play_keys::{KeyCost, Keyframes};
++
++/// The cutter of one batch: the kernel items cut onto `base` (a layer of
++/// `meta`'s lattice), the new layer, or why not. It must give the layer
++/// of the CPU twin law within the twin's claim margin.
++pub type LayerCutter = dyn Fn(&LatticeMeta, &[TwinItem], &[f32]) -> Result<Vec<f32>, String> + Send + Sync;
++
++/// The CPU twin law as a cutter: the fallback and the oracle.
++#[must_use]
++pub fn cpu_layer_cutter() -> Arc<LayerCutter> {
++    Arc::new(|meta: &LatticeMeta, items: &[TwinItem], base: &[f32]| {
++        run_twin_items_onto(items, meta, base).map_err(|e| e.to_string())
++    })
++}
++
++/// Bytes the layer keyframes may hold.
++pub const LAYER_KEY_BUDGET: usize = 256 << 20;
++
++/// Layer keyframes past the floor, at most.
++pub const LAYER_KEYS: usize = 64;
++
++/// One layer keyframe: a whole layer, shared.
++#[derive(Clone, Debug)]
++pub struct LayerKey(pub Arc<Vec<f32>>);
++
++impl KeyCost for LayerKey {
++    fn key_bytes(&self) -> usize {
++        self.0.len().saturating_mul(std::mem::size_of::<f32>())
++    }
++}
++
++/// One layer op of the program: its first global move, its moves and the
++/// tool the twin cuts with.
++#[derive(Clone, Copy, Debug)]
++pub struct LayerSpan<'a> {
++    pub start: usize,
++    pub moves: &'a [Move],
++    pub tool: &'a SdfTool,
++}
++
++/// The twin tool of a plain op on `stock`, by the display cut's own law
++/// (`Stock::simulate_display`: no shank, the flank from the lowest move to
++/// the stock top plus slack), or why the op stays on the field: a tool
++/// with no twin, a move that the twin refuses, or a stock with no field.
++pub fn layer_tool(op: &SimOp, stock: &Stock) -> Result<SdfTool, StockError> {
++    let Some(f) = stock.field() else {
++        return Err(StockError::Invalid("layer playback: the stock has no field".into()));
++    };
++    let ceiling = f.bounds().max.z;
++    let lowest = op.moves.iter().flat_map(|m| [m.from.z, m.to.z]).fold(f64::INFINITY, f64::min);
++    let slack = 2.0 * f.cap() + 4.0 * f.cell();
++    let flank = if lowest.is_finite() && ceiling.is_finite() { (ceiling - lowest).max(0.0) + slack } else { slack };
++    let tool = super::backend::op_sdf_tool(op, flank, false, false);
++    twin_refusal(op.moves, &tool)?;
++    Ok(tool)
++}
++
++/// `max(dst, src)` texel for texel: the merge of the field's packed cut
++/// with the layer.
++pub fn merge_max(dst: &mut [f32], src: &[f32]) -> Result<(), StockError> {
++    if dst.len() != src.len() {
++        return Err(StockError::Invalid(format!(
++            "layer playback: the layer has {} texels, the picture {}",
++            src.len(),
++            dst.len()
++        )));
++    }
++    for (d, s) in dst.iter_mut().zip(src) {
++        *d = d.max(*s);
++    }
++    Ok(())
++}
++
++/// The layer of the layer ops, cut to `at` moves, and its keyframes.
++pub struct LayerPlay {
++    meta: LatticeMeta,
++    cutter: Arc<LayerCutter>,
++    keys: Keyframes<LayerKey>,
++    cur: LayerKey,
++    at: usize,
++}
++
++impl LayerPlay {
++    /// The uncut layer (the `-4 cap` floor) of `meta`'s lattice, with
++    /// keyframes every `stride` moves within [`LAYER_KEY_BUDGET`].
++    pub fn new(meta: LatticeMeta, cutter: Arc<LayerCutter>, stride: usize) -> Result<Self, StockError> {
++        let n = (meta.dims[0] as usize)
++            .checked_mul(meta.dims[1] as usize)
++            .and_then(|n| n.checked_mul(meta.dims[2] as usize))
++            .filter(|n| *n > 0)
++            .ok_or_else(|| StockError::Invalid(format!("layer playback: the lattice dims {:?} are empty", meta.dims)))?;
++        let floor = (-4.0 * meta.cap) as f32;
++        if !floor.is_finite() {
++            return Err(StockError::Invalid(format!("layer playback: the cap {} is not finite", meta.cap)));
++        }
++        let mut layer = Vec::new();
++        layer.try_reserve_exact(n).map_err(|e| StockError::Invalid(format!("layer playback: no memory: {e}")))?;
++        layer.resize(n, floor);
++        let cur = LayerKey(Arc::new(layer));
++        let mut keys = Keyframes::new(cur.clone(), stride, LAYER_KEYS);
++        keys.restart(stride, LAYER_KEYS, LAYER_KEY_BUDGET);
++        Ok(LayerPlay { meta, cutter, keys, cur, at: 0 })
++    }
++
++    /// The lattice of the layer.
++    #[must_use]
++    pub const fn meta(&self) -> &LatticeMeta {
++        &self.meta
++    }
++
++    /// Moves the layer is cut to.
++    #[must_use]
++    pub const fn at(&self) -> usize {
++        self.at
++    }
++
++    /// Layer keyframes held (the floor included).
++    #[must_use]
++    pub fn keyframes(&self) -> usize {
++        self.keys.len()
++    }
++
++    /// The layer at `k` whole moves, plus the travelled fraction `frac`
++    /// of move `k` when move `k` is a layer op's (on a copy: the layer at
++    /// `k` stays exact).
++    pub fn frame(&mut self, k: usize, frac: f64, spans: &[LayerSpan<'_>]) -> Result<Arc<Vec<f32>>, StockError> {
++        self.seek(k, spans)?;
++        let flight = spans.iter().find_map(|s| {
++            let i = k.checked_sub(s.start)?;
++            s.moves.get(i).map(|m| (m, s.tool))
++        });
++        let Some((m, tool)) = flight else {
++            return Ok(Arc::clone(&self.cur.0));
++        };
++        let Some(sub) = partial_move(m, frac) else {
++            return Ok(Arc::clone(&self.cur.0));
++        };
++        Ok(Arc::new(self.cut_onto(std::slice::from_ref(&sub), tool, &self.cur.0)?.unwrap_or_else(|| (*self.cur.0).clone())))
++    }
++
++    /// Cut (or restore) the layer to exactly `k` moves.
++    pub fn seek(&mut self, k: usize, spans: &[LayerSpan<'_>]) -> Result<(), StockError> {
++        if k == self.at {
++            return Ok(());
++        }
++        if self.keys.restores(self.at, k) {
++            let (at, key) = self
++                .keys
++                .floor(k)
++                .ok_or_else(|| StockError::Invalid("layer playback lost its floor".into()))?;
++            self.cur = key.clone();
++            self.at = *at;
++        }
++        let stride = self.keys.stride();
++        while self.at < k {
++            let boundary = (self.at / stride).saturating_add(1).saturating_mul(stride);
++            let to = k.min(boundary);
++            self.cut_range(self.at, to, spans)?;
++            self.at = to;
++            if to == boundary {
++                self.keys.offer(to, &self.cur);
++            }
++        }
++        Ok(())
++    }
++
++    /// Cut global moves `[from, to)` of the layer ops onto the layer.
++    fn cut_range(&mut self, from: usize, to: usize, spans: &[LayerSpan<'_>]) -> Result<(), StockError> {
++        for s in spans {
++            let end = s.start.saturating_add(s.moves.len());
++            let (a, b) = (from.max(s.start), to.min(end));
++            if a >= b {
++                continue;
++            }
++            let moves = s
++                .moves
++                .get(a - s.start..b - s.start)
++                .ok_or_else(|| StockError::Invalid("layer playback: a move range fell outside its op".into()))?;
++            if let Some(next) = self.cut_onto(moves, s.tool, &self.cur.0)? {
++                self.cur = LayerKey(Arc::new(next));
++            }
++        }
++        Ok(())
++    }
++
++    /// `moves` cut onto `base` by the cutter; `None` when they claim no
++    /// cell of the lattice (rapids, or a reach outside it).
++    fn cut_onto(&self, moves: &[Move], tool: &SdfTool, base: &[f32]) -> Result<Option<Vec<f32>>, StockError> {
++        let work = twin_work(moves, tool, &self.meta)?;
++        if work.items.is_empty() {
++            return Ok(None);
++        }
++        let items = twin_items(&work, &self.meta)?;
++        let out = (self.cutter)(&self.meta, &items, base).map_err(|e| StockError::Invalid(format!("layer playback: {e}")))?;
++        if out.len() != base.len() {
++            return Err(StockError::Invalid(format!(
++                "layer playback: the cutter gave {} texels, not {}",
++                out.len(),
++                base.len()
++            )));
++        }
++        Ok(Some(out))
++    }
++}
+diff --git a/crates/sim/src/stock_sim/mod.rs b/crates/sim/src/stock_sim/mod.rs
+index 8f4fac5f3..cfc52ba96 100644
+--- a/crates/sim/src/stock_sim/mod.rs
++++ b/crates/sim/src/stock_sim/mod.rs
+@@ -96,6 +96,8 @@ mod dual;
+ // #2626: the f32 twin of the GPU cell cut and its brick work list.
+ mod cut_twin;
+ mod cut_twin_work;
++// #2629 (GPU stock sim S3b): the playback layer of the twin-able ops.
++mod layer_play;
+ mod field;
+ mod field_arc;
+ mod field_batch;
+@@ -159,7 +161,11 @@ pub use mark::{credit_marks, Mark};
+ pub use crate::verify::MARK_FLOOR;
+ pub use cut_twin::{cell_cut, from_ordered_bits, ordered_bits, TileChord, TwinChord, TwinTool, TWIN_ULPS};
+ pub use cut_twin_work::{
+-    run_twin, twin_cut, twin_items, twin_work, TwinItem, TwinWork, WorkItem, TWIN_MAX_CELLS_PER_CHORD,
++    run_twin, run_twin_items_onto, twin_cut, twin_items, twin_refusal, twin_work, TwinItem, TwinWork, WorkItem,
++    TWIN_MAX_CELLS_PER_CHORD,
++};
++pub use layer_play::{
++    cpu_layer_cutter, layer_tool, merge_max, LayerCutter, LayerKey, LayerPlay, LayerSpan, LAYER_KEYS, LAYER_KEY_BUDGET,
+ };
+ pub use field::SdfField;
+ pub use field_body::Lattice;
+diff --git a/crates/sim/tests/stock_cut_twin.rs b/crates/sim/tests/stock_cut_twin.rs
+index 80db32de1..9bce2cdf5 100644
+--- a/crates/sim/tests/stock_cut_twin.rs
++++ b/crates/sim/tests/stock_cut_twin.rs
+@@ -5,14 +5,19 @@
+ //! subtract_batch`, `preview::pack_cut`) as the reference; nothing
+ //! from vendor binaries.
+ //!
+-//! Gate map: covers camcraft_sim::stock_sim::cut_twin and
+-//! camcraft_sim::stock_sim::cut_twin_work.
++//! The layer playback (#2629, S3b) at the end: seeks, keyframes and the
++//! move in flight against the one-batch twin.
++//!
++//! Gate map: covers camcraft_sim::stock_sim::cut_twin,
++//! camcraft_sim::stock_sim::cut_twin_work and
++//! camcraft_sim::stock_sim::layer_play.
+ 
+ use camcraft_sim::cl::{Move, MoveKind};
+ use camcraft_sim::geometry::{cube, Point3};
+ use camcraft_sim::stock_sim::preview::{pack_cut, pack_field, LatticeMeta};
+ use camcraft_sim::stock_sim::{
+-    from_ordered_bits, ordered_bits, run_twin, twin_cut, twin_items, twin_work, SdfField, SdfTool, StockError,
++    cpu_layer_cutter, from_ordered_bits, layer_tool, merge_max, ordered_bits, partial_move, run_twin, run_twin_items_onto,
++    twin_cut, twin_items, twin_work, LayerPlay, LayerSpan, SdfField, SdfTool, SimOp, Stock, StockError,
+ };
+ 
+ fn p(x: f64, y: f64, z: f64) -> Point3 {
+@@ -279,3 +284,91 @@ fn every_other_tool_refuses_by_name() {
+     refusal(&ok, &SdfTool::Drill { r: 2.0, cot: 0.6, flank: 10.0 }, "drill");
+     refusal(&ok, &SdfTool::BullNose { r: 3.0, corner: 1.0, flank: 10.0 }, "bull nose");
+ }
++
++/// The one-batch twin of the moves before `k` of each span, merged: the
++/// layer that the playback must show at `k`.
++fn one_batch(spans: &[LayerSpan<'_>], k: usize, meta: &LatticeMeta) -> Vec<f32> {
++    let n = meta.dims.iter().map(|d| *d as usize).product();
++    let mut out = vec![(-4.0 * meta.cap) as f32; n];
++    for s in spans {
++        let upto = k.saturating_sub(s.start).min(s.moves.len());
++        if upto > 0 {
++            merge_max(&mut out, &twin_cut(&s.moves[..upto], s.tool, meta).expect("the twin")).expect("same lattice");
++        }
++    }
++    out
++}
++
++fn bits(v: &[f32]) -> Vec<u32> {
++    v.iter().map(|x| x.to_bits()).collect()
++}
++
++#[test]
++fn the_layer_playback_is_the_one_batch_twin_at_every_seek() {
++    let (_, meta) = block();
++    let moves = program();
++    let spans = [
++        LayerSpan { start: 0, moves: &moves, tool: &BALL },
++        LayerSpan { start: moves.len(), moves: &moves, tool: &FLAT },
++    ];
++    let total = 2 * moves.len();
++    let mut play = LayerPlay::new(meta.clone(), cpu_layer_cutter(), 2).expect("the layer");
++    // forward, a jump, backward past keyframes, the end, and back to 0
++    for k in [1, 2, 3, 7, total, 4, 9, 0, total, 5] {
++        play.seek(k, &spans).expect("the seek");
++        assert_eq!(play.at(), k);
++        let got = play.frame(k, 0.0, &spans).expect("the frame");
++        assert_eq!(bits(&got), bits(&one_batch(&spans, k, &meta)), "the layer at {k}");
++    }
++    assert!(play.keyframes() > 2, "the seeks keep keyframes: {}", play.keyframes());
++}
++
++#[test]
++fn the_layer_frame_shows_the_travelled_part_of_the_move_in_flight() {
++    let (_, meta) = block();
++    let moves = program();
++    let spans = [LayerSpan { start: 0, moves: &moves, tool: &FLAT }];
++    let mut play = LayerPlay::new(meta.clone(), cpu_layer_cutter(), 3).expect("the layer");
++    let k = 3; // the second ramp, a golden-section move
++    let half = play.frame(k, 0.5, &spans).expect("the half frame");
++    let sub = partial_move(&moves[k], 0.5).expect("a travelled part");
++    let mut with = moves[..k].to_vec();
++    with.push(sub);
++    let want = twin_cut(&with, &FLAT, &meta).expect("the twin");
++    assert_eq!(bits(&half), bits(&want), "the move in flight");
++    let whole = play.frame(k, 0.0, &spans).expect("the whole frame");
++    assert_eq!(bits(&whole), bits(&one_batch(&spans, k, &meta)), "the partial cut is on a copy");
++    assert_ne!(bits(&half), bits(&whole), "the fixture's half move cuts something");
++}
++
++#[test]
++fn an_op_without_a_twin_stays_on_the_field_by_name() {
++    let (f, _) = block();
++    let stock = Stock::Field(f);
++    let moves = program();
++    let ball = SimOp { moves: &moves, radius: 2.5, ball: true, cone: None, corner: None };
++    assert!(matches!(layer_tool(&ball, &stock), Ok(SdfTool::Ball { .. })));
++    let flat = SimOp { ball: false, ..ball };
++    assert!(matches!(layer_tool(&flat, &stock), Ok(SdfTool::Flat { .. })));
++    let bull = SimOp { corner: Some(0.5), ..flat };
++    let err = layer_tool(&bull, &stock).expect_err("a bull nose").to_string();
++    assert!(err.contains("bull nose"), "{err}");
++    let mut arc = moves.clone();
++    arc[0].arc = Some(camcraft_sim::cl::ArcMove { center: camcraft_sim::geo2d::Point2::new(8.0, 8.0), ccw: false, plane: Default::default() });
++    let err = layer_tool(&SimOp { moves: &arc, ..ball }, &stock).expect_err("an arc").to_string();
++    assert!(err.contains("arc"), "{err}");
++}
++
++#[test]
++fn a_bad_base_layer_is_refused_by_name() {
++    let (_, meta) = block();
++    let work = twin_work(&program(), &BALL, &meta).expect("the work");
++    let items = twin_items(&work, &meta).expect("the items");
++    let n: usize = meta.dims.iter().map(|d| *d as usize).product();
++    let err = run_twin_items_onto(&items, &meta, &vec![0.0; n - 1]).expect_err("a short base").to_string();
++    assert!(err.contains("base layer has"), "{err}");
++    let mut nan = vec![-1.0; n];
++    nan[3] = f32::NAN;
++    let err = run_twin_items_onto(&items, &meta, &nan).expect_err("a NaN").to_string();
++    assert!(err.contains("not finite"), "{err}");
++}
+diff --git a/docs/decisions/2629-gpu-playback-layer.md b/docs/decisions/2629-gpu-playback-layer.md
+new file mode 100644
+index 000000000..5073b3e09
+--- /dev/null
++++ b/docs/decisions/2629-gpu-playback-layer.md
+@@ -0,0 +1,74 @@
++## #2629 - GPU stock sim S3b: the playback layer mode
++
++**Decided.** Slice S3b of #2629 adds an opt-in layer mode to the
++playback (`FieldPlay`, `PlayWorker`).
++
++- At the build, before the first cut, each op gets one owner. A plain op
++  (no rotary, turning, undercut or drill) whose tool is a ball or a flat
++  end mill, and whose moves are all linear and upright, goes to the layer.
++  The f64 field cuts every other op and never a layer op.
++- The layer (`camcraft_sim::stock_sim::LayerPlay`) is a dense f32 cut layer
++  on the packed frame's lattice. Its value at move k is the max-law fold of
++  the layer ops' moves before k, so it has its own keyframes (every stride,
++  in a 256 MiB budget) and cuts only when a frame is published. A jump cuts
++  the layer once, not at each stride.
++- A cutter that the caller gives (`LayerCutter`) cuts each batch onto the
++  layer. `cpu_layer_cutter` is the CPU twin law (`run_twin_items_onto`). A
++  GPU cutter (S3c) maps the `TwinItem`s to `camcraft_gpu::CutItem` and
++  calls `cut_onto_or_cpu_on` with a device of the UI's choice.
++- The picture is `max(pack_cut(field), layer)`, always a whole layer. No
++  eye then repacks a layer frame from the field.
++- A layer fault (a cutter error, a window over the twin's ceiling) turns
++  the mode off. The reason is logged, and the field is rebuilt from the
++  uncut stock with every op, at the same position (the CPU playback of
++  before). The field keyframes start again; a precalc budget is lost.
++- The display flank of a flat end mill is the display cut's own law
++  (`simulate_display`: the stock top minus the lowest move, plus slack),
++  taken once for each op instead of for each batch. Any flank that reaches
++  above the stock gives the same visible cut.
++
++**Why opt-in, and why no `camcraft-gpu` edge in `camcraft-app`.**
++- The review of PR #3532 says that the shared compute device is the
++  software adapter first (WARP runs on the CPU). S3 must use the render
++  device or a hardware adapter.
++- #3589: two `wgpu` instances alive at the same time crash on an Intel Arc
++  adapter. The app has one instance today (the window's). A cutter that
++  called `cut_onto_or_cpu` (the shared device) from the worker would make
++  a second one.
++- So the worker takes the cutter as a parameter, and the UI makes it on
++  its render device in S3c. `camcraft-app` gets no new crate dependency.
++- In the layer mode `FieldView::stock` does not hold the layer ops' cut.
++  Two readers use it: the patch repack of `eye.rs` `full_cut` (layer
++  frames are always whole, so it is not reached) and the CPU eye
++  (`cpu_eye.rs` `march_job`). Only a caller with the GPU trace eye may
++  turn the mode on. Nothing turns it on in this slice, so the product
++  does not change.
++
++**The spot-check tie (review note of PR #3878).** `want_at` in
++`crates/gpu/src/cut_run.rs` now takes the largest claim margin of each
++item whose CPU value is within its own margin of the result. Before, a
++base value that won gave margin 0 and a bound of about one ULP. A spring
++pass over a keyframe on hardware could then refuse a good GPU layer and
++turn the GPU path off for the process. The bound stays on the safe side:
++the GPU value stays at least half an item margin under the f64 cut.
++
++**Dropped.**
++- Calling `cut_onto_or_cpu` from the worker: the second instance (#3589)
++  and the software adapter (the PR #3532 review).
++- A shared keyframe value (field and layer in one `Keyframes`): it would
++  tie the layer to the precalc seam of the field. The layer is a function
++  of k, so separate keyframes are exact.
++- A per-batch twin choice (a batch with an arc to the field, the rest to
++  the layer): each op has one owner, so the max-law picture has no gap
++  and no double cut to reason about.
++- Patch frames in the layer mode: a patch needs the layer's dirty bricks
++  and a merged patch; whole frames are first. This is a cost item for S3c.
++
++**Remains (S3c).** The GPU cutter on the render device (the item mapping,
++off the UI thread), the UI turning the layer mode on only with the trace
++eye, the CPU eye reading the packed frame or keeping the mode off, patch
++frames for the layer, the path choice from hardware timings, and the
++parity proof on a hardware adapter.
++
++**Cost to change.** Low: the mode is opt-in, and the field path keeps its
++code and tests (`cut` moved file without a change in the off mode).

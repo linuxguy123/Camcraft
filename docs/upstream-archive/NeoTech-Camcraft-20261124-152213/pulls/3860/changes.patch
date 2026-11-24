@@ -1,0 +1,1572 @@
+From 91e412fdcb44ceee7a9d743b599c90cac24605c6 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 00:26:55 -0800
+Subject: [PATCH 1/3] fix(mcp): run a stdio generate on a worker thread and
+ honour cancel
+
+camcraft-cli mcp ran each generate on the session thread. A long
+generate blocked every other call, and the client had no cancel.
+
+The stdio loop now reads input on its own thread. A generate is staged
+on the session thread (StagedGeneration, #2257) and finished on a
+worker thread. Other calls (get_job, save_project) answer meanwhile.
+The result lands through the History only if the operation and its
+cached path are unchanged; else the call is refused by name.
+notifications/cancelled drops the running generate with no answer.
+A second generate and open_project are refused while one runs.
+
+The run time of the generators stays open on the issue.
+
+Refs #3035
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/cli.rs                       |   4 +-
+ crates/app/src/mcp/background.rs            | 317 ++++++++++++++++++++
+ crates/app/src/mcp/live.rs                  |   3 +
+ crates/app/src/mcp/mod.rs                   |  55 ++--
+ crates/app/src/script/api.rs                |  36 ++-
+ crates/app/tests/mcp.rs                     |   2 +
+ crates/app/tests/mcp/background_generate.rs | 197 ++++++++++++
+ docs/decisions/3035-mcp-generate-worker.md  |  50 +++
+ 8 files changed, 622 insertions(+), 42 deletions(-)
+ create mode 100644 crates/app/src/mcp/background.rs
+ create mode 100644 crates/app/tests/mcp/background_generate.rs
+ create mode 100644 docs/decisions/3035-mcp-generate-worker.md
+
+diff --git a/crates/app/src/cli.rs b/crates/app/src/cli.rs
+index 06596a01e..44e3ef7cb 100644
+--- a/crates/app/src/cli.rs
++++ b/crates/app/src/cli.rs
+@@ -365,8 +365,8 @@ fn lane_mcp(args: &[String]) -> i32 {
+             return 2;
+         }
+     }
+-    let stdin = std::io::stdin();
+-    match crate::mcp::serve(stdin.lock(), std::io::stdout().lock()) {
++    // #3035: the stdin reader runs on its own thread, so it takes a Send handle.
++    match crate::mcp::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout().lock()) {
+         Ok(()) => 0,
+         Err(e) => {
+             eprintln!("camcraft-cli: mcp session ended: {e}");
+diff --git a/crates/app/src/mcp/background.rs b/crates/app/src/mcp/background.rs
+new file mode 100644
+index 000000000..961e8ae28
+--- /dev/null
++++ b/crates/app/src/mcp/background.rs
+@@ -0,0 +1,317 @@
++//! #3035: the stdio server (`camcraft-cli mcp`) runs a `generate` on a
++//! worker thread. The session answers every other call (`get_job`,
++//! `save_project`, ...) while the worker runs, and a client can drop the
++//! generate with `notifications/cancelled`.
++//!
++//! Provenance: MCP specification revision 2025-06-18, "Cancellation"
++//! (`notifications/cancelled` with `params.requestId`); the world-read /
++//! pure-finish split is our own #2257 `StagedGeneration` seam, landed
++//! with the same `still_current` law as the GUI's generation worker.
++//!
++//! The world stays on the session's thread. A worker gets only the staged
++//! job, which reads no world. Its result lands through the History, as
++//! the synchronous tool does, only if the operation and its cached path
++//! are still what they were when the job was staged. A generator has no
++//! cancel point: a cancelled worker runs to its end, and its result is
++//! dropped.
++
++use std::collections::VecDeque;
++use std::io::{BufRead, Read, Write};
++use std::sync::mpsc::{self, Receiver, Sender};
++use std::sync::{Arc, Mutex};
++
++use flecs_ecs::prelude::Entity;
++use serde_json::{json, Value};
++
++use super::{tool_err, tool_ok, Server, MAX_LINE_BYTES};
++use crate::commands::{CommandError, GenerateOperation, StagedGeneration};
++use crate::operation::OpStatus;
++use crate::script::api;
++
++/// One message for the session's own thread.
++pub(super) enum Event {
++    /// One wire line, or the parse-error text of a line that is not one.
++    Line(Result<String, String>),
++    /// The input ended.
++    Eof,
++    /// Reading the input failed.
++    Failed(std::io::Error),
++    /// A worker finished the job of `ticket`.
++    Done { ticket: u64, result: Box<Result<GenerateOperation, CommandError>> },
++}
++
++/// A test hook: each worker waits for one message before it runs.
++pub(super) type Gate = Arc<Mutex<Receiver<()>>>;
++
++/// The serve loop's state for background generation.
++pub(super) struct Background {
++    events: Sender<Event>,
++    running: Option<Running>,
++    next_ticket: u64,
++}
++
++/// The one `generate` call the session waits on.
++struct Running {
++    id: Value,
++    ticket: u64,
++    current: (String, Entity),
++    queue: VecDeque<(String, Entity)>,
++    unnamed: bool,
++    done: Vec<Value>,
++}
++
++impl Server {
++    fn generating(&self) -> bool {
++        self.bg.as_ref().is_some_and(|b| b.running.is_some())
++    }
++
++    fn on_event(&mut self, ev: Event) -> Option<String> {
++        match ev {
++            Event::Line(Ok(line)) => self.on_line(&line),
++            Event::Line(Err(msg)) => Some(super::parse_error(&msg)),
++            Event::Done { ticket, result } => self.on_done(ticket, *result).map(|v| v.to_string()),
++            Event::Eof | Event::Failed(_) => None,
++        }
++    }
++
++    fn on_line(&mut self, line: &str) -> Option<String> {
++        let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
++            return self.handle_line(line);
++        };
++        if let Some(id) = cancelled_request(&msg) {
++            self.cancel(&id);
++            return None;
++        }
++        if let Some((id, names)) = generate_call(&msg) {
++            return self.start(id, names).map(|v| v.to_string());
++        }
++        // `open_project` replaces the world that the worker's result lands in.
++        if let Some(id) = tool_call_id(&msg, "open_project")
++            && let Some(name) = self.running_name()
++        {
++            let why = format!("open_project: refused while generate runs ({name}) - wait for its answer, or cancel it");
++            return Some(answer(&id, tool_err(&why)).to_string());
++        }
++        self.handle_line(line)
++    }
++
++    fn running_name(&self) -> Option<String> {
++        self.bg.as_ref().and_then(|b| b.running.as_ref()).map(|r| r.current.0.clone())
++    }
++
++    /// `notifications/cancelled` for the running generate: forget it.
++    /// MCP: no answer goes out for a cancelled request.
++    fn cancel(&mut self, id: &Value) {
++        let Some(bg) = self.bg.as_mut() else { return };
++        if bg.running.as_ref().is_some_and(|r| r.id == *id) {
++            let name = bg.running.take().map(|r| r.current.0).unwrap_or_default();
++            tracing::info!(op = %name, "mcp: generate cancelled by the client; its result will be dropped");
++        }
++    }
++
++    fn start(&mut self, id: Value, names: Vec<Value>) -> Option<Value> {
++        if let Some(name) = self.running_name() {
++            let why = format!("generate: another generate is running ({name}) - wait for its answer, or cancel it");
++            return Some(answer(&id, tool_err(&why)));
++        }
++        let queue = match api::generate_targets(&self.env, &names) {
++            Ok(t) => VecDeque::from(t),
++            Err(e) => return Some(answer(&id, tool_err(&format!("generate: {e}")))),
++        };
++        let unnamed = names.is_empty();
++        let placeholder = (String::new(), Entity::null());
++        self.advance(Running { id, ticket: 0, current: placeholder, queue, unnamed, done: Vec::new() })
++    }
++
++    /// Stage the next operation and hand it to a worker; `None` while a
++    /// worker runs. The answer when the queue is empty or a stage refuses.
++    fn advance(&mut self, mut run: Running) -> Option<Value> {
++        loop {
++            let Some((name, entity)) = run.queue.pop_front() else {
++                return Some(answer(&run.id, tool_ok(json!({ "generated": run.done }))));
++            };
++            if run.unnamed && crate::operation::status_of(&self.env.world, &entity) == OpStatus::Ok {
++                continue;
++            }
++            let staged = match StagedGeneration::new(&self.env.world, &name) {
++                Ok(s) => s,
++                Err(e) => return Some(refused(&run.id, &name, &e)),
++            };
++            run.current = (name, entity);
++            let Some(bg) = self.bg.as_mut() else {
++                return Some(answer(&run.id, tool_err("generate: the session has no background lane")));
++            };
++            bg.next_ticket = bg.next_ticket.wrapping_add(1);
++            let ticket = bg.next_ticket;
++            match spawn(staged, ticket, bg.events.clone(), self.gate.clone()) {
++                Ok(()) => {
++                    run.ticket = ticket;
++                    bg.running = Some(run);
++                    return None;
++                }
++                // No thread: run the job here, as the synchronous tool does.
++                Err(Some(staged)) => {
++                    if let Err(reply) = self.land(&mut run, staged.finish(), false) {
++                        return Some(reply);
++                    }
++                }
++                Err(None) => {
++                    let why = format!("generate: {} - the worker could not start", run.current.0);
++                    return Some(answer(&run.id, tool_err(&why)));
++                }
++            }
++        }
++    }
++
++    fn on_done(&mut self, ticket: u64, result: Result<GenerateOperation, CommandError>) -> Option<Value> {
++        let bg = self.bg.as_mut()?;
++        if !bg.running.as_ref().is_some_and(|r| r.ticket == ticket) {
++            tracing::info!("mcp: dropped the result of a cancelled generate");
++            return None;
++        }
++        let mut run = bg.running.take()?;
++        match self.land(&mut run, result, true) {
++            Ok(()) => self.advance(run),
++            Err(reply) => Some(reply),
++        }
++    }
++
++    /// Write one finished generation through the History, or the answer
++    /// that refuses the call. A background result whose operation changed
++    /// while it ran is discarded by name (#2257).
++    fn land(&mut self, run: &mut Running, result: Result<GenerateOperation, CommandError>, background: bool) -> Result<(), Value> {
++        let (name, entity) = run.current.clone();
++        let cmd = result.map_err(|e| refused(&run.id, &name, &e))?;
++        if background && !cmd.still_current(&self.env.world) {
++            let why = format!("generate: {name} - discarded: the operation changed while it generated - generate it again");
++            return Err(answer(&run.id, tool_err(&why)));
++        }
++        self.env.history.execute(&self.env.world, cmd);
++        run.done.push(api::op_view(&self.env, &name, &entity, false));
++        Ok(())
++    }
++}
++
++fn refused(id: &Value, name: &str, e: &CommandError) -> Value {
++    answer(id, tool_err(&format!("generate: {}", api::refusal_text(name, e))))
++}
++
++fn answer(id: &Value, result: Value) -> Value {
++    json!({ "jsonrpc": "2.0", "id": id, "result": result })
++}
++
++/// Run `staged` on a worker thread; hand the job back if no thread starts.
++fn spawn(staged: StagedGeneration, ticket: u64, events: Sender<Event>, gate: Option<Gate>) -> Result<(), Option<Box<StagedGeneration>>> {
++    let slot = Arc::new(Mutex::new(Some(staged)));
++    let worker_slot = Arc::clone(&slot);
++    let started = std::thread::Builder::new().name("mcp-generate".into()).spawn(move || {
++        let Some(job) = worker_slot.lock().ok().and_then(|mut s| s.take()) else { return };
++        if let Some(gate) = gate
++            && let Ok(rx) = gate.lock()
++        {
++            let _ = rx.recv();
++        }
++        let name = job.name().to_owned();
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.finish())).unwrap_or_else(|_| {
++            Err(CommandError::Machining(format!(
++                "{name}: internal error - the generator stopped unexpectedly (a bug; please report it)"
++            )))
++        });
++        // The session may have ended; nobody waits for the result then.
++        let _ = events.send(Event::Done { ticket, result: Box::new(result) });
++    });
++    match started {
++        Ok(_) => Ok(()),
++        Err(e) => {
++            tracing::warn!("mcp: no generate worker ({e}); generating on the session thread");
++            Err(slot.lock().ok().and_then(|mut s| s.take()).map(Box::new))
++        }
++    }
++}
++
++/// A `tools/call` of `generate` that the background lane takes: a request
++/// with an id and no argument but an optional non-empty `name`. Each other
++/// form goes to the synchronous handler, which answers or refuses it.
++fn generate_call(msg: &Value) -> Option<(Value, Vec<Value>)> {
++    let id = tool_call_id(msg, "generate")?;
++    let names = match msg.get("params").and_then(|p| p.get("arguments")) {
++        None | Some(Value::Null) => Vec::new(),
++        Some(Value::Object(a)) if a.is_empty() => Vec::new(),
++        Some(Value::Object(a)) if a.len() == 1 => match a.get("name") {
++            Some(Value::String(n)) if !n.is_empty() => vec![json!(n)],
++            _ => return None,
++        },
++        Some(_) => return None,
++    };
++    Some((id, names))
++}
++
++/// The id of a well-formed `tools/call` request of tool `name`.
++fn tool_call_id(msg: &Value, name: &str) -> Option<Value> {
++    let id = msg.get("id")?;
++    let id_ok = id.is_string() || id.is_number();
++    let call = msg.get("jsonrpc") == Some(&json!("2.0"))
++        && msg.get("method").and_then(Value::as_str) == Some("tools/call")
++        && msg.get("params").and_then(|p| p.get("name")).and_then(Value::as_str) == Some(name);
++    (id_ok && call).then(|| id.clone())
++}
++
++/// The `requestId` of a `notifications/cancelled` notification.
++fn cancelled_request(msg: &Value) -> Option<Value> {
++    let note = msg.get("id").is_none() && msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled");
++    note.then(|| msg.get("params").and_then(|p| p.get("requestId")).cloned()).flatten()
++}
++
++/// The stdio loop with the background lane: a reader thread moves lines
++/// in, workers move results in, and this thread owns the world and the
++/// output. At the end of input a running generate still gets its answer.
++pub(super) fn serve_with<R: BufRead + Send>(mut server: Server, input: R, mut output: impl Write) -> std::io::Result<()> {
++    let (tx, rx) = mpsc::channel();
++    server.bg = Some(Background { events: tx.clone(), running: None, next_ticket: 0 });
++    std::thread::scope(|s| {
++        std::thread::Builder::new().name("mcp-stdin".into()).spawn_scoped(s, move || read_lines(input, &tx))?;
++        let mut ended = false;
++        loop {
++            if ended && !server.generating() {
++                return Ok(());
++            }
++            // The session holds a sender itself, so the channel never closes here.
++            let Ok(ev) = rx.recv() else { return Ok(()) };
++            let reply = match ev {
++                Event::Eof => {
++                    ended = true;
++                    None
++                }
++                Event::Failed(e) => return Err(e),
++                other => server.on_event(other),
++            };
++            if let Some(reply) = reply {
++                writeln!(output, "{reply}")?;
++                output.flush()?;
++            }
++        }
++    })
++}
++
++/// One line at a time, capped at [`MAX_LINE_BYTES`]; a longer line or one
++/// that is not UTF-8 goes over as its parse-error text.
++fn read_lines(mut input: impl BufRead, tx: &Sender<Event>) {
++    let mut buf = Vec::new();
++    let cap = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
++    loop {
++        buf.clear();
++        let ev = match (&mut input).take(cap).read_until(b'\n', &mut buf) {
++            Ok(0) => Event::Eof,
++            Ok(_) if !buf.ends_with(b"\n") && buf.len() > MAX_LINE_BYTES => match super::skip_line(&mut input) {
++                Ok(()) => Event::Line(Err(format!("line longer than {MAX_LINE_BYTES} bytes"))),
++                Err(e) => Event::Failed(e),
++            },
++            Ok(_) => Event::Line(String::from_utf8(std::mem::take(&mut buf)).map_err(|e| format!("the line is not UTF-8: {}", e.utf8_error()))),
++            Err(e) => Event::Failed(e),
++        };
++        let last = matches!(ev, Event::Eof | Event::Failed(_));
++        if tx.send(ev).is_err() || last {
++            return;
++        }
++    }
++}
+diff --git a/crates/app/src/mcp/live.rs b/crates/app/src/mcp/live.rs
+index 58ed57346..14190e986 100644
+--- a/crates/app/src/mcp/live.rs
++++ b/crates/app/src/mcp/live.rs
+@@ -246,6 +246,9 @@ pub fn answer_live_with(
+             last_value: Value::Null,
+             selection: options.selection.clone(),
+         },
++        // The live bridge answers one line at a time: no background lane.
++        bg: None,
++        gate: None,
+     };
+     let reply = server.handle_line(line);
+     *history = std::mem::take(&mut server.env.history);
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index aad534326..2d53daa65 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -24,6 +24,8 @@ mod schema_validation;
+ 
+ mod align_tools;
+ mod area;
++// #3035: the stdio server generates on a worker thread.
++mod background;
+ mod body_tools;
+ mod bridge;
+ // #1944: compact read modes for a model's context window.
+@@ -108,7 +110,7 @@ pub(crate) use tools::call;
+ use crate::script::Env;
+ 
+ use serde_json::{json, Value};
+-use std::io::{BufRead, Read, Write};
++use std::io::{BufRead, Write};
+ 
+ /// The protocol revisions this server speaks, newest first. A client
+ /// asking for one of them gets it echoed; anything else gets the newest
+@@ -125,6 +127,9 @@ const INVALID_PARAMS: i64 = -32602;
+ /// testable - `handle` is the whole protocol, `serve` only moves lines.
+ pub struct Server {
+     env: Env,
++    /// #3035: the background generate lane; only [`serve`] sets it.
++    bg: Option<background::Background>,
++    gate: Option<background::Gate>,
+ }
+ 
+ impl Default for Server {
+@@ -136,7 +141,17 @@ impl Default for Server {
+ impl Server {
+     #[must_use]
+     pub fn new() -> Self {
+-        Self { env: Env::fresh() }
++        Self { env: Env::fresh(), bg: None, gate: None }
++    }
++
++    /// Test hook (#3035): each generate worker that [`serve_with`] starts
++    /// waits for one message on the returned sender before it runs, so a
++    /// test can hold a generate open. Dropping the sender frees them all.
++    #[doc(hidden)]
++    pub fn hold_generations(&mut self) -> std::sync::mpsc::Sender<()> {
++        let (tx, rx) = std::sync::mpsc::channel();
++        self.gate = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
++        tx
+     }
+ 
+     /// One wire line in, at most one wire line out (notifications get
+@@ -280,30 +295,18 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+ /// JSON-RPC parse error for that line; the loop reads on. Only an I/O
+ /// failure of the streams themselves ends it early.
+ /// Diagnostics never go to stdout - that stream is the protocol's.
+-pub fn serve(mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+-    let mut server = Server::new();
+-    let mut buf = Vec::new();
+-    loop {
+-        buf.clear();
+-        let cap = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
+-        let n = (&mut input).take(cap).read_until(b'\n', &mut buf)?;
+-        if n == 0 {
+-            return Ok(());
+-        }
+-        let reply = if !buf.ends_with(b"\n") && buf.len() > MAX_LINE_BYTES {
+-            skip_line(&mut input)?;
+-            Some(parse_error(&format!("line longer than {MAX_LINE_BYTES} bytes")))
+-        } else {
+-            match std::str::from_utf8(&buf) {
+-                Ok(line) => server.handle_line(line),
+-                Err(e) => Some(parse_error(&format!("the line is not UTF-8: {e}"))),
+-            }
+-        };
+-        if let Some(reply) = reply {
+-            writeln!(output, "{reply}")?;
+-            output.flush()?;
+-        }
+-    }
++/// #3035: a `generate` runs on a worker thread; the loop answers the
++/// other calls meanwhile, and its answer goes out when it lands (so
++/// answers can come out of request order, as JSON-RPC permits). A
++/// `notifications/cancelled` for it drops it with no answer.
++pub fn serve(input: impl BufRead + Send, output: impl Write) -> std::io::Result<()> {
++    serve_with(Server::new(), input, output)
++}
++
++/// [`serve`] over a given session (tests set [`Server::hold_generations`]).
++#[doc(hidden)]
++pub fn serve_with(server: Server, input: impl BufRead + Send, output: impl Write) -> std::io::Result<()> {
++    background::serve_with(server, input, output)
+ }
+ 
+ fn parse_error(msg: &str) -> String {
+diff --git a/crates/app/src/script/api.rs b/crates/app/src/script/api.rs
+index daaab2141..dfcadc903 100644
+--- a/crates/app/src/script/api.rs
++++ b/crates/app/src/script/api.rs
+@@ -243,32 +243,40 @@ pub(crate) fn v_operations(env: &mut Env, _args: Vec<Value>) -> Result<Value, St
+ /// and leaves the generations before it real and undoable, exactly as
+ /// in the app.
+ pub(crate) fn v_generate(env: &mut Env, args: Vec<Value>) -> Result<Value, String> {
++    let targets = generate_targets(env, &args)?;
++    let mut done = Vec::with_capacity(targets.len());
++    for (name, entity) in targets {
++        if args.is_empty() && crate::operation::status_of(&env.world, &entity) == OpStatus::Ok {
++            continue;
++        }
++        let cmd = GenerateOperation::new(&env.world, &name).map_err(|e| refusal_text(&name, &e))?;
++        env.history.execute(&env.world, cmd);
++        done.push(op_view(env, &name, &entity, false));
++    }
++    Ok(Value::Array(done))
++}
++
++/// The operations a `generate` call runs, in program order: every one
++/// for no names (the caller skips the Ok ones as it reaches them), or
++/// each named one. #3035: the MCP server's background generate reads
++/// the same list, so the two paths cannot disagree on what runs.
++pub(crate) fn generate_targets(env: &Env, args: &[Value]) -> Result<Vec<(String, Entity)>, String> {
+     let all = inventory(env);
+-    let targets: Vec<(String, Entity)> = if args.is_empty() {
++    Ok(if args.is_empty() {
+         all.iter()
+             .map(|(n, e, _)| (n.clone(), *e))
+             .collect()
+     } else {
+         let mut out = Vec::with_capacity(args.len());
+         for i in 0..args.len() {
+-            let name = arg_str(&args, i, "an operation name")?;
++            let name = arg_str(args, i, "an operation name")?;
+             match all.iter().find(|(n, e, _)| *n == name || model::operation_label(&env.world, n, e) == name) {
+                 Some((key, e, _)) => out.push((key.clone(), *e)),
+                 None => return Err(format!("no operation named '{name}'")),
+             }
+         }
+         out
+-    };
+-    let mut done = Vec::with_capacity(targets.len());
+-    for (name, entity) in targets {
+-        if args.is_empty() && crate::operation::status_of(&env.world, &entity) == OpStatus::Ok {
+-            continue;
+-        }
+-        let cmd = GenerateOperation::new(&env.world, &name).map_err(|e| refusal_text(&name, &e))?;
+-        env.history.execute(&env.world, cmd);
+-        done.push(op_view(env, &name, &entity, false));
+-    }
+-    Ok(Value::Array(done))
++    })
+ }
+ 
+ /// A refused generation as the script's (and MCP's) error: the refusal,
+@@ -510,7 +518,7 @@ pub(crate) fn ops_view(env: &Env) -> Value {
+ 
+ /// One operation as the script sees it: the tree row, plus the cached
+ /// path's warnings when the caller is asking for a verdict.
+-fn op_view(env: &Env, name: &str, entity: &Entity, warnings: bool) -> Value {
++pub(crate) fn op_view(env: &Env, name: &str, entity: &Entity, warnings: bool) -> Value {
+     let op = model::operation_of(&env.world, entity);
+     let status = crate::operation::status_of(&env.world, entity);
+     let mut row = json!({
+diff --git a/crates/app/tests/mcp.rs b/crates/app/tests/mcp.rs
+index ea1623a87..1064520e2 100644
+--- a/crates/app/tests/mcp.rs
++++ b/crates/app/tests/mcp.rs
+@@ -10,6 +10,8 @@
+ //! app::operation (detect_holes, #312), app::mcp::pockets (detect_pockets, #35).
+ 
+ mod common;
++#[path = "mcp/background_generate.rs"]
++mod background_generate;
+ #[path = "mcp/approach_distance.rs"]
+ mod mcp_approach_distance;
+ #[path = "mcp/finish3d_direction.rs"]
+diff --git a/crates/app/tests/mcp/background_generate.rs b/crates/app/tests/mcp/background_generate.rs
+new file mode 100644
+index 000000000..956167276
+--- /dev/null
++++ b/crates/app/tests/mcp/background_generate.rs
+@@ -0,0 +1,197 @@
++//! #3035: the stdio MCP server runs a `generate` on a worker thread. A read
++//! or a save answers while the generate runs, `notifications/cancelled`
++//! drops it with no answer, a second generate is refused by name, and a
++//! result whose operation changed while it ran is discarded, never landed.
++//!
++//! Provenance: our own tests over our own server; the cancellation form is
++//! the public MCP specification's (revision 2025-06-18).
++//!
++//! Gate map: covers app::mcp (background, serve), app::script::api (generate_targets).
++
++use camcraft_app::mcp::{self, Server};
++use serde_json::{json, Value};
++use std::io::{BufReader, Read, Write};
++use std::sync::mpsc::{self, Receiver, Sender};
++use std::thread::JoinHandle;
++use std::time::Duration;
++
++/// The client's end of the input: each message is one chunk of bytes.
++struct Pipe {
++    rx: Receiver<Vec<u8>>,
++    buf: Vec<u8>,
++    pos: usize,
++}
++
++impl Read for Pipe {
++    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
++        if self.pos >= self.buf.len() {
++            match self.rx.recv() {
++                Ok(b) => {
++                    self.buf = b;
++                    self.pos = 0;
++                }
++                Err(_) => return Ok(0),
++            }
++        }
++        let n = out.len().min(self.buf.len() - self.pos);
++        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
++        self.pos += n;
++        Ok(n)
++    }
++}
++
++/// The server's output, one wire line per message.
++struct Lines {
++    tx: Sender<String>,
++    pending: Vec<u8>,
++}
++
++impl Write for Lines {
++    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
++        self.pending.extend_from_slice(data);
++        while let Some(i) = self.pending.iter().position(|&b| b == b'\n') {
++            let line: Vec<u8> = self.pending.drain(..=i).collect();
++            let _ = self.tx.send(String::from_utf8_lossy(&line).trim().to_owned());
++        }
++        Ok(data.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++struct Session {
++    input: Option<Sender<Vec<u8>>>,
++    output: Receiver<String>,
++    gate: Sender<()>,
++    thread: Option<JoinHandle<std::io::Result<()>>>,
++}
++
++impl Session {
++    /// A served session whose generate workers wait on `gate`.
++    fn start() -> Self {
++        let (in_tx, in_rx) = mpsc::channel();
++        let (out_tx, out_rx) = mpsc::channel();
++        let (gate_tx, gate_rx) = mpsc::channel();
++        let thread = std::thread::spawn(move || {
++            // The world is not Send: the session is built on its own thread.
++            let mut server = Server::new();
++            gate_tx.send(server.hold_generations()).expect("gate handed over");
++            let input = BufReader::new(Pipe { rx: in_rx, buf: Vec::new(), pos: 0 });
++            mcp::serve_with(server, input, Lines { tx: out_tx, pending: Vec::new() })
++        });
++        let gate = gate_rx.recv().expect("the session starts");
++        Self { input: Some(in_tx), output: out_rx, gate, thread: Some(thread) }
++    }
++
++    fn send(&self, msg: &Value) {
++        self.input.as_ref().expect("input open").send(format!("{msg}\n").into_bytes()).expect("session alive");
++    }
++
++    fn call(&self, id: i64, name: &str, args: Value) {
++        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } }));
++    }
++
++    fn next(&self) -> Value {
++        let line = self.output.recv_timeout(Duration::from_secs(120)).expect("an answer within 120 s");
++        serde_json::from_str(&line).expect("one JSON object per line")
++    }
++
++    /// Call and take the answer, which must be the next line and succeed.
++    fn ok(&self, id: i64, name: &str, args: Value) -> Value {
++        self.call(id, name, args);
++        let reply = self.next();
++        assert_eq!(reply["id"], json!(id), "{reply}");
++        assert_eq!(reply["result"]["isError"], json!(false), "{name}: {reply}");
++        reply["result"]["structuredContent"].clone()
++    }
++
++    fn release(&self) {
++        self.gate.send(()).expect("a held worker");
++    }
++
++    /// End the input; every line the session wrote after this point.
++    fn finish(mut self) -> Vec<Value> {
++        drop(self.input.take());
++        // Drop the gate's sender: any held worker runs, so the session can end.
++        self.gate = mpsc::channel::<()>().0;
++        let thread = self.thread.take().expect("thread");
++        thread.join().expect("the session thread").expect("serve");
++        self.output.try_iter().map(|l| serde_json::from_str(&l).expect("JSON")).collect()
++    }
++}
++
++fn status_of_first(s: &Session, id: i64) -> String {
++    let job = s.ok(id, "get_job", json!({}));
++    job["operations"][0]["status"].as_str().expect("status").to_owned()
++}
++
++fn one_face() -> Session {
++    let s = Session::start();
++    s.ok(1, "set_stock", json!({ "box": { "dx": 20.0, "dy": 20.0, "dz": 10.0 } }));
++    s.ok(2, "add_tool", json!({ "catalog": "EM-0400-2FL" }));
++    s.ok(3, "add_operation", json!({ "kind": "Face", "name": "First", "tool": "EM-0400-2FL" }));
++    s
++}
++
++/// The issue's case: a read and a save queued behind a long generate
++/// answer before the generate does, and the generate still lands.
++#[test]
++fn a_read_and_a_save_answer_while_a_generate_runs() {
++    let s = one_face();
++    s.call(10, "generate", json!({ "name": "First" }));
++    assert_eq!(status_of_first(&s, 11), "never", "the held generate has not landed");
++    let dir = std::env::temp_dir().join(format!("camcraft-mcp-bg-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    let path = dir.join("held.camproj");
++    s.ok(12, "save_project", json!({ "path": path.display().to_string(), "overwrite": true }));
++    s.call(13, "generate", json!({}));
++    let busy = s.next();
++    assert_eq!(busy["id"], json!(13), "{busy}");
++    assert_eq!(busy["result"]["isError"], json!(true), "{busy}");
++    let text = busy["result"]["content"][0]["text"].as_str().expect("text");
++    assert!(text.contains("another generate is running (First)"), "{text}");
++    s.release();
++    let done = s.next();
++    assert_eq!(done["id"], json!(10), "{done}");
++    assert_eq!(done["result"]["isError"], json!(false), "{done}");
++    assert_eq!(done["result"]["structuredContent"]["generated"][0]["key"], json!("First"), "{done}");
++    assert_eq!(status_of_first(&s, 14), "ok");
++    s.finish();
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// `notifications/cancelled` drops the running generate: no answer for
++/// its id, nothing lands, and the session goes on serving.
++#[test]
++fn a_cancelled_generate_gets_no_answer_and_lands_nothing() {
++    let s = one_face();
++    s.call(10, "generate", json!({}));
++    s.send(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 10, "reason": "timeout" } }));
++    assert_eq!(status_of_first(&s, 11), "never");
++    s.release();
++    // A new generate is free to start once the old one is cancelled.
++    s.release();
++    let again = s.ok(12, "generate", json!({ "name": "First" }));
++    assert_eq!(again["generated"][0]["key"], json!("First"));
++    let rest = s.finish();
++    assert!(rest.iter().all(|r| r["id"] != json!(10)), "a cancelled request gets no answer: {rest:?}");
++}
++
++/// A result whose operation was edited while it ran is discarded by
++/// name: old parameters never land over the newer ones.
++#[test]
++fn a_generate_whose_operation_changed_meanwhile_is_discarded() {
++    let s = one_face();
++    s.call(10, "generate", json!({ "name": "First" }));
++    s.ok(11, "edit_operation", json!({ "name": "First", "params": { "stepover": 2.0 } }));
++    s.release();
++    let done = s.next();
++    assert_eq!(done["id"], json!(10), "{done}");
++    assert_eq!(done["result"]["isError"], json!(true), "{done}");
++    let text = done["result"]["content"][0]["text"].as_str().expect("text");
++    assert!(text.contains("First") && text.contains("changed while it generated"), "{text}");
++    assert_eq!(status_of_first(&s, 12), "never", "the discarded path did not land");
++    s.finish();
++}
+diff --git a/docs/decisions/3035-mcp-generate-worker.md b/docs/decisions/3035-mcp-generate-worker.md
+new file mode 100644
+index 000000000..3126fe5eb
+--- /dev/null
++++ b/docs/decisions/3035-mcp-generate-worker.md
+@@ -0,0 +1,50 @@
++## #3035 - the stdio MCP server generates on a worker thread
++
++**What was decided.** `camcraft-cli mcp` (the stdio server, `mcp::serve`)
++runs each `generate` call on a worker thread. A reader thread moves the
++input lines to the session thread. The session thread keeps the world and
++answers every other call while the worker runs, for example `get_job` and
++`save_project`. The generate answer goes out when its result lands. Answers
++can therefore come out of request order, as JSON-RPC permits.
++
++- The worker gets only the staged job (`StagedGeneration`, #2257). The world
++  reads stay on the session thread.
++- The result lands through the History, as in the synchronous tool, only if
++  `still_current` is true. If the operation or its cached path changed
++  while the worker ran, the call is refused by name: "discarded: the
++  operation changed while it generated - generate it again". This is the
++  same law as the GUI's generation worker.
++- `notifications/cancelled` with the generate's `requestId` drops the
++  generate. No answer goes out for that id, as the MCP specification says,
++  and its result never lands.
++- One generate at a time. A second `generate` while one runs is refused by
++  name. `open_project` is refused while a generate runs, because it
++  replaces the world that the result lands in.
++- At the end of input, a running generate still gets its answer before the
++  loop ends. A piped script keeps its answers.
++- The live GUI bridge (`answer_live`) and the in-process `Server::handle`
++  stay synchronous. Their callers answer one line at a time.
++
++**Why.** The issue's agent lost its job: a generate over 900 s blocked the
++`save_project` and `get_job` calls behind it, and there was no cancel.
++The `StagedGeneration` seam already exists for the GUI, so the change is
++in the MCP layer only. No generator changes, and no posted output changes.
++
++**Dropped.**
++- A cancel point inside the generators. A cancelled worker runs to its end,
++  and the session drops its result. A real stop needs a cancel flag in each
++  generator (adaptive, waterline, 5-axis): that is the open run-time part
++  of #3035.
++- A `cancel_generate` tool. `notifications/cancelled` is the protocol's own
++  form, and clients send it at their timeout.
++- Refusing every write while a generate runs. `still_current` and the
++  operation stamp already keep a stale result from landing as current.
++
++**Not done here (stays open on #3035).** The run time of Rough12, Rest6 and
++Waterline6 on the mould core. The staging of a rest operation still
++simulates the operations ahead of it on the session thread, so that part
++still blocks other calls.
++
++**Cost to change later.** Small. The lane is one module,
++`crates/app/src/mcp/background.rs`. A generator cancel flag can be passed
++through the staged job later without a change to the protocol.
+
+From c83ab4889bc8455306a74827b6c6f9a13e3ba308 Mon Sep 17 00:00:00 2001
+From: mkinney <2219838+mkinney@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:29:34 -0800
+Subject: [PATCH 2/3] fix(mcp): bound background work and detach blocked input
+ on output failure
+
+Keep cancelled jobs in the worker budget until completion. Bound queued input, route accepted generate forms through background dispatch, and return output errors without waiting for input EOF.
+
+Refs #3035
+---
+ crates/app/src/mcp/background.rs            |  82 +++++-----
+ crates/app/src/mcp/mod.rs                   |   4 +-
+ crates/app/tests/mcp.rs                     |   4 +-
+ crates/app/tests/mcp/background_generate.rs |  80 +++++++++-
+ crates/app/tests/mcp/background_streams.rs  | 166 ++++++++++++++++++++
+ docs/decisions/3035-mcp-generate-worker.md  |  33 ++++
+ 6 files changed, 328 insertions(+), 41 deletions(-)
+ create mode 100644 crates/app/tests/mcp/background_streams.rs
+
+diff --git a/crates/app/src/mcp/background.rs b/crates/app/src/mcp/background.rs
+index 961e8ae28..0f3e14fa2 100644
+--- a/crates/app/src/mcp/background.rs
++++ b/crates/app/src/mcp/background.rs
+@@ -17,7 +17,7 @@
+ 
+ use std::collections::VecDeque;
+ use std::io::{BufRead, Read, Write};
+-use std::sync::mpsc::{self, Receiver, Sender};
++use std::sync::mpsc::{self, Receiver, SyncSender};
+ use std::sync::{Arc, Mutex};
+ 
+ use flecs_ecs::prelude::Entity;
+@@ -45,7 +45,7 @@ pub(super) type Gate = Arc<Mutex<Receiver<()>>>;
+ 
+ /// The serve loop's state for background generation.
+ pub(super) struct Background {
+-    events: Sender<Event>,
++    events: SyncSender<Event>,
+     running: Option<Running>,
+     next_ticket: u64,
+ }
+@@ -58,11 +58,12 @@ struct Running {
+     queue: VecDeque<(String, Entity)>,
+     unnamed: bool,
+     done: Vec<Value>,
++    cancelled: bool,
+ }
+ 
+ impl Server {
+     fn generating(&self) -> bool {
+-        self.bg.as_ref().is_some_and(|b| b.running.is_some())
++        self.bg.as_ref().is_some_and(|b| b.running.as_ref().is_some_and(|r| !r.cancelled))
+     }
+ 
+     fn on_event(&mut self, ev: Event) -> Option<String> {
+@@ -89,7 +90,7 @@ impl Server {
+         if let Some(id) = tool_call_id(&msg, "open_project")
+             && let Some(name) = self.running_name()
+         {
+-            let why = format!("open_project: refused while generate runs ({name}) - wait for its answer, or cancel it");
++            let why = format!("open_project: refused while generate runs ({name}) - wait for its worker to finish");
+             return Some(answer(&id, tool_err(&why)).to_string());
+         }
+         self.handle_line(line)
+@@ -99,19 +100,20 @@ impl Server {
+         self.bg.as_ref().and_then(|b| b.running.as_ref()).map(|r| r.current.0.clone())
+     }
+ 
+-    /// `notifications/cancelled` for the running generate: forget it.
++    /// Keep a cancelled worker in the single-worker budget until it finishes.
+     /// MCP: no answer goes out for a cancelled request.
+     fn cancel(&mut self, id: &Value) {
+         let Some(bg) = self.bg.as_mut() else { return };
+-        if bg.running.as_ref().is_some_and(|r| r.id == *id) {
+-            let name = bg.running.take().map(|r| r.current.0).unwrap_or_default();
+-            tracing::info!(op = %name, "mcp: generate cancelled by the client; its result will be dropped");
++        if let Some(run) = bg.running.as_mut().filter(|r| r.id == *id) {
++            run.cancelled = true;
++            run.queue.clear();
++            tracing::info!(op = %run.current.0, "mcp: generate cancelled by the client; its result will be dropped");
+         }
+     }
+ 
+     fn start(&mut self, id: Value, names: Vec<Value>) -> Option<Value> {
+         if let Some(name) = self.running_name() {
+-            let why = format!("generate: another generate is running ({name}) - wait for its answer, or cancel it");
++            let why = format!("generate: another generate is running ({name}) - wait for its worker to finish");
+             return Some(answer(&id, tool_err(&why)));
+         }
+         let queue = match api::generate_targets(&self.env, &names) {
+@@ -120,7 +122,7 @@ impl Server {
+         };
+         let unnamed = names.is_empty();
+         let placeholder = (String::new(), Entity::null());
+-        self.advance(Running { id, ticket: 0, current: placeholder, queue, unnamed, done: Vec::new() })
++        self.advance(Running { id, ticket: 0, current: placeholder, queue, unnamed, done: Vec::new(), cancelled: false })
+     }
+ 
+     /// Stage the next operation and hand it to a worker; `None` while a
+@@ -170,6 +172,9 @@ impl Server {
+             return None;
+         }
+         let mut run = bg.running.take()?;
++        if run.cancelled {
++            return None;
++        }
+         match self.land(&mut run, result, true) {
+             Ok(()) => self.advance(run),
+             Err(reply) => Some(reply),
+@@ -201,7 +206,7 @@ fn answer(id: &Value, result: Value) -> Value {
+ }
+ 
+ /// Run `staged` on a worker thread; hand the job back if no thread starts.
+-fn spawn(staged: StagedGeneration, ticket: u64, events: Sender<Event>, gate: Option<Gate>) -> Result<(), Option<Box<StagedGeneration>>> {
++fn spawn(staged: StagedGeneration, ticket: u64, events: SyncSender<Event>, gate: Option<Gate>) -> Result<(), Option<Box<StagedGeneration>>> {
+     let slot = Arc::new(Mutex::new(Some(staged)));
+     let worker_slot = Arc::clone(&slot);
+     let started = std::thread::Builder::new().name("mcp-generate".into()).spawn(move || {
+@@ -238,6 +243,7 @@ fn generate_call(msg: &Value) -> Option<(Value, Vec<Value>)> {
+         None | Some(Value::Null) => Vec::new(),
+         Some(Value::Object(a)) if a.is_empty() => Vec::new(),
+         Some(Value::Object(a)) if a.len() == 1 => match a.get("name") {
++            Some(Value::Null) => Vec::new(),
+             Some(Value::String(n)) if !n.is_empty() => vec![json!(n)],
+             _ => return None,
+         },
+@@ -249,7 +255,8 @@ fn generate_call(msg: &Value) -> Option<(Value, Vec<Value>)> {
+ /// The id of a well-formed `tools/call` request of tool `name`.
+ fn tool_call_id(msg: &Value, name: &str) -> Option<Value> {
+     let id = msg.get("id")?;
+-    let id_ok = id.is_string() || id.is_number();
++    // Match the synchronous handler: every non-null id gets an answer.
++    let id_ok = !id.is_null();
+     let call = msg.get("jsonrpc") == Some(&json!("2.0"))
+         && msg.get("method").and_then(Value::as_str) == Some("tools/call")
+         && msg.get("params").and_then(|p| p.get("name")).and_then(Value::as_str) == Some(name);
+@@ -265,37 +272,40 @@ fn cancelled_request(msg: &Value) -> Option<Value> {
+ /// The stdio loop with the background lane: a reader thread moves lines
+ /// in, workers move results in, and this thread owns the world and the
+ /// output. At the end of input a running generate still gets its answer.
+-pub(super) fn serve_with<R: BufRead + Send>(mut server: Server, input: R, mut output: impl Write) -> std::io::Result<()> {
+-    let (tx, rx) = mpsc::channel();
++pub(super) fn serve_with<R: BufRead + Send + 'static>(mut server: Server, input: R, mut output: impl Write) -> std::io::Result<()> {
++    // One queued event plus the reader's current line bounds input memory.
++    // Worker completion shares the queue and cannot grow it.
++    let (tx, rx) = mpsc::sync_channel(1);
+     server.bg = Some(Background { events: tx.clone(), running: None, next_ticket: 0 });
+-    std::thread::scope(|s| {
+-        std::thread::Builder::new().name("mcp-stdin".into()).spawn_scoped(s, move || read_lines(input, &tx))?;
+-        let mut ended = false;
+-        loop {
+-            if ended && !server.generating() {
+-                return Ok(());
+-            }
+-            // The session holds a sender itself, so the channel never closes here.
+-            let Ok(ev) = rx.recv() else { return Ok(()) };
+-            let reply = match ev {
+-                Event::Eof => {
+-                    ended = true;
+-                    None
+-                }
+-                Event::Failed(e) => return Err(e),
+-                other => server.on_event(other),
+-            };
+-            if let Some(reply) = reply {
+-                writeln!(output, "{reply}")?;
+-                output.flush()?;
++    // A generic blocking reader cannot be interrupted. Give it owned input so
++    // an output error can return immediately. It exits on its next read/send
++    // after the session drops the receiver, without retaining the session.
++    std::thread::Builder::new().name("mcp-stdin".into()).spawn(move || read_lines(input, &tx))?;
++    let mut ended = false;
++    loop {
++        if ended && !server.generating() {
++            return Ok(());
++        }
++        // The session holds a sender itself, so the channel never closes here.
++        let Ok(ev) = rx.recv() else { return Ok(()) };
++        let reply = match ev {
++            Event::Eof => {
++                ended = true;
++                None
+             }
++            Event::Failed(e) => return Err(e),
++            other => server.on_event(other),
++        };
++        if let Some(reply) = reply {
++            writeln!(output, "{reply}")?;
++            output.flush()?;
+         }
+-    })
++    }
+ }
+ 
+ /// One line at a time, capped at [`MAX_LINE_BYTES`]; a longer line or one
+ /// that is not UTF-8 goes over as its parse-error text.
+-fn read_lines(mut input: impl BufRead, tx: &Sender<Event>) {
++fn read_lines(mut input: impl BufRead, tx: &SyncSender<Event>) {
+     let mut buf = Vec::new();
+     let cap = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
+     loop {
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 2d53daa65..f595977a3 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -299,13 +299,13 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+ /// other calls meanwhile, and its answer goes out when it lands (so
+ /// answers can come out of request order, as JSON-RPC permits). A
+ /// `notifications/cancelled` for it drops it with no answer.
+-pub fn serve(input: impl BufRead + Send, output: impl Write) -> std::io::Result<()> {
++pub fn serve(input: impl BufRead + Send + 'static, output: impl Write) -> std::io::Result<()> {
+     serve_with(Server::new(), input, output)
+ }
+ 
+ /// [`serve`] over a given session (tests set [`Server::hold_generations`]).
+ #[doc(hidden)]
+-pub fn serve_with(server: Server, input: impl BufRead + Send, output: impl Write) -> std::io::Result<()> {
++pub fn serve_with(server: Server, input: impl BufRead + Send + 'static, output: impl Write) -> std::io::Result<()> {
+     background::serve_with(server, input, output)
+ }
+ 
+diff --git a/crates/app/tests/mcp.rs b/crates/app/tests/mcp.rs
+index 1064520e2..f07e69ab6 100644
+--- a/crates/app/tests/mcp.rs
++++ b/crates/app/tests/mcp.rs
+@@ -12,6 +12,8 @@
+ mod common;
+ #[path = "mcp/background_generate.rs"]
+ mod background_generate;
++#[path = "mcp/background_streams.rs"]
++mod background_streams;
+ #[path = "mcp/approach_distance.rs"]
+ mod mcp_approach_distance;
+ #[path = "mcp/finish3d_direction.rs"]
+@@ -555,7 +557,7 @@ fn a_null_id_is_an_invalid_request() {
+ 
+ fn serve_bytes(input: &[u8]) -> Vec<Value> {
+     let mut out = Vec::new();
+-    mcp::serve(input, &mut out).expect("serve");
++    mcp::serve(std::io::Cursor::new(input.to_vec()), &mut out).expect("serve");
+     let text = String::from_utf8(out).expect("utf8");
+     text.lines().map(|l| serde_json::from_str(l).expect("one JSON object per line")).collect()
+ }
+diff --git a/crates/app/tests/mcp/background_generate.rs b/crates/app/tests/mcp/background_generate.rs
+index 956167276..23ae264e8 100644
+--- a/crates/app/tests/mcp/background_generate.rs
++++ b/crates/app/tests/mcp/background_generate.rs
+@@ -171,9 +171,19 @@ fn a_cancelled_generate_gets_no_answer_and_lands_nothing() {
+     s.send(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 10, "reason": "timeout" } }));
+     assert_eq!(status_of_first(&s, 11), "never");
+     s.release();
+-    // A new generate is free to start once the old one is cancelled.
++    // The cancelled worker keeps its slot until its completion is drained.
+     s.release();
+-    let again = s.ok(12, "generate", json!({ "name": "First" }));
++    let deadline = std::time::Instant::now() + Duration::from_secs(120);
++    let again = loop {
++        s.call(12, "generate", json!({ "name": "First" }));
++        let reply = s.next();
++        assert_eq!(reply["id"], json!(12), "{reply}");
++        if reply["result"]["isError"] == json!(false) {
++            break reply["result"]["structuredContent"].clone();
++        }
++        assert!(std::time::Instant::now() < deadline, "cancelled worker did not release its slot");
++        std::thread::yield_now();
++    };
+     assert_eq!(again["generated"][0]["key"], json!("First"));
+     let rest = s.finish();
+     assert!(rest.iter().all(|r| r["id"] != json!(10)), "a cancelled request gets no answer: {rest:?}");
+@@ -195,3 +205,69 @@ fn a_generate_whose_operation_changed_meanwhile_is_discarded() {
+     assert_eq!(status_of_first(&s, 12), "never", "the discarded path did not land");
+     s.finish();
+ }
++
++/// Repeated cancellation cannot detach an unlimited number of held workers.
++#[test]
++fn cancelled_workers_keep_the_worker_budget_until_they_finish() {
++    let s = one_face();
++    s.call(10, "generate", json!({ "name": "First" }));
++    s.send(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 10 } }));
++    for id in 20..28 {
++        s.call(id, "generate", json!({ "name": "First" }));
++        // This read answers even if a mutation incorrectly starts another
++        // held worker, so the test fails immediately instead of hanging.
++        s.call(100 + id, "get_job", json!({}));
++        let busy = s.next();
++        assert_eq!(
++            busy["id"],
++            json!(id),
++            "retry started another held worker: {busy}"
++        );
++        assert_eq!(busy["result"]["isError"], json!(true), "{busy}");
++        assert!(busy["result"]["content"][0]["text"]
++            .as_str()
++            .expect("text")
++            .contains("another generate is running (First)"));
++        assert_eq!(s.next()["id"], json!(100 + id));
++        s.send(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id } }));
++    }
++    assert_eq!(status_of_first(&s, 99), "never");
++    let rest = s.finish();
++    assert!(rest.iter().all(|r| r["id"] != json!(10)), "{rest:?}");
++}
++
++/// A null optional name has the same background and busy rules as no name.
++#[test]
++fn a_null_name_uses_the_background_lane_and_busy_guard() {
++    let s = one_face();
++    s.call(10, "generate", json!({ "name": null }));
++    assert_eq!(
++        status_of_first(&s, 11),
++        "never",
++        "null-name generation must stay held in the background"
++    );
++    s.call(12, "generate", json!({ "name": null }));
++    s.call(13, "get_job", json!({}));
++    let busy = s.next();
++    assert_eq!(busy["id"], json!(12), "{busy}");
++    assert_eq!(busy["result"]["isError"], json!(true), "{busy}");
++    assert_eq!(s.next()["id"], json!(13));
++    // The synchronous handler accepts every non-null id. Each accepted form
++    // must therefore use the background busy guard too.
++    for id in [json!(true), json!({ "key": 1 }), json!([1, 2])] {
++        s.send(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
++            "name": "generate", "arguments": { "name": null }
++        } }));
++        s.call(13, "get_job", json!({}));
++        let busy = s.next();
++        assert_eq!(busy["id"], id, "{busy}");
++        assert_eq!(busy["result"]["isError"], json!(true), "accepted id bypassed the busy guard: {busy}");
++        assert_eq!(s.next()["id"], json!(13));
++    }
++    s.release();
++    let done = s.next();
++    assert_eq!(done["id"], json!(10), "{done}");
++    assert_eq!(done["result"]["isError"], json!(false), "{done}");
++    assert_eq!(status_of_first(&s, 14), "ok");
++    s.finish();
++}
+diff --git a/crates/app/tests/mcp/background_streams.rs b/crates/app/tests/mcp/background_streams.rs
+new file mode 100644
+index 000000000..c307e556e
+--- /dev/null
++++ b/crates/app/tests/mcp/background_streams.rs
+@@ -0,0 +1,166 @@
++//! MCP stream backpressure and output-error regressions from PR #3860.
++//! Provenance: our own stdio protocol tests.
++//! Gate map: covers app::mcp (background, serve).
++
++use camcraft_app::mcp;
++use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
++use std::sync::mpsc::{self, Receiver, Sender};
++use std::time::Duration;
++
++const PING: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n";
++
++/// Expose exactly one line per buffer and report every consumed line.
++struct CountLines {
++    data: Cursor<Vec<u8>>,
++    consumed: Sender<()>,
++}
++
++impl Read for CountLines {
++    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
++        let bytes = self.fill_buf()?;
++        let n = bytes.len().min(out.len());
++        out[..n].copy_from_slice(&bytes[..n]);
++        self.consume(n);
++        Ok(n)
++    }
++}
++
++impl BufRead for CountLines {
++    fn fill_buf(&mut self) -> io::Result<&[u8]> {
++        let bytes = self.data.fill_buf()?;
++        Ok(&bytes[..bytes
++            .iter()
++            .position(|&b| b == b'\n')
++            .map_or(bytes.len(), |i| i + 1)])
++    }
++
++    fn consume(&mut self, n: usize) {
++        let line_ended = self
++            .data
++            .fill_buf()
++            .expect("memory input")
++            .get(..n)
++            .is_some_and(|b| b.ends_with(b"\n"));
++        self.data.consume(n);
++        if line_ended {
++            let _ = self.consumed.send(());
++        }
++    }
++}
++
++/// The first response blocks until the client releases it, then fails.
++struct BlockedOutput {
++    entered: Sender<()>,
++    release: Receiver<()>,
++}
++
++impl Write for BlockedOutput {
++    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
++        self.entered.send(()).expect("client waiting for response");
++        self.release.recv().expect("client releases output");
++        Err(io::Error::new(
++            io::ErrorKind::BrokenPipe,
++            "client closed output",
++        ))
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++#[test]
++fn blocked_output_bounds_the_input_queue() {
++    let (consumed_tx, consumed_rx) = mpsc::channel();
++    let (entered_tx, entered_rx) = mpsc::channel();
++    let (release_tx, release_rx) = mpsc::channel();
++    let input = CountLines {
++        data: Cursor::new(PING.repeat(1000)),
++        consumed: consumed_tx,
++    };
++    let thread = std::thread::spawn(move || {
++        mcp::serve(
++            input,
++            BlockedOutput {
++                entered: entered_tx,
++                release: release_rx,
++            },
++        )
++    });
++    entered_rx
++        .recv_timeout(Duration::from_secs(10))
++        .expect("first response starts");
++    // One request is being answered, one is queued, and one line waits to send.
++    for _ in 0..3 {
++        consumed_rx
++            .recv_timeout(Duration::from_secs(10))
++            .expect("reader fills its finite budget");
++    }
++    let extra = consumed_rx.recv_timeout(Duration::from_millis(200));
++    release_tx.send(()).expect("release output");
++    let result = thread.join().expect("session thread");
++    assert_eq!(
++        result.expect_err("output fails").kind(),
++        io::ErrorKind::BrokenPipe
++    );
++    assert!(
++        matches!(extra, Err(mpsc::RecvTimeoutError::Timeout)),
++        "reader consumed more than three lines while output was blocked: {extra:?}"
++    );
++}
++
++/// Keep input open after its first request until the test closes the sender.
++struct OpenInput {
++    chunks: Receiver<Vec<u8>>,
++    current: Cursor<Vec<u8>>,
++}
++
++impl Read for OpenInput {
++    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
++        if self.current.position() == self.current.get_ref().len() as u64 {
++            self.current = match self.chunks.recv() {
++                Ok(chunk) => Cursor::new(chunk),
++                Err(_) => return Ok(0),
++            };
++        }
++        self.current.read(out)
++    }
++}
++
++#[test]
++fn an_output_error_returns_while_input_remains_open() {
++    let (input_tx, input_rx) = mpsc::channel();
++    let (entered_tx, entered_rx) = mpsc::channel();
++    let (release_tx, release_rx) = mpsc::channel();
++    let (done_tx, done_rx) = mpsc::channel();
++    let thread = std::thread::spawn(move || {
++        let input = BufReader::new(OpenInput {
++            chunks: input_rx,
++            current: Cursor::new(Vec::new()),
++        });
++        let result = mcp::serve(
++            input,
++            BlockedOutput {
++                entered: entered_tx,
++                release: release_rx,
++            },
++        );
++        done_tx.send(result).expect("client receives result");
++    });
++    input_tx.send(PING.to_vec()).expect("request");
++    entered_rx
++        .recv_timeout(Duration::from_secs(10))
++        .expect("response starts");
++    release_tx.send(()).expect("fail output");
++    let result = done_rx.recv_timeout(Duration::from_secs(2));
++    // Close input even on failure, so a scoped-reader mutation can exit.
++    drop(input_tx);
++    thread.join().expect("session thread");
++    assert_eq!(
++        result
++            .expect("serve must return before input closes")
++            .expect_err("output fails")
++            .kind(),
++        io::ErrorKind::BrokenPipe
++    );
++}
+diff --git a/docs/decisions/3035-mcp-generate-worker.md b/docs/decisions/3035-mcp-generate-worker.md
+index 3126fe5eb..702b3d5fa 100644
+--- a/docs/decisions/3035-mcp-generate-worker.md
++++ b/docs/decisions/3035-mcp-generate-worker.md
+@@ -48,3 +48,36 @@ still blocks other calls.
+ **Cost to change later.** Small. The lane is one module,
+ `crates/app/src/mcp/background.rs`. A generator cancel flag can be passed
+ through the staged job later without a change to the protocol.
++
++
++## PR #3860 review fixes
++
++**What was decided.** A cancelled generate keeps the single worker slot
++until its completion reaches the session. The session drops its result,
++clears its remaining operation queue, and sends no answer. A retry gets
++the busy refusal while that worker runs. The optional `name: null` value
++uses the same background path as an omitted name. Dispatch accepts the
++same non-null request IDs as the synchronous handler, so no accepted ID
++form bypasses the busy check.
++
++The input and completion events share a channel with capacity one. If an
++output response blocks, one input line can wait in the channel and one
++can wait in the reader. This bounds the input memory at the existing line
++size limit. A worker completion cannot make the channel grow.
++
++The reader owns its input with a `Send + 'static` bound. The session does
++not join it after an output error. The output error can therefore return
++while the client keeps input open. A generic blocking reader cannot be
++interrupted. Its thread can remain blocked until another input byte or
++EOF; it retains no session or world and exits when its next send fails.
++
++**Why.** Repeated cancel and retry must not accumulate staged jobs. Input
++must stop reading ahead when the session cannot write. Every accepted
++generate form must obey the worker budget. An output error must not wait
++for an unrelated input event.
++
++**Dropped.** Starting a replacement worker immediately after cancellation
++would leave the old worker outside the budget. An unbounded input queue
++would retain arbitrarily many permitted lines. Joining the input reader
++on an output error would wait for the client to close input. Generator
++cancellation points remain outside this fix.
+
+From 07e37adeb7a82b1bda741f8003251300db15a291 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 02:52:50 -0800
+Subject: [PATCH 3/3] fix(mcp): resolve background operations when used
+
+Keep operation names across concurrent calls. Skip removed queued operations and resolve the current operation after History execution.
+
+Pin deletion and undo of a queued operation during generation.
+
+Refs #3035
+---
+ crates/app/src/mcp/background.rs            | 31 +++++++++-------
+ crates/app/tests/mcp/background_generate.rs | 40 +++++++++++++++++++++
+ docs/decisions/3035-mcp-generate-worker.md  | 13 +++++++
+ 3 files changed, 72 insertions(+), 12 deletions(-)
+
+diff --git a/crates/app/src/mcp/background.rs b/crates/app/src/mcp/background.rs
+index 0f3e14fa2..07bdb07f4 100644
+--- a/crates/app/src/mcp/background.rs
++++ b/crates/app/src/mcp/background.rs
+@@ -20,11 +20,11 @@ use std::io::{BufRead, Read, Write};
+ use std::sync::mpsc::{self, Receiver, SyncSender};
+ use std::sync::{Arc, Mutex};
+ 
+-use flecs_ecs::prelude::Entity;
+ use serde_json::{json, Value};
+ 
+ use super::{tool_err, tool_ok, Server, MAX_LINE_BYTES};
+ use crate::commands::{CommandError, GenerateOperation, StagedGeneration};
++use crate::model;
+ use crate::operation::OpStatus;
+ use crate::script::api;
+ 
+@@ -54,8 +54,8 @@ pub(super) struct Background {
+ struct Running {
+     id: Value,
+     ticket: u64,
+-    current: (String, Entity),
+-    queue: VecDeque<(String, Entity)>,
++    current: String,
++    queue: VecDeque<String>,
+     unnamed: bool,
+     done: Vec<Value>,
+     cancelled: bool,
+@@ -97,7 +97,7 @@ impl Server {
+     }
+ 
+     fn running_name(&self) -> Option<String> {
+-        self.bg.as_ref().and_then(|b| b.running.as_ref()).map(|r| r.current.0.clone())
++        self.bg.as_ref().and_then(|b| b.running.as_ref()).map(|r| r.current.clone())
+     }
+ 
+     /// Keep a cancelled worker in the single-worker budget until it finishes.
+@@ -107,7 +107,7 @@ impl Server {
+         if let Some(run) = bg.running.as_mut().filter(|r| r.id == *id) {
+             run.cancelled = true;
+             run.queue.clear();
+-            tracing::info!(op = %run.current.0, "mcp: generate cancelled by the client; its result will be dropped");
++            tracing::info!(op = %run.current, "mcp: generate cancelled by the client; its result will be dropped");
+         }
+     }
+ 
+@@ -117,21 +117,25 @@ impl Server {
+             return Some(answer(&id, tool_err(&why)));
+         }
+         let queue = match api::generate_targets(&self.env, &names) {
+-            Ok(t) => VecDeque::from(t),
++            Ok(t) => t.into_iter().map(|(name, _)| name).collect(),
+             Err(e) => return Some(answer(&id, tool_err(&format!("generate: {e}")))),
+         };
+         let unnamed = names.is_empty();
+-        let placeholder = (String::new(), Entity::null());
+-        self.advance(Running { id, ticket: 0, current: placeholder, queue, unnamed, done: Vec::new(), cancelled: false })
++        self.advance(Running { id, ticket: 0, current: String::new(), queue, unnamed, done: Vec::new(), cancelled: false })
+     }
+ 
+     /// Stage the next operation and hand it to a worker; `None` while a
+     /// worker runs. The answer when the queue is empty or a stage refuses.
+     fn advance(&mut self, mut run: Running) -> Option<Value> {
+         loop {
+-            let Some((name, entity)) = run.queue.pop_front() else {
++            let Some(name) = run.queue.pop_front() else {
+                 return Some(answer(&run.id, tool_ok(json!({ "generated": run.done }))));
+             };
++            // Other calls can delete or re-create operations while a worker runs.
++            // Retain names only and resolve the current entity at each use.
++            let Some(entity) = model::find_by_name(&self.env.world, &name) else {
++                continue;
++            };
+             if run.unnamed && crate::operation::status_of(&self.env.world, &entity) == OpStatus::Ok {
+                 continue;
+             }
+@@ -139,7 +143,7 @@ impl Server {
+                 Ok(s) => s,
+                 Err(e) => return Some(refused(&run.id, &name, &e)),
+             };
+-            run.current = (name, entity);
++            run.current = name;
+             let Some(bg) = self.bg.as_mut() else {
+                 return Some(answer(&run.id, tool_err("generate: the session has no background lane")));
+             };
+@@ -158,7 +162,7 @@ impl Server {
+                     }
+                 }
+                 Err(None) => {
+-                    let why = format!("generate: {} - the worker could not start", run.current.0);
++                    let why = format!("generate: {} - the worker could not start", run.current);
+                     return Some(answer(&run.id, tool_err(&why)));
+                 }
+             }
+@@ -185,13 +189,16 @@ impl Server {
+     /// that refuses the call. A background result whose operation changed
+     /// while it ran is discarded by name (#2257).
+     fn land(&mut self, run: &mut Running, result: Result<GenerateOperation, CommandError>, background: bool) -> Result<(), Value> {
+-        let (name, entity) = run.current.clone();
++        let name = run.current.clone();
+         let cmd = result.map_err(|e| refused(&run.id, &name, &e))?;
+         if background && !cmd.still_current(&self.env.world) {
+             let why = format!("generate: {name} - discarded: the operation changed while it generated - generate it again");
+             return Err(answer(&run.id, tool_err(&why)));
+         }
+         self.env.history.execute(&self.env.world, cmd);
++        let Some(entity) = model::find_by_name(&self.env.world, &name) else {
++            return Err(answer(&run.id, tool_err(&format!("generate: {name} - the operation no longer exists"))));
++        };
+         run.done.push(api::op_view(&self.env, &name, &entity, false));
+         Ok(())
+     }
+diff --git a/crates/app/tests/mcp/background_generate.rs b/crates/app/tests/mcp/background_generate.rs
+index 23ae264e8..4aa0916f7 100644
+--- a/crates/app/tests/mcp/background_generate.rs
++++ b/crates/app/tests/mcp/background_generate.rs
+@@ -271,3 +271,43 @@ fn a_null_name_uses_the_background_lane_and_busy_guard() {
+     assert_eq!(status_of_first(&s, 14), "ok");
+     s.finish();
+ }
++
++/// A queued operation can be deleted while the preceding worker runs.
++#[test]
++fn a_deleted_queued_operation_is_skipped() {
++    let s = one_face();
++    s.ok(4, "add_operation", json!({ "kind": "Face", "name": "Second", "tool": "EM-0400-2FL" }));
++    s.call(10, "generate", json!({}));
++    s.ok(11, "delete_operation", json!({ "name": "Second" }));
++    s.release();
++    let done = s.next();
++    assert_eq!(done["id"], json!(10), "{done}");
++    assert_eq!(done["result"]["isError"], json!(false), "{done}");
++    let generated = done["result"]["structuredContent"]["generated"].as_array().expect("generated operations");
++    assert_eq!(generated.len(), 1, "{done}");
++    assert_eq!(generated[0]["key"], json!("First"), "{done}");
++    let job = s.ok(12, "get_job", json!({}));
++    assert_eq!(job["operations"].as_array().expect("operations").len(), 1, "{job}");
++    assert_eq!(status_of_first(&s, 13), "ok");
++    s.finish();
++}
++
++/// Undoing a queued add must not leave an entity handle in the lane.
++#[test]
++fn an_undone_queued_add_is_skipped() {
++    let s = one_face();
++    s.ok(4, "add_operation", json!({ "kind": "Face", "name": "Second", "tool": "EM-0400-2FL" }));
++    s.call(10, "generate", json!({}));
++    s.ok(11, "undo", json!({}));
++    s.release();
++    let done = s.next();
++    assert_eq!(done["id"], json!(10), "{done}");
++    assert_eq!(done["result"]["isError"], json!(false), "{done}");
++    let generated = done["result"]["structuredContent"]["generated"].as_array().expect("generated operations");
++    assert_eq!(generated.len(), 1, "{done}");
++    assert_eq!(generated[0]["key"], json!("First"), "{done}");
++    let job = s.ok(12, "get_job", json!({}));
++    assert_eq!(job["operations"].as_array().expect("operations").len(), 1, "{job}");
++    assert_eq!(status_of_first(&s, 13), "ok");
++    s.finish();
++}
+diff --git a/docs/decisions/3035-mcp-generate-worker.md b/docs/decisions/3035-mcp-generate-worker.md
+index 702b3d5fa..e81ce2bbf 100644
+--- a/docs/decisions/3035-mcp-generate-worker.md
++++ b/docs/decisions/3035-mcp-generate-worker.md
+@@ -81,3 +81,16 @@ would leave the old worker outside the budget. An unbounded input queue
+ would retain arbitrarily many permitted lines. Joining the input reader
+ on an output error would wait for the client to close input. Generator
+ cancellation points remain outside this fix.
++
++## PR #3860 review fix: operation references
++
++**What was decided.** The background lane keeps operation names only.
++It resolves each entity when it uses the operation. It skips a queued
++operation that was deleted or whose creation was undone. After a result
++lands through the History, a missing current operation gives a refusal.
++
++**Why.** Other calls can delete an operation while a worker runs. An entity
++handle retained across those calls can refer to a deleted entity and crash.
++
++**Dropped.** Retaining entity handles across calls. Refusing deletion or
++undo while generation runs would prevent useful edits.

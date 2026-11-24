@@ -1,0 +1,1669 @@
+From 1b4c37adddc5a5bedb7f2e630fe39727c90fceca Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Tue, 24 Nov 2026 08:45:20 +0100
+Subject: [PATCH] feat(cli): camcraft-cli --ui sends MCP tool calls to the
+ running window
+
+Each CamCraft window opens a UI link at start: a Unix domain socket on
+Unix, a 127.0.0.1-only TCP port on Windows (std has no named pipe; the
+dependency question is on #3751). A discovery file <pid>.json in the
+user's link folder names it, with a random token that each connection
+must send first. `camcraft-cli --ui call <tool> [<json>]`, `--ui mcp`
+and `--ui windows` find a window (by --window <pid|project> when
+several run) and send MCP JSON-RPC, which the window answers in
+mcp_host::pump on its own History, so Ctrl+Z undoes a CLI step. With
+no window the lane exits 3 and runs nothing; it never falls back to a
+headless document.
+
+Refs #3751
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/cli.rs                   |  11 +-
+ crates/app/src/cli_ui.rs                | 144 +++++++++++++
+ crates/app/src/lib.rs                   |   1 +
+ crates/app/src/mcp/link.rs              | 269 ++++++++++++++++++++++++
+ crates/app/src/mcp/link_client.rs       | 251 ++++++++++++++++++++++
+ crates/app/src/mcp/listen.rs            | 104 +++++----
+ crates/app/src/mcp/mod.rs               |   8 +-
+ crates/app/src/mcp/port_flag.rs         |  31 +++
+ crates/app/src/mcp/wire.rs              | 138 ++++++++++++
+ crates/app/tests/mcp_live.rs            |   6 +-
+ crates/app/tests/mcp_live/ui_link.rs    | 190 +++++++++++++++++
+ crates/ui/src/egui_app/shell_window.rs  |  21 ++
+ crates/ui/src/egui_app/tests.rs         |   2 +
+ crates/ui/src/egui_app/tests/ui_link.rs |  84 ++++++++
+ crates/ui/src/mcp_host.rs               |  12 ++
+ crates/ui/src/state.rs                  |   4 +
+ docs/decisions/3751-cli-ui-link.md      |  72 +++++++
+ 17 files changed, 1309 insertions(+), 39 deletions(-)
+ create mode 100644 crates/app/src/cli_ui.rs
+ create mode 100644 crates/app/src/mcp/link.rs
+ create mode 100644 crates/app/src/mcp/link_client.rs
+ create mode 100644 crates/app/src/mcp/port_flag.rs
+ create mode 100644 crates/app/src/mcp/wire.rs
+ create mode 100644 crates/app/tests/mcp_live/ui_link.rs
+ create mode 100644 crates/ui/src/egui_app/tests/ui_link.rs
+ create mode 100644 docs/decisions/3751-cli-ui-link.md
+
+diff --git a/crates/app/src/cli.rs b/crates/app/src/cli.rs
+index 06596a01e..5f6715e36 100644
+--- a/crates/app/src/cli.rs
++++ b/crates/app/src/cli.rs
+@@ -29,6 +29,7 @@ USAGE:
+     camcraft-cli help
+     camcraft-cli version
+     camcraft-cli <command> --help    the flags of one command
++    camcraft-cli --ui [--window <pid|project>] <call <tool> [<json>] | mcp | windows>
+ 
+ COMMANDS:
+     script    run a job script through the cam verbs (assets/scripts/
+@@ -41,6 +42,11 @@ COMMANDS:
+               with --connect, a stdio bridge to a running app started
+               with --mcp-port (the agent drives the open window live)
+ 
++LIVE WINDOW:
++    --ui      send MCP tool calls to a running CamCraft window, on its
++              own undo history (camcraft-cli --ui --help); exit 3 when no
++              window runs - it never falls back to a headless document
++
+ A clean run prints its logs, then the last verb's JSON answer on
+ stdout; refusals print on stderr. Exit: 0 stood, 1 refused, 2 usage.
+ ";
+@@ -114,11 +120,12 @@ OPTIONS:
+ /// text. The one list `command_usage` reads and the help test walks,
+ /// so a lane added here is checked and a lane added elsewhere is
+ /// caught by the test's cross-check against the top-level COMMANDS.
+-pub const HELP_LANES: [(&str, &str); 4] = [
++pub const HELP_LANES: [(&str, &str); 5] = [
+     ("script", SCRIPT_USAGE),
+     ("process", PROCESS_USAGE),
+     ("mcp", MCP_USAGE),
+     ("export-agie-inspection", AGIE_INSPECTION_USAGE),
++    ("--ui", crate::cli_ui::UI_USAGE),
+ ];
+ 
+ /// The top-level usage text (`camcraft-cli help`).
+@@ -201,6 +208,8 @@ pub fn run(args: &[String]) -> i32 {
+             println!("camcraft-cli {} (boa_engine)", env!("CARGO_PKG_VERSION"));
+             0
+         }
++        // #3751: the live window lane, before any headless lane parses.
++        "--ui" => crate::cli_ui::run(&args[1..]),
+         // Any position: `process x.camproj --help` answers too. Checked
+         // before the lane parses, so no lane starts (or reads stdin).
+         lane => match command_usage(lane) {
+diff --git a/crates/app/src/cli_ui.rs b/crates/app/src/cli_ui.rs
+new file mode 100644
+index 000000000..f79692002
+--- /dev/null
++++ b/crates/app/src/cli_ui.rs
+@@ -0,0 +1,144 @@
++//! `camcraft-cli --ui ...` (#3751): send MCP tool calls to a running
++//! CamCraft window instead of a headless document. The window runs each
++//! call on its own History, so the change shows at once and Ctrl+Z
++//! undoes it. With no window, the lane says so and exits 3; it never
++//! falls back to a headless run.
++//!
++//! Provenance: our own CLI shape over our own UI link
++//! (docs/decisions/3751-cli-ui-link.md). Clean-room, public sources only.
++
++use std::path::PathBuf;
++
++use serde_json::Value;
++
++use crate::mcp::{link, LinkError, Select};
++
++pub const UI_USAGE: &str = "\
++camcraft-cli --ui [--window <pid|project>] <verb>
++
++    send commands to a running CamCraft window: each call runs on the
++    window's own undo history, so the change shows in the window at once
++    and Ctrl+Z undoes it. Never falls back to a headless document.
++
++VERBS:
++    call <tool> [<json-args>]   one MCP tool call (the tools of
++                                `camcraft-cli mcp reference`); prints the
++                                tool's JSON answer
++    mcp                         a stdio MCP bridge to the window
++    windows                     list the link files of the running windows
++                                (pid, version, project); a file that a
++                                crashed window left shows too
++
++OPTIONS:
++    --window <pid|project>      the window to use, by process id or by the
++                                project path it has open (needed when more
++                                than one window runs)
++    -h, --help                  print this usage and exit 0
++
++The windows are found through the link files in the user's folder
++(CAMCRAFT_UI_LINK_DIR overrides it). A window started with
++CAMCRAFT_UI_LINK=off opens no link.
++
++Exit: 0 stood, 1 refused, 2 usage, 3 no running window.
++";
++
++/// The lane: `args` is everything after `--ui`. The windows are looked
++/// for in the user's link folder.
++pub fn run(args: &[String]) -> i32 {
++    run_in(link::dir(), args)
++}
++
++/// [`run`] with the link folder given (`None`: the user has none). The
++/// UI tests drive this, with the folder of the window they started.
++pub fn run_in(dir: Option<PathBuf>, args: &[String]) -> i32 {
++    if args.iter().any(|a| a == "--help" || a == "-h") {
++        print!("{UI_USAGE}");
++        return 0;
++    }
++    let mut select = Select::Only;
++    let mut rest = args;
++    if let [flag, value, tail @ ..] = args
++        && flag == "--window"
++    {
++        select = Select::parse(value);
++        rest = tail;
++    } else if args.first().is_some_and(|a| a == "--window") {
++        eprintln!("camcraft-cli: --window needs a process id or a project path");
++        return 2;
++    }
++    let Some(dir) = dir else {
++        eprintln!("camcraft-cli: --ui: no user folder to look for windows in (set {})", link::DIR_ENV);
++        return 3;
++    };
++    match rest {
++        [verb, tool, json @ ..] if verb == "call" && json.len() <= 1 => {
++            let args = match json.first().map(|t| serde_json::from_str::<Value>(t)) {
++                None => Value::Object(serde_json::Map::new()),
++                Some(Ok(v @ Value::Object(_))) => v,
++                Some(Ok(_)) => {
++                    eprintln!("camcraft-cli: --ui call {tool}: the arguments must be a JSON object");
++                    return 2;
++                }
++                Some(Err(e)) => {
++                    eprintln!("camcraft-cli: --ui call {tool}: the arguments are not JSON: {e}");
++                    return 2;
++                }
++            };
++            call(&dir, &select, tool, &args)
++        }
++        [verb] if verb == "mcp" => {
++            match crate::mcp::link_bridge(&dir, &select, std::io::stdin(), std::io::stdout().lock()) {
++                Ok(()) => 0,
++                Err(e) => fail(&e),
++            }
++        }
++        [verb] if verb == "windows" => windows(&dir),
++        _ => {
++            eprintln!("camcraft-cli: --ui takes call <tool> [<json-args>], mcp or windows (try --ui --help)");
++            2
++        }
++    }
++}
++
++fn fail(e: &LinkError) -> i32 {
++    eprintln!("camcraft-cli: --ui: {e}");
++    e.exit_code()
++}
++
++fn call(dir: &std::path::Path, select: &Select, tool: &str, args: &Value) -> i32 {
++    let result = match crate::mcp::link_call(dir, select, tool, args) {
++        Ok(r) => r,
++        Err(e) => return fail(&e),
++    };
++    let text = |r: &Value| {
++        r["content"]
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter_map(|c| c["text"].as_str())
++            .collect::<Vec<_>>()
++            .join("\n")
++    };
++    if result["isError"] == Value::Bool(true) {
++        eprintln!("camcraft-cli: {}", text(&result));
++        return 1;
++    }
++    match result.get("structuredContent") {
++        Some(v) => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
++        None => println!("{}", text(&result)),
++    }
++    0
++}
++
++fn windows(dir: &std::path::Path) -> i32 {
++    let entries = link::entries(dir);
++    if entries.is_empty() {
++        eprintln!("camcraft-cli: --ui: no running CamCraft window: no link file in {}", dir.display());
++        return 3;
++    }
++    for e in entries {
++        let project = e.project.map_or_else(|| "(unsaved)".to_owned(), |p: PathBuf| p.display().to_string());
++        println!("{}\t{}\t{}", e.pid, e.app_version, project);
++    }
++    0
++}
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 689adaa05..7e9152487 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -6,6 +6,7 @@
+ 
+ pub use camcraft_cl::cl;
+ pub mod cli;
++pub mod cli_ui;
+ pub mod clock;
+ pub mod commands;
+ // #3073: saved cut recipes - an operation's settings under a name.
+diff --git a/crates/app/src/mcp/link.rs b/crates/app/src/mcp/link.rs
+new file mode 100644
+index 000000000..fb281ab55
+--- /dev/null
++++ b/crates/app/src/mcp/link.rs
+@@ -0,0 +1,269 @@
++//! The UI link (#3751): each running CamCraft window opens a local
++//! socket at start and writes a discovery file, so `camcraft-cli --ui`
++//! can find it and send it MCP tool calls that run on the window's own
++//! History. This module is the window's end: the folder, the token, the
++//! discovery file and the hello line that opens a session.
++//!
++//! - **Local only.** On Unix the socket is a Unix domain socket in the
++//!   user's own folder (mode 0700, the socket 0600). Elsewhere (Windows:
++//!   std has no named pipe or local socket) it is TCP bound to 127.0.0.1
++//!   with an OS-chosen port; no other interface is ever bound.
++//! - **Same user only.** A client must open with the random token from
++//!   the discovery file, which only the user can read; any other first
++//!   line closes the connection before a byte of it reaches the app.
++//! - **One file per window.** `<pid>.json` in the link folder; a window
++//!   removes its file when it closes. A file left by a crash is stale:
++//!   its socket does not answer, and the client skips it.
++//!
++//! Provenance: our own design (docs/decisions/3751-cli-ui-link.md) over
++//! std; the per-user folders are the platforms' published locations
++//! (Windows `%APPDATA%`, macOS `~/Library/Application Support`, the XDG
++//! Base Directory spec with `XDG_RUNTIME_DIR` for sockets). Clean-room,
++//! public sources only.
++
++use std::ffi::OsString;
++use std::io::Write;
++use std::path::{Path, PathBuf};
++
++use serde::{Deserialize, Serialize};
++use serde_json::{json, Value};
++
++use super::wire::Listener;
++
++/// The override of the link folder: an absolute path (tests use one).
++pub const DIR_ENV: &str = "CAMCRAFT_UI_LINK_DIR";
++/// `CAMCRAFT_UI_LINK=off` starts a window without its link.
++pub const OFF_ENV: &str = "CAMCRAFT_UI_LINK";
++/// The discovery file format this build writes and reads.
++pub const FORMAT: u32 = 1;
++/// The window's answer to a good hello line.
++pub const HELLO_OK: &str = r#"{"camcraft_link":1,"ok":true}"#;
++/// The window's answer to any other first line; then it hangs up.
++pub const HELLO_REFUSED: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"camcraft UI link: wrong or missing token - the connection is closed"}}"#;
++
++/// One window's discovery file.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Entry {
++    pub format: u32,
++    /// The window's process id.
++    pub pid: u32,
++    /// `"unix"` (a socket path) or `"tcp"` (a 127.0.0.1 address).
++    pub transport: String,
++    pub address: String,
++    pub token: String,
++    /// The project the window has open, `None` for an unsaved document.
++    pub project: Option<PathBuf>,
++    pub app_version: String,
++}
++
++/// The link folder from an environment lookup, for the named platform
++/// (`std::env::consts::OS`). Pure, so the order is testable. `None` = no
++/// per-user folder to put one in.
++#[must_use]
++pub fn dir_for(os: &str, get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
++    let abs = |k: &str| get(k).map(PathBuf::from).filter(|p| p.is_absolute());
++    if let Some(dir) = abs(DIR_ENV) {
++        return Some(dir);
++    }
++    let base = match os {
++        "windows" => abs("APPDATA"),
++        "macos" => abs("HOME").map(|h| h.join("Library").join("Application Support")),
++        // A runtime folder is the user's own (0700) and short, which a
++        // socket path needs (about 100 bytes at most).
++        _ => abs("XDG_RUNTIME_DIR")
++            .or_else(|| abs("XDG_DATA_HOME"))
++            .or_else(|| abs("HOME").map(|h| h.join(".local").join("share"))),
++    }?;
++    Some(base.join("camcraft").join("ui-link"))
++}
++
++/// The link folder for this process.
++#[must_use]
++pub fn dir() -> Option<PathBuf> {
++    dir_for(std::env::consts::OS, |k| std::env::var_os(k))
++}
++
++/// Whether a window starts its link: on, unless `CAMCRAFT_UI_LINK=off`.
++#[must_use]
++pub fn enabled(env: Option<&str>) -> bool {
++    !env.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
++}
++
++/// A fresh token: 256 bits of SipHash output under keys that std seeds
++/// from the OS's random source (`RandomState`), mixed with the clock and
++/// the process id. No new dependency (decision 3751).
++fn new_token() -> String {
++    use std::collections::hash_map::RandomState;
++    use std::hash::{BuildHasher, Hasher};
++    let nanos = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_nanos());
++    (0..4_u64)
++        .map(|i| {
++            let mut h = RandomState::new().build_hasher();
++            h.write_u64(i);
++            h.write_u128(nanos);
++            h.write_u32(std::process::id());
++            format!("{:016x}", h.finish())
++        })
++        .collect()
++}
++
++/// The first line a client sends.
++#[must_use]
++pub fn hello_line(token: &str) -> String {
++    json!({ "camcraft_link": FORMAT, "token": token }).to_string()
++}
++
++/// Whether a first line is the hello with this token. The compare takes
++/// the same time for every token of the same length.
++#[must_use]
++pub fn hello_matches(line: &[u8], token: &str) -> bool {
++    let Ok(v) = serde_json::from_slice::<Value>(line) else { return false };
++    if v.get("camcraft_link").and_then(Value::as_u64) != Some(u64::from(FORMAT)) {
++        return false;
++    }
++    let Some(got) = v.get("token").and_then(Value::as_str) else { return false };
++    got.len() == token.len()
++        && got.bytes().zip(token.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
++}
++
++/// A window's registration: its discovery file (and socket file), removed
++/// when it drops.
++#[derive(Debug)]
++pub struct Registration {
++    file: PathBuf,
++    socket: Option<PathBuf>,
++    entry: Entry,
++}
++
++impl Registration {
++    #[must_use]
++    pub fn entry(&self) -> &Entry {
++        &self.entry
++    }
++
++    /// Record the window's open project, so `--window <project>` finds it.
++    /// Writes only when it changed; a failed write is logged.
++    pub fn note_project(&mut self, project: Option<&Path>) {
++        if self.entry.project.as_deref() == project {
++            return;
++        }
++        self.entry.project = project.map(Path::to_path_buf);
++        if let Err(e) = write_entry(&self.file, &self.entry) {
++            tracing::warn!("ui link: cannot update {}: {e}", self.file.display());
++        }
++    }
++}
++
++impl Drop for Registration {
++    fn drop(&mut self) {
++        for path in std::iter::once(&self.file).chain(self.socket.as_ref()) {
++            if let Err(e) = std::fs::remove_file(path)
++                && e.kind() != std::io::ErrorKind::NotFound
++            {
++                tracing::warn!("ui link: cannot remove {}: {e}", path.display());
++            }
++        }
++    }
++}
++
++/// Bind this window's socket in `dir` and write its discovery file.
++///
++/// # Errors
++/// The folder cannot be made private, the bind failed, or the file
++/// could not be written (then nothing is left behind).
++pub(crate) fn open(dir: &Path) -> std::io::Result<(Listener, Registration, String)> {
++    prepare_dir(dir)?;
++    let pid = std::process::id();
++    let token = new_token();
++    let (listener, transport, address, socket) = bind(dir, pid)?;
++    let entry = Entry {
++        format: FORMAT,
++        pid,
++        transport: transport.to_owned(),
++        address,
++        token: token.clone(),
++        project: None,
++        app_version: env!("CARGO_PKG_VERSION").to_owned(),
++    };
++    // Built before the write, so a failed write still removes the socket.
++    let registration = Registration { file: dir.join(format!("{pid}.json")), socket, entry };
++    write_entry(&registration.file, &registration.entry)?;
++    Ok((listener, registration, token))
++}
++
++fn prepare_dir(dir: &Path) -> std::io::Result<()> {
++    std::fs::create_dir_all(dir)?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn bind(dir: &Path, pid: u32) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
++    use std::os::unix::fs::PermissionsExt;
++    let path = dir.join(format!("{pid}.sock"));
++    let address = path
++        .to_str()
++        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the link folder path is not UTF-8"))?
++        .to_owned();
++    // A file of a crashed process with the same pid: nobody serves it.
++    let _ = std::fs::remove_file(&path);
++    let listener = std::os::unix::net::UnixListener::bind(&path)?;
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    Ok((Listener::Unix(listener), "unix", address, Some(path)))
++}
++
++#[cfg(not(unix))]
++fn bind(_dir: &Path, _pid: u32) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
++    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
++    let address = listener.local_addr()?.to_string();
++    Ok((Listener::Tcp(listener), "tcp", address, None))
++}
++
++/// Write the file all or nothing (a temp file, then a rename), readable
++/// by the user only on Unix.
++fn write_entry(file: &Path, entry: &Entry) -> std::io::Result<()> {
++    let text = serde_json::to_string_pretty(entry).map_err(std::io::Error::other)?;
++    let tmp = file.with_extension("json.tmp");
++    let mut options = std::fs::OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut out = options.open(&tmp)?;
++    out.write_all(text.as_bytes())?;
++    out.sync_all()?;
++    drop(out);
++    std::fs::rename(&tmp, file)
++}
++
++/// Every readable discovery file in `dir`, by process id. A file that is
++/// not one (a temp file, another format) is skipped and logged.
++#[must_use]
++pub fn entries(dir: &Path) -> Vec<Entry> {
++    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
++    let mut found: Vec<Entry> = read
++        .filter_map(Result::ok)
++        .map(|e| e.path())
++        .filter(|p| p.extension().is_some_and(|x| x == "json"))
++        .filter_map(|p| {
++            let parsed = std::fs::read_to_string(&p)
++                .ok()
++                .and_then(|t| serde_json::from_str::<Entry>(&t).ok())
++                .filter(|e| e.format == FORMAT);
++            if parsed.is_none() {
++                tracing::info!("ui link: {} is not a link file of this version; skipped", p.display());
++            }
++            parsed
++        })
++        .collect();
++    found.sort_by_key(|e| e.pid);
++    found
++}
+diff --git a/crates/app/src/mcp/link_client.rs b/crates/app/src/mcp/link_client.rs
+new file mode 100644
+index 000000000..f4892e6bd
+--- /dev/null
++++ b/crates/app/src/mcp/link_client.rs
+@@ -0,0 +1,251 @@
++//! The CLI's end of the UI link (#3751): find a running window from the
++//! discovery files, open a session with its token, and send it MCP
++//! `tools/call` lines - the same tool surface `camcraft-cli mcp` serves,
++//! answered on the window's UI thread through its History, so Ctrl+Z in
++//! the window undoes a CLI step. Never falls back to a headless
++//! document: no window is an error by name.
++//!
++//! Provenance: our own std code over our own link (link.rs); the framing
++//! is the MCP stdio transport (modelcontextprotocol.io, revision
++//! 2025-06-18). Clean-room, public sources only.
++
++use std::fmt;
++use std::io::{BufRead, BufReader, Read, Write};
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++use serde_json::{json, Value};
++
++use super::link::{self, Entry};
++use super::wire::Stream;
++
++/// How long a connect and the hello answer may take before a window is
++/// read as not answering (a stale file, a hung window).
++const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// Which window to talk to.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Select {
++    /// The one running window; an error when there are several.
++    Only,
++    /// The window of this process id.
++    Pid(u32),
++    /// The window that has this project open.
++    Project(PathBuf),
++}
++
++impl Select {
++    /// `--window <pid|project path>`: all digits is a process id.
++    #[must_use]
++    pub fn parse(text: &str) -> Self {
++        match text.parse::<u32>() {
++            Ok(pid) => Select::Pid(pid),
++            Err(_) => Select::Project(PathBuf::from(text)),
++        }
++    }
++
++    fn admits(&self, entry: &Entry) -> bool {
++        match self {
++            Select::Only => true,
++            Select::Pid(pid) => entry.pid == *pid,
++            Select::Project(want) => entry.project.as_deref().is_some_and(|p| same_path(p, want)),
++        }
++    }
++}
++
++fn same_path(a: &Path, b: &Path) -> bool {
++    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
++    a == b || canon(a) == canon(b)
++}
++
++/// Why a `--ui` call did not run.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum LinkError {
++    /// No window answered: nothing ran. Exit 3.
++    NoWindow(String),
++    /// Several windows answered and none was chosen. Exit 2.
++    Choose(String),
++    /// The window refused the session or the connection failed. Exit 1.
++    Failed(String),
++}
++
++impl LinkError {
++    /// The CLI's exit code for this error.
++    #[must_use]
++    pub fn exit_code(&self) -> i32 {
++        match self {
++            LinkError::NoWindow(_) => 3,
++            LinkError::Choose(_) => 2,
++            LinkError::Failed(_) => 1,
++        }
++    }
++}
++
++impl fmt::Display for LinkError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            LinkError::NoWindow(m) | LinkError::Choose(m) | LinkError::Failed(m) => f.write_str(m),
++        }
++    }
++}
++
++fn describe(entry: &Entry) -> String {
++    let project = entry
++        .project
++        .as_ref()
++        .map_or_else(|| "an unsaved document".to_owned(), |p| p.display().to_string());
++    format!("pid {} ({project})", entry.pid)
++}
++
++/// Connect to one window and pass its token check.
++fn open(entry: &Entry) -> std::io::Result<Stream> {
++    let stream = match entry.transport.as_str() {
++        "tcp" => {
++            let addr: std::net::SocketAddr = entry
++                .address
++                .parse()
++                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a socket address"))?;
++            // Never send a token off this machine, whatever the file says.
++            if !addr.ip().is_loopback() {
++                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a loopback address"));
++            }
++            Stream::Tcp(std::net::TcpStream::connect_timeout(&addr, HELLO_TIMEOUT)?)
++        }
++        #[cfg(unix)]
++        "unix" => Stream::Unix(std::os::unix::net::UnixStream::connect(&entry.address)?),
++        other => {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                format!("transport '{other}' is not served on this platform"),
++            ));
++        }
++    };
++    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
++    stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
++    let mut writer = stream.try_clone()?;
++    writeln!(writer, "{}", link::hello_line(&entry.token))?;
++    writer.flush()?;
++    let mut answer = String::new();
++    BufReader::new(stream.try_clone()?).take(4096).read_line(&mut answer)?;
++    if answer.trim() != link::HELLO_OK {
++        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the window refused the link token"));
++    }
++    // A tool may run for minutes (generate): no read deadline from here.
++    stream.set_read_timeout(None)?;
++    stream.set_write_timeout(None)?;
++    Ok(stream)
++}
++
++/// Find the selected window in `dir` and open a session with it.
++///
++/// # Errors
++/// No window answered, several answered without a choice, or the chosen
++/// window refused the token.
++pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError> {
++    let all = link::entries(dir);
++    if all.is_empty() {
++        return Err(LinkError::NoWindow(format!(
++            "no running CamCraft window: no link file in {} - start camcraft first (nothing ran)",
++            dir.display()
++        )));
++    }
++    let candidates: Vec<&Entry> = all.iter().filter(|e| select.admits(e)).collect();
++    if candidates.is_empty() {
++        let running: Vec<String> = all.iter().map(describe).collect();
++        let wanted = match select {
++            Select::Only => "a window".to_owned(),
++            Select::Pid(pid) => format!("process id {pid}"),
++            Select::Project(p) => format!("project {}", p.display()),
++        };
++        return Err(LinkError::NoWindow(format!(
++            "no CamCraft window with {wanted}; link files name: {} (nothing ran)",
++            running.join(", ")
++        )));
++    }
++    let mut refused = None;
++    let mut open_ones = Vec::new();
++    for entry in candidates {
++        match open(entry) {
++            Ok(stream) => open_ones.push((entry.clone(), stream)),
++            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => refused = Some(describe(entry)),
++            // A stale file of a closed window: its socket does not answer.
++            Err(e) => tracing::info!("ui link: {} does not answer: {e}", describe(entry)),
++        }
++    }
++    match open_ones.len() {
++        1 => open_ones.pop().ok_or_else(|| LinkError::Failed("ui link: lost the open session".into())),
++        0 => Err(match refused {
++            Some(who) => LinkError::Failed(format!(
++                "the CamCraft window {who} refused the link token in its link file (nothing ran)"
++            )),
++            None => LinkError::NoWindow(format!(
++                "no running CamCraft window answered: the link files in {} are stale (nothing ran)",
++                dir.display()
++            )),
++        }),
++        n => {
++            let names: Vec<String> = open_ones.iter().map(|(e, _)| describe(e)).collect();
++            Err(LinkError::Choose(format!(
++                "{n} CamCraft windows are running: {}; choose one with --window <pid|project path> (nothing ran)",
++                names.join(", ")
++            )))
++        }
++    }
++}
++
++/// Send one `tools/call` to the selected window and return its MCP
++/// result (`content`, `structuredContent`, `isError`).
++///
++/// # Errors
++/// See [`connect`]; or the session broke before the answer came.
++pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Value, LinkError> {
++    let (entry, stream) = connect(dir, select)?;
++    let lost = |e: std::io::Error| LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)));
++    let mut writer = stream.try_clone().map_err(lost)?;
++    let line = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": args } });
++    writeln!(writer, "{line}").and_then(|()| writer.flush()).map_err(lost)?;
++    let mut reader = BufReader::new(stream);
++    loop {
++        let mut text = String::new();
++        if reader.read_line(&mut text).map_err(lost)? == 0 {
++            return Err(LinkError::Failed(format!(
++                "the window {} closed the link before it answered",
++                describe(&entry)
++            )));
++        }
++        let Ok(msg) = serde_json::from_str::<Value>(text.trim()) else { continue };
++        // A notification (an idle note) has no id; only our answer counts.
++        if msg.get("id") != Some(&json!(1)) {
++            continue;
++        }
++        if let Some(result) = msg.get("result") {
++            return Ok(result.clone());
++        }
++        let why = msg["error"]["message"].as_str().unwrap_or("an unreadable answer");
++        return Err(LinkError::Failed(format!("the window refused the call: {why}")));
++    }
++}
++
++/// `--ui mcp`: a stdio bridge to the selected window's session, for an
++/// MCP client that launches stdio servers.
++///
++/// # Errors
++/// See [`connect`]; or a stream failed.
++pub fn bridge(dir: &Path, select: &Select, input: impl Read + Send + 'static, mut output: impl Write) -> Result<(), LinkError> {
++    let (entry, mut from_app) = connect(dir, select)?;
++    let lost = |e: std::io::Error| LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)));
++    let mut to_app = from_app.try_clone().map_err(lost)?;
++    // Detached on purpose: a blocked stdin read cannot be interrupted.
++    std::thread::Builder::new()
++        .name("camcraft-ui-link-bridge".into())
++        .spawn(move || {
++            let mut input = input;
++            if let Err(e) = std::io::copy(&mut input, &mut to_app) {
++                tracing::warn!("ui link bridge: sending failed: {e}");
++            }
++            let _ = to_app.shutdown_write();
++        })
++        .map_err(lost)?;
++    std::io::copy(&mut from_app, &mut output).map_err(lost)?;
++    Ok(())
++}
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index b26726c5f..235a44e61 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -3,6 +3,9 @@
+ //! handing each line to the owning (UI) thread over a channel and
+ //! writing that thread's answer back to the client.
+ //!
++//! The same loop serves the UI link (#3751, [`Inbox::link`]): a local
++//! socket whose first line must carry the token of its discovery file.
++//!
+ //! Provenance: our own std::net + std::sync::mpsc code; the framing is
+ //! the MCP stdio transport's (modelcontextprotocol.io, revision
+ //! 2025-06-18: one JSON-RPC message per line), carried over a socket.
+@@ -32,7 +35,8 @@
+ //! newline is dropped on the same schedule as a silent one.
+ 
+ use std::io::{Read, Write};
+-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
++use std::net::{Ipv4Addr, SocketAddr, TcpListener};
++use std::path::Path;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+ use std::sync::Arc;
+@@ -40,6 +44,9 @@ use std::thread::JoinHandle;
+ use crate::clock::Instant;
+ use std::time::Duration;
+ 
++use super::link::{self, Registration};
++use super::wire::{Listener, Stream};
++
+ /// How often a blocked wait looks at the stop flag: the bound on how
+ /// long dropping an [`Inbox`] can take.
+ const POLL: Duration = Duration::from_millis(50);
+@@ -66,6 +73,8 @@ enum End {
+     Closed,
+     /// It sent no complete line for the idle window.
+     Idle(Duration),
++    /// Its first line was not the UI link's hello with the token (#3751).
++    Refused,
+ }
+ 
+ /// Whether a wire line may be handed to the app: JSON-RPC is always an
+@@ -119,6 +128,8 @@ pub struct Inbox {
+     addr: Option<SocketAddr>,
+     stop: Arc<AtomicBool>,
+     thread: Option<JoinHandle<()>>,
++    /// The UI link's discovery file (#3751); removed after the thread ends.
++    link: Option<Registration>,
+ }
+ 
+ impl Inbox {
+@@ -148,9 +159,42 @@ impl Inbox {
+         let flag = Arc::clone(&stop);
+         let thread = std::thread::Builder::new()
+             .name("camcraft-mcp".into())
+-            .spawn(move || accept_loop(&listener, &tx, &flag, &wake, idle))?;
++            .spawn(move || accept_loop(&Listener::Tcp(listener), &tx, &flag, &wake, idle, None))?;
+         tracing::info!("mcp: listening on {addr} (an idle client is dropped after {}s)", idle.as_secs());
+-        Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread) })
++        Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread), link: None })
++    }
++
++    /// Open the UI link (#3751) in the link folder `dir`: a local socket
++    /// for `camcraft-cli --ui`, found through a discovery file and gated
++    /// by its token. The file goes when the inbox drops.
++    ///
++    /// # Errors
++    /// The folder, the bind, the file or the thread spawn failed.
++    pub fn link(dir: &Path, wake: Wake) -> std::io::Result<Self> {
++        let (listener, registration, token) = link::open(dir)?;
++        listener.set_nonblocking(true)?;
++        let (tx, rx) = mpsc::channel();
++        let stop = Arc::new(AtomicBool::new(false));
++        let flag = Arc::clone(&stop);
++        let thread = std::thread::Builder::new()
++            .name("camcraft-ui-link".into())
++            .spawn(move || accept_loop(&listener, &tx, &flag, &wake, IDLE_TIMEOUT, Some(&token)))?;
++        tracing::info!("ui link: {} {} (camcraft-cli --ui)", registration.entry().transport, registration.entry().address);
++        Ok(Self { rx, addr: None, stop, thread: Some(thread), link: Some(registration) })
++    }
++
++    /// The UI link's discovery entry, when this inbox is one.
++    #[must_use]
++    pub fn link_entry(&self) -> Option<&link::Entry> {
++        self.link.as_ref().map(Registration::entry)
++    }
++
++    /// Keep the discovery file's project current (`--window <project>`);
++    /// a no-op unless this inbox is a UI link and the project changed.
++    pub fn note_project(&mut self, project: Option<&Path>) {
++        if let Some(registration) = self.link.as_mut() {
++            registration.note_project(project);
++        }
+     }
+ 
+     /// An inbox with no socket: requests arrive through the returned
+@@ -158,7 +202,7 @@ impl Inbox {
+     #[must_use]
+     pub fn channel() -> (Sender<Request>, Self) {
+         let (tx, rx) = mpsc::channel();
+-        (tx, Self { rx, addr: None, stop: Arc::new(AtomicBool::new(false)), thread: None })
++        (tx, Self { rx, addr: None, stop: Arc::new(AtomicBool::new(false)), thread: None, link: None })
+     }
+ 
+     /// The next waiting request, never blocking.
+@@ -186,44 +230,18 @@ impl Drop for Inbox {
+     }
+ }
+ 
+-/// `--mcp-port <n>` / `--mcp-port=<n>` over `CAMCRAFT_MCP_PORT`: `None`
+-/// when neither asks for the server (it is off by default).
+-///
+-/// # Errors
+-/// The flag without a value, or a value that is not a port number.
+-pub fn port_from(args: &[String], env: Option<&str>) -> Result<Option<u16>, String> {
+-    let flag = args.iter().enumerate().find_map(|(i, a)| {
+-        if a == "--mcp-port" {
+-            Some(args.get(i + 1).cloned())
+-        } else {
+-            a.strip_prefix("--mcp-port=").map(|v| Some(v.to_owned()))
+-        }
+-    });
+-    let text = match flag {
+-        Some(None) => return Err("--mcp-port needs a port number".into()),
+-        Some(Some(v)) => v,
+-        None => match env.map(str::trim).filter(|v| !v.is_empty()) {
+-            Some(v) => v.to_owned(),
+-            None => return Ok(None),
+-        },
+-    };
+-    text.trim()
+-        .parse::<u16>()
+-        .map(Some)
+-        .map_err(|_| format!("MCP port must be a number from 0 to 65535, got '{text}'"))
+-}
+-
+-fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration) {
++fn accept_loop(listener: &Listener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration, token: Option<&str>) {
+     while !stop.load(Ordering::Relaxed) {
+         match listener.accept() {
+             Ok((stream, peer)) => {
+                 tracing::info!("mcp: client {peer} connected");
+-                match serve_client(stream, tx, stop, wake, idle) {
++                match serve_client(stream, tx, stop, wake, idle, token) {
+                     Ok(End::Closed) => tracing::info!("mcp: client {peer} left"),
+                     Ok(End::Idle(after)) => tracing::warn!(
+                         "mcp: client {peer} dropped: idle - no complete line for {:.1}s; serving the next client",
+                         after.as_secs_f64()
+                     ),
++                    Ok(End::Refused) => tracing::warn!("mcp: client {peer} refused: no valid UI link token"),
+                     Err(e) => tracing::warn!("mcp: client {peer} dropped: {e}"),
+                 }
+             }
+@@ -244,7 +262,11 @@ fn accept_loop(listener: &TcpListener, tx: &Sender<Request>, stop: &AtomicBool,
+ /// whichever is shorter, and takes at most [`CHUNK`] bytes, and the
+ /// deadline is checked after every chunk - so a client trickling bytes
+ /// with no newline cannot keep a read alive past its window.
+-fn serve_client(mut stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration) -> std::io::Result<End> {
++/// With a `token` (the UI link, #3751), the first complete line must be
++/// the link's hello with that token; anything else is refused and the
++/// connection closed before a line reaches the app.
++fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration, token: Option<&str>) -> std::io::Result<End> {
++    let mut gate = token;
+     // An accepted socket may inherit the listener's non-blocking mode
+     // (BSD does); reads wait, but only a POLL at a time.
+     stream.set_nonblocking(false)?;
+@@ -294,7 +316,7 @@ fn serve_client(mut stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool,
+         if got == 0 {
+             // End of input: a last unterminated line still counts, as
+             // it does on stdio.
+-            if !buf.is_empty() {
++            if !buf.is_empty() && gate.is_none() {
+                 let line = std::mem::take(&mut buf);
+                 forward(&line, tx, &mut writer, stop, wake)?;
+             }
+@@ -305,6 +327,16 @@ fn serve_client(mut stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool,
+         while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+             let rest = buf.split_off(nl.saturating_add(1));
+             let line = std::mem::replace(&mut buf, rest);
++            if let Some(want) = gate.take() {
++                if !link::hello_matches(&line, want) {
++                    let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
++                    return Ok(End::Refused);
++                }
++                writeln!(writer, "{}", link::HELLO_OK)?;
++                writer.flush()?;
++                active = Instant::now();
++                continue;
++            }
+             if !forward(&line, tx, &mut writer, stop, wake)? {
+                 return Ok(End::Closed);
+             }
+@@ -322,7 +354,7 @@ fn serve_client(mut stream: TcpStream, tx: &Sender<Request>, stop: &AtomicBool,
+ /// Hand one line to the owning thread and write its answer. `Ok(false)`
+ /// when the session cannot go on (the app is stopping or gone, or the
+ /// client is not speaking JSON-RPC).
+-fn forward(bytes: &[u8], tx: &Sender<Request>, writer: &mut TcpStream, stop: &AtomicBool, wake: &Wake) -> std::io::Result<bool> {
++fn forward(bytes: &[u8], tx: &Sender<Request>, writer: &mut Stream, stop: &AtomicBool, wake: &Wake) -> std::io::Result<bool> {
+     if !is_json_rpc_line(bytes) {
+         tracing::warn!("mcp: a client sent a line that is not JSON-RPC (an HTTP request?) - connection closed");
+         let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"not a JSON-RPC message - the connection is closed"}}"#;
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index aad534326..a6af9ad0f 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -42,6 +42,10 @@ mod holders;
+ mod holder_dxf_tools;
+ mod job;
+ mod listen;
++pub mod link;
++mod link_client;
++mod port_flag;
++mod wire;
+ mod live;
+ mod model_tools;
+ // #1862: DXF profiles placed on a setup's stock.
+@@ -97,7 +101,9 @@ mod recipe_tools;
+ // #183: the same tool table served live from inside the GUI, over a
+ // loopback socket, against the app's own document and History.
+ pub use bridge::bridge;
+-pub use listen::{port_from, Inbox, Request, Wake, IDLE_TIMEOUT};
++pub use link_client::{bridge as link_bridge, call as link_call, connect as link_connect, LinkError, Select};
++pub use listen::{Inbox, Request, Wake, IDLE_TIMEOUT};
++pub use port_flag::port_from;
+ pub use live::{
+     answer_live, answer_live_with, requires_approval, ApprovedCall, GateKind, LiveAnswer,
+     LiveGate, LiveOptions,
+diff --git a/crates/app/src/mcp/port_flag.rs b/crates/app/src/mcp/port_flag.rs
+new file mode 100644
+index 000000000..47e00f0d7
+--- /dev/null
++++ b/crates/app/src/mcp/port_flag.rs
+@@ -0,0 +1,31 @@
++//! The `--mcp-port` flag of the app (#183), moved out of listen.rs
++//! (#3751) to keep that file under the 400-line law.
++//!
++//! Provenance: our own argv parsing. Clean-room, public sources only.
++
++/// `--mcp-port <n>` / `--mcp-port=<n>` over `CAMCRAFT_MCP_PORT`: `None`
++/// when neither asks for the server (it is off by default).
++///
++/// # Errors
++/// The flag without a value, or a value that is not a port number.
++pub fn port_from(args: &[String], env: Option<&str>) -> Result<Option<u16>, String> {
++    let flag = args.iter().enumerate().find_map(|(i, a)| {
++        if a == "--mcp-port" {
++            Some(args.get(i + 1).cloned())
++        } else {
++            a.strip_prefix("--mcp-port=").map(|v| Some(v.to_owned()))
++        }
++    });
++    let text = match flag {
++        Some(None) => return Err("--mcp-port needs a port number".into()),
++        Some(Some(v)) => v,
++        None => match env.map(str::trim).filter(|v| !v.is_empty()) {
++            Some(v) => v.to_owned(),
++            None => return Ok(None),
++        },
++    };
++    text.trim()
++        .parse::<u16>()
++        .map(Some)
++        .map_err(|_| format!("MCP port must be a number from 0 to 65535, got '{text}'"))
++}
+diff --git a/crates/app/src/mcp/wire.rs b/crates/app/src/mcp/wire.rs
+new file mode 100644
+index 000000000..58be14b3f
+--- /dev/null
++++ b/crates/app/src/mcp/wire.rs
+@@ -0,0 +1,138 @@
++//! The byte streams the live listener serves (#183, #3751): a loopback
++//! TCP socket (`--mcp-port`, and the UI link on a platform where std has
++//! no local socket) or, on Unix, a Unix domain socket in the user's own
++//! folder. Both carry the same newline-delimited JSON-RPC; this module
++//! only hides which one it is.
++//!
++//! Provenance: our own wrapper over std::net and std::os::unix::net (the
++//! Rust standard library docs). Clean-room, public sources only.
++
++use std::io::{Read, Write};
++use std::net::{TcpListener, TcpStream};
++use std::time::Duration;
++
++#[cfg(unix)]
++use std::os::unix::net::{UnixListener, UnixStream};
++
++/// A listening socket: what [`super::Inbox`] accepts clients on.
++pub enum Listener {
++    Tcp(TcpListener),
++    #[cfg(unix)]
++    Unix(UnixListener),
++}
++
++impl Listener {
++    /// Accept one client, never blocking (the listener is non-blocking):
++    /// the stream and a label for the log lines.
++    ///
++    /// # Errors
++    /// `WouldBlock` when no client waits, else the OS error.
++    pub fn accept(&self) -> std::io::Result<(Stream, String)> {
++        match self {
++            Listener::Tcp(l) => l.accept().map(|(s, peer)| (Stream::Tcp(s), peer.to_string())),
++            #[cfg(unix)]
++            Listener::Unix(l) => l.accept().map(|(s, _)| (Stream::Unix(s), "local socket".to_owned())),
++        }
++    }
++
++    /// # Errors
++    /// The OS refused the mode change.
++    pub fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
++        match self {
++            Listener::Tcp(l) => l.set_nonblocking(on),
++            #[cfg(unix)]
++            Listener::Unix(l) => l.set_nonblocking(on),
++        }
++    }
++}
++
++/// One connected client (or, for the CLI, the connection to the app).
++pub enum Stream {
++    Tcp(TcpStream),
++    #[cfg(unix)]
++    Unix(UnixStream),
++}
++
++impl Stream {
++    /// # Errors
++    /// The OS refused the mode change.
++    pub fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
++        match self {
++            Stream::Tcp(s) => s.set_nonblocking(on),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.set_nonblocking(on),
++        }
++    }
++
++    /// # Errors
++    /// A zero duration, or the OS refused it.
++    pub fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
++        match self {
++            Stream::Tcp(s) => s.set_read_timeout(t),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.set_read_timeout(t),
++        }
++    }
++
++    /// # Errors
++    /// A zero duration, or the OS refused it.
++    pub fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
++        match self {
++            Stream::Tcp(s) => s.set_write_timeout(t),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.set_write_timeout(t),
++        }
++    }
++
++    /// A second handle on the same connection (one reads, one writes).
++    ///
++    /// # Errors
++    /// The OS could not duplicate the handle.
++    pub fn try_clone(&self) -> std::io::Result<Self> {
++        match self {
++            Stream::Tcp(s) => s.try_clone().map(Stream::Tcp),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.try_clone().map(Stream::Unix),
++        }
++    }
++
++    /// Close the sending half, so the other end reads the end of input.
++    ///
++    /// # Errors
++    /// The OS refused it (the connection is gone already).
++    pub fn shutdown_write(&self) -> std::io::Result<()> {
++        match self {
++            Stream::Tcp(s) => s.shutdown(std::net::Shutdown::Write),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.shutdown(std::net::Shutdown::Write),
++        }
++    }
++}
++
++impl Read for Stream {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        match self {
++            Stream::Tcp(s) => s.read(buf),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.read(buf),
++        }
++    }
++}
++
++impl Write for Stream {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        match self {
++            Stream::Tcp(s) => s.write(buf),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.write(buf),
++        }
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        match self {
++            Stream::Tcp(s) => s.flush(),
++            #[cfg(unix)]
++            Stream::Unix(s) => s.flush(),
++        }
++    }
++}
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index 1f32a0294..86978e859 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -2,7 +2,11 @@
+ //! History the caller owns (the GUI's), so undo there reverts an agent's
+ //! step; the loopback listener that carries it; and the CLI's flag.
+ //!
+-//! Gate map (M4.4): covers app::mcp (live, listen, bridge).
++//! Gate map (M4.4): covers app::mcp (live, listen, bridge, link,
++//! link_client) and app::cli_ui (the `--ui` lane, #3751).
++
++#[path = "mcp_live/ui_link.rs"]
++mod ui_link;
+ 
+ use camcraft_app::commands::History;
+ use camcraft_app::mcp::provider::{FallbackMode, parse_prompt};
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+new file mode 100644
+index 000000000..e674969a8
+--- /dev/null
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -0,0 +1,190 @@
++//! The UI link (#3751): `camcraft-cli --ui` finds a running window by
++//! its discovery file and opens a session with the file's token. Pinned
++//! here: no window is a clear error with exit 3 (never a headless run),
++//! a wrong token is refused before a line reaches the app, a good
++//! session carries a tool call to the window's inbox, and the file goes
++//! when the window's inbox drops.
++//! Provenance: our own tests over our own link; no HSMWorks material.
++
++use camcraft_app::mcp::link::{self, Entry};
++use camcraft_app::mcp::{link_call, Inbox, LinkError, Select};
++
++use serde_json::{json, Value};
++use std::path::{Path, PathBuf};
++use std::process::Command;
++use std::time::{Duration, Instant};
++
++fn fresh_dir(tag: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("camcraft-ui-link-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).expect("temp dir");
++    dir
++}
++
++fn cli_ui(dir: &Path, args: &[&str]) -> std::process::Output {
++    Command::new(env!("CARGO_BIN_EXE_camcraft-cli"))
++        .env(link::DIR_ENV, dir)
++        .arg("--ui")
++        .args(args)
++        .output()
++        .expect("the CLI binary runs")
++}
++
++fn write_entry(dir: &Path, entry: &Entry) {
++    let text = serde_json::to_string(entry).expect("entry json");
++    std::fs::write(dir.join(format!("{}.json", entry.pid)), text).expect("write entry");
++}
++
++/// Answer the inbox's requests on this thread (the window's frame loop
++/// stand-in) until `client` ends; returns the lines that reached it.
++fn serve_until<T: Send + 'static>(inbox: &Inbox, client: std::thread::JoinHandle<T>) -> (T, Vec<String>) {
++    let mut lines = Vec::new();
++    let deadline = Instant::now() + Duration::from_secs(20);
++    while !client.is_finished() {
++        assert!(Instant::now() < deadline, "the client did not finish");
++        while let Some(req) = inbox.next() {
++            let msg: Value = serde_json::from_str(req.line()).expect("json line");
++            lines.push(req.line().to_owned());
++            let reply = json!({
++                "jsonrpc": "2.0", "id": msg["id"],
++                "result": { "content": [], "structuredContent": { "echo": msg["params"]["name"] }, "isError": false }
++            });
++            req.answer(Some(reply.to_string()));
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    (client.join().expect("client thread"), lines)
++}
++
++#[test]
++fn a_cli_call_with_no_window_says_so_and_exits_3() {
++    let dir = fresh_dir("none");
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(3), "{err}");
++    assert!(err.contains("no running CamCraft window"), "{err}");
++    assert!(err.contains("nothing ran"), "{err}");
++    assert!(o.stdout.is_empty(), "no headless answer on stdout");
++
++    // A file a crashed window left behind: its socket does not answer.
++    let stale = Entry {
++        format: link::FORMAT,
++        pid: 4_000_000_000,
++        transport: "tcp".into(),
++        address: "127.0.0.1:1".into(),
++        token: "00".into(),
++        project: None,
++        app_version: "0".into(),
++    };
++    write_entry(&dir, &stale);
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(3), "{err}");
++    assert!(err.contains("stale"), "{err}");
++
++    // A window asked for by a pid that no file names.
++    let o = cli_ui(&dir, &["--window", "123", "call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(3), "{err}");
++    assert!(err.contains("process id 123"), "{err}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn bad_ui_arguments_are_usage_errors() {
++    let dir = fresh_dir("usage");
++    for args in [&["call"][..], &["call", "get_job", "[1]"], &["call", "get_job", "{nope"], &["--window"], &["dance"]] {
++        let o = cli_ui(&dir, args);
++        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
++    }
++    let o = cli_ui(&dir, &["--help"]);
++    assert_eq!(o.status.code(), Some(0));
++    assert!(String::from_utf8_lossy(&o.stdout).contains("Exit: 0 stood, 1 refused, 2 usage, 3 no running window"));
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
++    let dir = fresh_dir("token");
++    let inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
++    let entry = inbox.link_entry().expect("a link entry").clone();
++    assert_eq!(link::entries(&dir), vec![entry.clone()], "the discovery file names the window");
++    assert_eq!(entry.token.len(), 64);
++
++    // The same window, but a file with a wrong token.
++    let forged = fresh_dir("token-forged");
++    write_entry(&forged, &Entry { token: "f".repeat(64), ..entry.clone() });
++    let forged_dir = forged.clone();
++    let client = std::thread::spawn(move || link_call(&forged_dir, &Select::Only, "get_job", &json!({})));
++    let (result, lines) = serve_until(&inbox, client);
++    let err = result.expect_err("a wrong token is refused");
++    assert!(matches!(err, LinkError::Failed(_)), "{err:?}");
++    assert!(err.to_string().contains("refused the link token"), "{err}");
++    assert_eq!(err.exit_code(), 1);
++    assert!(lines.is_empty(), "no line of a refused client reached the app: {lines:?}");
++
++    // A hello that is not JSON at all is refused the same way.
++    let wrong_hello = json!({ "camcraft_link": 1 }).to_string();
++    assert!(!link::hello_matches(wrong_hello.as_bytes(), &entry.token));
++    assert!(!link::hello_matches(b"GET / HTTP/1.1", &entry.token));
++    assert!(link::hello_matches(link::hello_line(&entry.token).as_bytes(), &entry.token));
++
++    // The window still serves a client with the right token.
++    let good_dir = dir.clone();
++    let client = std::thread::spawn(move || link_call(&good_dir, &Select::Pid(std::process::id()), "get_job", &json!({})));
++    let (result, lines) = serve_until(&inbox, client);
++    let result = result.expect("the right token is served");
++    assert_eq!(result["structuredContent"]["echo"], json!("get_job"));
++    assert_eq!(lines.len(), 1, "one tools/call reached the window: {lines:?}");
++    let line: Value = serde_json::from_str(&lines[0]).expect("json");
++    assert_eq!(line["method"], json!("tools/call"));
++
++    // The window's file goes with its inbox.
++    drop(inbox);
++    assert!(link::entries(&dir).is_empty(), "the discovery file is removed on close");
++    let _ = std::fs::remove_dir_all(&dir);
++    let _ = std::fs::remove_dir_all(&forged);
++}
++
++#[test]
++fn the_link_file_follows_the_open_project() {
++    let dir = fresh_dir("project");
++    let mut inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
++    let project = dir.join("part.camproj");
++    inbox.note_project(Some(&project));
++    let entries = link::entries(&dir);
++    assert_eq!(entries.len(), 1);
++    assert_eq!(entries[0].project.as_deref(), Some(project.as_path()));
++    assert!(Select::Project(project.clone()) != Select::Only);
++    assert_eq!(Select::parse("42"), Select::Pid(42));
++    assert_eq!(Select::parse("a/part.camproj"), Select::Project(PathBuf::from("a/part.camproj")));
++    drop(inbox);
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
++    let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
++    move |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.into())
++}
++
++#[test]
++fn the_link_folder_is_the_users_own() {
++    let tail = Path::new("camcraft").join("ui-link");
++    // An absolute path is spelled per host, so each host checks its own.
++    if cfg!(windows) {
++        let roaming = r"C:\Users\u\AppData\Roaming";
++        assert_eq!(link::dir_for("windows", lookup(&[("APPDATA", roaming)])), Some(Path::new(roaming).join(&tail)));
++        assert_eq!(link::dir_for("windows", lookup(&[(link::DIR_ENV, r"D:\link")])), Some(PathBuf::from(r"D:\link")));
++    } else {
++        let run = "/run/user/1000";
++        let both = [("XDG_RUNTIME_DIR", run), ("HOME", "/home/u")];
++        assert_eq!(link::dir_for("linux", lookup(&both)), Some(Path::new(run).join(&tail)), "the runtime folder first");
++        assert_eq!(link::dir_for("linux", lookup(&[("HOME", "/home/u")])), Some(Path::new("/home/u/.local/share").join(&tail)));
++        assert_eq!(link::dir_for("macos", lookup(&[("HOME", "/Users/u")])), Some(Path::new("/Users/u/Library/Application Support").join(&tail)));
++    }
++    assert_eq!(link::dir_for("linux", lookup(&[])), None, "no home, no folder");
++    assert_eq!(link::dir_for("linux", lookup(&[("HOME", "relative")])), None, "a relative home is refused");
++    assert!(link::enabled(None));
++    assert!(link::enabled(Some("on")));
++    assert!(!link::enabled(Some(" OFF ")));
++}
+diff --git a/crates/ui/src/egui_app/shell_window.rs b/crates/ui/src/egui_app/shell_window.rs
+index 7df6b84bd..d28e8cffd 100644
+--- a/crates/ui/src/egui_app/shell_window.rs
++++ b/crates/ui/src/egui_app/shell_window.rs
+@@ -83,6 +83,27 @@ pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: O
+             }
+         }
+     }
++    // #3751: the UI link for `camcraft-cli --ui`, on by default. A window
++    // without it still runs; the status line says why.
++    let link_env = std::env::var(camcraft_app::mcp::link::OFF_ENV).ok();
++    if camcraft_app::mcp::link::enabled(link_env.as_deref()) {
++        match camcraft_app::mcp::link::dir() {
++            Some(dir) => {
++                let proxy = event_loop.create_proxy();
++                let wake: camcraft_app::mcp::Wake = Box::new(move || {
++                    let _ = proxy.send_event(());
++                });
++                match camcraft_app::mcp::Inbox::link(&dir, wake) {
++                    Ok(inbox) => shell.state.ui_link = Some(inbox),
++                    Err(err) => {
++                        diag_warn!("ui link: cannot open in {}: {err}", dir.display());
++                        shell.state.status = format!("CLI link not started: {err}");
++                    }
++                }
++            }
++            None => diag_warn!("ui link: no user folder for the link file; camcraft-cli --ui cannot reach this window"),
++        }
++    }
+     let code = match event_loop.run_app(&mut shell) {
+         Ok(()) => shell.exit_code,
+         Err(err) => {
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 966d0c28e..b07f2986f 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -178,6 +178,8 @@ mod wcs_page_picks;
+ // #343: the per-setup browser tree.
+ mod setup_tree;
+ mod mcp_live;
++// #3751: camcraft-cli --ui drives the window; Ctrl+Z undoes it.
++mod ui_link;
+ // #389: per-setup post options and the tool-list export.
+ mod setup_post_options;
+ // #2374: the machine's own post offered on the Post page.
+diff --git a/crates/ui/src/egui_app/tests/ui_link.rs b/crates/ui/src/egui_app/tests/ui_link.rs
+new file mode 100644
+index 000000000..7f1c677a1
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/ui_link.rs
+@@ -0,0 +1,84 @@
++//! #3751 in the window: `camcraft-cli --ui call ...` finds the window by
++//! its link file, and the shell's own frame loop answers each call on the
++//! window's History - the browser shows the new operation, and the
++//! user's Ctrl+Z removes it.
++//! Provenance: our own tests over our own shell; no HSMWorks material.
++
++use super::*;
++use super::super::browser_tree::Leaf;
++use camcraft_app::mcp::Inbox;
++use std::path::PathBuf;
++use std::time::{Duration, Instant};
++
++fn has_op_row(state: &State, name: &str) -> bool {
++    let (_, leaves) = panes::browser_rows(state);
++    leaves.iter().any(|l| *l == Leaf::Op(name.to_owned()))
++}
++
++fn ctrl_z(harness: &mut Harness<'static, ShellUi>) {
++    harness.input_mut().events.push(Event::ModifiersChanged(Modifiers::COMMAND));
++    harness.input_mut().events.push(Event::Key {
++        key: Key::Z,
++        physical_key: None,
++        pressed: true,
++        repeat: false,
++        modifiers: Modifiers::COMMAND,
++    });
++    harness.run_steps(2);
++}
++
++/// The `--ui` lane as the CLI runs it, on a thread (the CLI process
++/// stand-in), while this thread draws the window's frames.
++fn cli_ui(harness: &mut Harness<'static, ShellUi>, dir: &std::path::Path, args: &[&str]) -> i32 {
++    let dir = dir.to_path_buf();
++    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
++    let client = std::thread::spawn(move || camcraft_app::cli_ui::run_in(Some(dir), &args));
++    let deadline = Instant::now() + Duration::from_secs(30);
++    while !client.is_finished() {
++        assert!(Instant::now() < deadline, "the --ui call did not finish");
++        harness.step();
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    client.join().expect("the CLI thread")
++}
++
++#[test]
++fn a_cli_ui_call_shows_in_the_window_and_ctrl_z_removes_it() {
++    let dir: PathBuf = std::env::temp_dir().join(format!("camcraft-ui-link-window-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    let mut harness = Harness::builder()
++        .with_size(Vec2::new(1280.0, 720.0))
++        .build_ui_state(frame, ShellUi::blank());
++    let inbox = Inbox::link(&dir, Box::new(|| {})).expect("the window opens its link");
++    harness.state_mut().state.ui_link = Some(inbox);
++
++    for (tool, args) in [
++        ("set_stock", r#"{"box":{"dx":60,"dy":60,"dz":20}}"#),
++        ("add_tool", r#"{"catalog":"EM-0400-2FL"}"#),
++    ] {
++        assert_eq!(cli_ui(&mut harness, &dir, &["call", tool, args]), 0, "{tool}");
++    }
++    assert!(!has_op_row(&harness.state().state, "Face1"));
++    let code = cli_ui(&mut harness, &dir, &["call", "add_operation", r#"{"kind":"Face","tool":"EM-0400-2FL"}"#]);
++    assert_eq!(code, 0, "the window ran the call");
++    harness.run();
++    let st = &harness.state().state;
++    assert!(has_op_row(st, "Face1"), "the browser lists the CLI's operation");
++    assert_eq!(st.status, "agent: add_operation");
++
++    // The user's own Ctrl+Z undoes the CLI's step: it sits on the History.
++    ctrl_z(&mut harness);
++    let st = &harness.state().state;
++    assert!(!has_op_row(st, "Face1"), "Ctrl+Z removed the CLI's operation");
++    assert!(st.history.can_redo());
++
++    // A refused tool call is exit 1, and the window changes nothing.
++    let code = cli_ui(&mut harness, &dir, &["call", "add_operation", r#"{"kind":"Face","tool":"no-such-tool"}"#]);
++    assert_eq!(code, 1, "a refusal exits 1");
++    assert!(!has_op_row(&harness.state().state, "Face1"));
++
++    // The window's link file goes with the window.
++    harness.state_mut().state.ui_link = None;
++    assert!(camcraft_app::mcp::link::entries(&dir).is_empty());
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/crates/ui/src/mcp_host.rs b/crates/ui/src/mcp_host.rs
+index 4545cf65d..54fd66d6c 100644
+--- a/crates/ui/src/mcp_host.rs
++++ b/crates/ui/src/mcp_host.rs
+@@ -16,6 +16,18 @@ pub fn pump(state: &mut State) {
+     for request in waiting {
+         answer_request(state, request, false);
+     }
++    // #3751: `camcraft-cli --ui` calls take the same door as an agent's.
++    // The link file follows the open project, for `--window <project>`.
++    if let Some(link) = state.ui_link.as_mut() {
++        link.note_project(state.project_path.as_deref());
++    }
++    let link_waiting: Vec<_> = state
++        .ui_link
++        .as_ref()
++        .map_or_else(Vec::new, |inbox| std::iter::from_fn(|| inbox.next()).collect());
++    for request in link_waiting {
++        answer_request(state, request, false);
++    }
+     let ai_waiting: Vec<_> = state
+         .ai_mcp_inbox
+         .as_ref()
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index 3ec6c05bd..e64ed2298 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -1986,6 +1986,9 @@ pub struct State {
+     /// #183: the live MCP session's inbox when the app was started with
+     /// `--mcp-port` / `CAMCRAFT_MCP_PORT`; drained with `pending`.
+     pub mcp: Option<camcraft_app::mcp::Inbox>,
++    /// #3751: the UI link's inbox (`camcraft-cli --ui`), opened at start
++    /// unless `CAMCRAFT_UI_LINK=off`; drained with `mcp` in `mcp_host::pump`.
++    pub ui_link: Option<camcraft_app::mcp::Inbox>,
+     /// #1946: in-app AI chat panel state (conversations, worker handle, toggles).
+     pub ai_chat: crate::egui_app::ai_chat::AiChatState,
+     /// Sender used by the AI chat worker to dispatch MCP requests in-process.
+@@ -2452,6 +2455,7 @@ impl State {
+             pending: VecDeque::new(),
+             picker_in_click: false,
+             mcp: None,
++            ui_link: None,
+             ai_chat: crate::egui_app::ai_chat::AiChatState::new(),
+             ai_mcp_tx,
+             ai_mcp_inbox: Some(ai_mcp_inbox),
+diff --git a/docs/decisions/3751-cli-ui-link.md b/docs/decisions/3751-cli-ui-link.md
+new file mode 100644
+index 000000000..68b9edf05
+--- /dev/null
++++ b/docs/decisions/3751-cli-ui-link.md
+@@ -0,0 +1,72 @@
++## #3751 - `camcraft-cli --ui`: the UI link (part 1)
++
++The maintainer asked for a `--ui` flag that sends CLI commands to the
++running UI. The issue left five design questions open. Each answer below
++was taken unattended, as the recommended option.
++
++**1. Transport.** Each window opens a local socket at start.
++- Unix (Linux, macOS): a Unix domain socket `<pid>.sock` in the link
++  folder (std `UnixListener`). No network port.
++- Windows: std has no named pipe and no local socket. The window binds
++  TCP on `127.0.0.1` with a port that the OS selects. No other interface
++  is bound. A named pipe needs a new dependency (`windows-sys` with
++  `Win32_System_Pipes` in `camcraft-app`, or the `interprocess` crate,
++  which is not in `Cargo.lock`). That is the maintainer's decision; it is
++  asked on #3751. The token (point 2) closes the port to other users and
++  to web pages until then.
++- Dropped: loopback TCP on every platform (one code path, but a port
++  where std has a better door); a raw named pipe through FFI (unsafe
++  code and overlapped I/O for the deadlines, for a first slice).
++- The listener is the one that `--mcp-port` uses (`listen.rs`), with a
++  stream type that hides TCP or Unix (`wire.rs`). The same bounds hold:
++  one client at a time, a 16 MiB line cap, write deadlines, the idle
++  drop, and a dropped client is logged, never a panic.
++
++**2. Discovery and security.** The window writes `<pid>.json` in the
++link folder: pid, transport, address, a token, the open project, the app
++version. The window removes it when it closes.
++- The folder: `CAMCRAFT_UI_LINK_DIR`, else `%APPDATA%\camcraft\ui-link`
++  (Windows), `~/Library/Application Support/camcraft/ui-link` (macOS),
++  `$XDG_RUNTIME_DIR/camcraft/ui-link` or the XDG data folder (Linux).
++  On Unix the folder is 0700 and the file and socket are 0600.
++- The first line of each connection must be
++  `{"camcraft_link":1,"token":"<token>"}`. Any other line closes the
++  connection before a line reaches the app. The compare takes the same
++  time for each token of the same length.
++- The token is 256 bits of SipHash output under std's `RandomState` keys,
++  which std seeds from the OS random source, mixed with the clock and
++  the pid. Dropped: a new `rand` / `getrandom` dependency for
++  `camcraft-app` (both are only in `Cargo.lock` through other crates).
++- The client never sends a token to an address that is not loopback,
++  whatever the file says.
++- The link is on by default, as the issue asks. `CAMCRAFT_UI_LINK=off`
++  starts a window without it. A window that cannot open its link still
++  runs, and its status line says why.
++
++**3. Protocol.** After the hello, the session speaks the MCP JSON-RPC of
++`camcraft-cli mcp`. The window answers each line in `mcp_host::pump`
++with `answer_live_with`, exactly as for `--mcp-port`: on the UI thread,
++on the window's History, behind the same live gate. So `post`, file
++writes and machine edits still need the approval in the window. There is
++no second command set.
++- CLI verbs: `--ui call <tool> [<json-args>]` (one tool call; prints the
++  tool's JSON; a refused tool exits 1), `--ui mcp` (a stdio MCP bridge
++  to the window), `--ui windows` (the link files).
++- `script` and `process` with `--ui` are not in this slice. A script
++  runs its verbs in a headless world of its own; to run them on a
++  window needs the script host to send each verb over the link.
++
++**4. No window.** The CLI says "no running CamCraft window ... (nothing
++ran)" and exits 3, a code of its own, so a test runner can tell "the UI
++is not up" from a refusal (1) and a usage error (2). A stale file of a
++crashed window is skipped (its socket does not answer). The CLI never
++falls back to a headless document.
++
++**5. Several windows.** `--window <pid>` or `--window <project path>`
++selects one. The window rewrites its file when its project changes.
++With one window answering, the CLI uses it. With several and no
++`--window`, the CLI lists them and exits 2.
++
++**Cost to change later.** The file format has `format: 1`; a reader
++skips other versions. A named pipe on Windows replaces only the
++`not(unix)` arms of `link.rs`, `wire.rs` and `link_client.rs`.

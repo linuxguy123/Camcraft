@@ -1,0 +1,319 @@
+From 4773623d54b53b45a4d8f7521edbc78fd9a443b9 Mon Sep 17 00:00:00 2001
+From: JSwetz <Johnswetz1982@gmail.com>
+Date: Tue, 24 Nov 2026 06:32:59 -0500
+Subject: [PATCH] fix(mcp): enforce pre-hello deadline and line size limit on
+ UI link
+
+Add a 5-second deadline and 4 KiB line limit for unauthenticated UI link
+connections before token validation.
+
+Changelog: UI link: drop unauthenticated clients after 5 seconds or 4 KiB before token validation
+Fixes #3873
+---
+ crates/app/src/mcp/listen.rs            | 126 +++++++++++-------------
+ crates/app/tests/mcp_live/ui_link.rs    |  39 ++++++++
+ docs/decisions/3873-pre-hello-limits.md |  17 ++++
+ 3 files changed, 112 insertions(+), 70 deletions(-)
+ create mode 100644 docs/decisions/3873-pre-hello-limits.md
+
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index 235a44e61..affa028ae 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -2,37 +2,19 @@
+ //! same newline-delimited JSON-RPC `camcraft-cli mcp` speaks on stdio,
+ //! handing each line to the owning (UI) thread over a channel and
+ //! writing that thread's answer back to the client.
+-//!
+ //! The same loop serves the UI link (#3751, [`Inbox::link`]): a local
+ //! socket whose first line must carry the token of its discovery file.
++//! Provenance: our own std::net + std::sync::mpsc code; framing is the
++//! MCP stdio transport (modelcontextprotocol.io, 2025-06-18). Clean-room.
++//! The thread moves text: one client at a time; dropped clients or closed
++//! channels never panic. Dropping [`Inbox`] stops and joins the thread.
+ //!
+-//! Provenance: our own std::net + std::sync::mpsc code; the framing is
+-//! the MCP stdio transport's (modelcontextprotocol.io, revision
+-//! 2025-06-18: one JSON-RPC message per line), carried over a socket.
+-//! Clean-room, public sources only.
+-//!
+-//! The thread never touches a world: it only moves text. One client at
+-//! a time; a dropped client, a closed channel or an unreadable line is
+-//! logged and the listener goes on (or ends with the app), never a panic.
+-//! Dropping the [`Inbox`] stops and joins the thread.
+-//!
+-//! **Only JSON-RPC speaks** (review of #474): loopback is not a trust
+-//! boundary - any web page in the user's browser can POST to
+-//! 127.0.0.1. Every non-blank line must open a JSON object or array;
+-//! anything else (an HTTP request line, a header) closes the
+-//! connection before a single line of it reaches the app, so a page can
+-//! never smuggle a JSON-RPC body past its own HTTP headers. Reads are
+-//! bounded to [`MAX_LINE`] as they happen, and writes time out, so a
+-//! client can neither grow memory nor stall the listener.
+-//!
+-//! **An idle client lets go** (#567): one client holds the session, so
+-//! a client that sends no complete line for [`IDLE_TIMEOUT`] (time the
+-//! app spends answering does not count) is told why in an MCP
+-//! `notifications/message`, closed, logged by its peer address, and the
+-//! next client is served. A newcomer never pre-empts a connected client
+-//! before that: an agent pausing between calls keeps its session. The
+-//! deadline holds inside the read too: a client trickling bytes with no
+-//! newline is dropped on the same schedule as a silent one.
++//! **Only JSON-RPC speaks** (#474): any non-JSON line closes the
++//! connection before reaching the app. Reads are bounded to [`MAX_LINE`]
++//! ([`MAX_HELLO_LINE`] before hello, #3873) and writes time out.
++//! **An idle client lets go** (#567, #3873): a client idle for
++//! [`IDLE_TIMEOUT`] ([`HELLO_TIMEOUT`] before hello) is dropped so the
++//! next client can be served.
+ 
+ use std::io::{Read, Write};
+ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+@@ -55,6 +37,9 @@ const POLL: Duration = Duration::from_millis(50);
+ /// that never sends a newline must not grow the app's memory forever.
+ const MAX_LINE: usize = 16 * 1024 * 1024;
+ 
++/// A line longer than this before the UI link hello is refused (#3873).
++const MAX_HELLO_LINE: usize = 4 * 1024;
++
+ /// How long a write to a client may block before the client is dropped -
+ /// a client that stops reading must not hold the listener.
+ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+@@ -67,6 +52,10 @@ const CHUNK: usize = 8 * 1024;
+ /// is dropped so the next one can be served (#567).
+ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+ 
++/// How long an unauthenticated client may hold the UI link before
++/// sending a valid hello line (#3873).
++pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
++
+ /// How a served client's session ended, for the listener's log line.
+ enum End {
+     /// It hung up, was refused, or the app is stopping.
+@@ -159,7 +148,7 @@ impl Inbox {
+         let flag = Arc::clone(&stop);
+         let thread = std::thread::Builder::new()
+             .name("camcraft-mcp".into())
+-            .spawn(move || accept_loop(&Listener::Tcp(listener), &tx, &flag, &wake, idle, None))?;
++            .spawn(move || accept_loop(&Listener::Tcp(listener), &tx, &flag, &wake, idle, None, HELLO_TIMEOUT))?;
+         tracing::info!("mcp: listening on {addr} (an idle client is dropped after {}s)", idle.as_secs());
+         Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread), link: None })
+     }
+@@ -171,6 +160,11 @@ impl Inbox {
+     /// # Errors
+     /// The folder, the bind, the file or the thread spawn failed.
+     pub fn link(dir: &Path, wake: Wake) -> std::io::Result<Self> {
++        Self::link_with_timeouts(dir, wake, IDLE_TIMEOUT, HELLO_TIMEOUT)
++    }
++
++    /// [`Inbox::link`] with custom deadlines (#3873: tests use a short one).
++    pub fn link_with_timeouts(dir: &Path, wake: Wake, idle: Duration, hello_timeout: Duration) -> std::io::Result<Self> {
+         let (listener, registration, token) = link::open(dir)?;
+         listener.set_nonblocking(true)?;
+         let (tx, rx) = mpsc::channel();
+@@ -178,7 +172,7 @@ impl Inbox {
+         let flag = Arc::clone(&stop);
+         let thread = std::thread::Builder::new()
+             .name("camcraft-ui-link".into())
+-            .spawn(move || accept_loop(&listener, &tx, &flag, &wake, IDLE_TIMEOUT, Some(&token)))?;
++            .spawn(move || accept_loop(&listener, &tx, &flag, &wake, idle, Some(&token), hello_timeout))?;
+         tracing::info!("ui link: {} {} (camcraft-cli --ui)", registration.entry().transport, registration.entry().address);
+         Ok(Self { rx, addr: None, stop, thread: Some(thread), link: Some(registration) })
+     }
+@@ -230,21 +224,15 @@ impl Drop for Inbox {
+     }
+ }
+ 
+-fn accept_loop(listener: &Listener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration, token: Option<&str>) {
++fn accept_loop(listener: &Listener, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration, token: Option<&str>, hello: Duration) {
+     while !stop.load(Ordering::Relaxed) {
+         match listener.accept() {
+-            Ok((stream, peer)) => {
+-                tracing::info!("mcp: client {peer} connected");
+-                match serve_client(stream, tx, stop, wake, idle, token) {
+-                    Ok(End::Closed) => tracing::info!("mcp: client {peer} left"),
+-                    Ok(End::Idle(after)) => tracing::warn!(
+-                        "mcp: client {peer} dropped: idle - no complete line for {:.1}s; serving the next client",
+-                        after.as_secs_f64()
+-                    ),
+-                    Ok(End::Refused) => tracing::warn!("mcp: client {peer} refused: no valid UI link token"),
+-                    Err(e) => tracing::warn!("mcp: client {peer} dropped: {e}"),
+-                }
+-            }
++            Ok((stream, peer)) => match serve_client(stream, tx, stop, wake, idle, token, hello) {
++                Ok(End::Closed) => tracing::info!("mcp: client {peer} left"),
++                Ok(End::Idle(after)) => tracing::warn!("mcp: client {peer} dropped: idle ({:.1}s)", after.as_secs_f64()),
++                Ok(End::Refused) => tracing::warn!("mcp: client {peer} refused: no valid UI link token"),
++                Err(e) => tracing::warn!("mcp: client {peer} dropped: {e}"),
++            },
+             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
+             Err(e) => {
+                 tracing::warn!("mcp: accept failed: {e}");
+@@ -254,38 +242,35 @@ fn accept_loop(listener: &Listener, tx: &Sender<Request>, stop: &AtomicBool, wak
+     }
+ }
+ 
+-/// One client until it hangs up, the app stops, the app's end of the
+-/// channel is gone, or it sends no complete line for `idle`.
+-///
+-/// The idle deadline is enforced inside the read (#567 review): each
+-/// read waits at most the poll step or the time left in the window,
+-/// whichever is shorter, and takes at most [`CHUNK`] bytes, and the
+-/// deadline is checked after every chunk - so a client trickling bytes
+-/// with no newline cannot keep a read alive past its window.
+-/// With a `token` (the UI link, #3751), the first complete line must be
+-/// the link's hello with that token; anything else is refused and the
+-/// connection closed before a line reaches the app.
+-fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wake: &Wake, idle: Duration, token: Option<&str>) -> std::io::Result<End> {
++/// One client until it hangs up, the app stops, or idle/hello expires (#567, #3873).
++fn serve_client(
++    mut stream: Stream,
++    tx: &Sender<Request>,
++    stop: &AtomicBool,
++    wake: &Wake,
++    idle: Duration,
++    token: Option<&str>,
++    hello: Duration,
++) -> std::io::Result<End> {
+     let mut gate = token;
+-    // An accepted socket may inherit the listener's non-blocking mode
+-    // (BSD does); reads wait, but only a POLL at a time.
+     stream.set_nonblocking(false)?;
+     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+     let mut writer = stream.try_clone()?;
+-    // Bytes read but not yet a complete line. Between reads it never
+-    // holds a newline and never more than MAX_LINE bytes.
+     let mut buf = Vec::new();
+     let mut chunk = [0_u8; CHUNK];
+-    // The idle clock: reset by each complete line once it is answered,
+-    // so the app's own answering time never counts against the client.
+-    // A partial line never resets it.
+     let mut active = Instant::now();
+     loop {
+         if stop.load(Ordering::Relaxed) {
+             return Ok(End::Closed);
+         }
++        let cap = if gate.is_some() { MAX_HELLO_LINE } else { MAX_LINE };
++        let deadline = if gate.is_some() { hello } else { idle };
+         let quiet = active.elapsed();
+-        let Some(left) = idle.checked_sub(quiet).filter(|d| !d.is_zero()) else {
++        let Some(left) = deadline.checked_sub(quiet).filter(|d| !d.is_zero()) else {
++            if gate.is_some() {
++                let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
++                return Ok(End::Refused);
++            }
+             let note = format!(
+                 r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
+                 quiet.as_secs()
+@@ -299,7 +284,7 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+         // is non-zero, and a sub-millisecond rest rounds up to 1 ms.
+         stream.set_read_timeout(Some(left.min(POLL).max(Duration::from_millis(1))))?;
+         // Bounded as it reads: never more than one byte past the cap.
+-        let room = (MAX_LINE + 1).saturating_sub(buf.len()).clamp(1, CHUNK);
++        let room = (cap + 1).saturating_sub(buf.len()).clamp(1, CHUNK);
+         let got = match chunk.get_mut(..room).map(|c| stream.read(c)) {
+             Some(Ok(n)) => n,
+             Some(Err(e))
+@@ -342,7 +327,11 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             }
+             active = Instant::now();
+         }
+-        if buf.len() > MAX_LINE {
++        if buf.len() > cap {
++            if gate.is_some() {
++                let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
++                return Ok(End::Refused);
++            }
+             let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"message too long - the connection is closed"}}"#;
+             writeln!(writer, "{refusal}")?;
+             writer.flush()?;
+@@ -379,11 +368,8 @@ fn forward(bytes: &[u8], tx: &Sender<Request>, writer: &mut Stream, stop: &Atomi
+                 return Ok(true);
+             }
+             Ok(None) => return Ok(true),
+-            Err(RecvTimeoutError::Timeout) => {
+-                if stop.load(Ordering::Relaxed) {
+-                    return Ok(false);
+-                }
+-            }
++            Err(RecvTimeoutError::Timeout) if stop.load(Ordering::Relaxed) => return Ok(false),
++            Err(RecvTimeoutError::Timeout) => {}
+             Err(RecvTimeoutError::Disconnected) => {
+                 tracing::warn!("mcp: a request was dropped unanswered");
+                 return Ok(true);
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index e674969a8..a029984cc 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -10,6 +10,7 @@ use camcraft_app::mcp::link::{self, Entry};
+ use camcraft_app::mcp::{link_call, Inbox, LinkError, Select};
+ 
+ use serde_json::{json, Value};
++use std::io::Read;
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use std::time::{Duration, Instant};
+@@ -188,3 +189,41 @@ fn the_link_folder_is_the_users_own() {
+     assert!(link::enabled(Some("on")));
+     assert!(!link::enabled(Some(" OFF ")));
+ }
++
++#[test]
++fn an_unauthenticated_client_holding_the_link_times_out_and_releases_it() {
++    let dir = fresh_dir("hello-timeout");
++    // Short hello deadline (150 ms) so the test is quick.
++    let inbox = Inbox::link_with_timeouts(&dir, Box::new(|| {}), Duration::from_secs(60), Duration::from_millis(150))
++        .expect("open the link");
++    let entry = inbox.link_entry().expect("a link entry").clone();
++
++    // Client 1 connects to the socket and sends no hello (#3873).
++    let addr = entry.address.clone();
++    let transport = entry.transport.clone();
++    let client1 = std::thread::spawn(move || {
++        let mut stream: Box<dyn Read + Send> = match transport.as_str() {
++            "tcp" => Box::new(std::net::TcpStream::connect(&addr).expect("tcp connect")),
++            #[cfg(unix)]
++            "unix" => Box::new(std::os::unix::net::UnixStream::connect(&addr).expect("unix connect")),
++            other => panic!("unknown transport: {other}"),
++        };
++        let mut buf = Vec::new();
++        let _ = stream.read_to_end(&mut buf);
++    });
++
++    std::thread::sleep(Duration::from_millis(30));
++
++    // Client 2 connects with the token and gets the session after client 1 is dropped.
++    let good_dir = dir.clone();
++    let client2 = std::thread::spawn(move || link_call(&good_dir, &Select::Only, "get_job", &json!({})));
++
++    let (result, lines) = serve_until(&inbox, client2);
++    let result = result.expect("client 2 gets the session after client 1 times out");
++    assert_eq!(result["structuredContent"]["echo"], json!("get_job"));
++    assert_eq!(lines.len(), 1);
++
++    client1.join().expect("client 1 thread finishes");
++    drop(inbox);
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/docs/decisions/3873-pre-hello-limits.md b/docs/decisions/3873-pre-hello-limits.md
+new file mode 100644
+index 000000000..db45e14c4
+--- /dev/null
++++ b/docs/decisions/3873-pre-hello-limits.md
+@@ -0,0 +1,17 @@
++# #3873 - UI link pre-hello limits
++
++The UI link accepts one client at a time and requires token authentication on the first line. Prior to this change, the full 5-minute `IDLE_TIMEOUT` and 16 MiB line limit were applied before authentication, allowing an unauthenticated connection to hold the session for up to 5 minutes without sending a valid hello line.
++
++## Decision
++
++1. **Pre-hello deadline:**
++   - Prior to token verification, connections are bounded by `HELLO_TIMEOUT` (5 seconds).
++   - If a client fails to send a complete, matching hello line within this window, the connection is closed immediately, and subsequent waiting clients are served.
++   - `Inbox::link_with_timeouts` permits custom deadlines for deterministic testing.
++
++2. **Pre-hello buffer cap:**
++   - Prior to token verification, incoming data is capped at `MAX_HELLO_LINE` (4 KiB) instead of `MAX_LINE` (16 MiB).
++   - Any client exceeding 4 KiB before sending a newline is dropped immediately.
++
++3. **Post-authentication limits:**
++   - Once a valid hello line with the matching token is received, the normal `IDLE_TIMEOUT` (5 minutes) and `MAX_LINE` (16 MiB) take effect for the session.
