@@ -1,0 +1,514 @@
+From fabf04253f899055a13ac1258dbe579ac86a48f0 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 23 Nov 2026 20:00:21 +0100
+Subject: [PATCH 1/2] fix(xtask): the recording build writes its JSON to a
+ file, not a pipe
+
+The per-crate prebuild read cargo's JSON stdout through a pipe and joined
+the reader after cargo exited. A descendant that outlives the build (the
+sccache server that the first rustc wrapper call starts) inherits that
+stdout, so the reader got no end of file until the server stopped. No
+watchdog runs during that join. The JSON now goes to a temporary file;
+the watchdog counts its size, and the gate reads it when cargo exits.
+
+Pinned by watchdog_tests::a_recording_build_ends_when_cargo_exits_not_when_its_descendants_do
+(old code: 120 s wait, watchdog silent; new code: under 1 s).
+
+Fixes #3675
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/decisions/3675-prebuild-json-file.md | 49 +++++++++++++++++++++++
+ xtask/src/direct.rs                       | 47 +++++++++++++---------
+ xtask/src/watchdog_tests.rs               | 34 ++++++++++++++++
+ 3 files changed, 110 insertions(+), 20 deletions(-)
+ create mode 100644 docs/decisions/3675-prebuild-json-file.md
+
+diff --git a/docs/decisions/3675-prebuild-json-file.md b/docs/decisions/3675-prebuild-json-file.md
+new file mode 100644
+index 000000000..fc368bd22
+--- /dev/null
++++ b/docs/decisions/3675-prebuild-json-file.md
+@@ -0,0 +1,49 @@
++## #3675 - A recording build writes its JSON to a file, not to a pipe
++
++**Cause.** The gate's per-crate prebuild (`debug build: <crate> (--no-run)`)
++records its test executables from cargo's JSON on stdout. `direct::cargo`
++read that stdout through a pipe, in a reader thread, and joined the thread
++after cargo exited. A process that the build starts and that outlives the
++build inherits cargo's stdout. The sccache server is such a process: the
++first `rustc` wrapper call starts it when no server runs. On Windows the
++server keeps an inherited copy of the write end of the pipe, so the reader
++got no end of file until the server stopped (its idle timeout, 10 min by
++default). During that join no watchdog runs: the watchdog stops when cargo
++exits. So the gate waited after a green build, and the wait depended on
++the state of the sccache server, not on cargo. The issue named a cargo
++"rmeta handoff". This worker did not see the reported wedge on its own
++machine (cargo 1.100.0, a shared sccache server that already ran). The
++pipe hold is the one wait of the prebuild path that is shown (test below)
++and that depends on the sccache state. It is the probable cause, not a
++confirmed one. A second, private sccache server (other port) to start the
++server cold failed its compiles ("connection was forcibly closed"), so
++that path was not run end to end.
++
++Readings (this machine, cargo 1.100.0, Windows 11):
++
++- The pinning test with the old `direct.rs`: the fake cargo exits at once
++  and leaves a descendant that sleeps 120 s on its stdout. The step took
++  120.03 s. The 60 s watchdog did not fire.
++- The same test with the fix: the step ends at once (11 xtask watchdog and
++  direct tests pass in 7 s).
++
++**Decided.** The JSON goes to a file in the temporary directory (one name for
++each process and build). The watchdog counts the file size from the open
++handle as output, as it counted the pipe bytes. When cargo exits, the gate
++reads the file and deletes it. A descendant that still holds the file only
++delays the deletion. It cannot hold the gate.
++
++**Dropped.**
++
++- A bounded join of the reader thread (wait N seconds after the exit). It
++  keeps a thread blocked on the pipe and a time constant to tune. The file
++  needs neither.
++- Start the sccache server before the gate (`sccache --start-server`). It
++  fixes only the sccache case. Any other long-lived descendant (a build
++  script that starts a daemon) still holds the pipe.
++- A fallback from a wedged prebuild to the per-binary path. With the cause
++  removed, the prebuild no longer waits after cargo exits. A real silent
++  cargo still ends as a STALL row that names the step (#3303).
++
++**Cost to change later.** Small: one function, `direct::cargo`. The
++temporary file costs one write and one read of the JSON (a few MB at most).
+diff --git a/xtask/src/direct.rs b/xtask/src/direct.rs
+index 743180bcf..70de4926b 100644
+--- a/xtask/src/direct.rs
++++ b/xtask/src/direct.rs
+@@ -7,7 +7,7 @@
+ 
+ use std::ffi::OsString;
+ use std::fs::File;
+-use std::io::{Read, Write};
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+ use std::sync::atomic::{AtomicU64, Ordering};
+@@ -176,6 +176,11 @@ pub fn run(d: &Direct, root: &Path, mut log: File, limit: Duration) -> Result<(i
+ /// `capture`, stdout (the JSON messages of a recording build) comes back as text and only stderr (the
+ /// build's readable output) goes to the log; the JSON bytes count as output too. The `bool` is true when
+ /// the watchdog killed the step.
++///
++/// The JSON goes to a file, never to a pipe (#3675): a process that the build starts and that outlives
++/// it (the sccache server, which the first `rustc` wrapper call starts) inherits cargo's stdout. With a
++/// pipe, the reader got no end of file until that server stopped, so the gate waited after cargo had
++/// exited, where no watchdog runs. A file has no such end: the gate reads it when cargo exits.
+ pub fn cargo(cargo: &str, env: Vec<(&'static str, String)>, args: &[String], dir: &Path, log: File, capture: bool, limit: Duration) -> Result<(i32, Option<String>, bool), String> {
+     let fail = |e: std::io::Error| format!("cargo {}: {e}", args.join(" "));
+     let mut cmd = Command::new(cargo);
+@@ -183,32 +188,34 @@ pub fn cargo(cargo: &str, env: Vec<(&'static str, String)>, args: &[String], dir
+     cmd.envs(env).args(args).current_dir(dir).stdin(Stdio::null());
+     let err = log.try_clone().map_err(fail)?;
+     if capture {
+-        let mut child = cmd.stdout(Stdio::piped()).stderr(err).spawn().map_err(fail)?;
+-        let pipe = child.stdout.take();
+-        let bytes = AtomicU64::new(0);
+-        let (end, text) = std::thread::scope(|sc| {
+-            let reader = sc.spawn(|| {
+-                let mut all = Vec::new();
+-                let mut buf = [0u8; 8192];
+-                if let Some(mut p) = pipe {
+-                    while let Ok(n @ 1..) = p.read(&mut buf) {
+-                        all.extend_from_slice(&buf[..n]);
+-                        bytes.fetch_add(n as u64, Ordering::Relaxed);
+-                    }
+-                }
+-                all
+-            });
+-            let end = watchdog::wait(&mut child, &log, &|| bytes.load(Ordering::Relaxed), limit);
+-            (end, reader.join().unwrap_or_default())
++        let path = json_path();
++        let out = File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
++        // The size from the open handle: a directory entry of a file in work can show an old size on Windows.
++        let probe = out.try_clone().map_err(fail)?;
++        let spawned = cmd.stdout(out).stderr(err).spawn();
++        let end = spawned.map_err(fail).and_then(|mut child| {
++            watchdog::wait(&mut child, &log, &|| probe.metadata().map(|m| m.len()).unwrap_or(0), limit).map_err(fail)
+         });
+-        let (code, stalled) = code_of(end.map_err(fail)?);
+-        return Ok((code, Some(String::from_utf8_lossy(&text).into_owned()), stalled));
++        drop(probe);
++        let text = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()));
++        // A descendant that still holds the file only delays its deletion (Windows deletes it at the last close).
++        let _ = std::fs::remove_file(&path);
++        let (code, stalled) = code_of(end?);
++        return Ok((code, Some(String::from_utf8_lossy(&text?).into_owned()), stalled));
+     }
+     let mut child = cmd.stdout(log.try_clone().map_err(fail)?).stderr(err).spawn().map_err(fail)?;
+     let (code, stalled) = code_of(watchdog::wait(&mut child, &log, &|| 0, limit).map_err(fail)?);
+     Ok((code, None, stalled))
+ }
+ 
++/// A new file name in the temporary directory for the JSON of one recording build. Parallel lanes
++/// and gates in other worktrees each get their own name: the process id and a counter.
++fn json_path() -> PathBuf {
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++    let n = NEXT.fetch_add(1, Ordering::Relaxed);
++    std::env::temp_dir().join(format!("xtask-cargo-json-{}-{n}.json", std::process::id()))
++}
++
+ /// The step code of a watched cargo process (its exit code, -1 for a signal or a stall) and whether it stalled.
+ fn code_of(end: End) -> (i32, bool) {
+     match end {
+diff --git a/xtask/src/watchdog_tests.rs b/xtask/src/watchdog_tests.rs
+index 5288fb54a..314bfd9f6 100644
+--- a/xtask/src/watchdog_tests.rs
++++ b/xtask/src/watchdog_tests.rs
+@@ -40,6 +40,14 @@ fn watchdog_helper() {
+             let mut g = spawn("tick");
+             g.wait().expect("wait");
+         }
++        // As a build that starts the sccache server (#3675): a descendant that outlives the build holds
++        // its stdout, and the build exits at once.
++        "orphan" => {
++            #[expect(clippy::zombie_processes, reason = "the descendant must outlive this process; the test kills it by pid")]
++            let g = spawn("silent");
++            println!("{{\"reason\":\"build-finished\",\"success\":true}}");
++            println!("grandchild pid {}", g.id());
++        }
+         _ => {}
+     }
+ }
+@@ -104,6 +112,32 @@ fn output_of_the_child_or_a_descendant_keeps_the_step_alive() {
+     }
+ }
+ 
++/// #3675: a recording build ends when cargo exits, also when a descendant that outlives it (the
++/// sccache server) still holds its stdout. Before the fix the gate waited for that descendant, with no
++/// watchdog: the helper's descendant sleeps 120 s, so the old code took 120 s or more here.
++#[test]
++fn a_recording_build_ends_when_cargo_exits_not_when_its_descendants_do() {
++    let dir = std::env::temp_dir().join(format!("xtask-watchdog-orphan-{}", std::process::id()));
++    fs::create_dir_all(&dir).expect("dir");
++    let log = File::create(dir.join("step.log")).expect("log");
++    let me = std::env::current_exe().expect("exe");
++    let args: Vec<String> = ["--exact", "watchdog_tests::watchdog_helper", "--nocapture", "--test-threads=1"].map(String::from).to_vec();
++    let t0 = Instant::now();
++    let (code, json, stalled) = crate::direct::cargo(&me.to_string_lossy(), vec![(HELPER, "orphan".into())], &args, &dir, log, true, Duration::from_secs(60)).expect("run");
++    let took = t0.elapsed();
++    let json = json.unwrap_or_default();
++    let pid: Option<u32> = json.lines().find_map(|l| l.split_once("grandchild pid ").and_then(|(_, p)| p.trim().parse().ok()));
++    if let Some(pid) = pid.map(|p| p.to_string()) {
++        let (prog, kill) = if cfg!(windows) { ("taskkill", vec!["/F", "/PID", &pid]) } else { ("kill", vec!["-KILL", &pid]) };
++        let _ = Command::new(prog).args(kill).stdout(Stdio::null()).stderr(Stdio::null()).status();
++    }
++    let _ = fs::remove_dir_all(&dir);
++    assert!(took < Duration::from_secs(30), "the step must end when cargo exits: {took:?}");
++    assert!(!stalled && code == 0, "the build exits green: code {code}, stalled {stalled}");
++    assert!(json.contains("\"reason\":\"build-finished\""), "the JSON of the build comes back: {json}");
++    assert!(pid.is_some(), "the helper names its descendant: {json}");
++}
++
+ #[test]
+ fn the_stall_time_reads_as_the_job_budget_does() {
+     assert_eq!(watchdog::from_value(None).0, watchdog::DEFAULT_MIN);
+
+From ed4612b520d79e19cc2aec7d8d0f7d285664f16a Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Mon, 23 Nov 2026 22:57:27 +0100
+Subject: [PATCH 2/2] fix(xtask): one life rule for the JSON file of a
+ recording build
+
+Review of #3738. The JSON file is next to the step log, opened with
+create_new (an entry at the name is not followed), and removed by a guard
+on each exit. An I/O error of the file is "nothing recorded", not a gate
+error: the build runs with its JSON dropped and its suites start cargo.
+
+Refs #3675
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/decisions/3675-prebuild-json-file.md | 22 ++++--
+ xtask/src/direct.rs                       | 92 +++++++++++++++++------
+ xtask/src/exec.rs                         |  7 +-
+ xtask/src/watchdog_tests.rs               | 77 +++++++++++++++++--
+ 4 files changed, 159 insertions(+), 39 deletions(-)
+
+diff --git a/docs/decisions/3675-prebuild-json-file.md b/docs/decisions/3675-prebuild-json-file.md
+index fc368bd22..8fdb39d4f 100644
+--- a/docs/decisions/3675-prebuild-json-file.md
++++ b/docs/decisions/3675-prebuild-json-file.md
+@@ -27,11 +27,23 @@ Readings (this machine, cargo 1.100.0, Windows 11):
+ - The same test with the fix: the step ends at once (11 xtask watchdog and
+   direct tests pass in 7 s).
+ 
+-**Decided.** The JSON goes to a file in the temporary directory (one name for
+-each process and build). The watchdog counts the file size from the open
+-handle as output, as it counted the pipe bytes. When cargo exits, the gate
+-reads the file and deletes it. A descendant that still holds the file only
+-delays the deletion. It cannot hold the gate.
++**Decided.** The JSON goes to a file next to the step log, in the run's own
++log directory (`<step log>.json`). The watchdog counts the file size from
++the open handle as output, as it counted the pipe bytes. When cargo exits,
++the gate reads the file. A descendant that still holds the file only
++delays its deletion. It cannot hold the gate.
++
++The review of #3738 asked for one rule for the life of the file:
++
++- The file is opened with `create_new`. An entry that is at the name
++  already (a stale file, a link) is an error. The gate does not follow it,
++  write it or remove it.
++- A guard (`direct::JsonFile`) removes the file on each exit: green, red,
++  a failed start, an early return. Only a hard kill of xtask can leave it,
++  and then it stays in that run's log directory, not in a shared one.
++- An I/O error of the file (create, clone, read) is not a gate error. The
++  build runs with its JSON dropped, the step prints "no test executable of
++  <crate> recorded (<why>)", and its suite steps start cargo.
+ 
+ **Dropped.**
+ 
+diff --git a/xtask/src/direct.rs b/xtask/src/direct.rs
+index 70de4926b..687e7556f 100644
+--- a/xtask/src/direct.rs
++++ b/xtask/src/direct.rs
+@@ -10,7 +10,6 @@ use std::fs::File;
+ use std::io::Write;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+-use std::sync::atomic::{AtomicU64, Ordering};
+ use std::time::Duration;
+ 
+ use crate::artifacts::{self, Built, Package, TestExe};
+@@ -181,39 +180,82 @@ pub fn run(d: &Direct, root: &Path, mut log: File, limit: Duration) -> Result<(i
+ /// it (the sccache server, which the first `rustc` wrapper call starts) inherits cargo's stdout. With a
+ /// pipe, the reader got no end of file until that server stopped, so the gate waited after cargo had
+ /// exited, where no watchdog runs. A file has no such end: the gate reads it when cargo exits.
+-pub fn cargo(cargo: &str, env: Vec<(&'static str, String)>, args: &[String], dir: &Path, log: File, capture: bool, limit: Duration) -> Result<(i32, Option<String>, bool), String> {
++///
++/// `capture` is the path of that file, next to the step log. The file is new (`create_new`: an entry
++/// that is there already, a link too, is not followed) and a guard removes it on each exit. An I/O
++/// error of the file is not a gate error: the build runs without it, and the JSON is `Some(Err(why))`,
++/// so nothing is recorded and the suite steps start cargo.
++///
++/// The result is `Watched`: the step code, the JSON of a capture, and whether the watchdog killed it.
++pub fn cargo(cargo: &str, env: Vec<(&'static str, String)>, args: &[String], dir: &Path, log: File, capture: Option<&Path>, limit: Duration) -> Result<crate::direct::Watched, String> {
+     let fail = |e: std::io::Error| format!("cargo {}: {e}", args.join(" "));
+     let mut cmd = Command::new(cargo);
+     crate::unit_env::apply(&mut cmd);
+     cmd.envs(env).args(args).current_dir(dir).stdin(Stdio::null());
+     let err = log.try_clone().map_err(fail)?;
+-    if capture {
+-        let path = json_path();
+-        let out = File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+-        // The size from the open handle: a directory entry of a file in work can show an old size on Windows.
+-        let probe = out.try_clone().map_err(fail)?;
+-        let spawned = cmd.stdout(out).stderr(err).spawn();
+-        let end = spawned.map_err(fail).and_then(|mut child| {
+-            watchdog::wait(&mut child, &log, &|| probe.metadata().map(|m| m.len()).unwrap_or(0), limit).map_err(fail)
+-        });
+-        drop(probe);
+-        let text = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()));
++    let Some(path) = capture else {
++        let mut child = cmd.stdout(log.try_clone().map_err(fail)?).stderr(err).spawn().map_err(fail)?;
++        let (code, stalled) = code_of(watchdog::wait(&mut child, &log, &|| 0, limit).map_err(fail)?);
++        return Ok((code, None, stalled));
++    };
++    let json = match JsonFile::create(path) {
++        Ok(j) => j,
++        Err(why) => {
++            // The JSON has no other use than the record: drop it, the readable output goes to the log.
++            let mut child = cmd.stdout(Stdio::null()).stderr(err).spawn().map_err(fail)?;
++            let (code, stalled) = code_of(watchdog::wait(&mut child, &log, &|| 0, limit).map_err(fail)?);
++            return Ok((code, Some(Err(why)), stalled));
++        }
++    };
++    let out = json.out.try_clone().map_err(|e| json.error("open", &e));
++    let end = match out {
++        Ok(out) => {
++            let mut child = cmd.stdout(out).stderr(err).spawn().map_err(fail)?;
++            // The size from the open handle: a directory entry of a file in work can show an old size on Windows.
++            code_of(watchdog::wait(&mut child, &log, &|| json.out.metadata().map(|m| m.len()).unwrap_or(0), limit).map_err(fail)?)
++        }
++        Err(why) => {
++            let mut child = cmd.stdout(Stdio::null()).stderr(err).spawn().map_err(fail)?;
++            let end = code_of(watchdog::wait(&mut child, &log, &|| 0, limit).map_err(fail)?);
++            return Ok((end.0, Some(Err(why)), end.1));
++        }
++    };
++    let text = std::fs::read(&json.path).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| json.error("read", &e));
++    Ok((end.0, Some(text), end.1))
++}
++
++/// What `cargo` gives back: the step code, the JSON of a capture (`Err` says why there is none), and
++/// whether the watchdog killed the step.
++pub type Watched = (i32, Option<Result<String, String>>, bool);
++
++/// The JSON file of one recording build. Its drop removes it, on each exit of `cargo` (#3675).
++pub struct JsonFile {
++    pub path: PathBuf,
++    out: File,
++}
++
++impl JsonFile {
++    /// Creates `path` as a new file. An entry at `path` (a stale file, a link) is an error, not followed.
++    pub fn create(path: &Path) -> Result<JsonFile, String> {
++        let out = std::fs::OpenOptions::new().write(true).create_new(true).open(path);
++        out.map(|out| JsonFile { path: path.to_path_buf(), out }).map_err(|e| format!("create {}: {e}", path.display()))
++    }
++
++    fn error(&self, what: &str, e: &std::io::Error) -> String {
++        format!("{what} {}: {e}", self.path.display())
++    }
++}
++
++impl Drop for JsonFile {
++    fn drop(&mut self) {
+         // A descendant that still holds the file only delays its deletion (Windows deletes it at the last close).
+-        let _ = std::fs::remove_file(&path);
+-        let (code, stalled) = code_of(end?);
+-        return Ok((code, Some(String::from_utf8_lossy(&text?).into_owned()), stalled));
++        let _ = std::fs::remove_file(&self.path);
+     }
+-    let mut child = cmd.stdout(log.try_clone().map_err(fail)?).stderr(err).spawn().map_err(fail)?;
+-    let (code, stalled) = code_of(watchdog::wait(&mut child, &log, &|| 0, limit).map_err(fail)?);
+-    Ok((code, None, stalled))
+ }
+ 
+-/// A new file name in the temporary directory for the JSON of one recording build. Parallel lanes
+-/// and gates in other worktrees each get their own name: the process id and a counter.
+-fn json_path() -> PathBuf {
+-    static NEXT: AtomicU64 = AtomicU64::new(0);
+-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+-    std::env::temp_dir().join(format!("xtask-cargo-json-{}-{n}.json", std::process::id()))
++/// The JSON file of the step whose log is `log`: next to it, in the run's own log directory.
++pub fn json_path(log: &Path) -> PathBuf {
++    log.with_extension("json")
+ }
+ 
+ /// The step code of a watched cargo process (its exit code, -1 for a signal or a stall) and whether it stalled.
+diff --git a/xtask/src/exec.rs b/xtask/src/exec.rs
+index 86a62e21c..73838cca4 100644
+--- a/xtask/src/exec.rs
++++ b/xtask/src/exec.rs
+@@ -271,11 +271,14 @@ impl Run {
+                 let (code, stalled) = crate::direct::run(d, root, file, limit)?;
+                 (code, None, stalled)
+             }
+-            None => crate::direct::cargo(&cargo(), cache, &args, &dir, file, records.is_some(), limit)?,
++            None => {
++                let json = records.is_some().then(|| crate::direct::json_path(&log));
++                crate::direct::cargo(&cargo(), cache, &args, &dir, file, json.as_deref(), limit)?
++            }
+         };
+         let mut recorded = None;
+         if let (Some(name), Some(json), 0) = (records.filter(|_| !crate::direct::opted_out()), json, code) {
+-            match crate::direct::record(root, &cargo(), &name, &json) {
++            match json.and_then(|j| crate::direct::record(root, &cargo(), &name, &j)) {
+                 Ok(p) => {
+                     println!("     {} test executable(s) of {name} recorded: their steps start no cargo", p.count());
+                     recorded = Some((name, p));
+diff --git a/xtask/src/watchdog_tests.rs b/xtask/src/watchdog_tests.rs
+index 314bfd9f6..35dc40862 100644
+--- a/xtask/src/watchdog_tests.rs
++++ b/xtask/src/watchdog_tests.rs
+@@ -48,6 +48,10 @@ fn watchdog_helper() {
+             println!("{{\"reason\":\"build-finished\",\"success\":true}}");
+             println!("grandchild pid {}", g.id());
+         }
++        "fail" => {
++            println!("{{\"reason\":\"build-finished\",\"success\":false}}");
++            std::process::exit(3);
++        }
+         _ => {}
+     }
+ }
+@@ -117,25 +121,84 @@ fn output_of_the_child_or_a_descendant_keeps_the_step_alive() {
+ /// watchdog: the helper's descendant sleeps 120 s, so the old code took 120 s or more here.
+ #[test]
+ fn a_recording_build_ends_when_cargo_exits_not_when_its_descendants_do() {
+-    let dir = std::env::temp_dir().join(format!("xtask-watchdog-orphan-{}", std::process::id()));
+-    fs::create_dir_all(&dir).expect("dir");
+-    let log = File::create(dir.join("step.log")).expect("log");
+-    let me = std::env::current_exe().expect("exe");
+-    let args: Vec<String> = ["--exact", "watchdog_tests::watchdog_helper", "--nocapture", "--test-threads=1"].map(String::from).to_vec();
++    let dir = json_dir("orphan");
++    let path = crate::direct::json_path(&dir.join("01-step.log"));
+     let t0 = Instant::now();
+-    let (code, json, stalled) = crate::direct::cargo(&me.to_string_lossy(), vec![(HELPER, "orphan".into())], &args, &dir, log, true, Duration::from_secs(60)).expect("run");
++    let (code, json, stalled) = recording(None, "orphan", &dir, Some(&path)).expect("run");
+     let took = t0.elapsed();
+-    let json = json.unwrap_or_default();
++    let json = json.and_then(Result::ok).unwrap_or_default();
+     let pid: Option<u32> = json.lines().find_map(|l| l.split_once("grandchild pid ").and_then(|(_, p)| p.trim().parse().ok()));
+     if let Some(pid) = pid.map(|p| p.to_string()) {
+         let (prog, kill) = if cfg!(windows) { ("taskkill", vec!["/F", "/PID", &pid]) } else { ("kill", vec!["-KILL", &pid]) };
+         let _ = Command::new(prog).args(kill).stdout(Stdio::null()).stderr(Stdio::null()).status();
+     }
++    let removed = !path.exists();
+     let _ = fs::remove_dir_all(&dir);
+     assert!(took < Duration::from_secs(30), "the step must end when cargo exits: {took:?}");
+     assert!(!stalled && code == 0, "the build exits green: code {code}, stalled {stalled}");
+     assert!(json.contains("\"reason\":\"build-finished\""), "the JSON of the build comes back: {json}");
+     assert!(pid.is_some(), "the helper names its descendant: {json}");
++    assert!(removed, "the JSON file is removed after a green build: {}", path.display());
++}
++
++/// #3675 review: the JSON file goes away after a red build, and when cargo cannot start (an early return).
++#[test]
++fn the_json_file_is_removed_after_a_failed_build_and_a_failed_start() {
++    let dir = json_dir("removed");
++    let path = dir.join("02-step.json");
++    let (code, json, _) = recording(None, "fail", &dir, Some(&path)).expect("run");
++    let red_removed = !path.exists();
++    let start = recording(Some(&dir.join("no-such-cargo.exe")), "", &dir, Some(&path));
++    let start_removed = !path.exists();
++    let _ = fs::remove_dir_all(&dir);
++    assert!(code == 3, "the red build's code comes back: {code}");
++    assert!(json.is_some_and(|j| j.is_ok_and(|t| t.contains("\"success\":false"))), "the JSON of a red build still comes back");
++    assert!(red_removed, "the JSON file is removed after a red build");
++    assert!(start.is_err(), "a cargo that cannot start is an error, as before");
++    assert!(start_removed, "the JSON file is removed on the early return");
++}
++
++/// #3675 review: an I/O error of the JSON file is "nothing recorded", not a gate error.
++#[test]
++fn an_io_error_of_the_json_file_records_nothing_and_the_build_still_runs() {
++    let dir = json_dir("io");
++    let path = dir.join("missing-dir").join("03-step.json");
++    let (code, json, stalled) = recording(None, "", &dir, Some(&path)).expect("an I/O error is not a gate error");
++    let _ = fs::remove_dir_all(&dir);
++    assert!(code == 0 && !stalled, "the build runs to its end: code {code}");
++    let why = json.and_then(Result::err).unwrap_or_default();
++    assert!(why.starts_with("create ") && why.contains("03-step.json"), "the reason names the file: {why}");
++}
++
++/// #3675 review: an entry that is at the name already (a stale file, a planted link) is not followed,
++/// not written and not removed.
++#[test]
++fn an_entry_at_the_json_name_is_not_followed() {
++    let dir = json_dir("exists");
++    let path = dir.join("04-step.json");
++    fs::write(&path, "keep").expect("seed");
++    let (code, json, _) = recording(None, "", &dir, Some(&path)).expect("run");
++    let kept = fs::read_to_string(&path).unwrap_or_default();
++    let _ = fs::remove_dir_all(&dir);
++    assert_eq!(code, 0);
++    assert!(json.is_some_and(|j| j.is_err()), "nothing is recorded from a file that was there before");
++    assert_eq!(kept, "keep", "the entry at the name is not written and not removed");
++}
++
++fn json_dir(name: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("xtask-json-{name}-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&dir);
++    fs::create_dir_all(&dir).expect("dir");
++    dir
++}
++
++/// A recording build of the helper in `mode` (or of the program `prog`) with its JSON at `json`.
++fn recording(prog: Option<&std::path::Path>, mode: &str, dir: &std::path::Path, json: Option<&std::path::Path>) -> Result<crate::direct::Watched, String> {
++    let log = File::create(dir.join("step.log")).expect("log");
++    let me = std::env::current_exe().expect("exe");
++    let prog = prog.unwrap_or(&me).to_string_lossy().into_owned();
++    let args: Vec<String> = ["--exact", "watchdog_tests::watchdog_helper", "--nocapture", "--test-threads=1"].map(String::from).to_vec();
++    crate::direct::cargo(&prog, vec![(HELPER, mode.into())], &args, dir, log, json, Duration::from_secs(60))
+ }
+ 
+ #[test]
