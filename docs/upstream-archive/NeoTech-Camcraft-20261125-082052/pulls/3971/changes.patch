@@ -1,0 +1,462 @@
+From 765fadb802a6c733aa60cb6362424c63d8ae0a75 Mon Sep 17 00:00:00 2001
+From: tbrasselle <tbrasselle@gmail.com>
+Date: Tue, 24 Nov 2026 23:36:46 -0500
+Subject: [PATCH] fix(mcp): the cli refuses a ui link peer that does not prove
+ the token
+
+A crashed window leaves its discovery file behind, and on Windows the
+CLI opened a session with any peer on that stale port that answered
+HELLO_OK - the peer never proved that it read the file. Three closes:
+
+- The client sends a nonce in its hello; the window answers with a
+  proof (two FNV-1a 64-bit words over token and nonce, no new crypto
+  dependency) and the client refuses a peer whose answer does not
+  prove it. A plain hello (an older CLI) still gets plain HELLO_OK.
+- Before it connects, the CLI checks that the pid in the file is
+  alive (kill on Unix, OpenProcess on Windows) and removes the file of
+  a dead pid - never a live window's file.
+- The answer reads are bounded: one answer line at 1 MiB, a bridge
+  session at 256 MiB; the HELLO_TIMEOUT deadline covers the whole
+  proof exchange.
+
+Pinned by ui_link::a_false_window_that_does_not_prove_the_token_gets_no_tool_call.
+
+Fixes #3874
+---
+ Cargo.lock                           |   2 +
+ crates/app/Cargo.toml                |  10 +++
+ crates/app/src/mcp/link.rs           |  76 ++++++++++++++++
+ crates/app/src/mcp/link_client.rs    | 125 ++++++++++++++++++++++++---
+ crates/app/src/mcp/listen.rs         |   6 +-
+ crates/app/tests/mcp_live/ui_link.rs |  67 +++++++++++++-
+ 6 files changed, 273 insertions(+), 13 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f35105f76..93cc51f5e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -766,6 +766,7 @@ dependencies = [
+  "clipper2-rust",
+  "flecs_ecs",
+  "keyring",
++ "libc",
+  "png 0.18.1",
+  "rayon",
+  "reqwest",
+@@ -778,6 +779,7 @@ dependencies = [
+  "tracing-subscriber",
+  "url",
+  "web-time",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
+diff --git a/crates/app/Cargo.toml b/crates/app/Cargo.toml
+index adacec0db..676587857 100644
+--- a/crates/app/Cargo.toml
++++ b/crates/app/Cargo.toml
+@@ -39,5 +39,15 @@ keyring = { workspace = true }
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ web-time = { workspace = true }
+ 
++[target.'cfg(unix)'.dependencies]
++# #3874: the CLI checks that the pid in a discovery file is alive before
++# it connects; std has no pid check, so the platform's own `kill`.
++libc = "0.2"
++
++[target.'cfg(target_os = "windows")'.dependencies]
++# #3874: the same pid-alive check through OpenProcess. Both crates are
++# already in the lock through other deps - no new crate.
++windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
++
+ [dev-dependencies]
+ tempfile = "3"
+diff --git a/crates/app/src/mcp/link.rs b/crates/app/src/mcp/link.rs
+index fb281ab55..39756654c 100644
+--- a/crates/app/src/mcp/link.rs
++++ b/crates/app/src/mcp/link.rs
+@@ -109,6 +109,12 @@ fn new_token() -> String {
+         .collect()
+ }
+ 
++/// A fresh client nonce, from the same randomness as [`new_token`].
++#[must_use]
++pub fn new_nonce() -> String {
++    new_token()
++}
++
+ /// The first line a client sends.
+ #[must_use]
+ pub fn hello_line(token: &str) -> String {
+@@ -128,6 +134,76 @@ pub fn hello_matches(line: &[u8], token: &str) -> bool {
+         && got.bytes().zip(token.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
+ }
+ 
++/// The first line a client sends, with a nonce (#3874). The window's
++/// answer must carry a proof that it mixed this nonce with the token, so
++/// a peer that never read the discovery file cannot pass as the window.
++#[must_use]
++pub fn hello_with_nonce(token: &str, nonce: &str) -> String {
++    json!({ "camcraft_link": FORMAT, "token": token, "nonce": nonce }).to_string()
++}
++
++/// The nonce a client put in its hello line; `None` when there is none
++/// (an older CLI). At most 128 bytes: no honest nonce is longer.
++#[must_use]
++pub fn hello_nonce(line: &[u8]) -> Option<String> {
++    let v = serde_json::from_slice::<Value>(line).ok()?;
++    v.get("nonce")?
++        .as_str()
++        .map(str::to_owned)
++        .filter(|n| !n.is_empty() && n.len() <= 128)
++}
++
++/// The proof of the token (#3874): two FNV-1a 64-bit words over `token`,
++/// a zero byte, `nonce`. This is a knowledge proof, not encryption - the
++/// token itself already crosses the same socket in the clear - so a
++/// simple published hash is enough. The proof only binds the answer to a
++/// peer that read the discovery file and saw this client's fresh nonce.
++#[must_use]
++pub fn token_proof(token: &str, nonce: &str) -> String {
++    fn fnv1a(data: &[u8]) -> u64 {
++        // The published FNV-1a 64-bit parameters (public domain).
++        data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
++            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01B3)
++        })
++    }
++    let mut data = Vec::with_capacity(token.len() + nonce.len() + 1);
++    data.extend_from_slice(token.as_bytes());
++    data.push(0);
++    data.extend_from_slice(nonce.as_bytes());
++    let a = fnv1a(&data);
++    let b = fnv1a(&a.to_be_bytes());
++    format!("{a:016x}{b:016x}")
++}
++
++/// The window's answer to a good hello: plain [`HELLO_OK`] for a hello
++/// without a nonce (an older CLI), otherwise with the proof of the token
++/// and the client's nonce.
++#[must_use]
++pub fn hello_ok_line(token: &str, nonce: Option<&str>) -> String {
++    match nonce {
++        None => HELLO_OK.to_owned(),
++        Some(n) => json!({ "camcraft_link": FORMAT, "ok": true, "proof": token_proof(token, n) })
++            .to_string(),
++    }
++}
++
++/// Whether an answer proves that the peer knows `token` and mixed in the
++/// client's `nonce`. The compare takes the same time for equal lengths.
++#[must_use]
++pub fn proof_matches(answer: &[u8], token: &str, nonce: &str) -> bool {
++    let Ok(v) = serde_json::from_slice::<Value>(answer) else { return false };
++    if v.get("camcraft_link").and_then(Value::as_u64) != Some(u64::from(FORMAT)) {
++        return false;
++    }
++    if v.get("ok").and_then(Value::as_bool) != Some(true) {
++        return false;
++    }
++    let want = token_proof(token, nonce);
++    let Some(got) = v.get("proof").and_then(Value::as_str) else { return false };
++    got.len() == want.len()
++        && got.bytes().zip(want.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
++}
++
+ /// A window's registration: its discovery file (and socket file), removed
+ /// when it drops.
+ #[derive(Debug)]
+diff --git a/crates/app/src/mcp/link_client.rs b/crates/app/src/mcp/link_client.rs
+index 17bdf27d9..81da37d42 100644
+--- a/crates/app/src/mcp/link_client.rs
++++ b/crates/app/src/mcp/link_client.rs
+@@ -19,10 +19,25 @@ use serde_json::{json, Value};
+ use super::link::{self, Entry};
+ use super::wire::Stream;
+ 
+-/// How long a connect and the hello answer may take before a window is
+-/// read as not answering (a stale file, a hung window).
++/// How long a connect, the hello and its proof answer may take before a
++/// window is read as not answering (a stale file, a hung window). This
++/// deadline covers the whole token-proof exchange: the client sends the
++/// hello with its nonce, and the window's answer must carry the proof.
+ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+ 
++/// The most bytes of one answer line (#3874): a peer that sends one line
++/// with no end cannot make the client use all memory. A proof answer or
++/// a tool result never approaches the bound. After the proof, no read
++/// deadline applies (a tool may run for minutes, #3751) - but the peer
++/// proved that it read the discovery file, so a bound on what it may
++/// send is what remains to check.
++const MAX_ANSWER: u64 = 1024 * 1024;
++
++/// The most bytes a `--ui mcp` bridge session copies from the window to
++/// the MCP client, so a peer that never stops writing cannot run for
++/// ever. A link session transfers far less.
++const MAX_BRIDGE: u64 = 256 * 1024 * 1024;
++
+ /// Which window to talk to.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum Select {
+@@ -103,7 +118,10 @@ fn describe(entry: &Entry) -> String {
+     format!("pid {} ({project})", entry.pid)
+ }
+ 
+-/// Connect to one window and pass its token check.
++/// Connect to one window, pass its token check, and require the proof
++/// that the peer mixed the client's fresh nonce with the token (#3874):
++/// a peer that answers `HELLO_OK` without the proof never read the
++/// discovery file, so it is not the window.
+ fn open(entry: &Entry) -> std::io::Result<Stream> {
+     let stream = match entry.transport.as_str() {
+         "tcp" => {
+@@ -129,19 +147,75 @@ fn open(entry: &Entry) -> std::io::Result<Stream> {
+     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+     stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
+     let mut writer = stream.try_clone()?;
+-    writeln!(writer, "{}", link::hello_line(&entry.token))?;
++    // The nonce makes the window's proof answer fresh, so a recorded
++    // answer of an earlier session proves nothing.
++    let nonce = link::new_nonce();
++    writeln!(writer, "{}", link::hello_with_nonce(&entry.token, &nonce))?;
+     writer.flush()?;
+     let mut answer = String::new();
+-    BufReader::new(stream.try_clone()?).take(4096).read_line(&mut answer)?;
+-    if answer.trim() != link::HELLO_OK {
+-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the window refused the link token"));
++    BufReader::new(stream.try_clone()?).take(MAX_ANSWER).read_line(&mut answer)?;
++    if !link::proof_matches(answer.as_bytes(), &entry.token, &nonce) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "the peer did not prove the link token",
++        ));
+     }
+     // A tool may run for minutes (generate): no read deadline from here.
++    // The peer proved that it read the discovery file; its answer lines
++    // stay bounded by MAX_ANSWER.
+     stream.set_read_timeout(None)?;
+     stream.set_write_timeout(None)?;
+     Ok(stream)
+ }
+ 
++/// Whether the process `pid` runs now. `Some(false)` only when the OS
++/// says the pid does not exist; `None` when the check cannot say (an
++/// access error) - the caller then treats the window as alive.
++#[cfg(unix)]
++fn pid_alive(pid: u32) -> Option<bool> {
++    // A signal of 0 checks existence and sends nothing.
++    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
++        0 => Some(true),
++        -1 => match std::io::Error::last_os_error().raw_os_error() {
++            Some(libc::ESRCH) => Some(false),
++            // EPERM: the process exists, it is just not ours.
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
++#[cfg(windows)]
++fn pid_alive(pid: u32) -> Option<bool> {
++    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
++    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess};
++    // PROCESS_QUERY_LIMITED_INFORMATION: enough for the exit code, and
++    // allowed on another user's process.
++    const QUERY_LIMITED: u32 = 0x1000;
++    const STILL_ACTIVE: u32 = 259;
++    const ERROR_INVALID_PARAMETER: u32 = 87;
++    unsafe {
++        let handle = OpenProcess(QUERY_LIMITED, 0, pid);
++        if handle.is_null() {
++            return match GetLastError() {
++                // No process with this pid exists.
++                ERROR_INVALID_PARAMETER => Some(false),
++                // Cannot say (access denied): treat the window as alive.
++                _ => None,
++            };
++        }
++        let mut code = 0_u32;
++        let said = GetExitCodeProcess(handle, &mut code);
++        CloseHandle(handle);
++        (said != 0).then_some(code == STILL_ACTIVE)
++    }
++}
++
++#[cfg(not(any(unix, windows)))]
++fn pid_alive(_pid: u32) -> Option<bool> {
++    None
++}
++
+ /// Find the selected window in `dir` and open a session with it.
+ ///
+ /// # Errors
+@@ -155,8 +229,8 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             dir.display()
+         )));
+     }
+-    let candidates: Vec<&Entry> = all.iter().filter(|e| select.admits(e)).collect();
+-    if candidates.is_empty() {
++    let selected: Vec<&Entry> = all.iter().filter(|e| select.admits(e)).collect();
++    if selected.is_empty() {
+         let running: Vec<String> = all.iter().map(describe).collect();
+         let wanted = match select {
+             Select::Only => "a window".to_owned(),
+@@ -168,6 +242,27 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             running.join(", ")
+         )));
+     }
++    // A file a crashed window left behind (#3874): its pid is dead, so no
++    // window serves that socket - and a local process may have bound the
++    // port to read the token and the tool calls. The file is removed
++    // (never a live window's file) and the entry is skipped. When the
++    // check cannot say whether the pid lives, the entry stays and the
++    // token proof in `open` guards the connection.
++    let candidates: Vec<&Entry> = selected
++        .into_iter()
++        .filter(|entry| {
++            if entry.pid == std::process::id() || pid_alive(entry.pid) != Some(false) {
++                return true;
++            }
++            tracing::info!("ui link: {} is gone; its link file is stale and is removed", describe(entry));
++            match std::fs::remove_file(dir.join(format!("{}.json", entry.pid))) {
++                Ok(()) => {}
++                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++                Err(e) => tracing::warn!("ui link: cannot remove the stale file: {e}"),
++            }
++            false
++        })
++        .collect();
+     let mut refused = None;
+     let mut busy = None;
+     let mut open_ones = Vec::new();
+@@ -223,7 +318,9 @@ pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Val
+     let mut reader = BufReader::new(stream);
+     loop {
+         let mut text = String::new();
+-        if reader.read_line(&mut text).map_err(lost)? == 0 {
++        // Bounded (#3874): one answer line never exceeds MAX_ANSWER.
++        let got = reader.by_ref().take(MAX_ANSWER).read_line(&mut text).map_err(lost)?;
++        if got == 0 {
+             return Err(LinkError::Failed(format!(
+                 "the window {} closed the link before it answered",
+                 describe(&entry)
+@@ -262,6 +359,12 @@ pub fn bridge(dir: &Path, select: &Select, input: impl Read + Send + 'static, mu
+             let _ = to_app.shutdown_write();
+         })
+         .map_err(lost)?;
+-    std::io::copy(&mut from_app, &mut output).map_err(lost)?;
++    // Bounded (#3874): a peer that never stops writing ends at MAX_BRIDGE
++    // bytes, it cannot run for ever.
++    let copied = std::io::copy(&mut std::io::Read::by_ref(&mut from_app).take(MAX_BRIDGE), &mut output)
++        .map_err(lost)?;
++    if copied == MAX_BRIDGE {
++        tracing::warn!("ui link bridge: the answer reached the {} byte bound; the copy ended", MAX_BRIDGE);
++    }
+     Ok(())
+ }
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index 235a44e61..fa6a22f76 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -328,11 +328,15 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             let rest = buf.split_off(nl.saturating_add(1));
+             let line = std::mem::replace(&mut buf, rest);
+             if let Some(want) = gate.take() {
++                // A hello that carries a nonce (a client of #3874) gets
++                // the proof of the token back; a plain hello (an older
++                // CLI) gets plain HELLO_OK.
++                let nonce = link::hello_nonce(&line);
+                 if !link::hello_matches(&line, want) {
+                     let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
+                     return Ok(End::Refused);
+                 }
+-                writeln!(writer, "{}", link::HELLO_OK)?;
++                writeln!(writer, "{}", link::hello_ok_line(want, nonce.as_deref()))?;
+                 writer.flush()?;
+                 active = Instant::now();
+                 continue;
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index b74763c8b..f021576db 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -81,8 +81,13 @@ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(3), "{err}");
+     assert!(err.contains("stale"), "{err}");
++    // The dead pid's file is gone: the CLI removed it, so no later run
++    // sees the stale port (never a live window's file, #3874).
++    assert!(link::entries(&dir).is_empty(), "the stale file of a dead pid is removed");
+ 
+-    // A window asked for by a pid that no file names.
++    // A window asked for by a pid that no file names. The stale file is
++    // written again, so the listing names a file that is not pid 123.
++    write_entry(&dir, &stale);
+     let o = cli_ui(&dir, &["--window", "123", "call", "get_job"]);
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(3), "{err}");
+@@ -103,6 +108,66 @@ fn bad_ui_arguments_are_usage_errors() {
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn a_false_window_that_does_not_prove_the_token_gets_no_tool_call() {
++    let dir = fresh_dir("false-window");
++    // A false server on the port of a discovery entry (#3874): it read
++    // the file, so it has the token, but it cannot prove it - it answers
++    // a plain HELLO_OK with no mix of the client's nonce. The CLI must
++    // drop it before one tool-call line reaches it.
++    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
++    let entry = Entry {
++        format: link::FORMAT,
++        // A live pid, so the pid-alive check does not remove the file
++        // first: the pid of a window whose file a false server serves.
++        pid: std::process::id(),
++        transport: "tcp".into(),
++        address: listener.local_addr().expect("local address").to_string(),
++        token: "7".repeat(64),
++        project: None,
++        app_version: "0".into(),
++    };
++    write_entry(&dir, &entry);
++
++    use std::io::{Read, Write};
++    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
++    let server = std::thread::spawn(move || {
++        // One connection: read its first line, answer HELLO_OK without
++        // the proof, then read until the client hangs up.
++        let (mut s, _) = listener.accept().expect("accept");
++        s.set_read_timeout(Some(Duration::from_secs(20))).expect("read timeout");
++        let mut first = Vec::new();
++        let mut chunk = [0_u8; 256];
++        while !first.contains(&b'\n') {
++            let n = s.read(&mut chunk).expect("read the hello");
++            assert!(n > 0, "the client hung up before the hello");
++            first.extend_from_slice(&chunk[..n]);
++        }
++        lines_tx.send(String::from_utf8_lossy(&first).into_owned()).expect("send");
++        s.write_all(format!("{}\n", link::HELLO_OK).as_bytes()).expect("write HELLO_OK");
++        s.flush().expect("flush HELLO_OK");
++        let mut rest = Vec::new();
++        let _ = s.read_to_end(&mut rest);
++        String::from_utf8_lossy(&rest).into_owned()
++    });
++
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(1), "{err}");
++    assert!(err.contains("refused the link token"), "{err}");
++    assert!(err.contains("nothing ran"), "{err}");
++    assert!(o.stdout.is_empty(), "no answer from the false server on stdout");
++
++    let rest = server.join().expect("the false server thread");
++    assert!(!rest.contains("tools/call"), "no tool call after the refusal: {rest}");
++    let first = lines_rx.try_recv().expect("the false server saw one line");
++    assert!(first.contains("camcraft_link"), "{first}");
++    assert!(first.contains("nonce"), "the client sent a nonce: {first}");
++    assert!(!first.contains("tools/call"), "no tool call reached the false server: {first}");
++    assert!(link::entries(&dir).len() == 1, "a live pid's file is not removed");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
+     let dir = fresh_dir("token");
