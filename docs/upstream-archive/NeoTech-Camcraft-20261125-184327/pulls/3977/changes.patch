@@ -1,0 +1,1247 @@
+From 3683ebd6888671a9b632fe93d3905a7cd9ca58b2 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 19:46:31 -0800
+Subject: [PATCH 1/2] perf(sim): section a prismatic Z slab once for a ramped
+ path
+
+A keep-down ramp ends each move at a Z of its own. The verifier sectioned
+the model at each of those planes, probed each region edge of each move
+against the whole section, and gave the reach law the wall samples of each
+plane. On a plate with 38,432 facets one ring took 282 s (release).
+
+- verify/slab.rs: the Z ranges between two vertex levels where each
+  crossing facet is vertical. Each plane of such a slab is the same point
+  set. Rest::island_slice gives those planes one shared section. A plane
+  that the path cuts flat at keeps its own section.
+- reach law (c): a shared slab section is sampled along its walls each
+  0.25 mm, so a ramp reads a wall along its length as it did with one
+  section for each plane.
+- gouge law (b): the distance test comes before the wall probe. The two
+  tests are pure, so no result changes.
+
+The same case takes 1.2 s with the same moves and the same warnings.
+
+Fixes #3831
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/sim/src/verify/mod.rs                 |   4 +
+ crates/sim/src/verify/reach.rs               |  18 +-
+ crates/sim/src/verify/reach_tests.rs         |   3 +-
+ crates/sim/src/verify/rest.rs                |  85 ++++++-
+ crates/sim/src/verify/section.rs             |  33 +--
+ crates/sim/src/verify/section/wall.rs        |  33 +++
+ crates/sim/src/verify/slab.rs                | 232 +++++++++++++++++++
+ crates/sim/src/verify/slab_tests.rs          | 191 +++++++++++++++
+ docs/decisions/3831-verify-keepdown-speed.md |  80 +++++++
+ 9 files changed, 645 insertions(+), 34 deletions(-)
+ create mode 100644 crates/sim/src/verify/section/wall.rs
+ create mode 100644 crates/sim/src/verify/slab.rs
+ create mode 100644 crates/sim/src/verify/slab_tests.rs
+ create mode 100644 docs/decisions/3831-verify-keepdown-speed.md
+
+diff --git a/crates/sim/src/verify/mod.rs b/crates/sim/src/verify/mod.rs
+index 513482dda..12368c9dd 100644
+--- a/crates/sim/src/verify/mod.rs
++++ b/crates/sim/src/verify/mod.rs
+@@ -225,6 +225,10 @@ mod reach_reference;
+ mod reach_tests;
+ mod sample_grid;
+ mod rest;
++// #3831: the prismatic Z slabs a ramped path sections once.
++mod slab;
++#[cfg(test)]
++mod slab_tests;
+ // #3615: the exact Y-slab point-location index over a cached slice.
+ mod slice_index;
+ mod rotary;
+diff --git a/crates/sim/src/verify/reach.rs b/crates/sim/src/verify/reach.rs
+index 007ccf82f..360d5b719 100644
+--- a/crates/sim/src/verify/reach.rs
++++ b/crates/sim/src/verify/reach.rs
+@@ -102,10 +102,24 @@ pub(super) fn band_reach_counted(
+             let mut zs: Vec<u64> = rest.cut().iter().map(|c| c.2.to_bits()).collect();
+             zs.sort_unstable();
+             zs.dedup();
++            // #3831: the planes of one prismatic slab share one section
++            // (`Rest::island_slice`), read once here. Each plane used to
++            // put its own vertices on the slab's walls - a point that
++            // runs the length of every wall as the plane rises - so the
++            // shared section is sampled along its walls instead
++            // (`slab::wall_samples`), never at its corners alone.
++            let mut read: Vec<*const super::slice_index::IndexedSlice> = Vec::new();
+             for k in zs {
+                 stats.slices += 1;
+-                if let Some(s) = rest.islands_at(f, f64::from_bits(k)) {
+-                    samples.extend(boundary_samples(&s));
++                if let Some(s) = rest.island_slice(f, f64::from_bits(k)) {
++                    let id = std::rc::Rc::as_ptr(&s);
++                    if !read.contains(&id) {
++                        read.push(id);
++                        samples.extend(boundary_samples(s.region()));
++                        if rest.stands_for_slab(&s) {
++                            samples.extend(super::slab::wall_samples(s.region()));
++                        }
++                    }
+                 }
+             }
+         }
+diff --git a/crates/sim/src/verify/reach_tests.rs b/crates/sim/src/verify/reach_tests.rs
+index 5a58adaa5..51a01497e 100644
+--- a/crates/sim/src/verify/reach_tests.rs
++++ b/crates/sim/src/verify/reach_tests.rs
+@@ -70,7 +70,8 @@ fn both_on(
+     let mut new = Vec::new();
+     let s_new = band_reach_counted(&path, &cx, &Rest::new(&path, &cx, cx.gouge_tol, &[]), cx.gouge_tol, &mut new);
+     let mut old = Vec::new();
+-    let s_old = band_reach_reference(&path, &cx, &Rest::new(&path, &cx, cx.gouge_tol, &[]), cx.gouge_tol, &mut old);
++    // #3831: the reference reads every plane on its own, as the old scan did.
++    let s_old = band_reach_reference(&path, &cx, &Rest::new(&path, &cx, cx.gouge_tol, &[]).plane_exact(), cx.gouge_tol, &mut old);
+     ((new, s_new), (old, s_old))
+ }
+ 
+diff --git a/crates/sim/src/verify/rest.rs b/crates/sim/src/verify/rest.rs
+index 1e0d05705..07e309f03 100644
+--- a/crates/sim/src/verify/rest.rs
++++ b/crates/sim/src/verify/rest.rs
+@@ -2,11 +2,12 @@
+ 
+ use super::cut_index::CutIndex;
+ use super::laws::dist2_seg;
++use super::slab::Slabs;
+ use super::slice_index::IndexedSlice;
+ use super::types::VerifyContext;
+ 
+-use std::cell::RefCell;
+-use std::collections::HashMap;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::collections::{HashMap, HashSet};
+ use std::rc::Rc;
+ use crate::cl::{MoveKind, Toolpath};
+ use crate::geo2d::{Point2, Region};
+@@ -54,6 +55,24 @@ pub(super) struct Rest<'c, 'a> {
+     /// repeats its planes across all three readers. `None` means the slice
+     /// failed; every use of a failed slice fails closed (no proof, no pass).
+     island_cache: RefCell<HashMap<u64, Option<Rc<IndexedSlice>>>>,
++    /// The model's prismatic Z slabs (#3831, [`Slabs`]), found on the
++    /// first section asked. `None` inside reads every plane on its own -
++    /// the plane-exact reading the tests compare against.
++    slabs: OnceCell<Option<Slabs>>,
++    /// One section per prismatic slab (#3831): every plane of such a
++    /// slab is the same point set, so a ramp that ends each move at a Z
++    /// of its own sections the slab once, not once per move. Only a
++    /// section that sliced is kept: a failed one is asked again at each
++    /// plane, as before. A flat plane's own section is never kept here.
++    slab_cache: RefCell<HashMap<usize, Rc<IndexedSlice>>>,
++    /// The planes the path cuts flat at (a cutting move with one Z), by
++    /// their bits (#3831). Each keeps its own section, so a level ladder
++    /// reads exactly what it always read; only the planes between them -
++    /// the ends of a ramp's or a helix's moves - share the slab's section.
++    flat: HashSet<u64>,
++    /// The model sections sliced so far (#3831), counted always - one
++    /// integer add - and read only by the tests.
++    sliced: Cell<usize>,
+     /// Cutting (non-rapid) XY segments with the level they cut at: a
+     /// segment's whole disc sweep clears its column down to `to.z`
+     /// (plunges are degenerate segments at their XY, arcs contribute
+@@ -100,10 +119,20 @@ impl<'c, 'a> Rest<'c, 'a> {
+             .collect();
+         cut.sort_by(|a, b| a.2.total_cmp(&b.2));
+         let index = CutIndex::new(&cut, cx.tool.radius + 1e-9);
++        let flat = path
++            .moves
++            .iter()
++            .filter(|m| m.kind != MoveKind::Rapid && m.from.z == m.to.z)
++            .map(|m| m.to.z.to_bits())
++            .collect();
+         Self {
+             cx,
+             bodies,
+             island_cache: RefCell::new(HashMap::new()),
++            slabs: OnceCell::new(),
++            slab_cache: RefCell::new(HashMap::new()),
++            flat,
++            sliced: Cell::new(0),
+             cut,
+             index,
+             hidden_cache: RefCell::new(HashMap::new()),
+@@ -145,15 +174,26 @@ impl<'c, 'a> Rest<'c, 'a> {
+ 
+     /// The cached indexed slice at plane `z` (one region, one exact point
+     /// index). `None` is a failed slice, memoized so it fails closed on every
+-    /// later read too.
+-    fn island_slice(&self, facets: &[Triangle], z: f64) -> Option<Rc<IndexedSlice>> {
++    /// later read too. A plane in a prismatic slab of the context's model
++    /// (#3831) that the path does not cut flat at reads the slab's one
++    /// section: the first such plane that sliced stands for them all.
++    pub(super) fn island_slice(&self, facets: &[Triangle], z: f64) -> Option<Rc<IndexedSlice>> {
+         let key = z.to_bits();
+         if let Some(hit) = self.island_cache.borrow().get(&key) {
+             return hit.clone();
+         }
+-        let fresh = crate::geometry::slice::material_above_of(facets, self.bodies, z)
+-            .ok()
+-            .map(|r| Rc::new(IndexedSlice::new(r)));
++        let slab = self.slab_of(facets, z).filter(|_| !self.flat.contains(&key));
++        let shared = slab.and_then(|k| self.slab_cache.borrow().get(&k).cloned());
++        let fresh = shared.or_else(|| {
++            self.sliced.set(self.sliced.get().saturating_add(1));
++            let s = crate::geometry::slice::material_above_of(facets, self.bodies, z)
++                .ok()
++                .map(|r| Rc::new(IndexedSlice::new(r)))?;
++            if let Some(k) = slab {
++                self.slab_cache.borrow_mut().entry(k).or_insert_with(|| s.clone());
++            }
++            Some(s)
++        });
+         self.island_cache
+             .borrow_mut()
+             .entry(key)
+@@ -161,6 +201,37 @@ impl<'c, 'a> Rest<'c, 'a> {
+         fresh
+     }
+ 
++    /// The prismatic slab of the context's model that holds plane `z`
++    /// (#3831). Only `cx.model` itself is placed: any other facet slice
++    /// is sectioned plane by plane.
++    fn slab_of(&self, facets: &[Triangle], z: f64) -> Option<usize> {
++        let model = self.cx.model?;
++        if !std::ptr::eq(model, facets) {
++            return None;
++        }
++        self.slabs.get_or_init(|| Some(Slabs::new(model))).as_ref()?.of(z)
++    }
++
++    /// Whether `s` is the one section of a prismatic slab (#3831): it
++    /// stands for every plane between the slab's flat ones, so the reach
++    /// law reads its walls along their length ([`super::slab::wall_samples`]).
++    pub(super) fn stands_for_slab(&self, s: &Rc<IndexedSlice>) -> bool {
++        self.slab_cache.borrow().values().any(|v| Rc::ptr_eq(v, s))
++    }
++
++    /// How many model sections were sliced (#3831); the tests read it.
++    #[cfg(test)]
++    pub(super) fn sliced(&self) -> usize {
++        self.sliced.get()
++    }
++
++    /// This rest with every plane sectioned on its own, as before #3831:
++    /// the reference the tests compare the slab reading against.
++    #[cfg(test)]
++    pub(super) fn plane_exact(self) -> Self {
++        Self { slabs: OnceCell::from(None), ..self }
++    }
++
+     /// The model's section strictly above plane `z` (cached).
+     pub(super) fn islands_at(&self, facets: &[Triangle], z: f64) -> Option<Region> {
+         self.island_slice(facets, z).map(|s| s.region().clone())
+diff --git a/crates/sim/src/verify/section.rs b/crates/sim/src/verify/section.rs
+index 4eb1cd98b..399849d90 100644
+--- a/crates/sim/src/verify/section.rs
++++ b/crates/sim/src/verify/section.rs
+@@ -9,6 +9,9 @@ use crate::cl::{Move, MoveKind, Toolpath};
+ use crate::geo2d::{Loop, Point2};
+ 
+ mod radius;
++pub(super) mod wall;
++
++use wall::edge_is_wall;
+ 
+ /// Sample spacing of the solid law (b2) along each move, mm - the
+ /// operation layer's containment step.
+@@ -127,9 +130,10 @@ pub(super) fn tangency(
+             let floor = floor_of(l);
+             chords.iter().any(|&(a, b)| dist2_segs(a, b, p, q) < floor * floor)
+         };
++        // #3831: the cheap distance test first; both are pure, so no verdict moves.
+         let region_gouged = edges(cx.region).any(|e| {
+-            (!boundary_with_model || section.as_ref().is_some_and(|s| edge_is_wall(e.0, e.1, s)))
+-                && near_chords(e)
++            near_chords(e)
++                && (!boundary_with_model || section.as_ref().is_some_and(|s| edge_is_wall(e.0, e.1, s)))
+         });
+         let section_gouged = !on_relief && section.as_ref().is_some_and(|s| edges(s).any(near_chords));
+         let gouged = region_gouged || section_gouged;
+@@ -146,26 +150,6 @@ pub(super) fn tangency(
+     }
+ }
+ 
+-/// How far off a region edge's midpoint the wall probe stands, mm: well
+-/// past float dust on a section that shares the edge, well inside any
+-/// feature the tolerance could care about.
+-const WALL_PROBE: f64 = 0.05;
+-
+-/// Whether region edge `p`-`q` is a wall in `section` (#43, #2657):
+-/// part material stands [`WALL_PROBE`] off its midpoint on either side.
+-/// An open rim over air has no material beside it and returns `false`.
+-fn edge_is_wall(p: Point2, q: Point2, section: &crate::geo2d::Region) -> bool {
+-    let (dx, dy) = (q.x - p.x, q.y - p.y);
+-    let len = dx.hypot(dy);
+-    if len <= f64::EPSILON {
+-        return false;
+-    }
+-    let (nx, ny) = (-dy / len * WALL_PROBE, dx / len * WALL_PROBE);
+-    let (mx, my) = (0.5 * (p.x + q.x), 0.5 * (p.y + q.y));
+-    section.contains(Point2::new(mx + nx, my + ny))
+-        || section.contains(Point2::new(mx - nx, my - ny))
+-}
+-
+ /// The Boundary-mode whole-move reading (issue #43): a straight move, an
+ /// XY arc on its true circle (#905, [`super::arc_wall`]), or an XZ / YZ
+ /// arc on its true XY footprint (#946, [`super::arc_wall_plane`]), measured
+@@ -177,7 +161,7 @@ fn edge_is_wall(p: Point2, q: Point2, section: &crate::geo2d::Region) -> bool {
+ /// - every edge of the model section is a wall (part material on its
+ ///   one side, by construction);
+ /// - with a model, a region edge is a wall when the section holds a
+-///   probe [`WALL_PROBE`] off its midpoint on either side - a Face's
++///   probe `WALL_PROBE` off its midpoint on either side - a Face's
+ ///   rim over air (or stock) is open, a Contour's outline at a level
+ ///   the part still stands is a wall;
+ /// - without a model there is no material to probe: a move that
+@@ -196,7 +180,8 @@ fn wall_gouge(
+         return true;
+     }
+     if has_model {
+-        edges(region).any(|e| section.is_some_and(|s| edge_is_wall(e.0, e.1, s)) && near(e))
++        // #3831: the cheap distance test first; both are pure.
++        edges(region).any(|e| near(e) && section.is_some_and(|s| edge_is_wall(e.0, e.1, s)))
+     } else {
+         !crosses_rim(trace, region) && edges(region).any(near)
+     }
+diff --git a/crates/sim/src/verify/section/wall.rs b/crates/sim/src/verify/section/wall.rs
+new file mode 100644
+index 000000000..d7a718205
+--- /dev/null
++++ b/crates/sim/src/verify/section/wall.rs
+@@ -0,0 +1,33 @@
++//! The wall probe of law (b): whether a region edge has part material beside it in the model section - our own probe (issues #43, #2657), split from `section.rs` by #3831; structure only.
++
++use crate::geo2d::{Point2, Region};
++
++/// How far off a region edge's midpoint the wall probe stands, mm: well
++/// past float dust on a section that shares the edge, well inside any
++/// feature the tolerance could care about.
++const WALL_PROBE: f64 = 0.05;
++
++#[cfg(test)]
++thread_local! {
++    /// The probes asked on this thread (#3831); the tests read it.
++    pub(in crate::verify) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
++/// Whether region edge `p`-`q` is a wall in `section` (#43, #2657):
++/// part material stands [`WALL_PROBE`] off its midpoint on either side.
++/// An open rim over air has no material beside it and returns `false`.
++/// It walks the whole section twice: law (b) asks it only for an edge
++/// the move stands near (#3831).
++pub(super) fn edge_is_wall(p: Point2, q: Point2, section: &Region) -> bool {
++    #[cfg(test)]
++    PROBES.with(|c| c.set(c.get() + 1));
++    let (dx, dy) = (q.x - p.x, q.y - p.y);
++    let len = dx.hypot(dy);
++    if len <= f64::EPSILON {
++        return false;
++    }
++    let (nx, ny) = (-dy / len * WALL_PROBE, dx / len * WALL_PROBE);
++    let (mx, my) = (0.5 * (p.x + q.x), 0.5 * (p.y + q.y));
++    section.contains(Point2::new(mx + nx, my + ny))
++        || section.contains(Point2::new(mx - nx, my - ny))
++}
+diff --git a/crates/sim/src/verify/slab.rs b/crates/sim/src/verify/slab.rs
+new file mode 100644
+index 000000000..e7807d467
+--- /dev/null
++++ b/crates/sim/src/verify/slab.rs
+@@ -0,0 +1,232 @@
++//! The prismatic Z slabs of a mesh (#3831): the Z ranges between two neighbouring vertex levels where every facet that crosses is vertical, so the plane section is one point set at every height - the extrusion (prism) property of solid geometry textbooks, on our own mesh model; no vendor source.
++//!
++//! The verifier sections the model at each move's plane. A ramp ends
++//! every move at a Z of its own, so a ramped path asked for one section
++//! per move - each a walk over every facet - although a plate with
++//! through holes has ONE section from its bottom to its top. [`Slabs`]
++//! says when two planes must give the same section, so the rest model
++//! ([`super::rest::Rest`]) sections such a slab once.
++//!
++//! The claim is exact, not a tolerance:
++//! - no vertex stands strictly inside a slab, so the facets a plane
++//!   crosses are the same at every height of it;
++//! - a slab is prismatic only when each of those facets has two vertices
++//!   on one vertical line (bit-equal XY) - it lies in a vertical plane;
++//! - a solid bounded only by vertical faces between two heights is the
++//!   same in every plane between them.
++//!
++//! Anything else - a sloped or curved face in the slab, a plane too
++//! near a vertex level, an unreadable mesh - is not placed, and the
++//! caller sections that plane itself, as it always did.
++
++use crate::geo2d::{Point2, Region};
++use crate::geometry::Triangle;
++
++/// Spacing of [`wall_samples`] along a wall, mm - the solid law's own
++/// sample step (`section::SOLID_STEP`).
++const WALL_STEP: f64 = 0.25;
++/// Most wall samples one section keeps; past it the spacing widens.
++const MAX_WALL_SAMPLES: usize = 50_000;
++/// The nudge of `laws::boundary_samples`, mm: the same side, the same
++/// distance.
++const NUDGE: f64 = 0.05;
++
++/// How far above the asked plane the slicer may probe, mm
++/// (`slice::material_above` tries three planes a millionth apart), with
++/// one probe of margin: a plane is placed only when every probe stays
++/// in its slab.
++const PROBE_REACH: f64 = 4.0e-6;
++
++#[derive(Debug, Default)]
++pub(super) struct Slabs {
++    /// The distinct vertex levels, ascending. Slab `k` is
++    /// `zs[k] ..= zs[k + 1]`.
++    zs: Vec<f64>,
++    /// Whether slab `k` is prismatic.
++    prismatic: Vec<bool>,
++}
++
++impl Slabs {
++    /// The slabs of `facets`. A mesh with a non-finite vertex has none:
++    /// every plane is sectioned on its own and fails closed there.
++    pub(super) fn new(facets: &[Triangle]) -> Self {
++        let mut zs: Vec<f64> = Vec::with_capacity(facets.len() * 3);
++        for t in facets {
++            for p in [t.a, t.b, t.c] {
++                if !p.is_finite() {
++                    return Self::default();
++                }
++                zs.push(p.z);
++            }
++        }
++        zs.sort_by(f64::total_cmp);
++        zs.dedup();
++        let n = zs.len().saturating_sub(1);
++        // A difference array over the slabs: +1 where a facet that is
++        // not vertical starts to cross, -1 where it stops.
++        let mut delta = vec![0i64; n + 1];
++        for t in facets {
++            let (lo, hi) = (t.a.z.min(t.b.z).min(t.c.z), t.a.z.max(t.b.z).max(t.c.z));
++            if lo >= hi || vertical(t) {
++                continue; // a flat facet crosses no slab
++            }
++            // Both levels are in `zs`: the facet crosses slabs k0..k1.
++            let k0 = zs.partition_point(|v| *v < lo);
++            let k1 = zs.partition_point(|v| *v < hi);
++            if let Some(d) = delta.get_mut(k0) {
++                *d += 1;
++            }
++            if let Some(d) = delta.get_mut(k1) {
++                *d -= 1;
++            }
++        }
++        let mut open = 0i64;
++        let prismatic: Vec<bool> = delta
++            .iter()
++            .take(n)
++            .map(|d| {
++                open += d;
++                open == 0
++            })
++            .collect();
++        Self { zs, prismatic }
++    }
++
++    /// The prismatic slab that holds plane `z` and every plane the
++    /// slicer may probe above it; `None` when there is none.
++    pub(super) fn of(&self, z: f64) -> Option<usize> {
++        if !z.is_finite() {
++            return None;
++        }
++        // zs[k] <= z < zs[k + 1]
++        let k = self.zs.partition_point(|v| *v <= z).checked_sub(1)?;
++        let top = *self.zs.get(k + 1)?;
++        (z + PROBE_REACH <= top && self.prismatic.get(k).copied().unwrap_or(false)).then_some(k)
++    }
++}
++
++/// XY samples along every wall of a slab's section, [`WALL_STEP`]
++/// apart at most, each nudged toward its loop's vertex mean as
++/// `laws::boundary_samples` nudges - which still gives the corners and
++/// the edge midpoints; these are the points between them.
++///
++/// Why: the planes of a prismatic slab were sectioned one by one, and
++/// each put a vertex where the plane met the diagonal of a wall's two
++/// facets - a point that runs from one end of the wall to the other as
++/// the plane rises. Law (c) reads no sample's plane, so a ramp read
++/// its walls at as many points as it had planes. One section for the
++/// slab keeps that reading by sampling the walls themselves.
++pub(super) fn wall_samples(region: &Region) -> Vec<Point2> {
++    let len_of = |a: Point2, b: Point2| (b.x - a.x).hypot(b.y - a.y);
++    let total: f64 = region
++        .loops()
++        .iter()
++        .map(|l| {
++            let p = l.points();
++            (0..p.len()).map(|k| len_of(p[k], p[(k + 1) % p.len()])).sum::<f64>()
++        })
++        .sum();
++    if !total.is_finite() {
++        return Vec::new(); // the corners and midpoints still stand
++    }
++    let step = if total / WALL_STEP > MAX_WALL_SAMPLES as f64 { total / MAX_WALL_SAMPLES as f64 } else { WALL_STEP };
++    let mut out = Vec::new();
++    for l in region.loops() {
++        let pts = l.points();
++        if pts.is_empty() {
++            continue;
++        }
++        let (mx, my) = pts.iter().fold((0.0, 0.0), |s, q| (s.0 + q.x, s.1 + q.y));
++        let (mx, my) = (mx / pts.len() as f64, my / pts.len() as f64);
++        for k in 0..pts.len() {
++            let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
++            let n = ((len_of(a, b) / step).ceil() as usize).clamp(1, MAX_WALL_SAMPLES);
++            for i in 1..n {
++                let t = i as f64 / n as f64;
++                let q = Point2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
++                let (dx, dy) = (mx - q.x, my - q.y);
++                let d = (dx * dx + dy * dy).sqrt();
++                out.push(if d > f64::EPSILON { Point2::new(q.x + NUDGE * dx / d, q.y + NUDGE * dy / d) } else { q });
++            }
++        }
++    }
++    out
++}
++
++/// Whether `t` lies in a vertical plane by its own vertices: two of
++/// them share their XY bit for bit. No arithmetic, so no rounding can
++/// call a sloped facet vertical.
++fn vertical(t: &Triangle) -> bool {
++    let same = |p: crate::geometry::Point3, q: crate::geometry::Point3| p.x == q.x && p.y == q.y;
++    same(t.a, t.b) || same(t.b, t.c) || same(t.c, t.a)
++}
++
++#[cfg(test)]
++mod tests {
++    // Provenance: our own analytic fixtures (a cube, a cube under a
++    // pyramid roof) for issue #3831.
++    use super::*;
++    use crate::geometry::{Point3, cube};
++
++    fn block() -> Vec<Triangle> {
++        cube(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 10.0, 10.0)).facets.to_vec()
++    }
++
++    /// The block with a four-sided roof from Z 10 up to an apex at Z 15.
++    fn roofed() -> Vec<Triangle> {
++        let mut f = block();
++        let apex = Point3::new(5.0, 5.0, 15.0);
++        let c = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
++        for k in 0..4 {
++            let (a, b) = (c[k], c[(k + 1) % 4]);
++            f.push(Triangle::new(Point3::new(a.0, a.1, 10.0), Point3::new(b.0, b.1, 10.0), apex));
++        }
++        f
++    }
++
++    #[test]
++    fn a_prism_is_one_slab_from_bottom_to_top() {
++        let s = Slabs::new(&block());
++        assert_eq!(s.of(0.0), Some(0), "the bottom plane itself: the slicer probes above it");
++        assert_eq!(s.of(2.5), Some(0));
++        assert_eq!(s.of(9.99), Some(0));
++    }
++
++    #[test]
++    fn planes_outside_the_mesh_or_near_a_vertex_level_are_not_placed() {
++        let s = Slabs::new(&block());
++        assert_eq!(s.of(-0.001), None, "below the lowest vertex");
++        assert_eq!(s.of(10.0), None, "at the top: nothing above");
++        assert_eq!(s.of(10.0 - 1.0e-6), None, "a probe could pass the top level");
++        assert_eq!(s.of(f64::NAN), None);
++        assert_eq!(s.of(f64::INFINITY), None);
++    }
++
++    #[test]
++    fn a_slab_with_a_sloped_facet_is_not_prismatic() {
++        let s = Slabs::new(&roofed());
++        assert_eq!(s.of(5.0), Some(0), "the walls under the roof are a prism");
++        assert_eq!(s.of(12.0), None, "the roof section shrinks with height");
++    }
++
++    #[test]
++    fn a_sloped_facet_that_spans_several_levels_closes_each_of_them() {
++        // A tall sloped facet beside the block: it crosses Z 0..10 and
++        // adds no vertex level between them.
++        let mut f = block();
++        f.push(Triangle::new(Point3::new(20.0, 0.0, 0.0), Point3::new(21.0, 0.0, 0.0), Point3::new(22.0, 1.0, 10.0)));
++        assert_eq!(Slabs::new(&f).of(5.0), None);
++        // A vertical one changes nothing.
++        let mut f = block();
++        f.push(Triangle::new(Point3::new(20.0, 0.0, 0.0), Point3::new(21.0, 0.0, 0.0), Point3::new(21.0, 0.0, 10.0)));
++        assert_eq!(Slabs::new(&f).of(5.0), Some(0));
++    }
++
++    #[test]
++    fn an_unreadable_or_empty_mesh_has_no_slab() {
++        let mut f = block();
++        f[0].a.z = f64::NAN;
++        assert_eq!(Slabs::new(&f).of(5.0), None);
++        assert_eq!(Slabs::new(&[]).of(5.0), None);
++    }
++}
+diff --git a/crates/sim/src/verify/slab_tests.rs b/crates/sim/src/verify/slab_tests.rs
+new file mode 100644
+index 000000000..bbaca4117
+--- /dev/null
++++ b/crates/sim/src/verify/slab_tests.rs
+@@ -0,0 +1,191 @@
++//! #3831: a ramped path through a prismatic slab sections the model once, and the gouge law asks the wall probe only for the edges a move stands near - our own analytic fixtures.
++//!
++//! Gate map (#3831): covers camcraft_sim::verify (slab, rest, section, reach).
++
++use super::reach::band_reach_counted;
++use super::rest::Rest;
++use super::section;
++use super::types::{Mode, ToolGeom, VerifyContext, Warning};
++use crate::cl::{Move, MoveKind, Toolpath};
++use crate::geo2d::{Loop, Point2, Region};
++use crate::geometry::{Point3, Triangle, cube};
++
++fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
++    let pts = vec![Point2::new(x0, y0), Point2::new(x1, y0), Point2::new(x1, y1), Point2::new(x0, y1)];
++    match Loop::new(pts).and_then(|l| Region::new(vec![l])) {
++        Ok(r) => r,
++        Err(e) => panic!("region: {e:?}"),
++    }
++}
++
++/// A 6 mm cutter, a 10 mm shank 5 mm over the tip, a 30 mm holder.
++fn tool() -> ToolGeom {
++    ToolGeom { radius: 3.0, nose_radius: 0.0, flute_len: 5.0, shank_radius: 5.0, shank_len: 20.0, holder_radius: 15.0, holder_len: 30.0 }
++}
++
++/// A 20 mm boss (Z 0..10) on a 2 mm floor plate, in a 100 mm pocket.
++fn boss() -> Vec<Triangle> {
++    let mut f = cube(Point3::new(0.0, 0.0, -2.0), Point3::new(100.0, 100.0, 0.0)).facets.to_vec();
++    f.extend(cube(Point3::new(40.0, 40.0, 0.0), Point3::new(60.0, 60.0, 10.0)).facets.iter().cloned());
++    f
++}
++
++fn feed(a: (f64, f64, f64), b: (f64, f64, f64)) -> Move {
++    Move::new(MoveKind::Feed, Point3::new(a.0, a.1, a.2), Point3::new(b.0, b.1, b.2), Some(500.0))
++}
++
++/// A ramp of `n` moves along Y `y`, X 10 to 90, Z 9 down to Z 1: every
++/// move ends at a Z of its own, all inside the boss's one slab.
++fn ramp(n: usize, y: f64) -> Vec<Move> {
++    let (dz, dx) = (8.0 / n as f64, 80.0 / n as f64);
++    (0..n)
++        .map(|k| {
++            let (a, b) = (k as f64, (k + 1) as f64);
++            feed((10.0 + a * dx, y, 9.0 - a * dz), (10.0 + b * dx, y, 9.0 - b * dz))
++        })
++        .collect()
++}
++
++/// Laws (b) and (c) on `moves`: the findings and the sections sliced,
++/// with the slab reading and with every plane on its own.
++fn both(model: &[Triangle], moves: Vec<Move>, mode: Mode) -> ((Vec<Warning>, usize), (Vec<Warning>, usize)) {
++    let (region, tool) = (square(0.0, 0.0, 100.0, 100.0), tool());
++    let cx = VerifyContext {
++        region: &region,
++        stock: Some(&region),
++        model: Some(model),
++        tool: &tool,
++        mode,
++        stock_top_z: 10.0,
++        clearance_z: 30.0,
++        gouge_tol: 0.01,
++        z_tol: 1e-6,
++        ..Default::default()
++    };
++    let path = Toolpath { moves, ..Toolpath::default() };
++    let run = |rest: Rest| {
++        let mut w = Vec::new();
++        section::tangency(&path, &cx, &rest, 0.0, cx.gouge_tol, &mut w);
++        band_reach_counted(&path, &cx, &rest, cx.gouge_tol, &mut w);
++        (w, rest.sliced())
++    };
++    let slab = run(Rest::new(&path, &cx, cx.gouge_tol, &[]));
++    let plane = run(Rest::new(&path, &cx, cx.gouge_tol, &[]).plane_exact());
++    (slab, plane)
++}
++
++/// A stepped boss on the floor plate: a wide block (Z 0..5) under a
++/// narrow one (Z 5..10) - two slabs with two different sections.
++fn stepped() -> Vec<Triangle> {
++    let mut f = cube(Point3::new(0.0, 0.0, -2.0), Point3::new(100.0, 100.0, 0.0)).facets.to_vec();
++    f.extend(cube(Point3::new(40.0, 40.0, 0.0), Point3::new(60.0, 60.0, 5.0)).facets.iter().cloned());
++    f.extend(cube(Point3::new(45.0, 45.0, 5.0), Point3::new(55.0, 55.0, 10.0)).facets.iter().cloned());
++    f
++}
++
++/// The floor plate under a four-sided pyramid (Z 0 to an apex at Z 10):
++/// its section shrinks with every plane.
++fn pyramid() -> Vec<Triangle> {
++    let mut f = cube(Point3::new(0.0, 0.0, -2.0), Point3::new(100.0, 100.0, 0.0)).facets.to_vec();
++    let apex = Point3::new(50.0, 50.0, 10.0);
++    let c = [(40.0, 40.0), (60.0, 40.0), (60.0, 60.0), (40.0, 60.0)];
++    for k in 0..4 {
++        let (a, b) = (c[k], c[(k + 1) % 4]);
++        f.push(Triangle::new(Point3::new(a.0, a.1, 0.0), Point3::new(b.0, b.1, 0.0), apex));
++    }
++    f
++}
++
++fn shank_hits(w: &[Warning]) -> usize {
++    w.iter().filter(|w| matches!(w, Warning::ShankHit { .. })).count()
++}
++
++#[test]
++fn a_ramp_in_a_prismatic_slab_sections_the_model_once() {
++    // Clear of the boss (Y 34), the shank 1 mm into its wall (Y 36), and
++    // the cutter's rim 1.5 mm into it (Y 38.5).
++    for (n, y, hits) in [(500usize, 34.0, false), (500, 36.0, true), (2000, 36.0, true), (500, 38.5, true)] {
++        for mode in [Mode::Area, Mode::Boundary] {
++            let ((slab, sliced), (plane, by_plane)) = both(&boss(), ramp(n, y), mode);
++            assert_eq!(by_plane, n, "n {n} y {y} {mode:?}: one section for each plane, as before");
++            assert_eq!(sliced, 1, "n {n} y {y} {mode:?}: one section for the slab");
++            assert_eq!(slab, plane, "n {n} y {y} {mode:?}: the findings and their order must not move");
++            assert_eq!(shank_hits(&slab) > 0, hits, "n {n} y {y} {mode:?}: {slab:?}");
++        }
++    }
++}
++
++#[test]
++fn a_level_ladder_keeps_the_section_of_each_flat_plane() {
++    // Four rings round the boss, 1 mm off its walls, four moves a side
++    // (the law reads a straight move at its end): the shank is in it.
++    let (lo, hi) = (36.0, 64.0);
++    let corners = [(lo, lo), (hi, lo), (hi, hi), (lo, hi), (lo, lo)];
++    let mut moves = Vec::new();
++    for z in [8.0, 6.0, 4.0, 2.0] {
++        for w in corners.windows(2) {
++            let (a, b) = (w[0], w[1]);
++            for k in 0..4 {
++                let at = |t: f64| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, z);
++                moves.push(feed(at(f64::from(k) / 4.0), at(f64::from(k + 1) / 4.0)));
++            }
++        }
++    }
++    let ((slab, sliced), (plane, by_plane)) = both(&boss(), moves, Mode::Area);
++    assert_eq!((sliced, by_plane), (4, 4), "a flat plane is never read through its slab");
++    assert_eq!(slab, plane);
++    assert!(shank_hits(&slab) > 0, "{slab:?}");
++}
++
++#[test]
++fn each_slab_of_a_stepped_part_keeps_its_own_section() {
++    // The ramp at Y 49 puts the shank on the narrow upper block's wall
++    // and clear of the wide lower block's: only the upper slab convicts.
++    let ((slab, sliced), (plane, by_plane)) = both(&stepped(), ramp(500, 49.0), Mode::Area);
++    assert_eq!(by_plane, 500);
++    assert_eq!(sliced, 2, "the slab over Z 5 and the slab under it");
++    assert_eq!(slab, plane, "the findings and their order must not move");
++    assert!(slab.iter().any(|w| matches!(w, Warning::ShankHit { part: true, .. })), "{slab:?}");
++}
++
++#[test]
++fn a_sloped_part_is_still_sectioned_at_every_plane() {
++    let ((slab, sliced), (plane, by_plane)) = both(&pyramid(), ramp(200, 36.0), Mode::Area);
++    assert_eq!((sliced, by_plane), (200, 200), "no slab of a pyramid is a prism");
++    assert_eq!(slab, plane);
++}
++
++#[test]
++fn the_gouge_law_probes_a_wall_only_where_a_move_stands_near_it() {
++    use super::section::wall::PROBES;
++    let (region, tool) = (square(0.0, 0.0, 100.0, 100.0), tool());
++    let model = boss();
++    let cx = VerifyContext {
++        region: &region,
++        model: Some(&model),
++        tool: &tool,
++        mode: Mode::Boundary,
++        stock_top_z: 10.0,
++        clearance_z: 30.0,
++        gouge_tol: 0.01,
++        z_tol: 1e-6,
++        ..Default::default()
++    };
++    let run = |moves: Vec<Move>| {
++        let path = Toolpath { moves, ..Toolpath::default() };
++        let mut w = Vec::new();
++        PROBES.with(|c| c.set(0));
++        section::tangency(&path, &cx, &Rest::new(&path, &cx, cx.gouge_tol, &[]), 0.0, cx.gouge_tol, &mut w);
++        (w, PROBES.with(std::cell::Cell::get))
++    };
++    // 500 moves, each 34 mm or more from the region's four edges: the
++    // old order asked the probe for every edge of every move, twice.
++    let (clear, probes) = run(ramp(500, 34.0));
++    assert_eq!(clear, Vec::new());
++    assert_eq!(probes, 0, "no edge is near, so no probe is asked");
++    // A move that ends 1 mm from the region's X 0 edge still asks it,
++    // and the edge is no wall there (the plate is under the plane).
++    let (near, probes) = run(vec![feed((10.0, 20.0, 5.0), (1.0, 20.0, 5.0))]);
++    assert!(probes > 0, "the near edge is probed");
++    assert_eq!(near, Vec::new(), "an open rim over air is no wall");
++}
+diff --git a/docs/decisions/3831-verify-keepdown-speed.md b/docs/decisions/3831-verify-keepdown-speed.md
+new file mode 100644
+index 000000000..40f21707e
+--- /dev/null
++++ b/docs/decisions/3831-verify-keepdown-speed.md
+@@ -0,0 +1,80 @@
++## #3831 - One model section for each prismatic Z slab of a ramped path
++
++**What was decided.** The verifier sections the model one time for each
++prismatic Z slab, not one time for each plane that a ramp move ends at.
++A prismatic slab is the Z range between two neighbouring vertex levels in
++which each facet that a plane crosses is vertical (two of its vertices have
++bit-equal XY). Three changes go together:
++
++1. `Rest::island_slice` gives the planes of a prismatic slab one shared
++   section (`verify/slab.rs`). A plane that the path cuts flat at keeps
++   its own section. A plane outside a prismatic slab keeps its own section.
++2. The reach law (c) samples a shared slab section along its walls each
++   0.25 mm (`slab::wall_samples`), in addition to the corners and the edge
++   midpoints.
++3. The gouge law (b) asks the cheap distance test before the wall probe
++   (`edge_is_wall`). The two tests are pure, so the order changes no result.
++
++**Why.** A keep-down ramp ends each move at a Z of its own. The measured
++cost (release build, 38,432 facets, 16 holes, one ring, 2,422 moves) was
++282 s. It had three parts:
++
++- 2,406 model sections, each a walk over all facets (43 s).
++- A wall probe for each region edge of each move, each a walk over the
++  section (40 s). This part grows with the rings times the moves.
++- 61.5 million reach samples (about 1 GB), because each plane added its
++  own samples of the same walls (198 s).
++
++After the change the same case takes 1.2 s, with the same 2,422 moves and
++the same 326 warnings. Four rings take 5.1 s.
++
++**Why the section is exact.** No vertex is strictly inside a slab, so each
++plane of the slab crosses the same facets. If all those facets are
++vertical, the solid between the two levels is a prism. Each plane of a
++prism is the same point set. The test for "vertical" uses no arithmetic,
++so rounding cannot call a sloped facet vertical. A plane nearer than
++4e-6 mm to the top level of its slab is not placed, because the slicer
++probes up to 3e-6 mm above the plane. A shared section that fails to slice
++is not kept: each plane then asks for its own section, as before.
++
++**Why the wall samples.** This part is a decision, not a proof. Before the
++change, each plane put a vertex where the plane met the diagonal of the two
++facets of a wall. That vertex moves from one end of the wall to the other
++as the plane rises. Law (c) reads no sample's plane, so a ramp with 500
++planes read each wall at about 500 points. One section alone has only the
++corners, the diagonal point and the midpoints. On the test fixture
++(a ramp 1 mm into a boss wall) that gave 61 `ShankHit` findings where the
++old reading gave 80. Samples each 0.25 mm along the walls give the same 80
++findings, in the same order, on each fixture that I compared (500 and
++2,000 moves, three offsets, two modes, a stepped part). 0.25 mm is the
++sample step that the solid law already uses.
++
++The new reading is not bit-identical to the old reading for a ramped path:
++the sample positions are different. It can convict a move that the old
++reading missed between two of its samples. I found no case where it
++convicts fewer moves, but the tests are fixtures, not a proof.
++
++**What does not change.** A path that only cuts flat (a level ladder)
++reads the same sections and the same samples as before, bit for bit. A
++model with a sloped or curved wall in the slab is sectioned at each plane
++as before. The moves and the posted program do not change: the verifier
++only reads the path.
++
++**Considered and dropped.**
++
++- Only exact changes (the probe order, a memo of the column surface). They
++  give about 3 times, not 200 times, and the 1 GB sample set stays.
++- One section for each slab with the old corner and midpoint samples only.
++  It lost 19 of 80 findings on the fixture. A collision law must not get
++  weaker for speed.
++- One section for each slab for flat planes also. It would change the
++  samples of each level ladder in each existing project. The flat planes
++  are few, so the cost of their own sections is small.
++- A lower move count for the keep-down ramp (the other option in the
++  issue). That changes posted G-code and is a different decision.
++- A time limit in a test. The pins count sections and wall probes, which
++  do not depend on the machine.
++
++**Cost to change later.** Small. `Slabs::of` is the one gate: if it
++returns `None`, each plane is sectioned on its own again. The test helper
++`Rest::plane_exact` keeps that old reading available as a reference.
+
+From d8700760c03683818adf67cd50fabb5a8c2b3cd9 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Tue, 24 Nov 2026 22:12:41 -0800
+Subject: [PATCH 2/2] fix(sim): preserve plane-exact collision samples in
+ shared slabs
+
+Keep exact reach samples for every cut plane. Pin stock-only contacts, small bands, and large perimeters through the full verifier.
+
+Fixes #3831
+---
+ crates/sim/src/verify/reach.rs               |  24 ++--
+ crates/sim/src/verify/rest.rs                |  19 ++-
+ crates/sim/src/verify/slab.rs                |  58 ---------
+ crates/sim/src/verify/slab_tests.rs          |  51 +++++++-
+ docs/decisions/3831-verify-keepdown-speed.md | 122 +++++++++----------
+ 5 files changed, 126 insertions(+), 148 deletions(-)
+
+diff --git a/crates/sim/src/verify/reach.rs b/crates/sim/src/verify/reach.rs
+index 360d5b719..0e9bee867 100644
+--- a/crates/sim/src/verify/reach.rs
++++ b/crates/sim/src/verify/reach.rs
+@@ -102,24 +102,16 @@ pub(super) fn band_reach_counted(
+             let mut zs: Vec<u64> = rest.cut().iter().map(|c| c.2.to_bits()).collect();
+             zs.sort_unstable();
+             zs.dedup();
+-            // #3831: the planes of one prismatic slab share one section
+-            // (`Rest::island_slice`), read once here. Each plane used to
+-            // put its own vertices on the slab's walls - a point that
+-            // runs the length of every wall as the plane rises - so the
+-            // shared section is sampled along its walls instead
+-            // (`slab::wall_samples`), never at its corners alone.
+-            let mut read: Vec<*const super::slice_index::IndexedSlice> = Vec::new();
++            // #3831: geometric slab sections may share their point set,
++            // but their vertices and vertex means depend on the plane.
++            // Neither spaced wall samples nor a band-width threshold
++            // proves coverage of their nudged boundary samples. Keep
++            // every plane's original samples, including narrow annuli
++            // and near-tangent contacts with uncut stock.
+             for k in zs {
+                 stats.slices += 1;
+-                if let Some(s) = rest.island_slice(f, f64::from_bits(k)) {
+-                    let id = std::rc::Rc::as_ptr(&s);
+-                    if !read.contains(&id) {
+-                        read.push(id);
+-                        samples.extend(boundary_samples(s.region()));
+-                        if rest.stands_for_slab(&s) {
+-                            samples.extend(super::slab::wall_samples(s.region()));
+-                        }
+-                    }
++                if let Some(s) = rest.reach_slice(f, f64::from_bits(k)) {
++                    samples.extend(boundary_samples(s.region()));
+                 }
+             }
+         }
+diff --git a/crates/sim/src/verify/rest.rs b/crates/sim/src/verify/rest.rs
+index 07e309f03..951be24de 100644
+--- a/crates/sim/src/verify/rest.rs
++++ b/crates/sim/src/verify/rest.rs
+@@ -212,11 +212,20 @@ impl<'c, 'a> Rest<'c, 'a> {
+         self.slabs.get_or_init(|| Some(Slabs::new(model))).as_ref()?.of(z)
+     }
+ 
+-    /// Whether `s` is the one section of a prismatic slab (#3831): it
+-    /// stands for every plane between the slab's flat ones, so the reach
+-    /// law reads its walls along their length ([`super::slab::wall_samples`]).
+-    pub(super) fn stands_for_slab(&self, s: &Rc<IndexedSlice>) -> bool {
+-        self.slab_cache.borrow().values().any(|v| Rc::ptr_eq(v, s))
++    /// The section whose vertices law (c) samples at plane `z`.
++    /// A shared slab preserves geometric membership, but not the vertices
++    /// or their mean that `boundary_samples` nudges toward. No replacement
++    /// sample set proves coverage of those points, so section each such
++    /// plane exactly. Other planes reuse their exact cached section.
++    pub(super) fn reach_slice(&self, facets: &[Triangle], z: f64) -> Option<Rc<IndexedSlice>> {
++        let s = self.island_slice(facets, z)?;
++        if !self.slab_cache.borrow().values().any(|v| Rc::ptr_eq(v, &s)) {
++            return Some(s);
++        }
++        self.sliced.set(self.sliced.get().saturating_add(1));
++        crate::geometry::slice::material_above_of(facets, self.bodies, z)
++            .ok()
++            .map(|r| Rc::new(IndexedSlice::new(r)))
+     }
+ 
+     /// How many model sections were sliced (#3831); the tests read it.
+diff --git a/crates/sim/src/verify/slab.rs b/crates/sim/src/verify/slab.rs
+index e7807d467..2e2bc0af2 100644
+--- a/crates/sim/src/verify/slab.rs
++++ b/crates/sim/src/verify/slab.rs
+@@ -19,18 +19,8 @@
+ //! near a vertex level, an unreadable mesh - is not placed, and the
+ //! caller sections that plane itself, as it always did.
+ 
+-use crate::geo2d::{Point2, Region};
+ use crate::geometry::Triangle;
+ 
+-/// Spacing of [`wall_samples`] along a wall, mm - the solid law's own
+-/// sample step (`section::SOLID_STEP`).
+-const WALL_STEP: f64 = 0.25;
+-/// Most wall samples one section keeps; past it the spacing widens.
+-const MAX_WALL_SAMPLES: usize = 50_000;
+-/// The nudge of `laws::boundary_samples`, mm: the same side, the same
+-/// distance.
+-const NUDGE: f64 = 0.05;
+-
+ /// How far above the asked plane the slicer may probe, mm
+ /// (`slice::material_above` tries three planes a millionth apart), with
+ /// one probe of margin: a plane is placed only when every probe stays
+@@ -105,54 +95,6 @@ impl Slabs {
+     }
+ }
+ 
+-/// XY samples along every wall of a slab's section, [`WALL_STEP`]
+-/// apart at most, each nudged toward its loop's vertex mean as
+-/// `laws::boundary_samples` nudges - which still gives the corners and
+-/// the edge midpoints; these are the points between them.
+-///
+-/// Why: the planes of a prismatic slab were sectioned one by one, and
+-/// each put a vertex where the plane met the diagonal of a wall's two
+-/// facets - a point that runs from one end of the wall to the other as
+-/// the plane rises. Law (c) reads no sample's plane, so a ramp read
+-/// its walls at as many points as it had planes. One section for the
+-/// slab keeps that reading by sampling the walls themselves.
+-pub(super) fn wall_samples(region: &Region) -> Vec<Point2> {
+-    let len_of = |a: Point2, b: Point2| (b.x - a.x).hypot(b.y - a.y);
+-    let total: f64 = region
+-        .loops()
+-        .iter()
+-        .map(|l| {
+-            let p = l.points();
+-            (0..p.len()).map(|k| len_of(p[k], p[(k + 1) % p.len()])).sum::<f64>()
+-        })
+-        .sum();
+-    if !total.is_finite() {
+-        return Vec::new(); // the corners and midpoints still stand
+-    }
+-    let step = if total / WALL_STEP > MAX_WALL_SAMPLES as f64 { total / MAX_WALL_SAMPLES as f64 } else { WALL_STEP };
+-    let mut out = Vec::new();
+-    for l in region.loops() {
+-        let pts = l.points();
+-        if pts.is_empty() {
+-            continue;
+-        }
+-        let (mx, my) = pts.iter().fold((0.0, 0.0), |s, q| (s.0 + q.x, s.1 + q.y));
+-        let (mx, my) = (mx / pts.len() as f64, my / pts.len() as f64);
+-        for k in 0..pts.len() {
+-            let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+-            let n = ((len_of(a, b) / step).ceil() as usize).clamp(1, MAX_WALL_SAMPLES);
+-            for i in 1..n {
+-                let t = i as f64 / n as f64;
+-                let q = Point2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+-                let (dx, dy) = (mx - q.x, my - q.y);
+-                let d = (dx * dx + dy * dy).sqrt();
+-                out.push(if d > f64::EPSILON { Point2::new(q.x + NUDGE * dx / d, q.y + NUDGE * dy / d) } else { q });
+-            }
+-        }
+-    }
+-    out
+-}
+-
+ /// Whether `t` lies in a vertical plane by its own vertices: two of
+ /// them share their XY bit for bit. No arithmetic, so no rounding can
+ /// call a sloped facet vertical.
+diff --git a/crates/sim/src/verify/slab_tests.rs b/crates/sim/src/verify/slab_tests.rs
+index bbaca4117..f8b64babf 100644
+--- a/crates/sim/src/verify/slab_tests.rs
++++ b/crates/sim/src/verify/slab_tests.rs
+@@ -47,7 +47,8 @@ fn ramp(n: usize, y: f64) -> Vec<Move> {
+ }
+ 
+ /// Laws (b) and (c) on `moves`: the findings and the sections sliced,
+-/// with the slab reading and with every plane on its own.
++/// with the slab reading and with every plane on its own. The section
++/// count measures law (b); law (c) separately keeps exact plane samples.
+ fn both(model: &[Triangle], moves: Vec<Move>, mode: Mode) -> ((Vec<Warning>, usize), (Vec<Warning>, usize)) {
+     let (region, tool) = (square(0.0, 0.0, 100.0, 100.0), tool());
+     let cx = VerifyContext {
+@@ -66,8 +67,9 @@ fn both(model: &[Triangle], moves: Vec<Move>, mode: Mode) -> ((Vec<Warning>, usi
+     let run = |rest: Rest| {
+         let mut w = Vec::new();
+         section::tangency(&path, &cx, &rest, 0.0, cx.gouge_tol, &mut w);
++        let geometric_sections = rest.sliced();
+         band_reach_counted(&path, &cx, &rest, cx.gouge_tol, &mut w);
+-        (w, rest.sliced())
++        (w, geometric_sections)
+     };
+     let slab = run(Rest::new(&path, &cx, cx.gouge_tol, &[]));
+     let plane = run(Rest::new(&path, &cx, cx.gouge_tol, &[]).plane_exact());
+@@ -189,3 +191,48 @@ fn the_gouge_law_probes_a_wall_only_where_a_move_stands_near_it() {
+     assert!(probes > 0, "the near edge is probed");
+     assert_eq!(near, Vec::new(), "an open rim over air is no wall");
+ }
++
++/// The shank stays above the finished boss. Only the stock law can see
++/// these contacts, including points between fixed wall samples.
++fn stock_collision_hits(width: f64, x: f64, y: f64, radius: f64, shank_radius: f64, z_offset: f64) -> usize {
++    let region = square(0.0, 0.0, width + 100.0, 100.0);
++    let mut model = cube(Point3::new(0.0, 0.0, -2.0), Point3::new(width + 100.0, 100.0, 0.0)).facets.to_vec();
++    model.extend(cube(Point3::new(40.0, 40.0, 0.0), Point3::new(40.0 + width, 60.0, 10.0)).facets.iter().cloned());
++    let tool = ToolGeom { radius, nose_radius: 0.0, flute_len: 20.0, shank_radius, shank_len: 20.0, holder_radius: 0.0, holder_len: 0.0 };
++    let cx = VerifyContext {
++        region: &region,
++        stock: Some(&region),
++        model: Some(&model),
++        tool: &tool,
++        mode: Mode::Area,
++        stock_top_z: 30.0,
++        clearance_z: 60.0,
++        gouge_tol: 0.01,
++        z_tol: 1e-6,
++        ..Default::default()
++    };
++    let moves = (0..500).map(|k| {
++        let z = 9.0 + z_offset - f64::from(k) * 8.0 / 500.0;
++        feed((x, y, z), (x, y, z - 8.0 / 500.0))
++    }).collect();
++    let path = Toolpath { moves, ..Toolpath::default() };
++    shank_hits(&super::verify(&path, &cx))
++}
++
++#[test]
++fn a_shared_slab_keeps_near_tangent_stock_collisions() {
++    // Review #3977: fixed 0.25 mm samples miss every move here.
++    assert_eq!(stock_collision_hits(20.0, 50.125, 35.0501, 3.0, 5.0, 0.0), 500);
++}
++
++#[test]
++fn a_shared_slab_keeps_small_band_stock_collisions() {
++    assert_eq!(stock_collision_hits(20.0, 50.125, 39.97, 0.02, 0.1, 0.0), 500);
++}
++
++#[test]
++fn a_shared_slab_keeps_stock_collisions_when_wall_spacing_would_widen() {
++    // The 40,040 mm perimeter exceeded the old 50,000 sample budget.
++    // Shift the Z planes so their diagonal vertices meet X 10,040.125.
++    assert_eq!(stock_collision_hits(20_000.0, 10_040.125, 35.0501, 3.0, 5.0, 0.0000625), 500);
++}
+diff --git a/docs/decisions/3831-verify-keepdown-speed.md b/docs/decisions/3831-verify-keepdown-speed.md
+index 40f21707e..a3ff92f8c 100644
+--- a/docs/decisions/3831-verify-keepdown-speed.md
++++ b/docs/decisions/3831-verify-keepdown-speed.md
+@@ -1,80 +1,68 @@
+-## #3831 - One model section for each prismatic Z slab of a ramped path
++## #3831 - Share prismatic sections and preserve collision samples
+ 
+-**What was decided.** The verifier sections the model one time for each
+-prismatic Z slab, not one time for each plane that a ramp move ends at.
+-A prismatic slab is the Z range between two neighbouring vertex levels in
+-which each facet that a plane crosses is vertical (two of its vertices have
+-bit-equal XY). Three changes go together:
++**What was decided.** The verifier shares a model section for geometric
++queries inside each prismatic Z slab. The reach law (c) keeps the boundary
++samples from every cut plane. It does not replace those samples with
++points at fixed spacing.
+ 
+-1. `Rest::island_slice` gives the planes of a prismatic slab one shared
+-   section (`verify/slab.rs`). A plane that the path cuts flat at keeps
+-   its own section. A plane outside a prismatic slab keeps its own section.
+-2. The reach law (c) samples a shared slab section along its walls each
+-   0.25 mm (`slab::wall_samples`), in addition to the corners and the edge
+-   midpoints.
+-3. The gouge law (b) asks the cheap distance test before the wall probe
+-   (`edge_is_wall`). The two tests are pure, so the order changes no result.
++A prismatic slab is the Z range between two neighbouring vertex levels.
++Each crossing facet must be vertical: two vertices have bit-equal XY.
++A plane that the path cuts flat at keeps its own section. A plane outside
++a prismatic slab also keeps its own section.
+ 
+-**Why.** A keep-down ramp ends each move at a Z of its own. The measured
+-cost (release build, 38,432 facets, 16 holes, one ring, 2,422 moves) was
+-282 s. It had three parts:
++The gouge law (b) asks the cheap distance test before the wall probe
++`edge_is_wall`. These tests are pure. Their order does not change a result.
+ 
+-- 2,406 model sections, each a walk over all facets (43 s).
+-- A wall probe for each region edge of each move, each a walk over the
+-  section (40 s). This part grows with the rings times the moves.
+-- 61.5 million reach samples (about 1 GB), because each plane added its
+-  own samples of the same walls (198 s).
++**Why.** A keep-down ramp ends each move at a different Z. Repeated model
++sections and wall probes made verification expensive. A shared section
++reduces repeated geometric queries. However, equal geometric regions do
++not imply equal collision samples.
+ 
+-After the change the same case takes 1.2 s, with the same 2,422 moves and
+-the same 326 warnings. Four rings take 5.1 s.
++Each plane cuts the diagonal between two wall facets at a different point.
++The old reach law pools the vertices and edge midpoints from all planes.
++It nudges each point toward that section's loop vertex mean. Thus both the
++sample position and its nudge can change with the plane.
+ 
+-**Why the section is exact.** No vertex is strictly inside a slab, so each
+-plane of the slab crosses the same facets. If all those facets are
+-vertical, the solid between the two levels is a prism. Each plane of a
+-prism is the same point set. The test for "vertical" uses no arithmetic,
+-so rounding cannot call a sloped facet vertical. A plane nearer than
+-4e-6 mm to the top level of its slab is not placed, because the slicer
+-probes up to 3e-6 mm above the plane. A shared section that fails to slice
+-is not kept: each plane then asks for its own section, as before.
++The first version replaced these samples with wall points each 0.25 mm.
++The review of PR #3977 found a loss of collision coverage. On a 20 mm boss,
++a shank near a wall passed with no warning. The plane-exact reading found
++500 `ShankHit` warnings. The shank met stock above the finished part, so
++the solid law did not replace this stock check. Small bands and near-tangent
++contacts also lost findings. The sample limit could widen the spacing.
+ 
+-**Why the wall samples.** This part is a decision, not a proof. Before the
+-change, each plane put a vertex where the plane met the diagonal of the two
+-facets of a wall. That vertex moves from one end of the wall to the other
+-as the plane rises. Law (c) reads no sample's plane, so a ramp with 500
+-planes read each wall at about 500 points. One section alone has only the
+-corners, the diagonal point and the midpoints. On the test fixture
+-(a ramp 1 mm into a boss wall) that gave 61 `ShankHit` findings where the
+-old reading gave 80. Samples each 0.25 mm along the walls give the same 80
+-findings, in the same order, on each fixture that I compared (500 and
+-2,000 moves, three offsets, two modes, a stepped part). 0.25 mm is the
+-sample step that the solid law already uses.
++**Conservative rule.** A shared geometric section is not proof that its
++samples cover every plane's samples. Law (c) therefore reads the exact
++section for each cut plane that would otherwise use a shared section.
++It pools the original boundary samples. Other geometric queries can still
++use the shared section. Planes that already have their own section reuse
++that section for sampling.
+ 
+-The new reading is not bit-identical to the old reading for a ramped path:
+-the sample positions are different. It can convict a move that the old
+-reading missed between two of its samples. I found no case where it
+-convicts fewer moves, but the tests are fixtures, not a proof.
++This fallback applies to every shared slab. It does not depend on a minimum
++band size, a distance from tangency, or a perimeter limit. No finite fixed
++step proves that it preserves every old contact. A future replacement must
++prove coverage before it can remove the plane-exact fallback.
+ 
+-**What does not change.** A path that only cuts flat (a level ladder)
+-reads the same sections and the same samples as before, bit for bit. A
+-model with a sloped or curved wall in the slab is sectioned at each plane
+-as before. The moves and the posted program do not change: the verifier
+-only reads the path.
++**Performance limits.** The first version measured 282 s before the change
++and 1.2 s after it on a plate with 38,432 facets and 16 holes. That faster
++reading used the unsafe sample replacement. It is not a measurement of
++this corrected implementation. The fallback restores plane section work
++and the pooled sample set for law (c). The corrected implementation has
++not been timed on that plate.
+ 
+ **Considered and dropped.**
+ 
+-- Only exact changes (the probe order, a memo of the column surface). They
+-  give about 3 times, not 200 times, and the 1 GB sample set stays.
+-- One section for each slab with the old corner and midpoint samples only.
+-  It lost 19 of 80 findings on the fixture. A collision law must not get
+-  weaker for speed.
+-- One section for each slab for flat planes also. It would change the
+-  samples of each level ladder in each existing project. The flat planes
+-  are few, so the cost of their own sections is small.
+-- A lower move count for the keep-down ramp (the other option in the
+-  issue). That changes posted G-code and is a different decision.
+-- A time limit in a test. The pins count sections and wall probes, which
+-  do not depend on the machine.
++- Fixed wall spacing, including a smaller step. It cannot prove coverage
++  for narrow bands, near-tangent contacts, or a widened sample step.
++- Only corners and midpoints from one shared section. An earlier fixture
++  lost 19 of 80 findings with this option.
++- Shared sections for flat planes. Their original sample positions must
++  remain available, and a level ladder has few distinct planes.
++- A lower move count for keep-down ramps. That changes posted G-code and
++  is outside this PR.
++- A time limit in a test. Section counts and collision findings give
++  repeatable assertions across machines.
+ 
+-**Cost to change later.** Small. `Slabs::of` is the one gate: if it
+-returns `None`, each plane is sectioned on its own again. The test helper
+-`Rest::plane_exact` keeps that old reading available as a reference.
++**Cost to change later.** A future coverage proof can replace the law (c)
++fallback. Until then, exact sampling has the previous section and sample
++cost. `Rest::plane_exact` remains the test reference. The verifier reads
++the path; it does not change the moves or the posted program.

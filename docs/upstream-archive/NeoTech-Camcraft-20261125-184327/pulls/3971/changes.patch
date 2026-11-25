@@ -1,0 +1,3292 @@
+From 765fadb802a6c733aa60cb6362424c63d8ae0a75 Mon Sep 17 00:00:00 2001
+From: tbrasselle <tbrasselle@gmail.com>
+Date: Tue, 24 Nov 2026 23:36:46 -0500
+Subject: [PATCH 1/2] fix(mcp): the cli refuses a ui link peer that does not
+ prove the token
+
+A crashed window leaves its discovery file behind, and on Windows the
+CLI opened a session with any peer on that stale port that answered
+HELLO_OK - the peer never proved that it read the file. Three closes:
+
+- The client sends a nonce in its hello; the window answers with a
+  proof (two FNV-1a 64-bit words over token and nonce, no new crypto
+  dependency) and the client refuses a peer whose answer does not
+  prove it. A plain hello (an older CLI) still gets plain HELLO_OK.
+- Before it connects, the CLI checks that the pid in the file is
+  alive (kill on Unix, OpenProcess on Windows) and removes the file of
+  a dead pid - never a live window's file.
+- The answer reads are bounded: one answer line at 1 MiB, a bridge
+  session at 256 MiB; the HELLO_TIMEOUT deadline covers the whole
+  proof exchange.
+
+Pinned by ui_link::a_false_window_that_does_not_prove_the_token_gets_no_tool_call.
+
+Fixes #3874
+---
+ Cargo.lock                           |   2 +
+ crates/app/Cargo.toml                |  10 +++
+ crates/app/src/mcp/link.rs           |  76 ++++++++++++++++
+ crates/app/src/mcp/link_client.rs    | 125 ++++++++++++++++++++++++---
+ crates/app/src/mcp/listen.rs         |   6 +-
+ crates/app/tests/mcp_live/ui_link.rs |  67 +++++++++++++-
+ 6 files changed, 273 insertions(+), 13 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f35105f76..93cc51f5e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -766,6 +766,7 @@ dependencies = [
+  "clipper2-rust",
+  "flecs_ecs",
+  "keyring",
++ "libc",
+  "png 0.18.1",
+  "rayon",
+  "reqwest",
+@@ -778,6 +779,7 @@ dependencies = [
+  "tracing-subscriber",
+  "url",
+  "web-time",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
+diff --git a/crates/app/Cargo.toml b/crates/app/Cargo.toml
+index adacec0db..676587857 100644
+--- a/crates/app/Cargo.toml
++++ b/crates/app/Cargo.toml
+@@ -39,5 +39,15 @@ keyring = { workspace = true }
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ web-time = { workspace = true }
+ 
++[target.'cfg(unix)'.dependencies]
++# #3874: the CLI checks that the pid in a discovery file is alive before
++# it connects; std has no pid check, so the platform's own `kill`.
++libc = "0.2"
++
++[target.'cfg(target_os = "windows")'.dependencies]
++# #3874: the same pid-alive check through OpenProcess. Both crates are
++# already in the lock through other deps - no new crate.
++windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
++
+ [dev-dependencies]
+ tempfile = "3"
+diff --git a/crates/app/src/mcp/link.rs b/crates/app/src/mcp/link.rs
+index fb281ab55..39756654c 100644
+--- a/crates/app/src/mcp/link.rs
++++ b/crates/app/src/mcp/link.rs
+@@ -109,6 +109,12 @@ fn new_token() -> String {
+         .collect()
+ }
+ 
++/// A fresh client nonce, from the same randomness as [`new_token`].
++#[must_use]
++pub fn new_nonce() -> String {
++    new_token()
++}
++
+ /// The first line a client sends.
+ #[must_use]
+ pub fn hello_line(token: &str) -> String {
+@@ -128,6 +134,76 @@ pub fn hello_matches(line: &[u8], token: &str) -> bool {
+         && got.bytes().zip(token.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
+ }
+ 
++/// The first line a client sends, with a nonce (#3874). The window's
++/// answer must carry a proof that it mixed this nonce with the token, so
++/// a peer that never read the discovery file cannot pass as the window.
++#[must_use]
++pub fn hello_with_nonce(token: &str, nonce: &str) -> String {
++    json!({ "camcraft_link": FORMAT, "token": token, "nonce": nonce }).to_string()
++}
++
++/// The nonce a client put in its hello line; `None` when there is none
++/// (an older CLI). At most 128 bytes: no honest nonce is longer.
++#[must_use]
++pub fn hello_nonce(line: &[u8]) -> Option<String> {
++    let v = serde_json::from_slice::<Value>(line).ok()?;
++    v.get("nonce")?
++        .as_str()
++        .map(str::to_owned)
++        .filter(|n| !n.is_empty() && n.len() <= 128)
++}
++
++/// The proof of the token (#3874): two FNV-1a 64-bit words over `token`,
++/// a zero byte, `nonce`. This is a knowledge proof, not encryption - the
++/// token itself already crosses the same socket in the clear - so a
++/// simple published hash is enough. The proof only binds the answer to a
++/// peer that read the discovery file and saw this client's fresh nonce.
++#[must_use]
++pub fn token_proof(token: &str, nonce: &str) -> String {
++    fn fnv1a(data: &[u8]) -> u64 {
++        // The published FNV-1a 64-bit parameters (public domain).
++        data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
++            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01B3)
++        })
++    }
++    let mut data = Vec::with_capacity(token.len() + nonce.len() + 1);
++    data.extend_from_slice(token.as_bytes());
++    data.push(0);
++    data.extend_from_slice(nonce.as_bytes());
++    let a = fnv1a(&data);
++    let b = fnv1a(&a.to_be_bytes());
++    format!("{a:016x}{b:016x}")
++}
++
++/// The window's answer to a good hello: plain [`HELLO_OK`] for a hello
++/// without a nonce (an older CLI), otherwise with the proof of the token
++/// and the client's nonce.
++#[must_use]
++pub fn hello_ok_line(token: &str, nonce: Option<&str>) -> String {
++    match nonce {
++        None => HELLO_OK.to_owned(),
++        Some(n) => json!({ "camcraft_link": FORMAT, "ok": true, "proof": token_proof(token, n) })
++            .to_string(),
++    }
++}
++
++/// Whether an answer proves that the peer knows `token` and mixed in the
++/// client's `nonce`. The compare takes the same time for equal lengths.
++#[must_use]
++pub fn proof_matches(answer: &[u8], token: &str, nonce: &str) -> bool {
++    let Ok(v) = serde_json::from_slice::<Value>(answer) else { return false };
++    if v.get("camcraft_link").and_then(Value::as_u64) != Some(u64::from(FORMAT)) {
++        return false;
++    }
++    if v.get("ok").and_then(Value::as_bool) != Some(true) {
++        return false;
++    }
++    let want = token_proof(token, nonce);
++    let Some(got) = v.get("proof").and_then(Value::as_str) else { return false };
++    got.len() == want.len()
++        && got.bytes().zip(want.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
++}
++
+ /// A window's registration: its discovery file (and socket file), removed
+ /// when it drops.
+ #[derive(Debug)]
+diff --git a/crates/app/src/mcp/link_client.rs b/crates/app/src/mcp/link_client.rs
+index 17bdf27d9..81da37d42 100644
+--- a/crates/app/src/mcp/link_client.rs
++++ b/crates/app/src/mcp/link_client.rs
+@@ -19,10 +19,25 @@ use serde_json::{json, Value};
+ use super::link::{self, Entry};
+ use super::wire::Stream;
+ 
+-/// How long a connect and the hello answer may take before a window is
+-/// read as not answering (a stale file, a hung window).
++/// How long a connect, the hello and its proof answer may take before a
++/// window is read as not answering (a stale file, a hung window). This
++/// deadline covers the whole token-proof exchange: the client sends the
++/// hello with its nonce, and the window's answer must carry the proof.
+ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+ 
++/// The most bytes of one answer line (#3874): a peer that sends one line
++/// with no end cannot make the client use all memory. A proof answer or
++/// a tool result never approaches the bound. After the proof, no read
++/// deadline applies (a tool may run for minutes, #3751) - but the peer
++/// proved that it read the discovery file, so a bound on what it may
++/// send is what remains to check.
++const MAX_ANSWER: u64 = 1024 * 1024;
++
++/// The most bytes a `--ui mcp` bridge session copies from the window to
++/// the MCP client, so a peer that never stops writing cannot run for
++/// ever. A link session transfers far less.
++const MAX_BRIDGE: u64 = 256 * 1024 * 1024;
++
+ /// Which window to talk to.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum Select {
+@@ -103,7 +118,10 @@ fn describe(entry: &Entry) -> String {
+     format!("pid {} ({project})", entry.pid)
+ }
+ 
+-/// Connect to one window and pass its token check.
++/// Connect to one window, pass its token check, and require the proof
++/// that the peer mixed the client's fresh nonce with the token (#3874):
++/// a peer that answers `HELLO_OK` without the proof never read the
++/// discovery file, so it is not the window.
+ fn open(entry: &Entry) -> std::io::Result<Stream> {
+     let stream = match entry.transport.as_str() {
+         "tcp" => {
+@@ -129,19 +147,75 @@ fn open(entry: &Entry) -> std::io::Result<Stream> {
+     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+     stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
+     let mut writer = stream.try_clone()?;
+-    writeln!(writer, "{}", link::hello_line(&entry.token))?;
++    // The nonce makes the window's proof answer fresh, so a recorded
++    // answer of an earlier session proves nothing.
++    let nonce = link::new_nonce();
++    writeln!(writer, "{}", link::hello_with_nonce(&entry.token, &nonce))?;
+     writer.flush()?;
+     let mut answer = String::new();
+-    BufReader::new(stream.try_clone()?).take(4096).read_line(&mut answer)?;
+-    if answer.trim() != link::HELLO_OK {
+-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the window refused the link token"));
++    BufReader::new(stream.try_clone()?).take(MAX_ANSWER).read_line(&mut answer)?;
++    if !link::proof_matches(answer.as_bytes(), &entry.token, &nonce) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "the peer did not prove the link token",
++        ));
+     }
+     // A tool may run for minutes (generate): no read deadline from here.
++    // The peer proved that it read the discovery file; its answer lines
++    // stay bounded by MAX_ANSWER.
+     stream.set_read_timeout(None)?;
+     stream.set_write_timeout(None)?;
+     Ok(stream)
+ }
+ 
++/// Whether the process `pid` runs now. `Some(false)` only when the OS
++/// says the pid does not exist; `None` when the check cannot say (an
++/// access error) - the caller then treats the window as alive.
++#[cfg(unix)]
++fn pid_alive(pid: u32) -> Option<bool> {
++    // A signal of 0 checks existence and sends nothing.
++    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
++        0 => Some(true),
++        -1 => match std::io::Error::last_os_error().raw_os_error() {
++            Some(libc::ESRCH) => Some(false),
++            // EPERM: the process exists, it is just not ours.
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
++#[cfg(windows)]
++fn pid_alive(pid: u32) -> Option<bool> {
++    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
++    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess};
++    // PROCESS_QUERY_LIMITED_INFORMATION: enough for the exit code, and
++    // allowed on another user's process.
++    const QUERY_LIMITED: u32 = 0x1000;
++    const STILL_ACTIVE: u32 = 259;
++    const ERROR_INVALID_PARAMETER: u32 = 87;
++    unsafe {
++        let handle = OpenProcess(QUERY_LIMITED, 0, pid);
++        if handle.is_null() {
++            return match GetLastError() {
++                // No process with this pid exists.
++                ERROR_INVALID_PARAMETER => Some(false),
++                // Cannot say (access denied): treat the window as alive.
++                _ => None,
++            };
++        }
++        let mut code = 0_u32;
++        let said = GetExitCodeProcess(handle, &mut code);
++        CloseHandle(handle);
++        (said != 0).then_some(code == STILL_ACTIVE)
++    }
++}
++
++#[cfg(not(any(unix, windows)))]
++fn pid_alive(_pid: u32) -> Option<bool> {
++    None
++}
++
+ /// Find the selected window in `dir` and open a session with it.
+ ///
+ /// # Errors
+@@ -155,8 +229,8 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             dir.display()
+         )));
+     }
+-    let candidates: Vec<&Entry> = all.iter().filter(|e| select.admits(e)).collect();
+-    if candidates.is_empty() {
++    let selected: Vec<&Entry> = all.iter().filter(|e| select.admits(e)).collect();
++    if selected.is_empty() {
+         let running: Vec<String> = all.iter().map(describe).collect();
+         let wanted = match select {
+             Select::Only => "a window".to_owned(),
+@@ -168,6 +242,27 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             running.join(", ")
+         )));
+     }
++    // A file a crashed window left behind (#3874): its pid is dead, so no
++    // window serves that socket - and a local process may have bound the
++    // port to read the token and the tool calls. The file is removed
++    // (never a live window's file) and the entry is skipped. When the
++    // check cannot say whether the pid lives, the entry stays and the
++    // token proof in `open` guards the connection.
++    let candidates: Vec<&Entry> = selected
++        .into_iter()
++        .filter(|entry| {
++            if entry.pid == std::process::id() || pid_alive(entry.pid) != Some(false) {
++                return true;
++            }
++            tracing::info!("ui link: {} is gone; its link file is stale and is removed", describe(entry));
++            match std::fs::remove_file(dir.join(format!("{}.json", entry.pid))) {
++                Ok(()) => {}
++                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++                Err(e) => tracing::warn!("ui link: cannot remove the stale file: {e}"),
++            }
++            false
++        })
++        .collect();
+     let mut refused = None;
+     let mut busy = None;
+     let mut open_ones = Vec::new();
+@@ -223,7 +318,9 @@ pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Val
+     let mut reader = BufReader::new(stream);
+     loop {
+         let mut text = String::new();
+-        if reader.read_line(&mut text).map_err(lost)? == 0 {
++        // Bounded (#3874): one answer line never exceeds MAX_ANSWER.
++        let got = reader.by_ref().take(MAX_ANSWER).read_line(&mut text).map_err(lost)?;
++        if got == 0 {
+             return Err(LinkError::Failed(format!(
+                 "the window {} closed the link before it answered",
+                 describe(&entry)
+@@ -262,6 +359,12 @@ pub fn bridge(dir: &Path, select: &Select, input: impl Read + Send + 'static, mu
+             let _ = to_app.shutdown_write();
+         })
+         .map_err(lost)?;
+-    std::io::copy(&mut from_app, &mut output).map_err(lost)?;
++    // Bounded (#3874): a peer that never stops writing ends at MAX_BRIDGE
++    // bytes, it cannot run for ever.
++    let copied = std::io::copy(&mut std::io::Read::by_ref(&mut from_app).take(MAX_BRIDGE), &mut output)
++        .map_err(lost)?;
++    if copied == MAX_BRIDGE {
++        tracing::warn!("ui link bridge: the answer reached the {} byte bound; the copy ended", MAX_BRIDGE);
++    }
+     Ok(())
+ }
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index 235a44e61..fa6a22f76 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -328,11 +328,15 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             let rest = buf.split_off(nl.saturating_add(1));
+             let line = std::mem::replace(&mut buf, rest);
+             if let Some(want) = gate.take() {
++                // A hello that carries a nonce (a client of #3874) gets
++                // the proof of the token back; a plain hello (an older
++                // CLI) gets plain HELLO_OK.
++                let nonce = link::hello_nonce(&line);
+                 if !link::hello_matches(&line, want) {
+                     let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
+                     return Ok(End::Refused);
+                 }
+-                writeln!(writer, "{}", link::HELLO_OK)?;
++                writeln!(writer, "{}", link::hello_ok_line(want, nonce.as_deref()))?;
+                 writer.flush()?;
+                 active = Instant::now();
+                 continue;
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index b74763c8b..f021576db 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -81,8 +81,13 @@ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(3), "{err}");
+     assert!(err.contains("stale"), "{err}");
++    // The dead pid's file is gone: the CLI removed it, so no later run
++    // sees the stale port (never a live window's file, #3874).
++    assert!(link::entries(&dir).is_empty(), "the stale file of a dead pid is removed");
+ 
+-    // A window asked for by a pid that no file names.
++    // A window asked for by a pid that no file names. The stale file is
++    // written again, so the listing names a file that is not pid 123.
++    write_entry(&dir, &stale);
+     let o = cli_ui(&dir, &["--window", "123", "call", "get_job"]);
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(3), "{err}");
+@@ -103,6 +108,66 @@ fn bad_ui_arguments_are_usage_errors() {
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn a_false_window_that_does_not_prove_the_token_gets_no_tool_call() {
++    let dir = fresh_dir("false-window");
++    // A false server on the port of a discovery entry (#3874): it read
++    // the file, so it has the token, but it cannot prove it - it answers
++    // a plain HELLO_OK with no mix of the client's nonce. The CLI must
++    // drop it before one tool-call line reaches it.
++    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
++    let entry = Entry {
++        format: link::FORMAT,
++        // A live pid, so the pid-alive check does not remove the file
++        // first: the pid of a window whose file a false server serves.
++        pid: std::process::id(),
++        transport: "tcp".into(),
++        address: listener.local_addr().expect("local address").to_string(),
++        token: "7".repeat(64),
++        project: None,
++        app_version: "0".into(),
++    };
++    write_entry(&dir, &entry);
++
++    use std::io::{Read, Write};
++    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
++    let server = std::thread::spawn(move || {
++        // One connection: read its first line, answer HELLO_OK without
++        // the proof, then read until the client hangs up.
++        let (mut s, _) = listener.accept().expect("accept");
++        s.set_read_timeout(Some(Duration::from_secs(20))).expect("read timeout");
++        let mut first = Vec::new();
++        let mut chunk = [0_u8; 256];
++        while !first.contains(&b'\n') {
++            let n = s.read(&mut chunk).expect("read the hello");
++            assert!(n > 0, "the client hung up before the hello");
++            first.extend_from_slice(&chunk[..n]);
++        }
++        lines_tx.send(String::from_utf8_lossy(&first).into_owned()).expect("send");
++        s.write_all(format!("{}\n", link::HELLO_OK).as_bytes()).expect("write HELLO_OK");
++        s.flush().expect("flush HELLO_OK");
++        let mut rest = Vec::new();
++        let _ = s.read_to_end(&mut rest);
++        String::from_utf8_lossy(&rest).into_owned()
++    });
++
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(1), "{err}");
++    assert!(err.contains("refused the link token"), "{err}");
++    assert!(err.contains("nothing ran"), "{err}");
++    assert!(o.stdout.is_empty(), "no answer from the false server on stdout");
++
++    let rest = server.join().expect("the false server thread");
++    assert!(!rest.contains("tools/call"), "no tool call after the refusal: {rest}");
++    let first = lines_rx.try_recv().expect("the false server saw one line");
++    assert!(first.contains("camcraft_link"), "{first}");
++    assert!(first.contains("nonce"), "the client sent a nonce: {first}");
++    assert!(!first.contains("tools/call"), "no tool call reached the false server: {first}");
++    assert!(link::entries(&dir).len() == 1, "a live pid's file is not removed");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
+     let dir = fresh_dir("token");
+
+From 660d7a65e6487cbd3d4be00c6f53795aacb5e502 Mon Sep 17 00:00:00 2001
+From: tbrasselle <tbrasselle@gmail.com>
+Date: Wed, 25 Nov 2026 03:46:17 -0500
+Subject: [PATCH 2/2] fix(mcp): the ui link verifies the peer by transport, not
+ by a disclosed token
+
+The review of PR #3971 (#3874) showed the token-proof hello cannot
+work: the client sends the token to the peer before the peer proves
+anything, so a false server that never read the discovery file still
+receives the token and computes the proof. No exchange over an open
+port fixes that, because the first client gives the secret away.
+
+- Windows: the link listens on a named pipe with a user-only ACL
+  (link_pipe, link_pipe_acl, link_pipe_stream); the CLI asks the
+  kernel which process serves the pipe and refuses a peer that is
+  not the process the file names, before one byte of the token
+  crosses. A "tcp" entry is refused by name on every platform. The
+  nonce/proof exchange is removed.
+- One elapsed deadline covers the whole hello exchange
+  (link_peer::read_line_bounded); a peer that trickles bytes ends
+  within it.
+- A line that reaches the 1 MiB bound without its newline closes the
+  link; no remainder is read as a new message.
+- The bridge's byte bound is a visible failure when the session was
+  still open, never a quiet success after a truncated answer.
+
+The decision record is docs/decisions/3874-ui-link-transport.md.
+
+Fixes #3874
+---
+ crates/app/Cargo.toml                    |  17 +-
+ crates/app/src/mcp/link.rs               | 190 ++++----
+ crates/app/src/mcp/link_client.rs        | 297 ++++++------
+ crates/app/src/mcp/link_peer.rs          | 299 ++++++++++++
+ crates/app/src/mcp/link_pipe.rs          | 325 +++++++++++++
+ crates/app/src/mcp/link_pipe_acl.rs      | 157 ++++++
+ crates/app/src/mcp/link_pipe_stream.rs   | 257 ++++++++++
+ crates/app/src/mcp/listen.rs             |  11 +-
+ crates/app/src/mcp/mod.rs                |  17 +-
+ crates/app/src/mcp/wire.rs               |  32 ++
+ crates/app/tests/mcp_live/ui_link.rs     | 594 +++++++++++++++++++----
+ docs/decisions/3874-ui-link-transport.md |  60 +++
+ 12 files changed, 1891 insertions(+), 365 deletions(-)
+ create mode 100644 crates/app/src/mcp/link_peer.rs
+ create mode 100644 crates/app/src/mcp/link_pipe.rs
+ create mode 100644 crates/app/src/mcp/link_pipe_acl.rs
+ create mode 100644 crates/app/src/mcp/link_pipe_stream.rs
+ create mode 100644 docs/decisions/3874-ui-link-transport.md
+
+diff --git a/crates/app/Cargo.toml b/crates/app/Cargo.toml
+index 676587857..6630db6d3 100644
+--- a/crates/app/Cargo.toml
++++ b/crates/app/Cargo.toml
+@@ -45,9 +45,20 @@ web-time = { workspace = true }
+ libc = "0.2"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+-# #3874: the same pid-alive check through OpenProcess. Both crates are
+-# already in the lock through other deps - no new crate.
+-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
++# #3874: the pid-alive check through OpenProcess, and the UI link's
++# named-pipe transport: a pipe with a user-only DACL replaces the TCP
++# port, and the CLI asks the kernel which process serves the pipe. Both
++# crates are already in the lock through other deps - no new crate.
++# The maintainer still has to confirm these dependency declarations.
++windows-sys = { version = "0.59", features = [
++    "Win32_Foundation",
++    "Win32_System_Threading",
++    "Win32_System_IO",
++    "Win32_System_Pipes",
++    "Win32_Security",
++    "Win32_Security_Authorization",
++    "Win32_Storage_FileSystem",
++] }
+ 
+ [dev-dependencies]
+ tempfile = "3"
+diff --git a/crates/app/src/mcp/link.rs b/crates/app/src/mcp/link.rs
+index 39756654c..0883d4344 100644
+--- a/crates/app/src/mcp/link.rs
++++ b/crates/app/src/mcp/link.rs
+@@ -1,25 +1,30 @@
+ //! The UI link (#3751): each running CamCraft window opens a local
+-//! socket at start and writes a discovery file, so `camcraft-cli --ui`
+-//! can find it and send it MCP tool calls that run on the window's own
+-//! History. This module is the window's end: the folder, the token, the
+-//! discovery file and the hello line that opens a session.
++//! transport at start and writes a discovery file, so `camcraft-cli
++//! --ui` can find it and send it MCP tool calls that run on the window's
++//! own History. This module is the window's end: the folder, the token,
++//! the discovery file and the hello line that opens a session.
+ //!
+ //! - **Local only.** On Unix the socket is a Unix domain socket in the
+-//!   user's own folder (mode 0700, the socket 0600). Elsewhere (Windows:
+-//!   std has no named pipe or local socket) it is TCP bound to 127.0.0.1
+-//!   with an OS-chosen port; no other interface is ever bound.
+-//! - **Same user only.** A client must open with the random token from
+-//!   the discovery file, which only the user can read; any other first
+-//!   line closes the connection before a byte of it reaches the app.
++//!   user's own folder (mode 0700, the socket 0600). On Windows it is a
++//!   named pipe with a security descriptor that admits the window's own
++//!   user only (`link_pipe`); the pipe name carries the process id.
++//! - **Who the peer is.** On Unix the 0700 folder is the gate. On
++//!   Windows the pipe's ACL is the gate, and the CLI asks the kernel
++//!   which process serves the pipe and refuses a peer that is not the
++//!   process the file names - before one byte of the token crosses.
++//!   The token then tells the window that the client read the
++//!   discovery file. A token on the wire proves nothing about a peer
++//!   on an open port: the first client that sends it gives it away
++//!   (#3874), so a TCP address is refused outright.
+ //! - **One file per window.** `<pid>.json` in the link folder; a window
+ //!   removes its file when it closes. A file left by a crash is stale:
+-//!   its socket does not answer, and the client skips it.
++//!   its transport does not answer, and the client skips it.
+ //!
+-//! Provenance: our own design (docs/decisions/3751-cli-ui-link.md) over
+-//! std; the per-user folders are the platforms' published locations
+-//! (Windows `%APPDATA%`, macOS `~/Library/Application Support`, the XDG
+-//! Base Directory spec with `XDG_RUNTIME_DIR` for sockets). Clean-room,
+-//! public sources only.
++//! Provenance: our own design (docs/decisions/3751-cli-ui-link.md,
++//! 3874-ui-link-transport.md) over std; the per-user folders are the
++//! platforms' published locations (Windows `%APPDATA%`, macOS
++//! `~/Library/Application Support`, the XDG Base Directory spec with
++//! `XDG_RUNTIME_DIR` for sockets). Clean-room, public sources only.
+ 
+ use std::ffi::OsString;
+ use std::io::Write;
+@@ -47,7 +52,9 @@ pub struct Entry {
+     pub format: u32,
+     /// The window's process id.
+     pub pid: u32,
+-    /// `"unix"` (a socket path) or `"tcp"` (a 127.0.0.1 address).
++    /// `"unix"` (a socket path), `"pipe"` (a Windows pipe name). A
++    /// `"tcp"` address is what builds before #3874 wrote: this build
++    /// refuses it by name, and never binds one.
+     pub transport: String,
+     pub address: String,
+     pub token: String,
+@@ -109,11 +116,12 @@ fn new_token() -> String {
+         .collect()
+ }
+ 
+-/// A fresh client nonce, from the same randomness as [`new_token`].
+-#[must_use]
+-pub fn new_nonce() -> String {
+-    new_token()
+-}
++/// The pipe name of the window with this process id (#3874): the
++/// discovery file's `address` field on Windows. The name is derived
++/// from the pid, so the CLI can refuse a file whose pipe name belongs
++/// to another pid.
++#[cfg(windows)]
++pub use super::link_pipe::pipe_name;
+ 
+ /// The first line a client sends.
+ #[must_use]
+@@ -125,83 +133,21 @@ pub fn hello_line(token: &str) -> String {
+ /// the same time for every token of the same length.
+ #[must_use]
+ pub fn hello_matches(line: &[u8], token: &str) -> bool {
+-    let Ok(v) = serde_json::from_slice::<Value>(line) else { return false };
+-    if v.get("camcraft_link").and_then(Value::as_u64) != Some(u64::from(FORMAT)) {
++    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+         return false;
+-    }
+-    let Some(got) = v.get("token").and_then(Value::as_str) else { return false };
+-    got.len() == token.len()
+-        && got.bytes().zip(token.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
+-}
+-
+-/// The first line a client sends, with a nonce (#3874). The window's
+-/// answer must carry a proof that it mixed this nonce with the token, so
+-/// a peer that never read the discovery file cannot pass as the window.
+-#[must_use]
+-pub fn hello_with_nonce(token: &str, nonce: &str) -> String {
+-    json!({ "camcraft_link": FORMAT, "token": token, "nonce": nonce }).to_string()
+-}
+-
+-/// The nonce a client put in its hello line; `None` when there is none
+-/// (an older CLI). At most 128 bytes: no honest nonce is longer.
+-#[must_use]
+-pub fn hello_nonce(line: &[u8]) -> Option<String> {
+-    let v = serde_json::from_slice::<Value>(line).ok()?;
+-    v.get("nonce")?
+-        .as_str()
+-        .map(str::to_owned)
+-        .filter(|n| !n.is_empty() && n.len() <= 128)
+-}
+-
+-/// The proof of the token (#3874): two FNV-1a 64-bit words over `token`,
+-/// a zero byte, `nonce`. This is a knowledge proof, not encryption - the
+-/// token itself already crosses the same socket in the clear - so a
+-/// simple published hash is enough. The proof only binds the answer to a
+-/// peer that read the discovery file and saw this client's fresh nonce.
+-#[must_use]
+-pub fn token_proof(token: &str, nonce: &str) -> String {
+-    fn fnv1a(data: &[u8]) -> u64 {
+-        // The published FNV-1a 64-bit parameters (public domain).
+-        data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+-            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01B3)
+-        })
+-    }
+-    let mut data = Vec::with_capacity(token.len() + nonce.len() + 1);
+-    data.extend_from_slice(token.as_bytes());
+-    data.push(0);
+-    data.extend_from_slice(nonce.as_bytes());
+-    let a = fnv1a(&data);
+-    let b = fnv1a(&a.to_be_bytes());
+-    format!("{a:016x}{b:016x}")
+-}
+-
+-/// The window's answer to a good hello: plain [`HELLO_OK`] for a hello
+-/// without a nonce (an older CLI), otherwise with the proof of the token
+-/// and the client's nonce.
+-#[must_use]
+-pub fn hello_ok_line(token: &str, nonce: Option<&str>) -> String {
+-    match nonce {
+-        None => HELLO_OK.to_owned(),
+-        Some(n) => json!({ "camcraft_link": FORMAT, "ok": true, "proof": token_proof(token, n) })
+-            .to_string(),
+-    }
+-}
+-
+-/// Whether an answer proves that the peer knows `token` and mixed in the
+-/// client's `nonce`. The compare takes the same time for equal lengths.
+-#[must_use]
+-pub fn proof_matches(answer: &[u8], token: &str, nonce: &str) -> bool {
+-    let Ok(v) = serde_json::from_slice::<Value>(answer) else { return false };
++    };
+     if v.get("camcraft_link").and_then(Value::as_u64) != Some(u64::from(FORMAT)) {
+         return false;
+     }
+-    if v.get("ok").and_then(Value::as_bool) != Some(true) {
++    let Some(got) = v.get("token").and_then(Value::as_str) else {
+         return false;
+-    }
+-    let want = token_proof(token, nonce);
+-    let Some(got) = v.get("proof").and_then(Value::as_str) else { return false };
+-    got.len() == want.len()
+-        && got.bytes().zip(want.bytes()).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
++    };
++    got.len() == token.len()
++        && got
++            .bytes()
++            .zip(token.bytes())
++            .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
++            == 0
+ }
+ 
+ /// A window's registration: its discovery file (and socket file), removed
+@@ -264,7 +210,11 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<(Listener, Registration, Strin
+         app_version: env!("CARGO_PKG_VERSION").to_owned(),
+     };
+     // Built before the write, so a failed write still removes the socket.
+-    let registration = Registration { file: dir.join(format!("{pid}.json")), socket, entry };
++    let registration = Registration {
++        file: dir.join(format!("{pid}.json")),
++        socket,
++        entry,
++    };
+     write_entry(&registration.file, &registration.entry)?;
+     Ok((listener, registration, token))
+ }
+@@ -280,12 +230,20 @@ fn prepare_dir(dir: &Path) -> std::io::Result<()> {
+ }
+ 
+ #[cfg(unix)]
+-fn bind(dir: &Path, pid: u32) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
++fn bind(
++    dir: &Path,
++    pid: u32,
++) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
+     use std::os::unix::fs::PermissionsExt;
+     let path = dir.join(format!("{pid}.sock"));
+     let address = path
+         .to_str()
+-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the link folder path is not UTF-8"))?
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "the link folder path is not UTF-8",
++            )
++        })?
+         .to_owned();
+     // A file of a crashed process with the same pid: nobody serves it.
+     let _ = std::fs::remove_file(&path);
+@@ -294,11 +252,30 @@ fn bind(dir: &Path, pid: u32) -> std::io::Result<(Listener, &'static str, String
+     Ok((Listener::Unix(listener), "unix", address, Some(path)))
+ }
+ 
+-#[cfg(not(unix))]
+-fn bind(_dir: &Path, _pid: u32) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
+-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+-    let address = listener.local_addr()?.to_string();
+-    Ok((Listener::Tcp(listener), "tcp", address, None))
++/// Windows: a named pipe with a user-only ACL (#3874 review): the pipe
++/// name carries the pid, the kernel says which process serves it, and
++/// no port exists for a false server to hold.
++#[cfg(windows)]
++fn bind(
++    _dir: &Path,
++    pid: u32,
++) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
++    let name = pipe_name(pid);
++    let listener = super::link_pipe::PipeListener::new(&name)?;
++    Ok((Listener::Pipe(listener), "pipe", name, None))
++}
++
++/// Any other platform: no local link transport. The window still runs,
++/// and its status line says why (decision 3751).
++#[cfg(not(any(unix, windows)))]
++fn bind(
++    _dir: &Path,
++    _pid: u32,
++) -> std::io::Result<(Listener, &'static str, String, Option<PathBuf>)> {
++    Err(std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "this platform has no local UI link transport",
++    ))
+ }
+ 
+ /// Write the file all or nothing (a temp file, then a rename), readable
+@@ -324,7 +301,9 @@ fn write_entry(file: &Path, entry: &Entry) -> std::io::Result<()> {
+ /// not one (a temp file, another format) is skipped and logged.
+ #[must_use]
+ pub fn entries(dir: &Path) -> Vec<Entry> {
+-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
++    let Ok(read) = std::fs::read_dir(dir) else {
++        return Vec::new();
++    };
+     let mut found: Vec<Entry> = read
+         .filter_map(Result::ok)
+         .map(|e| e.path())
+@@ -335,7 +314,10 @@ pub fn entries(dir: &Path) -> Vec<Entry> {
+                 .and_then(|t| serde_json::from_str::<Entry>(&t).ok())
+                 .filter(|e| e.format == FORMAT);
+             if parsed.is_none() {
+-                tracing::info!("ui link: {} is not a link file of this version; skipped", p.display());
++                tracing::info!(
++                    "ui link: {} is not a link file of this version; skipped",
++                    p.display()
++                );
+             }
+             parsed
+         })
+diff --git a/crates/app/src/mcp/link_client.rs b/crates/app/src/mcp/link_client.rs
+index 81da37d42..ae19130ed 100644
+--- a/crates/app/src/mcp/link_client.rs
++++ b/crates/app/src/mcp/link_client.rs
+@@ -1,41 +1,36 @@
+ //! The CLI's end of the UI link (#3751): find a running window from the
+-//! discovery files, open a session with its token, and send it MCP
+-//! `tools/call` lines - the same tool surface `camcraft-cli mcp` serves,
+-//! answered on the window's UI thread through its History, so Ctrl+Z in
+-//! the window undoes a CLI step. Never falls back to a headless
+-//! document: no window is an error by name.
++//! discovery files, open a session with its transport and token, and
++//! send it MCP `tools/call` lines - the same tool surface
++//! `camcraft-cli mcp` serves, answered on the window's UI thread
++//! through its History, so Ctrl+Z in the window undoes a CLI step.
++//! Never falls back to a headless document: no window is an error by
++//! name.
+ //!
+-//! Provenance: our own std code over our own link (link.rs); the framing
+-//! is the MCP stdio transport (modelcontextprotocol.io, revision
+-//! 2025-06-18). Clean-room, public sources only.
++//! Who the peer is (#3874) is `link_peer`'s law: the transport proves
++//! the peer before the token crosses, the hello runs under one elapsed
++//! deadline, and every answer line is read under a byte cap. This
++//! module is the CLI's own surface on top of it: the window choice, the
++//! one-call verb, and the stdio bridge.
++//!
++//! Provenance: our own std code over our own link (link.rs, link_peer,
++//! link_pipe.rs); the framing is the MCP stdio transport
++//! (modelcontextprotocol.io, revision 2025-06-18). Clean-room, public
++//! sources only.
+ 
+ use std::fmt;
+-use std::io::{BufRead, BufReader, Read, Write};
++use std::io::{BufReader, Read, Write};
+ use std::path::{Path, PathBuf};
+-use std::time::Duration;
+ 
+ use serde_json::{json, Value};
+ 
+ use super::link::{self, Entry};
++use super::link_peer::{self, read_line_bounded};
+ use super::wire::Stream;
+ 
+-/// How long a connect, the hello and its proof answer may take before a
+-/// window is read as not answering (a stale file, a hung window). This
+-/// deadline covers the whole token-proof exchange: the client sends the
+-/// hello with its nonce, and the window's answer must carry the proof.
+-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+-
+-/// The most bytes of one answer line (#3874): a peer that sends one line
+-/// with no end cannot make the client use all memory. A proof answer or
+-/// a tool result never approaches the bound. After the proof, no read
+-/// deadline applies (a tool may run for minutes, #3751) - but the peer
+-/// proved that it read the discovery file, so a bound on what it may
+-/// send is what remains to check.
+-const MAX_ANSWER: u64 = 1024 * 1024;
+-
+ /// The most bytes a `--ui mcp` bridge session copies from the window to
+ /// the MCP client, so a peer that never stops writing cannot run for
+-/// ever. A link session transfers far less.
++/// ever. Reaching the bound with the session still open is a visible
++/// failure, never a quiet success after a truncated answer.
+ const MAX_BRIDGE: u64 = 256 * 1024 * 1024;
+ 
+ /// Which window to talk to.
+@@ -82,7 +77,8 @@ pub enum LinkError {
+     Choose(String),
+     /// The window refused the session or the connection failed. Exit 1.
+     Failed(String),
+-    /// The window is busy with another call. Exit 4.
++    /// The window is busy with another call, or too slow to answer.
++    /// Exit 4.
+     Busy(String),
+ }
+ 
+@@ -111,109 +107,33 @@ impl fmt::Display for LinkError {
+ }
+ 
+ fn describe(entry: &Entry) -> String {
+-    let project = entry
+-        .project
+-        .as_ref()
+-        .map_or_else(|| "an unsaved document".to_owned(), |p| p.display().to_string());
++    let project = entry.project.as_ref().map_or_else(
++        || "an unsaved document".to_owned(),
++        |p| p.display().to_string(),
++    );
+     format!("pid {} ({project})", entry.pid)
+ }
+ 
+-/// Connect to one window, pass its token check, and require the proof
+-/// that the peer mixed the client's fresh nonce with the token (#3874):
+-/// a peer that answers `HELLO_OK` without the proof never read the
+-/// discovery file, so it is not the window.
+-fn open(entry: &Entry) -> std::io::Result<Stream> {
+-    let stream = match entry.transport.as_str() {
+-        "tcp" => {
+-            let addr: std::net::SocketAddr = entry
+-                .address
+-                .parse()
+-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a socket address"))?;
+-            // Never send a token off this machine, whatever the file says.
+-            if !addr.ip().is_loopback() {
+-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a loopback address"));
+-            }
+-            Stream::Tcp(std::net::TcpStream::connect_timeout(&addr, HELLO_TIMEOUT)?)
+-        }
+-        #[cfg(unix)]
+-        "unix" => Stream::Unix(std::os::unix::net::UnixStream::connect(&entry.address)?),
+-        other => {
+-            return Err(std::io::Error::new(
+-                std::io::ErrorKind::Unsupported,
+-                format!("transport '{other}' is not served on this platform"),
+-            ));
+-        }
+-    };
+-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+-    stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
+-    let mut writer = stream.try_clone()?;
+-    // The nonce makes the window's proof answer fresh, so a recorded
+-    // answer of an earlier session proves nothing.
+-    let nonce = link::new_nonce();
+-    writeln!(writer, "{}", link::hello_with_nonce(&entry.token, &nonce))?;
+-    writer.flush()?;
+-    let mut answer = String::new();
+-    BufReader::new(stream.try_clone()?).take(MAX_ANSWER).read_line(&mut answer)?;
+-    if !link::proof_matches(answer.as_bytes(), &entry.token, &nonce) {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::PermissionDenied,
+-            "the peer did not prove the link token",
+-        ));
+-    }
+-    // A tool may run for minutes (generate): no read deadline from here.
+-    // The peer proved that it read the discovery file; its answer lines
+-    // stay bounded by MAX_ANSWER.
+-    stream.set_read_timeout(None)?;
+-    stream.set_write_timeout(None)?;
+-    Ok(stream)
++/// A transport connection held open with no hello - the busy test uses
++/// it to occupy the window's one-client session. Drop it to let go.
++pub struct HeldSession {
++    stream: Stream,
+ }
+ 
+-/// Whether the process `pid` runs now. `Some(false)` only when the OS
+-/// says the pid does not exist; `None` when the check cannot say (an
+-/// access error) - the caller then treats the window as alive.
+-#[cfg(unix)]
+-fn pid_alive(pid: u32) -> Option<bool> {
+-    // A signal of 0 checks existence and sends nothing.
+-    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+-        0 => Some(true),
+-        -1 => match std::io::Error::last_os_error().raw_os_error() {
+-            Some(libc::ESRCH) => Some(false),
+-            // EPERM: the process exists, it is just not ours.
+-            _ => None,
+-        },
+-        _ => None,
++impl Drop for HeldSession {
++    fn drop(&mut self) {
++        // Let a socket window see the session end at once; a pipe
++        // window notices through the broken pipe instead.
++        let _ = self.stream.shutdown_write();
+     }
+ }
+ 
+-#[cfg(windows)]
+-fn pid_alive(pid: u32) -> Option<bool> {
+-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess};
+-    // PROCESS_QUERY_LIMITED_INFORMATION: enough for the exit code, and
+-    // allowed on another user's process.
+-    const QUERY_LIMITED: u32 = 0x1000;
+-    const STILL_ACTIVE: u32 = 259;
+-    const ERROR_INVALID_PARAMETER: u32 = 87;
+-    unsafe {
+-        let handle = OpenProcess(QUERY_LIMITED, 0, pid);
+-        if handle.is_null() {
+-            return match GetLastError() {
+-                // No process with this pid exists.
+-                ERROR_INVALID_PARAMETER => Some(false),
+-                // Cannot say (access denied): treat the window as alive.
+-                _ => None,
+-            };
+-        }
+-        let mut code = 0_u32;
+-        let said = GetExitCodeProcess(handle, &mut code);
+-        CloseHandle(handle);
+-        (said != 0).then_some(code == STILL_ACTIVE)
+-    }
+-}
+-
+-#[cfg(not(any(unix, windows)))]
+-fn pid_alive(_pid: u32) -> Option<bool> {
+-    None
++/// [`HeldSession`]: the transport connection of `entry`, open and idle.
++///
++/// # Errors
++/// See [`link_peer::dial`].
++pub fn hold(entry: &Entry) -> std::io::Result<HeldSession> {
++    link_peer::dial(entry).map(|stream| HeldSession { stream })
+ }
+ 
+ /// Find the selected window in `dir` and open a session with it.
+@@ -242,19 +162,21 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             running.join(", ")
+         )));
+     }
+-    // A file a crashed window left behind (#3874): its pid is dead, so no
+-    // window serves that socket - and a local process may have bound the
+-    // port to read the token and the tool calls. The file is removed
+-    // (never a live window's file) and the entry is skipped. When the
+-    // check cannot say whether the pid lives, the entry stays and the
+-    // token proof in `open` guards the connection.
++    // A file a crashed window left behind (#3874): its pid is dead, so
++    // no window serves that transport. The file is removed (never a
++    // live window's file) and the entry is skipped. When the check
++    // cannot say whether the pid lives, the entry stays; the
++    // transport proof in `link_peer::open` guards the connection.
+     let candidates: Vec<&Entry> = selected
+         .into_iter()
+         .filter(|entry| {
+-            if entry.pid == std::process::id() || pid_alive(entry.pid) != Some(false) {
++            if entry.pid == std::process::id() || link_peer::pid_alive(entry.pid) != Some(false) {
+                 return true;
+             }
+-            tracing::info!("ui link: {} is gone; its link file is stale and is removed", describe(entry));
++            tracing::info!(
++                "ui link: {} is gone; its link file is stale and is removed",
++                describe(entry)
++            );
+             match std::fs::remove_file(dir.join(format!("{}.json", entry.pid))) {
+                 Ok(()) => {}
+                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+@@ -265,29 +187,51 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+         .collect();
+     let mut refused = None;
+     let mut busy = None;
++    let mut unserved = None;
+     let mut open_ones = Vec::new();
+     for entry in candidates {
+-        match open(entry) {
++        match link_peer::open(entry) {
+             Ok(stream) => open_ones.push((entry.clone(), stream)),
+-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => refused = Some(describe(entry)),
+-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+-                tracing::info!("ui link: {} is busy: {e}", describe(entry));
++            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
++                refused = Some(describe(entry))
++            }
++            Err(e)
++                if matches!(
++                    e.kind(),
++                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
++                ) =>
++            {
++                tracing::info!("ui link: {} is busy or too slow: {e}", describe(entry));
+                 busy = Some(describe(entry));
+             }
+-            // A stale file of a closed window: its socket does not answer.
++            // A file this build refuses to dial: a TCP port, or a pipe
++            // that another process serves. The reason is the report.
++            Err(e)
++                if matches!(
++                    e.kind(),
++                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidData
++                ) =>
++            {
++                unserved = Some(format!("{}, refused: {e}", describe(entry)));
++            }
++            // A stale file of a closed window: its transport does not answer.
+             Err(e) => tracing::info!("ui link: {} does not answer: {e}", describe(entry)),
+         }
+     }
+     match open_ones.len() {
+-        1 => open_ones.pop().ok_or_else(|| LinkError::Failed("ui link: lost the open session".into())),
++        1 => open_ones
++            .pop()
++            .ok_or_else(|| LinkError::Failed("ui link: lost the open session".into())),
+         0 => Err(if let Some(who) = refused {
+             LinkError::Failed(format!(
+                 "the CamCraft window {who} refused the link token in its link file (nothing ran)"
+             ))
+         } else if let Some(who) = busy {
+             LinkError::Busy(format!(
+-                "the CamCraft window {who} is busy with another call (nothing ran)"
++                "the CamCraft window {who} is busy with another call or too slow to answer (nothing ran)"
+             ))
++        } else if let Some(what) = unserved {
++            LinkError::Failed(format!("the link file of {what} (nothing ran)"))
+         } else {
+             LinkError::NoWindow(format!(
+                 "no running CamCraft window answered: the link files in {} are stale (nothing ran)",
+@@ -311,22 +255,30 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+ /// See [`connect`]; or the session broke before the answer came.
+ pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Value, LinkError> {
+     let (entry, stream) = connect(dir, select)?;
+-    let lost = |e: std::io::Error| LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)));
++    let lost = |e: std::io::Error| {
++        LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)))
++    };
+     let mut writer = stream.try_clone().map_err(lost)?;
+     let line = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": args } });
+-    writeln!(writer, "{line}").and_then(|()| writer.flush()).map_err(lost)?;
++    writeln!(writer, "{line}")
++        .and_then(|()| writer.flush())
++        .map_err(lost)?;
+     let mut reader = BufReader::new(stream);
+     loop {
+-        let mut text = String::new();
+-        // Bounded (#3874): one answer line never exceeds MAX_ANSWER.
+-        let got = reader.by_ref().take(MAX_ANSWER).read_line(&mut text).map_err(lost)?;
+-        if got == 0 {
++        // Bounded (#3874): one answer line never exceeds MAX_ANSWER, a
++        // line that reaches the bound ends the link, and no remainder
++        // of an oversized line is read as a new message.
++        let Some(text) =
++            read_line_bounded(&mut reader, link_peer::MAX_ANSWER, None).map_err(lost)?
++        else {
+             return Err(LinkError::Failed(format!(
+                 "the window {} closed the link before it answered",
+                 describe(&entry)
+             )));
+-        }
+-        let Ok(msg) = serde_json::from_str::<Value>(text.trim()) else { continue };
++        };
++        let Ok(msg) = serde_json::from_str::<Value>(text.trim()) else {
++            continue;
++        };
+         // A notification (an idle note) has no id; only our answer counts.
+         if msg.get("id") != Some(&json!(1)) {
+             continue;
+@@ -334,8 +286,12 @@ pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Val
+         if let Some(result) = msg.get("result") {
+             return Ok(result.clone());
+         }
+-        let why = msg["error"]["message"].as_str().unwrap_or("an unreadable answer");
+-        return Err(LinkError::Failed(format!("the window refused the call: {why}")));
++        let why = msg["error"]["message"]
++            .as_str()
++            .unwrap_or("an unreadable answer");
++        return Err(LinkError::Failed(format!(
++            "the window refused the call: {why}"
++        )));
+     }
+ }
+ 
+@@ -344,11 +300,35 @@ pub fn call(dir: &Path, select: &Select, tool: &str, args: &Value) -> Result<Val
+ ///
+ /// # Errors
+ /// See [`connect`]; or a stream failed.
+-pub fn bridge(dir: &Path, select: &Select, input: impl Read + Send + 'static, mut output: impl Write) -> Result<(), LinkError> {
++pub fn bridge(
++    dir: &Path,
++    select: &Select,
++    input: impl Read + Send + 'static,
++    mut output: impl Write,
++) -> Result<(), LinkError> {
++    bridge_with_bound(dir, select, input, &mut output, MAX_BRIDGE)
++}
++
++/// [`bridge`] with the copy bound given: the bound is a test seam, so a
++/// test can exceed it without writing [`MAX_BRIDGE`] bytes.
++///
++/// # Errors
++/// See [`bridge`]; or the bound ended a session that was still open.
++pub fn bridge_with_bound(
++    dir: &Path,
++    select: &Select,
++    input: impl Read + Send + 'static,
++    output: &mut impl Write,
++    max: u64,
++) -> Result<(), LinkError> {
+     let (entry, mut from_app) = connect(dir, select)?;
+-    let lost = |e: std::io::Error| LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)));
++    let lost = |e: std::io::Error| {
++        LinkError::Failed(format!("the link to {} broke: {e}", describe(&entry)))
++    };
+     let mut to_app = from_app.try_clone().map_err(lost)?;
+     // Detached on purpose: a blocked stdin read cannot be interrupted.
++    // A pipe has no half-close, so this shutdown signals only a socket
++    // transport; a pipe session ends through the idle drop instead.
+     std::thread::Builder::new()
+         .name("camcraft-ui-link-bridge".into())
+         .spawn(move || {
+@@ -359,12 +339,21 @@ pub fn bridge(dir: &Path, select: &Select, input: impl Read + Send + 'static, mu
+             let _ = to_app.shutdown_write();
+         })
+         .map_err(lost)?;
+-    // Bounded (#3874): a peer that never stops writing ends at MAX_BRIDGE
+-    // bytes, it cannot run for ever.
+-    let copied = std::io::copy(&mut std::io::Read::by_ref(&mut from_app).take(MAX_BRIDGE), &mut output)
+-        .map_err(lost)?;
+-    if copied == MAX_BRIDGE {
+-        tracing::warn!("ui link bridge: the answer reached the {} byte bound; the copy ended", MAX_BRIDGE);
++    // Bounded (#3874): a peer that never stops writing ends at the
++    // bound - and the bound is a visible failure when the session was
++    // still open, never a quiet success after a truncated answer.
++    let copied =
++        std::io::copy(&mut std::io::Read::by_ref(&mut from_app).take(max), output).map_err(lost)?;
++    if copied == max {
++        // The take hid whether the peer had more to send: one more
++        // byte says. A clean close there is a complete transfer.
++        let mut probe = [0_u8; 1];
++        if from_app.read(&mut probe).map_err(lost)? > 0 {
++            return Err(LinkError::Failed(format!(
++                "the link to {} passed the {max} byte bound with the session still open - the answer is truncated and the session ended (nothing ran)",
++                describe(&entry)
++            )));
++        }
+     }
+     Ok(())
+ }
+diff --git a/crates/app/src/mcp/link_peer.rs b/crates/app/src/mcp/link_peer.rs
+new file mode 100644
+index 000000000..6c16ce07c
+--- /dev/null
++++ b/crates/app/src/mcp/link_peer.rs
+@@ -0,0 +1,299 @@
++//! The CLI's trust law of the UI link (#3874): who the peer is, and how
++//! a line from it is read. The transport proves the peer before one
++//! byte of the token crosses - the 0700 socket folder on Unix, the
++//! pipe's user-only ACL and the kernel-reported server process id on
++//! Windows - and a TCP address is refused outright, because a token
++//! sent to an open port is given away to whoever holds it. After the
++//! peer is proven, every answer line is read under a byte cap and the
++//! hello exchange under one elapsed deadline: a peer that trickles
++//! bytes ends on the same clock as a silent one.
++//!
++//! Provenance: our own law over our own transports (link.rs,
++//! link_pipe.rs); the framing is the MCP stdio transport
++//! (modelcontextprotocol.io, revision 2025-06-18). Clean-room, public
++//! sources only.
++
++use std::io::{BufRead, BufReader, Write};
++use std::time::Duration;
++
++use super::link::{self, Entry};
++use super::wire::Stream;
++use crate::clock::Instant;
++
++/// How long the whole hello exchange may take - the connect, the hello
++/// line and the window's answer - before a window is read as busy or
++/// too slow (a stale file, a hung window, a peer that trickles bytes:
++/// one elapsed deadline ends all of them).
++pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// The most bytes of one answer line (#3874): a peer that sends one
++/// line with no end cannot make the client use all memory, and a line
++/// that reaches the bound without its newline ends the link - a
++/// remainder of it is never read as a new message. A tool result never
++/// approaches the bound. After the hello, no read deadline applies (a
++/// tool may run for minutes, #3751) - the peer proved its transport,
++/// so the byte bound is what remains to check.
++pub(super) const MAX_ANSWER: u64 = 1024 * 1024;
++
++pub(super) fn timed_out(what: &str) -> std::io::Error {
++    std::io::Error::new(std::io::ErrorKind::TimedOut, what)
++}
++
++pub(super) fn overlong(cap: u64) -> std::io::Error {
++    std::io::Error::new(
++        std::io::ErrorKind::InvalidData,
++        format!(
++            "a link line passed the {cap} byte bound without its end - the connection is closed"
++        ),
++    )
++}
++
++/// Open the entry's transport only. This is where the peer proves what
++/// it is, before one byte of the token crosses (#3874):
++/// - `"tcp"` is refused outright: any local process can hold an open
++///   port, and a token sent to it is given away - no exchange after
++///   that can tell the real window from the holder.
++/// - `"pipe"` (Windows) must be the entry pid's own pipe name, and the
++///   kernel must report the pipe's server as that same process.
++/// - `"unix"` (Unix) lives in the user's 0700 link folder: only the
++///   user's own processes can hold the path.
++///
++/// # Errors
++/// The transport is refused by name or by peer, or the OS connect
++/// failed.
++pub(super) fn dial(entry: &Entry) -> std::io::Result<Stream> {
++    match entry.transport.as_str() {
++        "tcp" => Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            format!(
++                "the file names the TCP port {} - this build refuses the TCP link: a peer on an open port cannot be verified against a false server; start the window again with this build",
++                entry.address
++            ),
++        )),
++        #[cfg(unix)]
++        "unix" => Ok(Stream::Unix(std::os::unix::net::UnixStream::connect(
++            &entry.address,
++        )?)),
++        #[cfg(windows)]
++        "pipe" => {
++            if entry.address != link::pipe_name(entry.pid) {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    format!(
++                        "the file's pipe name does not belong to process id {}",
++                        entry.pid
++                    ),
++                ));
++            }
++            let pipe = super::link_pipe::connect(&entry.address)?;
++            let server = super::link_pipe::server_pid(&pipe)?;
++            if server != entry.pid {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    format!(
++                        "the pipe is served by process {server}, not the window {} - the link file is stale",
++                        entry.pid
++                    ),
++                ));
++            }
++            Ok(Stream::Pipe(pipe))
++        }
++        other => Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            format!("transport '{other}' is not served on this platform"),
++        )),
++    }
++}
++
++/// Connect to one window and pass its hello: [`dial`] proves the peer
++/// first, then the token tells the window that this client read the
++/// discovery file. One elapsed deadline covers the whole exchange
++/// (#3874 review): a peer that sends one byte at a time ends on the
++/// same clock as a silent one.
++///
++/// # Errors
++/// The connect, the hello or the answer failed inside the deadline.
++pub(super) fn open(entry: &Entry) -> std::io::Result<Stream> {
++    let deadline = Instant::now() + HELLO_TIMEOUT;
++    let stream = dial(entry)?;
++    let left = |what: &str| -> std::io::Result<Duration> {
++        let rest = deadline.saturating_duration_since(Instant::now());
++        if rest.is_zero() {
++            Err(timed_out(what))
++        } else {
++            Ok(rest)
++        }
++    };
++    // The hello write waits for the peer to take it, under the same
++    // deadline as everything else in the exchange.
++    let mut writer = stream.try_clone()?;
++    writer.set_write_timeout(Some(left("the window did not take the hello in time")?))?;
++    writeln!(writer, "{}", link::hello_line(&entry.token)).and_then(|()| writer.flush())?;
++    let mut reader = BufReader::new(stream.try_clone()?);
++    let Some(answer) = read_line_bounded(&mut reader, MAX_ANSWER, Some(deadline))? else {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::UnexpectedEof,
++            "the peer closed the link before its hello answer",
++        ));
++    };
++    if answer.trim() != link::HELLO_OK {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "the peer did not accept the link token",
++        ));
++    }
++    // A tool may run for minutes (generate): no read deadline from
++    // here. The peer proved its transport; its answer lines stay
++    // bounded by MAX_ANSWER.
++    stream.set_read_timeout(None)?;
++    stream.set_write_timeout(None)?;
++    Ok(stream)
++}
++
++/// One step of a bounded line read.
++enum Step {
++    /// A complete line, delimiter included.
++    Line(String),
++    /// The peer hung up.
++    Eof,
++    /// More bytes needed; the loop reads again.
++    More,
++}
++
++/// Read one line under a byte cap, and under one elapsed deadline for
++/// the whole read when one is given (#3874 review). A line that
++/// reaches `cap` bytes without its newline ends the link: no remainder
++/// of it is ever read as a new message, so a valid reply hidden in a
++/// later piece of an oversized line never counts. `Ok(None)` is a
++/// clean close at a line start; a close mid-line is an error.
++///
++/// With no deadline the caller's own read timeout governs (none, once
++/// the peer proved itself: a tool may answer after minutes).
++pub(super) fn read_line_bounded(
++    reader: &mut BufReader<Stream>,
++    cap: u64,
++    deadline: Option<Instant>,
++) -> std::io::Result<Option<String>> {
++    let mut line = Vec::new();
++    loop {
++        if deadline.is_some_and(|d| Instant::now() >= d) {
++            return Err(timed_out(
++                "the link peer did not complete its answer in time",
++            ));
++        }
++        if let Some(d) = deadline {
++            // One read waits at most the time left to the deadline.
++            reader
++                .get_ref()
++                .set_read_timeout(Some(d.saturating_duration_since(Instant::now())))?;
++        }
++        let mut used = 0;
++        let step = {
++            let available = match reader.fill_buf() {
++                Ok(b) => b,
++                Err(e)
++                    if matches!(
++                        e.kind(),
++                        std::io::ErrorKind::WouldBlock
++                            | std::io::ErrorKind::TimedOut
++                            | std::io::ErrorKind::Interrupted
++                    ) =>
++                {
++                    // Nothing new inside the deadline window: the
++                    // check at the loop top ends the wait when it is
++                    // due; otherwise the peer may send again.
++                    continue;
++                }
++                Err(e) => return Err(e),
++            };
++            if available.is_empty() {
++                Ok(Step::Eof)
++            } else if let Some(at) = available.iter().position(|b| *b == b'\n') {
++                line.extend_from_slice(&available[..=at]);
++                used = at + 1;
++                // A whole line, delimiter included, fits the cap.
++                if line.len() > cap as usize {
++                    Err(overlong(cap))
++                } else {
++                    Ok(Step::Line(String::from_utf8_lossy(&line).into_owned()))
++                }
++            } else {
++                line.extend_from_slice(available);
++                used = available.len();
++                // No delimiter yet: one more byte - the delimiter
++                // itself included - cannot keep the line inside the
++                // cap, so the link ends here, not after it.
++                if line.len() >= cap as usize {
++                    Err(overlong(cap))
++                } else {
++                    Ok(Step::More)
++                }
++            }
++        };
++        reader.consume(used);
++        match step? {
++            Step::Line(text) => return Ok(Some(text)),
++            Step::Eof => {
++                if line.is_empty() {
++                    return Ok(None);
++                }
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::UnexpectedEof,
++                    "the link peer closed the connection mid-line",
++                ));
++            }
++            Step::More => continue,
++        }
++    }
++}
++
++/// Whether the process `pid` runs now. `Some(false)` only when the OS
++/// says the pid does not exist; `None` when the check cannot say (an
++/// access error) - the caller then treats the window as alive.
++#[cfg(unix)]
++pub(super) fn pid_alive(pid: u32) -> Option<bool> {
++    // A signal of 0 checks existence and sends nothing.
++    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
++        0 => Some(true),
++        -1 => match std::io::Error::last_os_error().raw_os_error() {
++            Some(libc::ESRCH) => Some(false),
++            // EPERM: the process exists, it is just not ours.
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
++/// The same check through `OpenProcess` on Windows.
++#[cfg(windows)]
++pub(super) fn pid_alive(pid: u32) -> Option<bool> {
++    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
++    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess};
++    // PROCESS_QUERY_LIMITED_INFORMATION: enough for the exit code, and
++    // allowed on another user's process.
++    const QUERY_LIMITED: u32 = 0x1000;
++    const STILL_ACTIVE: u32 = 259;
++    const ERROR_INVALID_PARAMETER: u32 = 87;
++    unsafe {
++        let handle = OpenProcess(QUERY_LIMITED, 0, pid);
++        if handle.is_null() {
++            return match GetLastError() {
++                // No process with this pid exists.
++                ERROR_INVALID_PARAMETER => Some(false),
++                // Cannot say (access denied): treat the window as alive.
++                _ => None,
++            };
++        }
++        let mut code = 0_u32;
++        let said = GetExitCodeProcess(handle, &mut code);
++        CloseHandle(handle);
++        (said != 0).then_some(code == STILL_ACTIVE)
++    }
++}
++
++/// A platform without a pid check: the caller treats the window as
++/// alive, and the transport proof in `open` guards the connection.
++#[cfg(not(any(unix, windows)))]
++pub(super) fn pid_alive(_pid: u32) -> Option<bool> {
++    None
++}
+diff --git a/crates/app/src/mcp/link_pipe.rs b/crates/app/src/mcp/link_pipe.rs
+new file mode 100644
+index 000000000..c2e99302f
+--- /dev/null
++++ b/crates/app/src/mcp/link_pipe.rs
+@@ -0,0 +1,325 @@
++//! The Windows transport of the UI link (#3874): a named pipe with a
++//! security descriptor that admits the window's own user only
++//! (`link_pipe_acl`), so the kernel - not a token on the wire - decides
++//! who the peer is. The pipe name carries the window's process id, and
++//! the CLI asks the kernel which process serves the pipe before it
++//! sends the token: a TCP port cannot be verified this way, because a
++//! peer that never read the discovery file still receives the token
++//! and can answer anything.
++//!
++//! Every wait is bounded and every handle is closed on its owner's
++//! drop, never by a panic. The byte stream itself is `link_pipe_stream`.
++//!
++//! Provenance: our own FFI over the platform's published named-pipe
++//! API (Microsoft Learn: CreateNamedPipeW, ConnectNamedPipe,
++//! GetNamedPipeServerProcessId). Clean-room, public sources only.
++
++#![allow(clippy::undocumented_unsafe_blocks)] // every block names its API below
++
++use std::ffi::OsStr;
++use std::io;
++use std::os::windows::ffi::OsStrExt;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::mpsc::{self, Receiver, TryRecvError};
++use std::sync::{Arc, Mutex};
++
++use windows_sys::Win32::Foundation::{
++    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
++    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
++};
++use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING};
++use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResultEx, OVERLAPPED};
++use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, GetNamedPipeServerProcessId};
++
++use super::link_pipe_acl::{SecurityDescriptor, create_instance};
++// The stream type is this transport's public face: `wire` and the
++// tests name it through this module.
++pub use super::link_pipe_stream::PipeStream;
++use super::link_pipe_stream::OpEvent;
++
++/// How long one slice of the connect wait runs before the stop flag is
++/// looked at again: the bound on how long dropping the listener takes.
++const WAIT_SLICE: u32 = 50;
++
++/// The pipe name of the window with this process id: the discovery
++/// file's `address` field on Windows. Derived from the pid, so the CLI
++/// can refuse a file whose pipe name belongs to another pid.
++#[must_use]
++pub fn pipe_name(pid: u32) -> String {
++    format!(r"\\.\pipe\camcraft-ui-link-{pid}")
++}
++
++fn wide(text: &str) -> Vec<u16> {
++    OsStr::new(text).encode_wide().chain([0]).collect()
++}
++
++pub(super) fn close(handle: HANDLE) {
++    // Safety: the caller owns the handle; no other thread uses it.
++    unsafe {
++        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
++            CloseHandle(handle);
++        }
++    }
++}
++
++/// A raw pipe handle on its way between threads: the creator thread,
++/// the accept channel, the CLI's bridge threads. One owner at a time,
++/// so the move is sound even though a raw pointer is not `Send` alone.
++#[derive(Clone, Copy)]
++struct RawHandle(HANDLE);
++// Safety: a kernel handle is thread-agnostic; each move hands the only
++// user of this end of the pipe to the next thread.
++unsafe impl Send for RawHandle {}
++
++enum Connect {
++    /// A client took the instance.
++    Arrived,
++    /// The listener is gone: end without a client.
++    Cancelled,
++    /// The OS refused the wait; the caller makes a fresh instance.
++    Failed,
++}
++
++/// Wait for a client in short slices, so the stop flag is seen even
++/// while the wait is pending, and a cancel settles it at once.
++///
++/// # Safety
++/// `handle` is a listening pipe instance that no other thread uses.
++/// Wait for a client in short slices, so the stop flag is seen even
++/// while the wait is pending, and a cancel settles it at once.
++///
++/// # Errors
++/// The operation's event could not be made.
++///
++/// # Safety
++/// `handle` is a listening pipe instance that no other thread uses.
++unsafe fn wait_connect(handle: HANDLE, stop: &AtomicBool) -> std::io::Result<Connect> {
++    // The connect waits on its own event, like every other operation:
++    // a handle wait could see a stale signal of the instance object.
++    let event = OpEvent::new()?;
++    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
++    overlapped.hEvent = event.handle();
++    if unsafe { ConnectNamedPipe(handle, &mut overlapped) } != 0 {
++        return Ok(Connect::Arrived);
++    }
++    let pending = unsafe { GetLastError() };
++    if pending == ERROR_PIPE_CONNECTED {
++        return Ok(Connect::Arrived);
++    }
++    if pending != ERROR_IO_PENDING {
++        return Ok(Connect::Failed);
++    }
++    loop {
++        let mut taken = 0_u32;
++        if unsafe { GetOverlappedResultEx(handle, &overlapped, &mut taken, WAIT_SLICE, 0) } != 0 {
++            return Ok(Connect::Arrived);
++        }
++        let err = unsafe { GetLastError() };
++        if err == WAIT_TIMEOUT {
++            if stop.load(Ordering::Acquire) {
++                unsafe { CancelIoEx(handle, std::ptr::null()) };
++                return Ok(Connect::Cancelled);
++            }
++            continue;
++        }
++        // A client that connected and left before the wait: retry.
++        return Ok(Connect::Failed);
++    }
++}
++
++struct ListenerState {
++    stop: AtomicBool,
++    /// The instance whose connect wait is pending (or was just made):
++    /// Drop cancels it, and the thread closes it when it sees `stop`.
++    pending: Mutex<Option<RawHandle>>,
++}
++
++/// The window's end of the pipe: a thread that keeps one instance
++/// waiting for the next client, and hands each connected instance to
++/// [`accept`](Self::accept), which never blocks.
++pub struct PipeListener {
++    connected: Receiver<io::Result<PipeStream>>,
++    state: Arc<ListenerState>,
++    thread: Option<std::thread::JoinHandle<()>>,
++}
++
++impl PipeListener {
++    /// Serve the pipe `name` (fail fast: the first instance exists, or
++    /// the name is taken and the error says so).
++    ///
++    /// # Errors
++    /// The security descriptor or the pipe creation failed.
++    pub fn new(name: &str) -> io::Result<Self> {
++        let wide = wide(name);
++        let state = Arc::new(ListenerState {
++            stop: AtomicBool::new(false),
++            pending: Mutex::new(None),
++        });
++        // The first instance exists before the link is said to be up:
++        // a taken name (a squatter) is an error now. The kernel copies
++        // the descriptor into the pipe, so it is freed right after.
++        let first = {
++            let sd = SecurityDescriptor::user_only()?;
++            create_instance(&wide, sd.attributes(), true)?
++        };
++        *state.pending.lock().expect("the listener lock") = Some(RawHandle(first));
++        // The thread's own copy: a raw handle crosses as `RawHandle`.
++        let first = RawHandle(first);
++        let (tx, connected) = mpsc::channel();
++        let worker = Arc::clone(&state);
++        let thread = std::thread::Builder::new()
++            .name("camcraft-ui-link-pipe".into())
++            .spawn(move || {
++                // Each later instance gets its own descriptor: one
++                // built here, never a captured pointer.
++                let sd = match SecurityDescriptor::user_only() {
++                    Ok(sd) => sd,
++                    Err(e) => {
++                        let _ = tx.send(Err(e));
++                        return;
++                    }
++                };
++                // The whole `RawHandle` crosses (a bare field capture
++                // would move the raw pointer itself, which is not Send).
++                let mut handle = first;
++                loop {
++                    if worker.stop.load(Ordering::Acquire) {
++                        close(handle.0);
++                        break;
++                    }
++                    let connect = match unsafe { wait_connect(handle.0, &worker.stop) } {
++                        Ok(c) => c,
++                        Err(e) => {
++                            close(handle.0);
++                            let _ = tx.send(Err(e));
++                            break;
++                        }
++                    };
++                    match connect {
++                        Connect::Arrived => {
++                            *worker.pending.lock().expect("the listener lock") = None;
++                            if worker.stop.load(Ordering::Acquire) {
++                                close(handle.0);
++                                break;
++                            }
++                            // The stream owns the instance from here:
++                            // the receiver drops it, or this send does
++                            // - a connected instance is never left open,
++                            // or the pipe's name could never free.
++                            if tx.send(Ok(PipeStream::from_handle(handle.0))).is_err() {
++                                break;
++                            }
++                        }
++                        Connect::Cancelled => {
++                            close(handle.0);
++                            break;
++                        }
++                        Connect::Failed => {
++                            close(handle.0);
++                            if worker.stop.load(Ordering::Acquire) {
++                                break;
++                            }
++                        }
++                    }
++                    // The next instance, so the next client connects
++                    // while this one is still served (the backlog).
++                    handle = match create_instance(&wide, sd.attributes(), false) {
++                        Ok(h) => RawHandle(h),
++                        Err(e) => {
++                            let _ = tx.send(Err(e));
++                            break;
++                        }
++                    };
++                    *worker.pending.lock().expect("the listener lock") = Some(handle);
++                }
++            })?;
++        Ok(Self {
++            connected,
++            state,
++            thread: Some(thread),
++        })
++    }
++
++    /// Take the next connected client, never blocking.
++    ///
++    /// # Errors
++    /// `WouldBlock` while no client waits; the creation error, once,
++    /// when the pipe could not make its next instance.
++    pub fn accept(&self) -> io::Result<(PipeStream, String)> {
++        match self.connected.try_recv() {
++            Ok(Ok(stream)) => Ok((stream, "named pipe".to_owned())),
++            Ok(Err(e)) => Err(e),
++            // The creator thread ended (its error was delivered once):
++            // report an empty listener, not a new error on every poll.
++            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => Err(io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "no pipe client waits",
++            )),
++        }
++    }
++
++    /// The accept loop polls; the pipe wait is sliced by itself.
++    pub fn set_nonblocking(&self, _on: bool) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++impl Drop for PipeListener {
++    fn drop(&mut self) {
++        self.state.stop.store(true, Ordering::Release);
++        // Wake the thread out of a pending connect wait; a thread that
++        // has not started its wait sees `stop` at its next slice.
++        let pending = self.state.pending.lock().expect("the listener lock").take();
++        if let Some(handle) = pending {
++            unsafe { CancelIoEx(handle.0, std::ptr::null()) };
++        }
++        if let Some(thread) = self.thread.take() {
++            let _ = thread.join();
++        }
++    }
++}
++
++/// Open the client end of the pipe `name`.
++///
++/// # Errors
++/// `TimedOut` when every instance is busy (the window's one session is
++/// taken); the OS error otherwise.
++pub fn connect(name: &str) -> io::Result<PipeStream> {
++    let wide = wide(name);
++    let handle = unsafe {
++        CreateFileW(
++            wide.as_ptr(),
++            GENERIC_READ | GENERIC_WRITE,
++            0,
++            std::ptr::null(),
++            OPEN_EXISTING,
++            FILE_FLAG_OVERLAPPED,
++            std::ptr::null_mut(),
++        )
++    };
++    if handle == INVALID_HANDLE_VALUE {
++        let why = unsafe { GetLastError() };
++        if why == ERROR_PIPE_BUSY {
++            return Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                "the window's link is busy: another client holds the session",
++            ));
++        }
++        return Err(io::Error::from_raw_os_error(why as i32));
++    }
++    Ok(PipeStream::from_handle(handle))
++}
++
++/// The process id of the pipe's server side, as the kernel reports it.
++/// The CLI's proof that the peer is the process the link file names
++/// (#3874): it runs before one byte of the token crosses.
++///
++/// # Errors
++/// The kernel could not say (the handle is not a pipe).
++pub fn server_pid(stream: &PipeStream) -> io::Result<u32> {
++    let mut pid = 0_u32;
++    if unsafe { GetNamedPipeServerProcessId(stream.handle(), &mut pid) } == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(pid)
++}
+diff --git a/crates/app/src/mcp/link_pipe_acl.rs b/crates/app/src/mcp/link_pipe_acl.rs
+new file mode 100644
+index 000000000..34abfc674
+--- /dev/null
++++ b/crates/app/src/mcp/link_pipe_acl.rs
+@@ -0,0 +1,157 @@
++//! The gate of the UI link's Windows pipe (#3874): the security
++//! descriptor that admits the window's own user only, and the pipe
++//! instance creation that carries it. The kernel - not a token on the
++//! wire - refuses another local user the pipe open, before our code
++//! runs.
++//!
++//! Provenance: our own FFI over the platform's published security API
++//! (Microsoft Learn: ConvertStringSecurityDescriptorToSecurityDescriptorW,
++//! GetTokenInformation, CreateNamedPipeW). Clean-room, public sources
++//! only.
++
++#![allow(clippy::undocumented_unsafe_blocks)] // every block names its API below
++
++use std::ffi::OsStr;
++use std::io;
++use std::os::windows::ffi::OsStrExt;
++
++use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
++use windows_sys::Win32::Security::Authorization::{
++    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
++};
++use windows_sys::Win32::Security::{
++    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
++    TokenUser,
++};
++use windows_sys::Win32::Storage::FileSystem::{
++    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
++};
++use windows_sys::Win32::System::Pipes::{
++    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
++};
++use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
++
++/// One read or write buffer of a pipe instance.
++const PIPE_BUF: u32 = 64 * 1024;
++
++/// The SDDL descriptor string `D:P(A;;GA;;;<user SID>)`: access granted
++/// to the current user and to nobody else.
++fn user_only_sddl() -> io::Result<String> {
++    unsafe {
++        let mut token: HANDLE = std::ptr::null_mut();
++        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
++            return Err(io::Error::last_os_error());
++        }
++        let mut len = 0_u32;
++        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
++        let mut buf = vec![0_u8; len.max(4) as usize];
++        let said = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
++        CloseHandle(token);
++        if said == 0 {
++            return Err(io::Error::last_os_error());
++        }
++        let user = buf.as_ptr().cast::<TOKEN_USER>();
++        let sid: PSID = (*user).User.Sid;
++        let mut text = std::ptr::null_mut();
++        if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
++            return Err(io::Error::last_os_error());
++        }
++        let mut utf16 = Vec::new();
++        let mut i = 0_usize;
++        while *text.add(i) != 0 {
++            utf16.push(*text.add(i));
++            i += 1;
++        }
++        LocalFree(text.cast());
++        let sid = String::from_utf16(&utf16)
++            .map_err(|_| io::Error::other("the user SID is not UTF-16"))?;
++        Ok(format!("D:P(A;;GA;;;{sid})"))
++    }
++}
++
++/// A pipe security descriptor that admits the current user only. The
++/// kernel copies it into each instance, so it is freed after the last
++/// `CreateNamedPipeW` that borrowed it (the listener's own lifetime).
++pub(super) struct SecurityDescriptor(SECURITY_ATTRIBUTES);
++
++impl SecurityDescriptor {
++    /// The `D:P(A;;GA;;;<user SID>)` descriptor of this process's user.
++    ///
++    /// # Errors
++    /// The token or the descriptor conversion failed.
++    pub(super) fn user_only() -> io::Result<Self> {
++        let wide = OsStr::new(&user_only_sddl()?)
++            .encode_wide()
++            .chain([0])
++            .collect::<Vec<_>>();
++        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
++        let made = unsafe {
++            ConvertStringSecurityDescriptorToSecurityDescriptorW(
++                wide.as_ptr(),
++                SDDL_REVISION_1,
++                &mut sd,
++                std::ptr::null_mut(),
++            )
++        };
++        if made == 0 || sd.is_null() {
++            return Err(io::Error::last_os_error());
++        }
++        let attributes = SECURITY_ATTRIBUTES {
++            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
++            lpSecurityDescriptor: sd.cast(),
++            bInheritHandle: 0,
++        };
++        Ok(Self(attributes))
++    }
++
++    /// The raw attributes each `CreateNamedPipeW` call borrows.
++    pub(super) fn attributes(&self) -> &SECURITY_ATTRIBUTES {
++        &self.0
++    }
++}
++
++impl Drop for SecurityDescriptor {
++    fn drop(&mut self) {
++        unsafe { LocalFree(self.0.lpSecurityDescriptor.cast()) };
++    }
++}
++
++/// One pipe instance waiting for a client. `first` adds the
++/// anti-hijack flag: the name must be free, or the window's link fails
++/// to open (a squatter cannot shadow a real window).
++///
++/// # Errors
++/// The pipe creation failed (the name is taken, or the OS refused).
++pub(super) fn create_instance(
++    name: &[u16],
++    sd: &SECURITY_ATTRIBUTES,
++    first: bool,
++) -> io::Result<HANDLE> {
++    let mode = windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX
++        | FILE_FLAG_OVERLAPPED
++        | if first {
++            FILE_FLAG_FIRST_PIPE_INSTANCE
++        } else {
++            0
++        };
++    let kind = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
++    // FILE_FLAG_OVERLAPPED: every wait on this handle carries its own
++    // deadline (the synchronous pipe API has none).
++    let handle = unsafe {
++        CreateNamedPipeW(
++            name.as_ptr(),
++            mode,
++            kind,
++            PIPE_UNLIMITED_INSTANCES,
++            PIPE_BUF,
++            PIPE_BUF,
++            0,
++            sd,
++        )
++    };
++    if handle == INVALID_HANDLE_VALUE {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(handle)
++    }
++}
+diff --git a/crates/app/src/mcp/link_pipe_stream.rs b/crates/app/src/mcp/link_pipe_stream.rs
+new file mode 100644
+index 000000000..53be56376
+--- /dev/null
++++ b/crates/app/src/mcp/link_pipe_stream.rs
+@@ -0,0 +1,257 @@
++//! The byte stream of the UI link's Windows pipe (#3874): one
++//! connected end, read and written through overlapped I/O so every
++//! wait carries its own deadline - the synchronous pipe API has none,
++//! and the idle law of `listen.rs` and the hello deadline need one.
++//! Read and write deadlines are shared by every clone of one pipe, as
++//! a socket option is.
++//!
++//! Provenance: our own FFI over the platform's published pipe API
++//! (Microsoft Learn: ReadFile, WriteFile, GetOverlappedResultEx,
++//! CancelIoEx). Clean-room, public sources only.
++
++#![allow(clippy::undocumented_unsafe_blocks)] // every block names its API below
++
++use std::io;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use windows_sys::Win32::Foundation::{
++    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
++    ERROR_NO_DATA, ERROR_OPERATION_ABORTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
++    WAIT_TIMEOUT,
++};
++use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
++use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResultEx, OVERLAPPED};
++use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
++
++use super::link_pipe::close;
++
++/// The event of one overlapped operation: each op waits on its own
++/// event, never on the pipe handle - completions signal the shared
++/// instance object, so a handle wait cannot tell one completion from
++/// another (the server's connect, this side's earlier write).
++pub(super) struct OpEvent(HANDLE);
++
++impl OpEvent {
++    /// A fresh unnamed auto-reset event.
++    ///
++    /// # Errors
++    /// The OS could not make the event.
++    pub(super) fn new() -> std::io::Result<Self> {
++        let made = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
++        if made.is_null() || made == INVALID_HANDLE_VALUE {
++            return Err(std::io::Error::last_os_error());
++        }
++        Ok(Self(made))
++    }
++
++    /// The raw event handle, set into an operation's OVERLAPPED.
++    pub(super) fn handle(&self) -> HANDLE {
++        self.0
++    }
++}
++
++impl Drop for OpEvent {
++    fn drop(&mut self) {
++        close(self.0);
++    }
++}
++
++/// Read and write deadlines, shared by every clone of one pipe.
++#[derive(Default)]
++struct StreamLimits(Mutex<(Option<Duration>, Option<Duration>)>);
++
++/// One connected end of a pipe: the window's accepted client, or the
++/// CLI's connection to the window.
++pub struct PipeStream {
++    handle: HANDLE,
++    limits: Arc<StreamLimits>,
++}
++
++impl PipeStream {
++    pub(super) fn from_handle(handle: HANDLE) -> Self {
++        Self {
++            handle,
++            limits: Arc::new(StreamLimits(Mutex::new((None, None)))),
++        }
++    }
++
++    /// The raw handle, for the kernel's own queries about this pipe.
++    pub(super) fn handle(&self) -> HANDLE {
++        self.handle
++    }
++
++    fn ms(limits: &StreamLimits, write: bool) -> u32 {
++        let guard = limits.0.lock().expect("the stream lock");
++        let set = if write { guard.1 } else { guard.0 };
++        // None: wait for ever, as a socket with no timeout does.
++        set.map_or(u32::MAX, |d| d.as_millis().min(u32::MAX as u128) as u32)
++    }
++
++    /// # Errors
++    /// A zero duration, like a socket timeout of zero.
++    pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        if t.is_some_and(|d| d.is_zero()) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "a pipe read timeout cannot be zero",
++            ));
++        }
++        self.limits.0.lock().expect("the stream lock").0 = t;
++        Ok(())
++    }
++
++    /// # Errors
++    /// A zero duration, like a socket timeout of zero.
++    pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
++        if t.is_some_and(|d| d.is_zero()) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "a pipe write timeout cannot be zero",
++            ));
++        }
++        self.limits.0.lock().expect("the stream lock").1 = t;
++        Ok(())
++    }
++
++    /// The pipe API has no non-blocking mode that our callers need:
++    /// every wait already runs under a deadline.
++    pub fn set_nonblocking(&self, _on: bool) -> io::Result<()> {
++        Ok(())
++    }
++
++    /// A second handle on the same pipe (one reads, one writes).
++    ///
++    /// # Errors
++    /// The OS could not duplicate the handle.
++    pub fn try_clone(&self) -> io::Result<Self> {
++        let mut twin: HANDLE = std::ptr::null_mut();
++        let made = unsafe {
++            DuplicateHandle(
++                GetCurrentProcess(),
++                self.handle,
++                GetCurrentProcess(),
++                &mut twin,
++                0,
++                0,
++                DUPLICATE_SAME_ACCESS,
++            )
++        };
++        if made == 0 || twin.is_null() {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(Self {
++            handle: twin,
++            limits: Arc::clone(&self.limits),
++        })
++    }
++
++    /// A pipe cannot close one direction only. The caller's session
++    /// still ends cleanly: the idle drop on the window's side, or the
++    /// broken pipe when this process exits, closes it.
++    pub fn shutdown_write(&self) -> io::Result<()> {
++        Ok(())
++    }
++
++    /// One overlapped read under a deadline.
++    fn read_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++        // Safety: the buffer is valid and only this call uses it.
++        unsafe { self.io(false, buf.as_mut_ptr(), buf.len()) }
++    }
++
++    /// One overlapped write under a deadline. The pointer is cast mut
++    /// for the shared core only; the OS reads from it, never writes.
++    fn write_from(&self, buf: &[u8]) -> io::Result<usize> {
++        // Safety: the buffer is valid for the length, and the OS only
++        // reads through it on the write path.
++        unsafe { self.io(true, buf.as_ptr() as *mut u8, buf.len()) }
++    }
++
++    /// One overlapped file operation under a deadline in milliseconds:
++    /// on timeout the operation is cancelled and reaped, so the handle
++    /// never keeps a pending operation past the caller's bounds.
++    ///
++    /// # Safety
++    /// `buf` is valid for `len` bytes; only this call uses the handle.
++    unsafe fn io(&self, write: bool, buf: *mut u8, len: usize) -> io::Result<usize> {
++        // Each operation carries its own event: the wait below must
++        // see THIS operation's completion, not the instance's last one.
++        let event = OpEvent::new()?;
++        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
++        overlapped.hEvent = event.handle();
++        let mut moved = 0_u32;
++        let said = unsafe {
++            if write {
++                WriteFile(self.handle, buf, len as u32, &mut moved, &mut overlapped)
++            } else {
++                ReadFile(self.handle, buf, len as u32, &mut moved, &mut overlapped)
++            }
++        };
++        if said != 0 {
++            return Ok(moved as usize);
++        }
++        let pending = unsafe { GetLastError() };
++        if pending != ERROR_IO_PENDING {
++            return self.finished(write, pending);
++        }
++        let wait = Self::ms(&self.limits, write);
++        if unsafe { GetOverlappedResultEx(self.handle, &overlapped, &mut moved, wait, 0) } != 0 {
++            return Ok(moved as usize);
++        }
++        let why = unsafe { GetLastError() };
++        if why == WAIT_TIMEOUT {
++            unsafe { CancelIoEx(self.handle, std::ptr::null()) };
++            // Reap the settled operation: data that raced the deadline
++            // still counts, a true timeout does not.
++            if unsafe { GetOverlappedResultEx(self.handle, &overlapped, &mut moved, u32::MAX, 0) }
++                != 0
++            {
++                return Ok(moved as usize);
++            }
++            return self.finished(write, unsafe { GetLastError() });
++        }
++        self.finished(write, why)
++    }
++
++    /// The error (or the end of input) of a completed operation.
++    fn finished(&self, write: bool, code: u32) -> io::Result<usize> {
++        match code {
++            // Reading a pipe whose writer hung up is the end of input.
++            ERROR_BROKEN_PIPE | ERROR_NO_DATA if !write => Ok(0),
++            ERROR_OPERATION_ABORTED => Err(io::Error::new(
++                io::ErrorKind::WouldBlock,
++                "the pipe operation timed out",
++            )),
++            _ => Err(io::Error::from_raw_os_error(code as i32)),
++        }
++    }
++}
++
++impl Drop for PipeStream {
++    fn drop(&mut self) {
++        close(self.handle);
++    }
++}
++
++impl std::io::Read for PipeStream {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        if buf.is_empty() {
++            return Ok(0);
++        }
++        self.read_into(buf)
++    }
++}
++
++impl std::io::Write for PipeStream {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        self.write_from(buf)
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(()) // byte pipes hand each written buffer to the peer at once
++    }
++}
++
++// Safety: a kernel handle is thread-agnostic; a clone is a separate
++// handle of its own, used by one thread at a time.
++unsafe impl Send for PipeStream {}
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index fa6a22f76..b33ba7a34 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -328,15 +328,16 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             let rest = buf.split_off(nl.saturating_add(1));
+             let line = std::mem::replace(&mut buf, rest);
+             if let Some(want) = gate.take() {
+-                // A hello that carries a nonce (a client of #3874) gets
+-                // the proof of the token back; a plain hello (an older
+-                // CLI) gets plain HELLO_OK.
+-                let nonce = link::hello_nonce(&line);
++                // The transport already proved the peer's identity
++                // (#3874: the 0700 socket folder, or the pipe's
++                // user-only ACL and the server process id). The token
++                // now tells the window that this client read the
++                // discovery file; any other first line is refused.
+                 if !link::hello_matches(&line, want) {
+                     let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
+                     return Ok(End::Refused);
+                 }
+-                writeln!(writer, "{}", link::hello_ok_line(want, nonce.as_deref()))?;
++                writeln!(writer, "{}", link::HELLO_OK)?;
+                 writer.flush()?;
+                 active = Instant::now();
+                 continue;
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 75b3896a3..9be0b6674 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -46,6 +46,21 @@ mod job;
+ mod listen;
+ pub mod link;
+ mod link_client;
++/// The CLI's trust law of that link (#3874): the peer proves its
++/// transport before the token crosses, and every line is bounded.
++mod link_peer;
++// The Windows named-pipe transport of the UI link (#3874): a pipe with
++// a user-only ACL replaces the TCP port, and the CLI asks the kernel
++// which process serves the pipe. Public so the link tests can stand a
++// false pipe server up.
++#[cfg(windows)]
++pub mod link_pipe;
++/// The user-only gate of that pipe: its security descriptor.
++#[cfg(windows)]
++mod link_pipe_acl;
++/// The byte stream of that pipe: overlapped reads and writes.
++#[cfg(windows)]
++mod link_pipe_stream;
+ mod port_flag;
+ mod wire;
+ mod live;
+@@ -103,7 +118,7 @@ mod recipe_tools;
+ // #183: the same tool table served live from inside the GUI, over a
+ // loopback socket, against the app's own document and History.
+ pub use bridge::bridge;
+-pub use link_client::{bridge as link_bridge, call as link_call, connect as link_connect, LinkError, Select};
++pub use link_client::{bridge as link_bridge, bridge_with_bound, call as link_call, connect as link_connect, hold as link_hold, HeldSession, LinkError, Select};
+ pub use listen::{Inbox, Request, Wake, IDLE_TIMEOUT};
+ pub use port_flag::port_from;
+ pub use live::{
+diff --git a/crates/app/src/mcp/wire.rs b/crates/app/src/mcp/wire.rs
+index 58be14b3f..948cb158d 100644
+--- a/crates/app/src/mcp/wire.rs
++++ b/crates/app/src/mcp/wire.rs
+@@ -14,11 +14,18 @@ use std::time::Duration;
+ #[cfg(unix)]
+ use std::os::unix::net::{UnixListener, UnixStream};
+ 
++#[cfg(windows)]
++use super::link_pipe::{PipeListener, PipeStream};
++
+ /// A listening socket: what [`super::Inbox`] accepts clients on.
+ pub enum Listener {
+     Tcp(TcpListener),
+     #[cfg(unix)]
+     Unix(UnixListener),
++    /// The UI link on Windows (#3874): a named pipe in the user's own
++    /// name space, never a TCP port.
++    #[cfg(windows)]
++    Pipe(PipeListener),
+ }
+ 
+ impl Listener {
+@@ -32,6 +39,8 @@ impl Listener {
+             Listener::Tcp(l) => l.accept().map(|(s, peer)| (Stream::Tcp(s), peer.to_string())),
+             #[cfg(unix)]
+             Listener::Unix(l) => l.accept().map(|(s, _)| (Stream::Unix(s), "local socket".to_owned())),
++            #[cfg(windows)]
++            Listener::Pipe(l) => l.accept().map(|(s, peer)| (Stream::Pipe(s), peer)),
+         }
+     }
+ 
+@@ -42,6 +51,9 @@ impl Listener {
+             Listener::Tcp(l) => l.set_nonblocking(on),
+             #[cfg(unix)]
+             Listener::Unix(l) => l.set_nonblocking(on),
++            // The pipe's own connect wait is sliced; it needs no mode.
++            #[cfg(windows)]
++            Listener::Pipe(l) => l.set_nonblocking(on),
+         }
+     }
+ }
+@@ -51,6 +63,8 @@ pub enum Stream {
+     Tcp(TcpStream),
+     #[cfg(unix)]
+     Unix(UnixStream),
++    #[cfg(windows)]
++    Pipe(PipeStream),
+ }
+ 
+ impl Stream {
+@@ -61,6 +75,8 @@ impl Stream {
+             Stream::Tcp(s) => s.set_nonblocking(on),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.set_nonblocking(on),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.set_nonblocking(on),
+         }
+     }
+ 
+@@ -71,6 +87,8 @@ impl Stream {
+             Stream::Tcp(s) => s.set_read_timeout(t),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.set_read_timeout(t),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.set_read_timeout(t),
+         }
+     }
+ 
+@@ -81,6 +99,8 @@ impl Stream {
+             Stream::Tcp(s) => s.set_write_timeout(t),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.set_write_timeout(t),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.set_write_timeout(t),
+         }
+     }
+ 
+@@ -93,6 +113,8 @@ impl Stream {
+             Stream::Tcp(s) => s.try_clone().map(Stream::Tcp),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.try_clone().map(Stream::Unix),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.try_clone().map(Stream::Pipe),
+         }
+     }
+ 
+@@ -105,6 +127,10 @@ impl Stream {
+             Stream::Tcp(s) => s.shutdown(std::net::Shutdown::Write),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.shutdown(std::net::Shutdown::Write),
++            // A pipe cannot close one direction only; the session ends
++            // through the idle drop or the broken pipe instead.
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.shutdown_write(),
+         }
+     }
+ }
+@@ -115,6 +141,8 @@ impl Read for Stream {
+             Stream::Tcp(s) => s.read(buf),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.read(buf),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.read(buf),
+         }
+     }
+ }
+@@ -125,6 +153,8 @@ impl Write for Stream {
+             Stream::Tcp(s) => s.write(buf),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.write(buf),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.write(buf),
+         }
+     }
+ 
+@@ -133,6 +163,8 @@ impl Write for Stream {
+             Stream::Tcp(s) => s.flush(),
+             #[cfg(unix)]
+             Stream::Unix(s) => s.flush(),
++            #[cfg(windows)]
++            Stream::Pipe(s) => s.flush(),
+         }
+     }
+ }
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index f021576db..c31f9631a 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -1,15 +1,17 @@
+-//! The UI link (#3751): `camcraft-cli --ui` finds a running window by
+-//! its discovery file and opens a session with the file's token. Pinned
+-//! here: no window is a clear error with exit 3 (never a headless run),
+-//! a wrong token is refused before a line reaches the app, a good
+-//! session carries a tool call to the window's inbox, and the file goes
+-//! when the window's inbox drops.
++//! The UI link (#3751, #3874): `camcraft-cli --ui` finds a running
++//! window by its discovery file and opens a session with its transport
++//! and token. Pinned here: no window is a clear error with exit 3
++//! (never a headless run), a wrong token is refused before a line
++//! reaches the app, a TCP address is refused by name, a pipe served by
++//! another process gets nothing, one deadline ends a slow hello, an
++//! oversized line is never split into messages, the file goes when the
++//! window's inbox drops, and the bridge's bound reports a truncation.
+ //! Provenance: our own tests over our own link; no HSMWorks material.
+ 
+ use camcraft_app::mcp::link::{self, Entry};
+-use camcraft_app::mcp::{link_call, Inbox, LinkError, Select};
++use camcraft_app::mcp::{Inbox, LinkError, Select, bridge_with_bound, link_call, link_hold};
+ 
+-use serde_json::{json, Value};
++use serde_json::{Value, json};
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use std::time::{Duration, Instant};
+@@ -35,9 +37,44 @@ fn write_entry(dir: &Path, entry: &Entry) {
+     std::fs::write(dir.join(format!("{}.json", entry.pid)), text).expect("write entry");
+ }
+ 
++/// A live pid that is not this test's own: a child that stays up for
++/// the whole check (Windows builds it from `ping`, Unix from `sleep`).
++fn live_foreign_pid() -> std::process::Child {
++    #[cfg(windows)]
++    let child = Command::new("ping")
++        .args(["-n", "30", "127.0.0.1"])
++        .stdout(std::process::Stdio::null())
++        .spawn()
++        .expect("a live pid donor");
++    #[cfg(unix)]
++    let child = Command::new("sleep")
++        .arg("30")
++        .spawn()
++        .expect("a live pid donor");
++    child
++}
++
+ /// Answer the inbox's requests on this thread (the window's frame loop
+ /// stand-in) until `client` ends; returns the lines that reached it.
+-fn serve_until<T: Send + 'static>(inbox: &Inbox, client: std::thread::JoinHandle<T>) -> (T, Vec<String>) {
++fn serve_until<T: Send + 'static>(
++    inbox: &Inbox,
++    client: std::thread::JoinHandle<T>,
++) -> (T, Vec<String>) {
++    serve_until_reply(inbox, client, |msg| {
++        json!({
++            "jsonrpc": "2.0", "id": msg["id"],
++            "result": { "content": [], "structuredContent": { "echo": msg["params"]["name"] }, "isError": false }
++        })
++        .to_string()
++    })
++}
++
++/// [`serve_until`] with the window's reply given by `reply`.
++fn serve_until_reply<T: Send + 'static>(
++    inbox: &Inbox,
++    client: std::thread::JoinHandle<T>,
++    reply: impl Fn(&Value) -> String,
++) -> (T, Vec<String>) {
+     let mut lines = Vec::new();
+     let deadline = Instant::now() + Duration::from_secs(20);
+     while !client.is_finished() {
+@@ -45,17 +82,133 @@ fn serve_until<T: Send + 'static>(inbox: &Inbox, client: std::thread::JoinHandle
+         while let Some(req) = inbox.next() {
+             let msg: Value = serde_json::from_str(req.line()).expect("json line");
+             lines.push(req.line().to_owned());
+-            let reply = json!({
+-                "jsonrpc": "2.0", "id": msg["id"],
+-                "result": { "content": [], "structuredContent": { "echo": msg["params"]["name"] }, "isError": false }
+-            });
+-            req.answer(Some(reply.to_string()));
++            req.answer(Some(reply(&msg)));
+         }
+         std::thread::sleep(Duration::from_millis(5));
+     }
+     (client.join().expect("client thread"), lines)
+ }
+ 
++/// Every test of this binary runs in ONE process, and the Windows pipe
++/// name comes from the process id: the tests that hold a pipe (a window
++/// inbox, or a false window) serialize on this lock, or the second
++/// taker of the same name cannot create its instance.
++static PIPE_NAME_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
++fn pipe_name_slot() -> std::sync::MutexGuard<'static, ()> {
++    PIPE_NAME_SLOT.lock().unwrap_or_else(|p| p.into_inner())
++}
++
++/// A false window this test process serves on the platform transport
++/// (#3874 review). The entry's pid is the test's own, so the
++/// transport-level checks pass and the false behaviour is what the CLI
++/// sees. What the false window does with the connection is each test's
++/// business. The caller holds [`pipe_name_slot`] for the listener's
++/// lifetime.
++enum FalseWindow {
++    #[cfg(windows)]
++    Pipe(camcraft_app::mcp::link_pipe::PipeListener),
++    #[cfg(unix)]
++    Unix(std::os::unix::net::UnixListener),
++}
++
++/// One connected CLI, as the false window sees it.
++enum FalseClient {
++    #[cfg(windows)]
++    Pipe(camcraft_app::mcp::link_pipe::PipeStream),
++    #[cfg(unix)]
++    Unix(std::os::unix::net::UnixStream),
++}
++
++impl std::io::Read for FalseClient {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        match self {
++            #[cfg(windows)]
++            Self::Pipe(s) => s.read(buf),
++            #[cfg(unix)]
++            Self::Unix(s) => s.read(buf),
++        }
++    }
++}
++
++impl std::io::Write for FalseClient {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        match self {
++            #[cfg(windows)]
++            Self::Pipe(s) => s.write(buf),
++            #[cfg(unix)]
++            Self::Unix(s) => s.write(buf),
++        }
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        match self {
++            #[cfg(windows)]
++            Self::Pipe(s) => s.flush(),
++            #[cfg(unix)]
++            Self::Unix(s) => s.flush(),
++        }
++    }
++}
++
++/// The transport a false window holds in this test, and the entry that
++/// points the CLI at it. The `_dir` is the socket path on Unix; on
++/// Windows the pipe name comes from the test's own pid.
++fn false_window(_dir: &Path) -> (Entry, FalseWindow) {
++    let pid = std::process::id();
++    #[cfg(windows)]
++    let (transport, address, made) = {
++        let name = camcraft_app::mcp::link_pipe::pipe_name(pid);
++        let listener =
++            camcraft_app::mcp::link_pipe::PipeListener::new(&name).expect("the false pipe");
++        ("pipe".to_owned(), name, FalseWindow::Pipe(listener))
++    };
++    #[cfg(unix)]
++    let (transport, address, made) = {
++        let path = _dir.join(format!("{pid}.sock"));
++        let listener = std::os::unix::net::UnixListener::bind(&path).expect("the false socket");
++        listener.set_nonblocking(true).expect("a polling accept");
++        let address = path.to_str().expect("temp dir is UTF-8").to_owned();
++        ("unix".to_owned(), address, FalseWindow::Unix(listener))
++    };
++    let entry = Entry {
++        format: link::FORMAT,
++        pid,
++        transport,
++        address,
++        token: "7".repeat(64),
++        project: None,
++        app_version: "0".into(),
++    };
++    (entry, made)
++}
++
++/// Take the CLI's connection on a false window, within `wait`.
++fn accept_false(window: &FalseWindow, wait: Duration) -> FalseClient {
++    let deadline = Instant::now() + wait;
++    loop {
++        assert!(
++            Instant::now() < deadline,
++            "no CLI connected to the false window"
++        );
++        match window {
++            #[cfg(windows)]
++            FalseWindow::Pipe(l) => {
++                if let Ok((s, _)) = l.accept() {
++                    return FalseClient::Pipe(s);
++                }
++            }
++            #[cfg(unix)]
++            FalseWindow::Unix(l) => {
++                if let Ok((s, _)) = l.accept() {
++                    return FalseClient::Unix(s);
++                }
++            }
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++
+ #[test]
+ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+     let dir = fresh_dir("none");
+@@ -66,7 +219,7 @@ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+     assert!(err.contains("nothing ran"), "{err}");
+     assert!(o.stdout.is_empty(), "no headless answer on stdout");
+ 
+-    // A file a crashed window left behind: its socket does not answer.
++    // A file a crashed window left behind: its transport does not answer.
+     let stale = Entry {
+         format: link::FORMAT,
+         pid: 4_000_000_000,
+@@ -82,8 +235,11 @@ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+     assert_eq!(o.status.code(), Some(3), "{err}");
+     assert!(err.contains("stale"), "{err}");
+     // The dead pid's file is gone: the CLI removed it, so no later run
+-    // sees the stale port (never a live window's file, #3874).
+-    assert!(link::entries(&dir).is_empty(), "the stale file of a dead pid is removed");
++    // sees the stale entry (never a live window's file, #3874).
++    assert!(
++        link::entries(&dir).is_empty(),
++        "the stale file of a dead pid is removed"
++    );
+ 
+     // A window asked for by a pid that no file names. The stale file is
+     // written again, so the listing names a file that is not pid 123.
+@@ -98,121 +254,202 @@ fn a_cli_call_with_no_window_says_so_and_exits_3() {
+ #[test]
+ fn bad_ui_arguments_are_usage_errors() {
+     let dir = fresh_dir("usage");
+-    for args in [&["call"][..], &["call", "get_job", "[1]"], &["call", "get_job", "{nope"], &["--window"], &["dance"]] {
++    for args in [
++        &["call"][..],
++        &["call", "get_job", "[1]"],
++        &["call", "get_job", "{nope"],
++        &["--window"],
++        &["dance"],
++    ] {
+         let o = cli_ui(&dir, args);
+-        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
++        assert_eq!(
++            o.status.code(),
++            Some(2),
++            "{args:?}: {}",
++            String::from_utf8_lossy(&o.stderr)
++        );
+     }
+     let o = cli_ui(&dir, &["--help"]);
+     assert_eq!(o.status.code(), Some(0));
+-    assert!(String::from_utf8_lossy(&o.stdout).contains("Exit: 0 stood, 1 refused, 2 usage, 3 no running window, 4 window busy"));
++    assert!(
++        String::from_utf8_lossy(&o.stdout)
++            .contains("Exit: 0 stood, 1 refused, 2 usage, 3 no running window, 4 window busy")
++    );
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
+ #[test]
+-fn a_false_window_that_does_not_prove_the_token_gets_no_tool_call() {
+-    let dir = fresh_dir("false-window");
+-    // A false server on the port of a discovery entry (#3874): it read
+-    // the file, so it has the token, but it cannot prove it - it answers
+-    // a plain HELLO_OK with no mix of the client's nonce. The CLI must
+-    // drop it before one tool-call line reaches it.
+-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
++fn a_tcp_link_file_is_refused_by_name() {
++    let dir = fresh_dir("tcp");
++    // A live pid (this test's own), so the pid filter keeps the file:
++    // the refusal must come from the transport itself. A peer on an
++    // open TCP port cannot be verified (#3874) - whatever it answers,
++    // it first received the token - so this build never dials one.
+     let entry = Entry {
+         format: link::FORMAT,
+-        // A live pid, so the pid-alive check does not remove the file
+-        // first: the pid of a window whose file a false server serves.
+         pid: std::process::id(),
+         transport: "tcp".into(),
+-        address: listener.local_addr().expect("local address").to_string(),
++        address: "127.0.0.1:1".into(),
+         token: "7".repeat(64),
+         project: None,
+         app_version: "0".into(),
+     };
+     write_entry(&dir, &entry);
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(1), "{err}");
++    assert!(err.contains("refuses the TCP link"), "{err}");
++    assert!(err.contains("nothing ran"), "{err}");
++    assert!(o.stdout.is_empty(), "no answer from a TCP entry");
++    assert!(
++        link::entries(&dir).len() == 1,
++        "a live pid's file is not removed"
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
+ 
+-    use std::io::{Read, Write};
+-    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
++#[test]
++#[cfg(windows)]
++fn a_pipe_served_by_another_process_gets_no_token_and_no_tool_call() {
++    use std::io::Read;
++    let dir = fresh_dir("false-pipe");
++    // The kernel reports the pipe's server process id (#3874): the
++    // file names a live foreign pid, but this test's pipe serves the
++    // name. The CLI must refuse before it sends anything - not the
++    // token, not a tool call - and say which process it found.
++    let mut donor = live_foreign_pid();
++    let pid = donor.id();
++    let name = camcraft_app::mcp::link_pipe::pipe_name(pid);
++    let listener = camcraft_app::mcp::link_pipe::PipeListener::new(&name).expect("the false pipe");
++    let entry = Entry {
++        format: link::FORMAT,
++        pid,
++        transport: "pipe".into(),
++        address: name,
++        token: "7".repeat(64),
++        project: None,
++        app_version: "0".into(),
++    };
++    write_entry(&dir, &entry);
++
++    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+     let server = std::thread::spawn(move || {
+-        // One connection: read its first line, answer HELLO_OK without
+-        // the proof, then read until the client hangs up.
+-        let (mut s, _) = listener.accept().expect("accept");
+-        s.set_read_timeout(Some(Duration::from_secs(20))).expect("read timeout");
+-        let mut first = Vec::new();
+-        let mut chunk = [0_u8; 256];
+-        while !first.contains(&b'\n') {
+-            let n = s.read(&mut chunk).expect("read the hello");
+-            assert!(n > 0, "the client hung up before the hello");
+-            first.extend_from_slice(&chunk[..n]);
+-        }
+-        lines_tx.send(String::from_utf8_lossy(&first).into_owned()).expect("send");
+-        s.write_all(format!("{}\n", link::HELLO_OK).as_bytes()).expect("write HELLO_OK");
+-        s.flush().expect("flush HELLO_OK");
+-        let mut rest = Vec::new();
+-        let _ = s.read_to_end(&mut rest);
+-        String::from_utf8_lossy(&rest).into_owned()
++        let mut client = accept_false(&FalseWindow::Pipe(listener), Duration::from_secs(20));
++        // The false server would answer anything - even a computed
++        // proof - but it never gets the chance: nothing reaches it.
++        let mut seen = Vec::new();
++        let _ = client.read_to_end(&mut seen);
++        seen_tx.send(seen).expect("send what the false server saw");
+     });
+ 
+     let o = cli_ui(&dir, &["call", "get_job"]);
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(1), "{err}");
+-    assert!(err.contains("refused the link token"), "{err}");
++    assert!(err.contains("served by process"), "{err}");
++    assert!(err.contains(&format!("not the window {pid}")), "{err}");
+     assert!(err.contains("nothing ran"), "{err}");
+-    assert!(o.stdout.is_empty(), "no answer from the false server on stdout");
+-
+-    let rest = server.join().expect("the false server thread");
+-    assert!(!rest.contains("tools/call"), "no tool call after the refusal: {rest}");
+-    let first = lines_rx.try_recv().expect("the false server saw one line");
+-    assert!(first.contains("camcraft_link"), "{first}");
+-    assert!(first.contains("nonce"), "the client sent a nonce: {first}");
+-    assert!(!first.contains("tools/call"), "no tool call reached the false server: {first}");
+-    assert!(link::entries(&dir).len() == 1, "a live pid's file is not removed");
++    assert!(o.stdout.is_empty(), "no answer from the false server");
++
++    let seen = seen_rx
++        .recv_timeout(Duration::from_secs(20))
++        .expect("the false server's capture");
++    let text = String::from_utf8_lossy(&seen);
++    assert!(
++        text.is_empty(),
++        "the false server received nothing, not the token: {text}"
++    );
++    assert!(
++        !text.contains("tools/call"),
++        "no tool call reached the false server: {text}"
++    );
++    assert!(
++        link::entries(&dir).len() == 1,
++        "a live pid's file is not removed"
++    );
++    let _ = server.join();
++    let _ = donor.kill();
++    let _ = donor.wait();
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
+ #[test]
+ fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
++    let _slot = pipe_name_slot();
+     let dir = fresh_dir("token");
+     let inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
+     let entry = inbox.link_entry().expect("a link entry").clone();
+-    assert_eq!(link::entries(&dir), vec![entry.clone()], "the discovery file names the window");
++    assert_eq!(
++        link::entries(&dir),
++        vec![entry.clone()],
++        "the discovery file names the window"
++    );
+     assert_eq!(entry.token.len(), 64);
+ 
+     // The same window, but a file with a wrong token.
+     let forged = fresh_dir("token-forged");
+-    write_entry(&forged, &Entry { token: "f".repeat(64), ..entry.clone() });
++    write_entry(
++        &forged,
++        &Entry {
++            token: "f".repeat(64),
++            ..entry.clone()
++        },
++    );
+     let forged_dir = forged.clone();
+-    let client = std::thread::spawn(move || link_call(&forged_dir, &Select::Only, "get_job", &json!({})));
++    let client =
++        std::thread::spawn(move || link_call(&forged_dir, &Select::Only, "get_job", &json!({})));
+     let (result, lines) = serve_until(&inbox, client);
+     let err = result.expect_err("a wrong token is refused");
+     assert!(matches!(err, LinkError::Failed(_)), "{err:?}");
+     assert!(err.to_string().contains("refused the link token"), "{err}");
+     assert_eq!(err.exit_code(), 1);
+-    assert!(lines.is_empty(), "no line of a refused client reached the app: {lines:?}");
++    assert!(
++        lines.is_empty(),
++        "no line of a refused client reached the app: {lines:?}"
++    );
+ 
+     // A hello that is not JSON at all is refused the same way.
+     let wrong_hello = json!({ "camcraft_link": 1 }).to_string();
+     assert!(!link::hello_matches(wrong_hello.as_bytes(), &entry.token));
+     assert!(!link::hello_matches(b"GET / HTTP/1.1", &entry.token));
+-    assert!(link::hello_matches(link::hello_line(&entry.token).as_bytes(), &entry.token));
++    assert!(link::hello_matches(
++        link::hello_line(&entry.token).as_bytes(),
++        &entry.token
++    ));
+ 
+     // The window still serves a client with the right token.
+     let good_dir = dir.clone();
+-    let client = std::thread::spawn(move || link_call(&good_dir, &Select::Pid(std::process::id()), "get_job", &json!({})));
++    let client = std::thread::spawn(move || {
++        link_call(
++            &good_dir,
++            &Select::Pid(std::process::id()),
++            "get_job",
++            &json!({}),
++        )
++    });
+     let (result, lines) = serve_until(&inbox, client);
+     let result = result.expect("the right token is served");
+     assert_eq!(result["structuredContent"]["echo"], json!("get_job"));
+-    assert_eq!(lines.len(), 1, "one tools/call reached the window: {lines:?}");
++    assert_eq!(
++        lines.len(),
++        1,
++        "one tools/call reached the window: {lines:?}"
++    );
+     let line: Value = serde_json::from_str(&lines[0]).expect("json");
+     assert_eq!(line["method"], json!("tools/call"));
+ 
+     // The window's file goes with its inbox.
+     drop(inbox);
+-    assert!(link::entries(&dir).is_empty(), "the discovery file is removed on close");
++    assert!(
++        link::entries(&dir).is_empty(),
++        "the discovery file is removed on close"
++    );
+     let _ = std::fs::remove_dir_all(&dir);
+     let _ = std::fs::remove_dir_all(&forged);
+ }
+ 
+ #[test]
+ fn the_link_file_follows_the_open_project() {
++    let _slot = pipe_name_slot();
+     let dir = fresh_dir("project");
+     let mut inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
+     let project = dir.join("part.camproj");
+@@ -222,13 +459,19 @@ fn the_link_file_follows_the_open_project() {
+     assert_eq!(entries[0].project.as_deref(), Some(project.as_path()));
+     assert!(Select::Project(project.clone()) != Select::Only);
+     assert_eq!(Select::parse("42"), Select::Pid(42));
+-    assert_eq!(Select::parse("a/part.camproj"), Select::Project(PathBuf::from("a/part.camproj")));
++    assert_eq!(
++        Select::parse("a/part.camproj"),
++        Select::Project(PathBuf::from("a/part.camproj"))
++    );
+     drop(inbox);
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
+ fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+-    let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
++    let pairs: Vec<(String, String)> = pairs
++        .iter()
++        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
++        .collect();
+     move |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.into())
+ }
+ 
+@@ -238,17 +481,41 @@ fn the_link_folder_is_the_users_own() {
+     // An absolute path is spelled per host, so each host checks its own.
+     if cfg!(windows) {
+         let roaming = r"C:\Users\u\AppData\Roaming";
+-        assert_eq!(link::dir_for("windows", lookup(&[("APPDATA", roaming)])), Some(Path::new(roaming).join(&tail)));
+-        assert_eq!(link::dir_for("windows", lookup(&[(link::DIR_ENV, r"D:\link")])), Some(PathBuf::from(r"D:\link")));
++        assert_eq!(
++            link::dir_for("windows", lookup(&[("APPDATA", roaming)])),
++            Some(Path::new(roaming).join(&tail))
++        );
++        assert_eq!(
++            link::dir_for("windows", lookup(&[(link::DIR_ENV, r"D:\link")])),
++            Some(PathBuf::from(r"D:\link"))
++        );
+     } else {
+         let run = "/run/user/1000";
+         let both = [("XDG_RUNTIME_DIR", run), ("HOME", "/home/u")];
+-        assert_eq!(link::dir_for("linux", lookup(&both)), Some(Path::new(run).join(&tail)), "the runtime folder first");
+-        assert_eq!(link::dir_for("linux", lookup(&[("HOME", "/home/u")])), Some(Path::new("/home/u/.local/share").join(&tail)));
+-        assert_eq!(link::dir_for("macos", lookup(&[("HOME", "/Users/u")])), Some(Path::new("/Users/u/Library/Application Support").join(&tail)));
++        assert_eq!(
++            link::dir_for("linux", lookup(&both)),
++            Some(Path::new(run).join(&tail)),
++            "the runtime folder first"
++        );
++        assert_eq!(
++            link::dir_for("linux", lookup(&[("HOME", "/home/u")])),
++            Some(Path::new("/home/u/.local/share").join(&tail))
++        );
++        assert_eq!(
++            link::dir_for("macos", lookup(&[("HOME", "/Users/u")])),
++            Some(Path::new("/Users/u/Library/Application Support").join(&tail))
++        );
+     }
+-    assert_eq!(link::dir_for("linux", lookup(&[])), None, "no home, no folder");
+-    assert_eq!(link::dir_for("linux", lookup(&[("HOME", "relative")])), None, "a relative home is refused");
++    assert_eq!(
++        link::dir_for("linux", lookup(&[])),
++        None,
++        "no home, no folder"
++    );
++    assert_eq!(
++        link::dir_for("linux", lookup(&[("HOME", "relative")])),
++        None,
++        "a relative home is refused"
++    );
+     assert!(link::enabled(None));
+     assert!(link::enabled(Some("on")));
+     assert!(!link::enabled(Some(" OFF ")));
+@@ -256,39 +523,170 @@ fn the_link_folder_is_the_users_own() {
+ 
+ #[test]
+ fn a_second_ui_call_during_a_slow_call_reports_busy_and_exits_4() {
++    let _slot = pipe_name_slot();
+     let dir = fresh_dir("busy");
+     let inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
+     let entry = inbox.link_entry().expect("a link entry").clone();
+ 
+-    // Client 1 connects directly to the socket to occupy the session
+-    let addr = entry.address.clone();
+-    let transport = entry.transport.clone();
+-    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+-    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+-
+-    let client1 = std::thread::spawn(move || {
+-        let stream = match transport.as_str() {
+-            "tcp" => Box::new(std::net::TcpStream::connect(&addr).expect("tcp")) as Box<dyn std::io::Read + Send>,
+-            #[cfg(unix)]
+-            "unix" => Box::new(std::os::unix::net::UnixStream::connect(&addr).expect("unix")) as Box<dyn std::io::Read + Send>,
+-            other => panic!("unknown: {other}"),
+-        };
+-        let _ = connected_tx.send(());
+-        let _ = finish_rx.recv();
+-        drop(stream);
+-    });
+-
+-    connected_rx.recv().expect("client 1 connected");
++    // Client 1 holds the window's one-client session: connected, and
++    // sending no hello, so the window never becomes free for client 2.
++    let held = link_hold(&entry).expect("client 1 holds the session");
+     std::thread::sleep(Duration::from_millis(50));
+ 
+-    // Client 2 attempts to call a tool via cli_ui; times out waiting on busy window
++    // Client 2 waits out the whole hello deadline and reports busy.
+     let o = cli_ui(&dir, &["call", "get_job"]);
+     let err = String::from_utf8_lossy(&o.stderr);
+     assert_eq!(o.status.code(), Some(4), "{err}");
+     assert!(err.contains("is busy with another call"), "{err}");
+ 
+-    let _ = finish_tx.send(());
+-    let _ = client1.join();
++    drop(held);
++    drop(inbox);
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn a_slow_peer_ends_within_the_hello_deadline() {
++    use std::io::{Read, Write};
++    let _slot = pipe_name_slot();
++    let dir = fresh_dir("slow");
++    // The whole exchange runs under one elapsed deadline (#3874
++    // review): this false window answers the hello one byte every
++    // 300 ms with no newline in sight. The CLI must end within the
++    // deadline, not one read timeout per byte for ever.
++    let (entry, window) = false_window(&dir);
++    write_entry(&dir, &entry);
++    let started = Instant::now();
++    let server = std::thread::spawn(move || {
++        let mut client = accept_false(&window, Duration::from_secs(20));
++        let mut saw = Vec::new();
++        // The hello (or nothing): the trickle is the answer under test.
++        let mut chunk = [0_u8; 256];
++        let _ = client.read(&mut chunk);
++        for _ in 0..60 {
++            if client.write_all(b"x").is_err() {
++                break; // the CLI hung up
++            }
++            let _ = client.flush();
++            std::thread::sleep(Duration::from_millis(300));
++        }
++        let _ = client.read_to_end(&mut saw);
++        saw
++    });
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let elapsed = started.elapsed();
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(4), "{err}");
++    assert!(err.contains("too slow to answer"), "{err}");
++    // The deadline is 5 s; the wait ends with it, not with the trickle.
++    assert!(
++        elapsed < Duration::from_secs(8),
++        "the exchange ran {elapsed:?}"
++    );
++    let saw = server.join().expect("the false window thread");
++    assert!(
++        !String::from_utf8_lossy(&saw).contains("tools/call"),
++        "no tool call reached the slow peer"
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn an_answer_line_past_the_bound_is_refused_and_never_split() {
++    use std::io::{Read, Write};
++    let _slot = pipe_name_slot();
++    // Two oversized answers (#3874 review): one with a final newline
++    // and a valid hello-ok hidden after it, one with neither. The cap
++    // (1 MiB, more than any honest answer) must refuse both, and the
++    // hidden valid reply must never count - no remainder of an
++    // oversized line is read as a new message.
++    let over: usize = 2 * 1024 * 1024;
++    for tail in [Some(format!("{}\n", link::HELLO_OK)), None] {
++        let dir = fresh_dir("oversized");
++        let (entry, window) = false_window(&dir);
++        write_entry(&dir, &entry);
++        let payload = vec![b'x'; over];
++        let tail = tail.clone();
++        let server = std::thread::spawn(move || {
++            let mut client = accept_false(&window, Duration::from_secs(20));
++            let mut hello = Vec::new();
++            let mut chunk = [0_u8; 256];
++            while !hello.contains(&b'\n') {
++                if client.read(&mut chunk).unwrap_or(0) == 0 {
++                    break;
++                }
++                hello.extend_from_slice(&chunk);
++            }
++            // The CLI refuses mid-write once the cap is past: the
++            // write breaking is the expected end, not an error.
++            let _ = client.write_all(&payload);
++            if let Some(tail) = tail.as_deref() {
++                let _ = client.write_all(tail.as_bytes());
++            }
++            let _ = client.flush();
++            let mut saw = Vec::new();
++            let _ = client.read_to_end(&mut saw);
++            saw
++        });
++        let o = cli_ui(&dir, &["call", "get_job"]);
++        let err = String::from_utf8_lossy(&o.stderr);
++        assert_eq!(o.status.code(), Some(1), "{err}");
++        assert!(err.contains("passed the"), "{err}");
++        assert!(err.contains("byte bound without its end"), "{err}");
++        assert!(err.contains("nothing ran"), "{err}");
++        let saw = server.join().expect("the false window thread");
++        assert!(
++            !String::from_utf8_lossy(&saw).contains("tools/call"),
++            "no tool call reached the false window"
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
++
++#[test]
++fn the_bridge_reports_a_truncated_session_at_its_bound() {
++    let _slot = pipe_name_slot();
++    // Reaching the bridge's bound with the session still open is a
++    // visible failure (#3874 review), never a quiet success after a
++    // truncated MCP answer. The bound is a seam, so the test passes a
++    // small one and a reply that passes it.
++    let dir = fresh_dir("bridge");
++    let inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
++    let bound: u64 = 16 * 1024;
++    let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "get_job", "arguments": {} } }).to_string();
++    let client_dir = dir.clone();
++    let client = std::thread::spawn(move || {
++        let input = std::io::Cursor::new(format!("{request}\n").into_bytes());
++        let mut output = Vec::new();
++        let result = bridge_with_bound(&client_dir, &Select::Only, input, &mut output, bound);
++        (result, output)
++    });
++    let (result, lines) = serve_until_reply(&inbox, client, |msg| {
++        json!({
++            "jsonrpc": "2.0", "id": msg["id"],
++            "result": { "content": [], "structuredContent": { "pad": "y".repeat(96 * 1024) }, "isError": false }
++        })
++        .to_string()
++    });
++    let (result, output) = result;
++    assert_eq!(
++        lines.len(),
++        1,
++        "one tools/call crossed the bridge: {lines:?}"
++    );
++    let err = result.expect_err("a truncated session is a failure");
++    assert!(matches!(err, LinkError::Failed(_)), "{err:?}");
++    assert!(err.to_string().contains("byte bound"), "{err}");
++    assert!(err.to_string().contains("truncated"), "{err}");
++    assert_eq!(
++        err.exit_code(),
++        1,
++        "the CLI exits 1 on a truncated bridge session"
++    );
++    assert_eq!(
++        output.len(),
++        bound as usize,
++        "the bound's bytes, no more, were delivered"
++    );
+     drop(inbox);
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+diff --git a/docs/decisions/3874-ui-link-transport.md b/docs/decisions/3874-ui-link-transport.md
+new file mode 100644
+index 000000000..d7d31e7cf
+--- /dev/null
++++ b/docs/decisions/3874-ui-link-transport.md
+@@ -0,0 +1,60 @@
++## #3874 - the UI link transport: a verified peer, not a disclosed token
++
++**What was decided.** The CLI verifies the peer by transport, before
++the token crosses. On Windows the window listens on a named pipe
++(`\\.\pipe\camcraft-ui-link-<pid>`) with a security descriptor that
++admits the window's own user only; the CLI asks the kernel which
++process serves the pipe (`GetNamedPipeServerProcessId`) and refuses a
++peer that is not the process the discovery file names, before it sends
++one byte. On Unix the link keeps the Unix domain socket in the user's
++0700 folder. The token stays as the client-side proof that the CLI read
++the discovery file; it no longer proves anything about the window. A
++`"tcp"` entry is refused by name on every platform, with a diagnostic
++that names the reason.
++
++**Why.** The review of PR #3971 showed the token-proof exchange cannot
++work on an open port: the hello sends the token to the peer before the
++peer proves anything, so a false server that never read the discovery
++file still receives the token and can answer with a computed proof.
++The stale-file threat of #3874 (a crashed window, a port or pipe name
++taken by another process) is not fixed by any exchange that discloses
++the secret first. Only the transport can verify the peer: the pipe's
++user-only ACL keeps other local users off the pipe, and the
++kernel-reported server process id tells the CLI who serves it. The
++residual window is pid reuse by a same-user process; a same-user
++process can read the discovery file anyway, so it is outside the
++threat model of #3874 (a different local user).
++
++**What was considered and dropped.**
++- The nonce/proof hello of the first PR cut: dropped, per the review;
++  it disclosed the token to the very peer it tried to check.
++- Loopback TCP with a better exchange: dropped; no exchange fixes the
++  disclosure, and the reviewer named the pipe as the sanctioned route.
++- The `interprocess` crate: not taken; it is not in `Cargo.lock` and a
++  new crate needs the maintainer's decision. The named pipe is written
++  against `windows-sys`, which the PR already introduces; the feature
++  list grows (`Win32_System_Pipes`, `Win32_System_IO`,
++  `Win32_Storage_FileSystem`, `Win32_Security`,
++  `Win32_Security_Authorization`). The maintainer still has to confirm
++  these dependency declarations (`libc` on Unix for the pid check,
++  `windows-sys` on Windows).
++- A pipe read or write without overlapped I/O: dropped; the
++  synchronous pipe API has no read or write deadline, and the idle law
++  and the hello deadline need one. Every overlapped wait is bounded and
++  cancelled on timeout.
++
++**Known limit, recorded.** A named pipe cannot close one direction
++only, so the `--ui mcp` bridge's end-of-stdin does not signal the
++window the way a socket half-close does. The window's idle drop (5
++minutes) or the broken pipe when the CLI process exits ends the
++session instead. A tool answer already written is never lost: the
++window writes each answer before it reads the next request.
++
++**Cost to change later.** The discovery file keeps its fields; only
++the `transport` value changes (`"pipe"`, a name derived from the pid).
++An old CLI reading a pipe entry refuses it by transport name; a new
++CLI reading an old TCP entry refuses it with the risk-naming
++diagnostic. The three other review blockers ride the same cut: one
++elapsed deadline over the whole hello exchange, a byte cap that ends
++the link at a line that never ends, and a bridge bound that reports a
++truncated session as a failure.

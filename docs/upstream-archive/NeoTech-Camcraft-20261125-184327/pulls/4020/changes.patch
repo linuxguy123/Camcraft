@@ -1,0 +1,584 @@
+From ea51a4b2b22c7832dd957cdb143d4286a78cce10 Mon Sep 17 00:00:00 2001
+From: NeoTech <andreas@roughedge.se>
+Date: Wed, 25 Nov 2026 14:24:59 +0000
+Subject: [PATCH] fix(mcp): the cli dials a ui link file only while its window
+ holds its lock
+
+A stale discovery file let a false server on the freed port of a crashed
+window receive the CLI's tool calls: whoever reads the file can compute
+every token proof. Each window now holds an exclusive OS file lock on
+<pid>.lock for its whole life (std File::try_lock; the OS releases it at
+any exit). The CLI tests the lock before it dials an entry and again
+after the hello. A free lock marks the file stale: it is removed and
+logged, never dialed. A file with no lock to test is skipped and logged,
+never a silent fall-back. No new dependency.
+
+The Windows named-pipe transport (peer process check) stays a follow-up.
+
+Refs #3995
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/mcp/link.rs                 |  28 ++++-
+ crates/app/src/mcp/link_client.rs          |  38 ++++++-
+ crates/app/src/mcp/link_owner.rs           | 100 ++++++++++++++++++
+ crates/app/src/mcp/mod.rs                  |   1 +
+ crates/app/tests/mcp_live.rs               |   4 +-
+ crates/app/tests/mcp_live/ui_link.rs       |  33 ++++--
+ crates/app/tests/mcp_live/ui_link_owner.rs | 116 +++++++++++++++++++++
+ docs/decisions/3995-ui-link-owner-lock.md  |  50 +++++++++
+ 8 files changed, 355 insertions(+), 15 deletions(-)
+ create mode 100644 crates/app/src/mcp/link_owner.rs
+ create mode 100644 crates/app/tests/mcp_live/ui_link_owner.rs
+ create mode 100644 docs/decisions/3995-ui-link-owner-lock.md
+
+diff --git a/crates/app/src/mcp/link.rs b/crates/app/src/mcp/link.rs
+index e94135e0c..1dd8fedaf 100644
+--- a/crates/app/src/mcp/link.rs
++++ b/crates/app/src/mcp/link.rs
+@@ -12,8 +12,10 @@
+ //!   the discovery file, which only the user can read; any other first
+ //!   line closes the connection before a byte of it reaches the app.
+ //! - **One file per window.** `<pid>.json` in the link folder; a window
+-//!   removes its file when it closes. A file left by a crash is stale:
+-//!   its socket does not answer, and the client skips it.
++//!   removes its file when it closes. While it runs it holds the OS lock
++//!   of `<pid>.lock` (link_owner.rs, #3995). A file left by a crash is
++//!   stale: its lock is free, so the client removes it and never dials
++//!   its address, which a false server can hold.
+ //!
+ //! Provenance: our own design (docs/decisions/3751-cli-ui-link.md) over
+ //! std; the per-user folders are the platforms' published locations
+@@ -216,6 +218,10 @@ pub struct Registration {
+     file: PathBuf,
+     socket: Option<PathBuf>,
+     entry: Entry,
++    lock_file: PathBuf,
++    /// Held for the life of the window: the proof that it runs (#3995).
++    /// Dropped after `Drop::drop` removed the files.
++    _lock: std::fs::File,
+ }
+ 
+ impl Registration {
+@@ -239,7 +245,8 @@ impl Registration {
+ 
+ impl Drop for Registration {
+     fn drop(&mut self) {
+-        for path in std::iter::once(&self.file).chain(self.socket.as_ref()) {
++        let files = std::iter::once(&self.file).chain(self.socket.as_ref());
++        for path in files.chain(std::iter::once(&self.lock_file)) {
+             if let Err(e) = std::fs::remove_file(path)
+                 && e.kind() != std::io::ErrorKind::NotFound
+             {
+@@ -258,7 +265,17 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<(Listener, Registration, Strin
+     prepare_dir(dir)?;
+     let pid = std::process::id();
+     let token = new_token();
+-    let (listener, transport, address, socket) = bind(dir, pid)?;
++    // The lock comes first, so no link file of this window is ever unproved.
++    let lock = super::link_owner::hold(dir, pid)?;
++    let lock_file = super::link_owner::lock_path(dir, pid);
++    let (listener, transport, address, socket) = match bind(dir, pid) {
++        Ok(bound) => bound,
++        Err(e) => {
++            drop(lock);
++            let _ = std::fs::remove_file(&lock_file);
++            return Err(e);
++        }
++    };
+     let entry = Entry {
+         format: FORMAT,
+         pid,
+@@ -269,7 +286,8 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<(Listener, Registration, Strin
+         app_version: env!("CARGO_PKG_VERSION").to_owned(),
+     };
+     // Built before the write, so a failed write still removes the socket.
+-    let registration = Registration { file: dir.join(format!("{pid}.json")), socket, entry };
++    let file = dir.join(format!("{pid}.json"));
++    let registration = Registration { file, socket, entry, lock_file, _lock: lock };
+     write_entry(&registration.file, &registration.entry)?;
+     Ok((listener, registration, token))
+ }
+diff --git a/crates/app/src/mcp/link_client.rs b/crates/app/src/mcp/link_client.rs
+index ea51cfa01..089c1852d 100644
+--- a/crates/app/src/mcp/link_client.rs
++++ b/crates/app/src/mcp/link_client.rs
+@@ -17,6 +17,7 @@ use std::time::Duration;
+ use serde_json::{json, Value};
+ 
+ use super::link::{self, Entry};
++use super::link_owner::{self, Owner};
+ use super::wire::Stream;
+ 
+ /// How long a connect and the hello answer may take before a window is
+@@ -181,10 +182,21 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+     }
+     let mut refused = None;
+     let mut busy = None;
++    let mut unproved = Vec::new();
+     let mut open_ones = Vec::new();
+     for entry in candidates {
++        // #3995: only a file whose window is proved alive is dialed.
++        if let Some(why) = not_alive(dir, entry) {
++            unproved.push(why);
++            continue;
++        }
+         match open(entry) {
+-            Ok(stream) => open_ones.push((entry.clone(), stream)),
++            // Proved again after the hello: the window held its lock for the
++            // whole exchange, so the peer that answered is its own socket.
++            Ok(stream) => match not_alive(dir, entry) {
++                None => open_ones.push((entry.clone(), stream)),
++                Some(why) => unproved.push(why),
++            },
+             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => refused = Some(describe(entry)),
+             Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                 tracing::info!("ui link: {} is busy: {e}", describe(entry));
+@@ -206,8 +218,9 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+             ))
+         } else {
+             LinkError::NoWindow(format!(
+-                "no running CamCraft window answered: the link files in {} are stale (nothing ran)",
+-                dir.display()
++                "no running CamCraft window answered: the link files in {} are stale or unproved{} (nothing ran)",
++                dir.display(),
++                if unproved.is_empty() { String::new() } else { format!(": {}", unproved.join("; ")) }
+             ))
+         }),
+         n => {
+@@ -220,6 +233,25 @@ pub fn connect(dir: &Path, select: &Select) -> Result<(Entry, Stream), LinkError
+     }
+ }
+ 
++/// `None` when the lock of `entry`'s window proves it alive; else why the
++/// entry is not used, logged. A stale entry's files are removed.
++fn not_alive(dir: &Path, entry: &Entry) -> Option<String> {
++    match link_owner::owner(dir, entry.pid) {
++        Owner::Alive => None,
++        Owner::Gone => {
++            let why = format!("{} is stale: its window has ended; its link file is removed", describe(entry));
++            tracing::warn!("ui link: {why}");
++            link_owner::remove_stale(dir, entry.pid);
++            Some(why)
++        }
++        Owner::Unproved(reason) => {
++            let why = format!("{} is not used: nothing proves that its window runs ({reason})", describe(entry));
++            tracing::warn!("ui link: {why}");
++            Some(why)
++        }
++    }
++}
++
+ /// Maximum byte length for one answer line from a window (16 MiB, #3874).
+ pub const MAX_ANSWER_LINE: usize = 16 * 1024 * 1024;
+ 
+diff --git a/crates/app/src/mcp/link_owner.rs b/crates/app/src/mcp/link_owner.rs
+new file mode 100644
+index 000000000..d747564d8
+--- /dev/null
++++ b/crates/app/src/mcp/link_owner.rs
+@@ -0,0 +1,100 @@
++//! Proof that the window that wrote a UI link file still runs (#3995).
++//!
++//! The token in a discovery file proves nothing about the peer that
++//! answers: whoever reads a stale file can compute every token proof, and
++//! a false server can take the freed port of a crashed window. So a
++//! window holds an exclusive OS file lock on `<pid>.lock` in the link
++//! folder for its whole life. The OS releases the lock when the process
++//! ends, a crash included, so the lock and not the pid is the proof: a
++//! reused pid cannot hold it.
++//!
++//! The CLI uses an entry only while the lock is held, before the hello
++//! and again after it. A file whose lock is free is stale: it is removed
++//! and logged. A file with no lock to test is unproved: it is skipped and
++//! logged, never dialed.
++//!
++//! Provenance: our own design (docs/decisions/3995-ui-link-owner-lock.md)
++//! over std's advisory file locks (`File::try_lock`: `flock` on Unix,
++//! `LockFileEx` on Windows). Clean-room, public sources only.
++
++use std::fs::{File, OpenOptions, TryLockError};
++use std::io::{Error, ErrorKind};
++use std::path::{Path, PathBuf};
++
++/// The lock file of the window with this process id.
++#[must_use]
++pub fn lock_path(dir: &Path, pid: u32) -> PathBuf {
++    dir.join(format!("{pid}.lock"))
++}
++
++/// The window's end: take the lock of `pid` and keep it while the returned
++/// file stays open.
++///
++/// # Errors
++/// The lock file cannot be opened, or another live process holds it.
++pub(crate) fn hold(dir: &Path, pid: u32) -> std::io::Result<File> {
++    let path = lock_path(dir, pid);
++    let mut options = OpenOptions::new();
++    options.read(true).write(true).create(true).truncate(false);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let file = options.open(&path)?;
++    match file.try_lock() {
++        Ok(()) => Ok(file),
++        Err(TryLockError::WouldBlock) => Err(Error::new(
++            ErrorKind::AlreadyExists,
++            format!("{} is held by another running process", path.display()),
++        )),
++        Err(TryLockError::Error(e)) => Err(e),
++    }
++}
++
++/// What the lock says about the window that wrote a link file.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Owner {
++    /// A live process holds the lock: the window runs.
++    Alive,
++    /// The lock is free: the window has ended and the file is stale.
++    Gone,
++    /// No lock can be tested; the reason, for the diagnostic.
++    Unproved(String),
++}
++
++/// Test the lock of `pid` in `dir` without holding it.
++#[must_use]
++pub fn owner(dir: &Path, pid: u32) -> Owner {
++    let path = lock_path(dir, pid);
++    let file = match OpenOptions::new().read(true).write(true).open(&path) {
++        Ok(file) => file,
++        Err(e) if e.kind() == ErrorKind::NotFound => {
++            return Owner::Unproved(format!(
++                "no lock file {} (a window of an older build, or a file no window wrote)",
++                path.display()
++            ));
++        }
++        Err(e) => return Owner::Unproved(format!("cannot open {}: {e}", path.display())),
++    };
++    match file.try_lock() {
++        Err(TryLockError::WouldBlock) => Owner::Alive,
++        // The lock goes when `file` drops at the end of this function.
++        Ok(()) => Owner::Gone,
++        Err(TryLockError::Error(e)) => Owner::Unproved(format!("cannot test the lock {}: {e}", path.display())),
++    }
++}
++
++/// Remove the files of a window that has ended: its link file, socket
++/// file and lock file. Only these names in `dir`; never a path read from
++/// the link file. A failed removal is logged.
++pub fn remove_stale(dir: &Path, pid: u32) {
++    for name in [format!("{pid}.json"), format!("{pid}.sock"), format!("{pid}.lock")] {
++        let path = dir.join(name);
++        if let Err(e) = std::fs::remove_file(&path)
++            && e.kind() != ErrorKind::NotFound
++        {
++            tracing::warn!("ui link: cannot remove the stale file {}: {e}", path.display());
++        }
++    }
++}
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index 75b3896a3..d172762bf 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -46,6 +46,7 @@ mod job;
+ mod listen;
+ pub mod link;
+ mod link_client;
++pub mod link_owner;
+ mod port_flag;
+ mod wire;
+ mod live;
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index 72ab943f3..1d3b348e4 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -3,10 +3,12 @@
+ //! step; the loopback listener that carries it; and the CLI's flag.
+ //!
+ //! Gate map (M4.4): covers app::mcp (live, listen, bridge, link,
+-//! link_client) and app::cli_ui (the `--ui` lane, #3751).
++//! link_client, link_owner) and app::cli_ui (the `--ui` lane, #3751).
+ 
+ #[path = "mcp_live/ui_link.rs"]
+ mod ui_link;
++#[path = "mcp_live/ui_link_owner.rs"]
++mod ui_link_owner;
+ 
+ use camcraft_app::commands::History;
+ use camcraft_app::mcp::provider::{FallbackMode, parse_prompt};
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index 3bc61467e..a74038441 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -3,10 +3,12 @@
+ //! here: no window is a clear error with exit 3 (never a headless run),
+ //! a wrong token is refused before a line reaches the app, a good
+ //! session carries a tool call to the window's inbox, and the file goes
+-//! when the window's inbox drops.
++//! when the window's inbox drops. A file whose window is not proved
++//! alive by its lock is never dialed (#3995).
+ //! Provenance: our own tests over our own link; no HSMWorks material.
+ 
+ use camcraft_app::mcp::link::{self, Entry};
++use camcraft_app::mcp::link_owner::{self, Owner};
+ use camcraft_app::mcp::{link_call, link_connect, Inbox, LinkError, Select};
+ 
+ use serde_json::{json, Value};
+@@ -15,14 +17,14 @@ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use std::time::{Duration, Instant};
+ 
+-fn fresh_dir(tag: &str) -> PathBuf {
++pub(super) fn fresh_dir(tag: &str) -> PathBuf {
+     let dir = std::env::temp_dir().join(format!("camcraft-ui-link-{tag}-{}", std::process::id()));
+     let _ = std::fs::remove_dir_all(&dir);
+     std::fs::create_dir_all(&dir).expect("temp dir");
+     dir
+ }
+ 
+-fn cli_ui(dir: &Path, args: &[&str]) -> std::process::Output {
++pub(super) fn cli_ui(dir: &Path, args: &[&str]) -> std::process::Output {
+     Command::new(env!("CARGO_BIN_EXE_camcraft-cli"))
+         .env(link::DIR_ENV, dir)
+         .arg("--ui")
+@@ -31,7 +33,20 @@ fn cli_ui(dir: &Path, args: &[&str]) -> std::process::Output {
+         .expect("the CLI binary runs")
+ }
+ 
+-fn write_entry(dir: &Path, entry: &Entry) {
++/// Hold the lock of `pid` in `dir`, as a running window does (#3995).
++pub(super) fn hold_lock(dir: &Path, pid: u32) -> std::fs::File {
++    let file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open(link_owner::lock_path(dir, pid))
++        .expect("open the lock file");
++    file.try_lock().expect("take the lock");
++    file
++}
++
++pub(super) fn write_entry(dir: &Path, entry: &Entry) {
+     let text = serde_json::to_string(entry).expect("entry json");
+     std::fs::write(dir.join(format!("{}.json", entry.pid)), text).expect("write entry");
+ }
+@@ -112,9 +127,10 @@ fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
+     assert_eq!(link::entries(&dir), vec![entry.clone()], "the discovery file names the window");
+     assert_eq!(entry.token.len(), 64);
+ 
+-    // The same window, but a file with a wrong token.
++    // The same window, but a file with a wrong token (its lock is held).
+     let forged = fresh_dir("token-forged");
+     write_entry(&forged, &Entry { token: "f".repeat(64), ..entry.clone() });
++    let _forged_lock = hold_lock(&forged, entry.pid);
+     let forged_dir = forged.clone();
+     let client = std::thread::spawn(move || link_call(&forged_dir, &Select::Only, "get_job", &json!({})));
+     let (result, lines) = serve_until(&inbox, client);
+@@ -140,9 +156,11 @@ fn a_wrong_token_is_refused_and_the_window_goes_on_serving() {
+     let line: Value = serde_json::from_str(&lines[0]).expect("json");
+     assert_eq!(line["method"], json!("tools/call"));
+ 
+-    // The window's file goes with its inbox.
++    // The window's file and its lock file go with its inbox.
++    assert_eq!(link_owner::owner(&dir, entry.pid), Owner::Alive, "the window holds its lock");
+     drop(inbox);
+     assert!(link::entries(&dir).is_empty(), "the discovery file is removed on close");
++    assert!(!link_owner::lock_path(&dir, entry.pid).exists(), "the lock file is removed on close");
+     let _ = std::fs::remove_dir_all(&dir);
+     let _ = std::fs::remove_dir_all(&forged);
+ }
+@@ -207,6 +225,8 @@ fn false_server_on_stale_entry_is_refused_with_no_tool_calls_sent() {
+         app_version: "0.26.0".into(),
+     };
+     write_entry(&dir, &stale_entry);
++    // A live owner, so the CLI reaches the hello and the proof check.
++    let _lock = hold_lock(&dir, stale_entry.pid);
+ 
+     // False server thread: accepts connection, sends generic HELLO_OK without proving token
+     let false_server = std::thread::spawn(move || {
+@@ -300,3 +320,4 @@ fn a_second_ui_call_during_a_slow_call_reports_busy_and_exits_4() {
+     drop(inbox);
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
+diff --git a/crates/app/tests/mcp_live/ui_link_owner.rs b/crates/app/tests/mcp_live/ui_link_owner.rs
+new file mode 100644
+index 000000000..bd5bd60d0
+--- /dev/null
++++ b/crates/app/tests/mcp_live/ui_link_owner.rs
+@@ -0,0 +1,116 @@
++//! The UI link's owner proof (#3995): a link file counts only while the
++//! lock of its window is held, before the hello and after it. A stale
++//! file is removed, an unproved one is skipped, and neither is dialed.
++//! Provenance: our own tests over our own link; no HSMWorks material.
++
++use super::ui_link::{cli_ui, fresh_dir, hold_lock, write_entry};
++use camcraft_app::mcp::link::{self, Entry};
++use camcraft_app::mcp::link_owner::{self, Owner};
++use camcraft_app::mcp::{link_call, LinkError, Select};
++
++use serde_json::{json, Value};
++use std::io::{BufRead, Write};
++
++const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
++
++fn false_entry(pid: u32, addr: std::net::SocketAddr) -> Entry {
++    Entry {
++        format: link::FORMAT,
++        pid,
++        transport: "tcp".into(),
++        address: addr.to_string(),
++        token: TOKEN.into(),
++        project: None,
++        app_version: "0.26.0".into(),
++    }
++}
++
++/// True when a connection waits on `listener` (it never blocks).
++fn was_dialed(listener: &std::net::TcpListener) -> bool {
++    listener.set_nonblocking(true).expect("nonblocking");
++    match listener.accept() {
++        Ok(_) => true,
++        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
++        Err(e) => panic!("accept: {e}"),
++    }
++}
++
++/// #3995: a window crashed and left its file; a false server that read the
++/// file holds the freed port and could prove the token. The free lock
++/// shows that the window has ended: the CLI never dials, removes the stale
++/// files and says so.
++#[test]
++fn a_crashed_windows_file_is_removed_and_its_port_is_never_dialed() {
++    let dir = fresh_dir("crashed");
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind false server");
++    let entry = false_entry(4_000_000_001, listener.local_addr().expect("addr"));
++    write_entry(&dir, &entry);
++    // The lock file of the crashed window: its lock went with its process.
++    drop(hold_lock(&dir, entry.pid));
++    assert_eq!(link_owner::owner(&dir, entry.pid), Owner::Gone);
++
++    let err = link_call(&dir, &Select::Only, "get_job", &json!({})).expect_err("no window runs");
++    assert!(matches!(err, LinkError::NoWindow(_)), "{err:?}");
++    assert_eq!(err.exit_code(), 3);
++    assert!(err.to_string().contains("is stale: its window has ended"), "{err}");
++    assert!(!was_dialed(&listener), "the false server got no connection, so no hello and no tool call");
++    assert!(link::entries(&dir).is_empty(), "the stale link file is removed");
++    assert!(!link_owner::lock_path(&dir, entry.pid).exists(), "the stale lock file is removed");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// #3995: a link file with no lock to test (an older build, or a file no
++/// window wrote) is never dialed and the diagnostic says why. It is not a
++/// silent fall-back to an unproved window.
++#[test]
++fn a_link_file_with_no_owner_proof_is_never_dialed() {
++    let dir = fresh_dir("unproved");
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind false server");
++    let entry = false_entry(std::process::id(), listener.local_addr().expect("addr"));
++    write_entry(&dir, &entry);
++
++    let o = cli_ui(&dir, &["call", "get_job"]);
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert_eq!(o.status.code(), Some(3), "{err}");
++    assert!(err.contains("nothing proves that its window runs"), "{err}");
++    assert!(err.contains("nothing ran"), "{err}");
++    assert!(!was_dialed(&listener), "an unproved file is never dialed");
++    assert_eq!(link::entries(&dir), vec![entry], "an unproved file is kept: its window may run");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// #3995: a false server that knows the token and proves it correctly, but
++/// whose window is not alive at the end of the hello, gets no tool call.
++/// The CLI tests the lock again after the hello.
++#[test]
++fn a_false_server_that_proves_the_token_gets_no_tool_call_when_the_window_has_ended() {
++    let dir = fresh_dir("proving-server");
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind false server");
++    let entry = false_entry(4_000_000_002, listener.local_addr().expect("addr"));
++    write_entry(&dir, &entry);
++    let lock = hold_lock(&dir, entry.pid);
++
++    let false_server = std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().expect("accept");
++        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
++        let mut line = String::new();
++        reader.read_line(&mut line).expect("read hello");
++        let hello: Value = serde_json::from_str(line.trim()).expect("hello json");
++        let nonce = hello["nonce"].as_str().expect("nonce").to_owned();
++        // The window ends during the hello; the false server answers with
++        // the proof that it computes from the token in the file.
++        drop(lock);
++        writeln!(stream, "{}", link::hello_ok(&link::token_proof(TOKEN, &nonce, "server"))).expect("answer");
++        stream.flush().expect("flush");
++        line.clear();
++        let n = reader.read_line(&mut line).unwrap_or(0);
++        (n, line)
++    });
++
++    let err = link_call(&dir, &Select::Only, "get_job", &json!({})).expect_err("the window has ended");
++    assert!(matches!(err, LinkError::NoWindow(_)), "{err:?}");
++    let (n, line) = false_server.join().expect("server thread");
++    assert_eq!(n, 0, "no tool call reached the false server: {line}");
++    assert!(link::entries(&dir).is_empty(), "the stale link file is removed");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/docs/decisions/3995-ui-link-owner-lock.md b/docs/decisions/3995-ui-link-owner-lock.md
+new file mode 100644
+index 000000000..2d13ec381
+--- /dev/null
++++ b/docs/decisions/3995-ui-link-owner-lock.md
+@@ -0,0 +1,50 @@
++## #3995 - UI link: a link file counts only while its window holds its lock
++
++**Decided.** Each window holds an exclusive OS file lock on `<pid>.lock`
++in the link folder for its whole life (`std::fs::File::try_lock`: `flock`
++on Unix, `LockFileEx` on Windows). The window takes the lock before it
++writes its link file and removes both when it closes. The CLI tests the
++lock of each candidate entry two times: before it dials the address and
++after the hello.
++
++- The lock is held: the window runs, and the entry is used.
++- The lock is free: the window has ended (a crash included, because the
++  OS releases the lock with the process). The entry is stale. The CLI
++  removes `<pid>.json`, `<pid>.sock` and `<pid>.lock` (fixed names in the
++  folder, never a path read from the file), logs it, and never dials it.
++- No lock can be tested (no lock file, an error): the entry is unproved.
++  The CLI logs why, keeps the file and never dials it. When nothing else
++  answers, the CLI exits 3 and the message names each skipped entry.
++
++A false server on the freed port of a crashed window therefore gets no
++connection, so no hello and no tool call, even when it read the token and
++can compute every proof. The test after the hello closes the gap where
++the window ends during the exchange.
++
++**Why.** The issue asks that only a window that is proved alive gets the
++calls, with no silent fall-back. A lock is a stronger proof than a pid
++check: a reused pid cannot hold the lock of an ended process. It needs
++only std (MSRV 1.90; `File::try_lock` is stable since 1.89), so it adds no
++dependency and builds the same on Windows, Linux and macOS.
++
++**Dropped.**
++
++- A pid-alive check (`kill(pid, 0)`, `OpenProcess`) as on the branch of
++  PR #3971: it needs the new direct dependencies `libc` and `windows-sys`
++  (a maintainer decision, which closed #3971), and a reused pid passes it.
++- The Windows named pipe with a user-only ACL and a check of the server
++  process id. It needs `windows-sys` (std has no pipe API) and is a
++  transport design choice for the maintainer. It is the follow-up issue
++  filed with this PR. The gap that it closes: while a window runs on
++  Windows, a local process could share its TCP port (`SO_REUSEADDR`) and
++  take a connection. The lock proves that the window runs; it does not
++  prove which socket on the port answers. On Unix the socket is in a 0700
++  folder, so only the same user can replace it.
++- Compatibility with a window of an older build: such a window writes no
++  lock file, so a new CLI does not dial it (exit 3, with the reason). A
++  silent fall-back to an unproved window is the defect that this issue
++  closes, so it is not kept.
++
++**Cost to change later.** Small. The proof is one module
++(`crates/app/src/mcp/link_owner.rs`) and one call site in `connect`. A
++named-pipe transport adds a second proof beside it and keeps this one.

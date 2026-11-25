@@ -1,0 +1,189 @@
+From 78b21945cc550d7ce77b8b8134df80d3290fb9c3 Mon Sep 17 00:00:00 2001
+From: tbrasselle <tbrasselle@gmail.com>
+Date: Tue, 24 Nov 2026 23:45:57 -0500
+Subject: [PATCH] fix(mcp): close a pre-hello link client after a short
+ deadline and a small line limit
+
+A UI link client that sent no hello line held the only session for the
+5-minute idle window and could buffer up to 16 MiB unauthenticated. A
+pre-hello deadline (PRE_HELLO_DEADLINE, 5 s) and a pre-hello line size
+limit (PRE_HELLO_MAX_LINE, 4 KiB) now apply before the token check; the
+idle window and MAX_LINE govern only after it. The busy-test client now
+passes the token check like a real slow call, and a new pin shows a
+second client with the token is served within seconds of a silent one.
+
+Fixes #3873
+---
+ crates/app/src/mcp/listen.rs         | 43 ++++++++++++++----
+ crates/app/tests/mcp_live/ui_link.rs | 66 ++++++++++++++++++++++++++--
+ 2 files changed, 98 insertions(+), 11 deletions(-)
+
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index 235a44e61..b02448b53 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -67,6 +67,17 @@ const CHUNK: usize = 8 * 1024;
+ /// is dropped so the next one can be served (#567).
+ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+ 
++/// How long a UI link client has to send its hello line before it is
++/// dropped (#3873): a client without the token must not hold the only
++/// session for the idle window. Applies only before the token check;
++/// after it, [`IDLE_TIMEOUT`] governs.
++const PRE_HELLO_DEADLINE: Duration = Duration::from_secs(5);
++
++/// How large a client's buffered bytes may grow before the token check
++/// (#3873): an unauthenticated client must not grow the app's memory.
++/// After the token check, [`MAX_LINE`] governs.
++const PRE_HELLO_MAX_LINE: usize = 4 * 1024;
++
+ /// How a served client's session ended, for the listener's log line.
+ enum End {
+     /// It hung up, was refused, or the app is stopping.
+@@ -255,7 +266,10 @@ fn accept_loop(listener: &Listener, tx: &Sender<Request>, stop: &AtomicBool, wak
+ }
+ 
+ /// One client until it hangs up, the app stops, the app's end of the
+-/// channel is gone, or it sends no complete line for `idle`.
++/// channel is gone, or it sends no complete line for `idle`. On the UI
++/// link, the hello line must arrive within [`PRE_HELLO_DEADLINE`] and
++/// stay under [`PRE_HELLO_MAX_LINE`] (#3873); `idle` and [`MAX_LINE`]
++/// govern only after the token check.
+ ///
+ /// The idle deadline is enforced inside the read (#567 review): each
+ /// read waits at most the poll step or the time left in the window,
+@@ -285,11 +299,22 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             return Ok(End::Closed);
+         }
+         let quiet = active.elapsed();
+-        let Some(left) = idle.checked_sub(quiet).filter(|d| !d.is_zero()) else {
+-            let note = format!(
+-                r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
+-                quiet.as_secs()
+-            );
++        // Before the token check, the short pre-hello window applies
++        // (#3873); after it, the idle window. `active` is reset only
++        // when the hello passes, so `quiet` covers the whole wait.
++        let window = if gate.is_some() { idle.min(PRE_HELLO_DEADLINE) } else { idle };
++        let Some(left) = window.checked_sub(quiet).filter(|d| !d.is_zero()) else {
++            let note = if gate.is_some() {
++                format!(
++                    r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"no hello line in {}s - the connection is closed"}}}}"#,
++                    quiet.as_secs()
++                )
++            } else {
++                format!(
++                    r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
++                    quiet.as_secs()
++                )
++            };
+             // Best effort: the write times out, and the client goes either way.
+             let _ = writeln!(writer, "{note}").and_then(|()| writer.flush());
+             return Ok(End::Idle(quiet));
+@@ -299,7 +324,9 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+         // is non-zero, and a sub-millisecond rest rounds up to 1 ms.
+         stream.set_read_timeout(Some(left.min(POLL).max(Duration::from_millis(1))))?;
+         // Bounded as it reads: never more than one byte past the cap.
+-        let room = (MAX_LINE + 1).saturating_sub(buf.len()).clamp(1, CHUNK);
++        // The small cap applies before the token check (#3873).
++        let cap = if gate.is_some() { PRE_HELLO_MAX_LINE } else { MAX_LINE };
++        let room = (cap + 1).saturating_sub(buf.len()).clamp(1, CHUNK);
+         let got = match chunk.get_mut(..room).map(|c| stream.read(c)) {
+             Some(Ok(n)) => n,
+             Some(Err(e))
+@@ -342,7 +369,7 @@ fn serve_client(mut stream: Stream, tx: &Sender<Request>, stop: &AtomicBool, wak
+             }
+             active = Instant::now();
+         }
+-        if buf.len() > MAX_LINE {
++        if buf.len() > cap {
+             let refusal = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"message too long - the connection is closed"}}"#;
+             writeln!(writer, "{refusal}")?;
+             writer.flush()?;
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index b74763c8b..4042d22ab 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -162,6 +162,60 @@ fn the_link_file_follows_the_open_project() {
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn a_client_that_sends_no_hello_cannot_hold_the_session() {
++    let dir = fresh_dir("prehello");
++    let inbox = Inbox::link(&dir, Box::new(|| {})).expect("open the link");
++    let entry = inbox.link_entry().expect("a link entry").clone();
++
++    // Client 1 connects to the socket and sends nothing: no hello, no
++    // newline. Before #3873 it held the only session for the 5-minute
++    // idle window.
++    let addr = entry.address.clone();
++    let transport = entry.transport.clone();
++    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
++    let holder = std::thread::spawn(move || {
++        let stream = match transport.as_str() {
++            "tcp" => std::net::TcpStream::connect(&addr).expect("tcp"),
++            other => panic!("unknown transport: {other}"),
++        };
++        let _ = connected_tx.send(());
++        std::thread::sleep(Duration::from_secs(30));
++        drop(stream);
++    });
++    connected_rx.recv().expect("client 1 connected");
++    std::thread::sleep(Duration::from_millis(50));
++
++    // Client 2, with the token, must get a session within seconds: the
++    // silent client is dropped after the short pre-hello deadline, not
++    // after the idle window. The link call gives up while the session
++    // is held (exit 4), so it retries until the drop frees the session.
++    let good_dir = dir.clone();
++    let client = std::thread::spawn(move || {
++        let started = Instant::now();
++        loop {
++            match link_call(&good_dir, &Select::Only, "get_job", &json!({})) {
++                Ok(answer) => break Ok(answer),
++                Err(e) if e.exit_code() == 4 && started.elapsed() < Duration::from_secs(12) => {
++                    std::thread::sleep(Duration::from_millis(200));
++                }
++                Err(e) => break Err(e),
++            }
++        }
++    });
++    let started = Instant::now();
++    let (result, lines) = serve_until(&inbox, client);
++    assert!(started.elapsed() < Duration::from_secs(15), "the second client waited too long");
++    let result = result.expect("a client with the token is served after the silent one is dropped");
++    assert_eq!(result["structuredContent"]["echo"], json!("get_job"));
++    assert_eq!(lines.len(), 1, "one tools/call reached the window: {lines:?}");
++
++    drop(inbox);
++    // Detach the holder; it only sleeps and drops its stream.
++    drop(holder);
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+     let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+     move |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.into())
+@@ -202,12 +256,18 @@ fn a_second_ui_call_during_a_slow_call_reports_busy_and_exits_4() {
+     let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+ 
+     let client1 = std::thread::spawn(move || {
+-        let stream = match transport.as_str() {
+-            "tcp" => Box::new(std::net::TcpStream::connect(&addr).expect("tcp")) as Box<dyn std::io::Read + Send>,
++        let mut stream: Box<dyn std::io::Write + Send> = match transport.as_str() {
++            "tcp" => Box::new(std::net::TcpStream::connect(&addr).expect("tcp")),
+             #[cfg(unix)]
+-            "unix" => Box::new(std::os::unix::net::UnixStream::connect(&addr).expect("unix")) as Box<dyn std::io::Read + Send>,
++            "unix" => Box::new(std::os::unix::net::UnixStream::connect(&addr).expect("unix")),
+             other => panic!("unknown: {other}"),
+         };
++        use std::io::Write;
++        // A slow call is a served client: it passes the token check and
++        // then holds the session while its call runs. (A client that
++        // sends nothing is dropped after the short pre-hello deadline,
++        // #3873.)
++        writeln!(stream, "{}", link::hello_line(&entry.token)).expect("hello");
+         let _ = connected_tx.send(());
+         let _ = finish_rx.recv();
+         drop(stream);
