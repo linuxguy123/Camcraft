@@ -1,0 +1,1412 @@
+From 25eca3ba4ba53f78c88fbadbf95bd1a36358bd0f Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Thu, 26 Nov 2026 17:00:13 +0100
+Subject: [PATCH 1/2] feat(tools): multi-seat indexable face mills and end
+ mills
+
+A cutter body (tool item) whose seats all take one shared insert
+resolves to the milling tool record: diameter, corner radius, flutes,
+flute length and centre cutting. The tool is never smaller than the
+real cutter: below 90 degrees the cutting diameter is the edge reach,
+and the shank holds the rest of the inserts. In an assembly the seats
+must put the cutting point on DC, and the judged body is enclosed.
+
+Refs #3646
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/tools/src/lib.rs                   |   5 +
+ crates/tools/src/milling_cutter.rs        | 318 ++++++++++++++++++++++
+ crates/tools/src/milling_cutter_error.rs  |  84 ++++++
+ crates/tools/src/milling_cutter_tests.rs  | 290 ++++++++++++++++++++
+ docs/decisions/3646-multi-seat-cutters.md |  87 ++++++
+ 5 files changed, 784 insertions(+)
+ create mode 100644 crates/tools/src/milling_cutter.rs
+ create mode 100644 crates/tools/src/milling_cutter_error.rs
+ create mode 100644 crates/tools/src/milling_cutter_tests.rs
+ create mode 100644 docs/decisions/3646-multi-seat-cutters.md
+
+diff --git a/crates/tools/src/lib.rs b/crates/tools/src/lib.rs
+index 72a4b52af..e3a40927a 100644
+--- a/crates/tools/src/lib.rs
++++ b/crates/tools/src/lib.rs
+@@ -91,6 +91,11 @@ pub mod frame;
+ pub mod tool_assembly;
+ #[cfg(test)]
+ mod tool_assembly_tests;
++// #3646: multi-seat indexable face mills and end mills resolved to the
++// milling tool record, never smaller than the real cutter.
++pub mod milling_cutter;
++#[cfg(test)]
++mod milling_cutter_tests;
+ 
+ // #743: DXF half-profile parsing and projection into validated holder profiles.
+ pub mod tool_profile_dxf;
+diff --git a/crates/tools/src/milling_cutter.rs b/crates/tools/src/milling_cutter.rs
+new file mode 100644
+index 000000000..3d64b52c0
+--- /dev/null
++++ b/crates/tools/src/milling_cutter.rs
+@@ -0,0 +1,318 @@
++//! #3646: a multi-seat indexable milling cutter - a face mill or an
++//! indexable end mill: one cutter body (a tool item, #3642) whose seats
++//! (`CSW1_1..CSW1_N`, or one seat port and a seat count) all take one
++//! shared insert - resolved to the milling `Tool` record the toolpath,
++//! gouge and collision laws read. Our own design over the public
++//! ISO 13399 cutter properties (`DC`, the cutting edge angle `KAPR`,
++//! `APMX`) and the ISO 1832 insert code; textbook plane geometry. No
++//! vendor source or file consulted.
++//!
++//! The law: the tool is never smaller than the real cutter. Inside the
++//! cutting depth its cylinder holds every cutting edge, and its shank
++//! holds the rest of the inserts above it. Each refusal names the
++//! cutter body: bad numbers, a seat that does not take the insert, a
++//! corner that does not fit, a body that stands outside the cutter.
++
++use crate::component::{ComponentKind, ToolComponent};
++use crate::component_fit::check_insert_fit;
++use crate::holder_profile::{HolderBand, HolderProfile, MAX_BODY_RADIUS};
++use crate::insert_codes::InsertShape;
++use crate::insert_iso1832::{Corner, InsertSpec};
++use crate::taper::TaperTip;
++use crate::tool_assembly::ResolvedAssembly;
++use crate::tools::{Tool, ToolKind};
++
++#[path = "milling_cutter_error.rs"]
++mod error;
++pub use error::MillingError;
++
++/// The most seats one cutter has: a tool record counts 1..=32 flutes.
++pub const MAX_SEATS: usize = 32;
++/// A cutting edge angle this close to 90 degrees is read as 90.
++const SQUARE_TOL: f64 = 1e-9;
++/// How far (mm) the seat geometry may put the cutting point off `DC`.
++pub const SEAT_TOL: f64 = 1e-3;
++
++/// The cutter body's own facts, as its catalog states them.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MillingBody {
++    /// `DC`: the diameter where the main cutting edges (carried past
++    /// the corner) meet the tip plane. On a round-insert cutter, the
++    /// largest diameter the round edges sweep.
++    pub dc: f64,
++    /// `KAPR`: the angle (degrees) of the main cutting edge from the
++    /// tip plane - 90 for a shoulder mill, 45 for a common face mill.
++    /// Not read on a round-insert cutter.
++    pub kapr_deg: f64,
++    /// `APMX`: the largest axial depth of cut (mm).
++    pub apmx: f64,
++    /// Can it plunge into solid material? False for a face or shell
++    /// mill with a centre hole (the M11.3 plunge refusal).
++    pub center_cutting: bool,
++    /// A seat count for a body that states one seat port for all its
++    /// seats; `None` counts the body's seat ports.
++    pub seat_count: Option<u32>,
++}
++
++/// What a multi-seat cutter resolves to, in the tool frame (tip at the
++/// origin, +Z toward the spindle).
++#[derive(Clone, Debug, PartialEq)]
++pub struct MillingCutter {
++    /// The cutter body's name, for the refusals that follow.
++    pub name: String,
++    /// The stated `DC`.
++    pub dc: f64,
++    pub kind: ToolKind,
++    /// The cutting diameter: `DC` at 90 degrees and on round inserts;
++    /// below 90 degrees the larger diameter that the edges reach at the
++    /// top of the cutting depth (a `DC` cylinder would be smaller than
++    /// the cutter there).
++    pub diameter: f64,
++    pub corner_r: f64,
++    /// One cutting edge for each seat.
++    pub flutes: u32,
++    /// `APMX`, no deeper than the insert edge reaches at `KAPR`.
++    pub flute_len: f64,
++    pub center_cutting: bool,
++    /// The diameter that holds the inserts above the cutting depth.
++    pub insert_d: f64,
++    /// How high above the tip the inserts reach.
++    pub insert_top: f64,
++}
++
++/// Resolve the cutter `body` with its facts `spec` and the shared
++/// `insert` (the module's law).
++pub fn derive(body: &ToolComponent, spec: &MillingBody, insert: &ToolComponent) -> Result<MillingCutter, MillingError> {
++    let name = body.name().to_owned();
++    for (what, value) in [("DC", spec.dc), ("cutting edge angle", spec.kapr_deg), ("APMX", spec.apmx)] {
++        if !value.is_finite() {
++            return Err(MillingError::NonFinite { name, what, value });
++        }
++    }
++    if !(spec.dc > 0.0 && spec.dc <= 500.0) {
++        return Err(MillingError::BadDiameter { name, dc: spec.dc });
++    }
++    if spec.apmx <= 0.0 {
++        return Err(MillingError::BadDepth { name, apmx: spec.apmx });
++    }
++    if !matches!(body.kind(), ComponentKind::ToolItem { .. }) {
++        return Err(MillingError::NotABody { name });
++    }
++    let ports = body.ports();
++    let flutes = seat_count(&name, spec.seat_count, ports.len())?;
++    for port in &ports {
++        check_insert_fit(body, port, insert)?;
++    }
++    let Some(ins) = insert.insert() else {
++        // The fit checks refuse a component that is not an insert.
++        return Err(MillingError::NotABody { name: insert.name().to_owned() });
++    };
++    let shape = if ins.shape == InsertShape::R { round(&name, spec, ins)? } else { edged(&name, spec, ins)? };
++    let kind = if shape.corner_r <= 0.0 {
++        ToolKind::EndMill
++    } else if (shape.corner_r - 0.5 * shape.diameter).abs() <= 1e-9 {
++        ToolKind::BallNose
++    } else {
++        ToolKind::BullNose
++    };
++    Ok(MillingCutter {
++        name,
++        dc: spec.dc,
++        kind,
++        diameter: shape.diameter,
++        corner_r: shape.corner_r,
++        flutes,
++        flute_len: shape.flute_len,
++        center_cutting: spec.center_cutting,
++        insert_d: shape.insert_d,
++        insert_top: shape.insert_top,
++    })
++}
++
++/// The seat count: the stated one (the body states one seat port for
++/// all, or a port for each), else the body's seat ports.
++fn seat_count(name: &str, stated: Option<u32>, ports: usize) -> Result<u32, MillingError> {
++    let n = match stated {
++        None => ports,
++        Some(0) => return Err(MillingError::NoSeats { name: name.to_owned() }),
++        Some(n) => {
++            let count = usize::try_from(n).unwrap_or(usize::MAX);
++            if ports != 1 && ports != count {
++                return Err(MillingError::SeatCount { name: name.to_owned(), stated: n, ports });
++            }
++            count
++        }
++    };
++    if n == 0 {
++        return Err(MillingError::NoSeats { name: name.to_owned() });
++    }
++    u32::try_from(n)
++        .ok()
++        .filter(|_| n <= MAX_SEATS)
++        .ok_or_else(|| MillingError::TooManySeats { name: name.to_owned(), count: n })
++}
++
++/// The cutter's meridian shape before it becomes a tool record.
++struct Shape {
++    diameter: f64,
++    corner_r: f64,
++    flute_len: f64,
++    insert_d: f64,
++    insert_top: f64,
++}
++
++/// A round insert: the corner is half its diameter (the size code, cut
++/// to whole mm, so the model corner is never rounder than the insert);
++/// the edge cuts up to half the insert; the insert stands no higher
++/// than its diameter (the code plus 1 mm) and inside `DC`.
++fn round(name: &str, spec: &MillingBody, ins: &InsertSpec) -> Result<Shape, MillingError> {
++    let ic = f64::from(ins.size);
++    let corner_r = 0.5 * ic;
++    if corner_r > 0.5 * spec.dc {
++        let why = format!("the Ø{ic} mm round insert is larger than the Ø{} mm cutting diameter", spec.dc);
++        return Err(MillingError::Corner { name: name.to_owned(), why });
++    }
++    let flute_len = spec.apmx.min(corner_r);
++    Ok(Shape { diameter: spec.dc, corner_r, flute_len, insert_d: spec.dc, insert_top: ic + 1.0 })
++}
++
++/// An insert with straight edges at the cutting edge angle `KAPR`.
++fn edged(name: &str, spec: &MillingBody, ins: &InsertSpec) -> Result<Shape, MillingError> {
++    let k = spec.kapr_deg;
++    if !(k > 0.0 && k <= 90.0) {
++        return Err(MillingError::BadLeadAngle { name: name.to_owned(), deg: k });
++    }
++    let square = k >= 90.0 - SQUARE_TOL;
++    let (sin_k, cos_k) = if square { (1.0, 0.0) } else { k.to_radians().sin_cos() };
++    let cot_k = cos_k / sin_k;
++    let size = f64::from(ins.size);
++    // The size code cuts the edge to whole mm: the true edge is no
++    // shorter than `edge_lo` (the depth bound) and no longer than
++    // `edge_hi` (the envelope bound).
++    let ic = ins.inscribed_circle_mm();
++    let edge_hi = match (ic, ins.shape.edge_per_ic()) {
++        (Some(ic), Some(per)) => (ic * per).max(size),
++        _ => size + 1.0,
++    };
++    let edge_lo = size.min(edge_hi);
++    let flute_len = spec.apmx.min(edge_lo * sin_k);
++    let corner_r = match ins.corner {
++        Corner::Facet { .. } => 0.0,
++        c => c.nose_radius_mm().unwrap_or(0.0),
++    };
++    let diameter = spec.dc + 2.0 * flute_len * cot_k;
++    let corner = |why: String| Err(MillingError::Corner { name: name.to_owned(), why });
++    if corner_r > 0.5 * spec.dc {
++        return corner(format!("its {corner_r} mm nose radius is more than half the {} mm DC", spec.dc));
++    }
++    // Below 90 degrees the model corner sits on the wider diameter: it
++    // holds the real corner only while it is no larger than the depth
++    // and the edge's run-out over that depth.
++    if !square && (corner_r > flute_len || corner_r > flute_len * cot_k) {
++        return corner(format!(
++            "its {corner_r} mm nose radius is larger than the {flute_len:.3} mm cutting depth or the {:.3} mm the edge runs out over it",
++            flute_len * cot_k
++        ));
++    }
++    // Any point of the insert is within its longest chord of the tip
++    // corner, so no higher than that.
++    let chord = match (ic, ins.shape.corner_deg()) {
++        (Some(ic), Some(a)) => ic / (0.5 * a.to_radians()).sin(),
++        _ => 2.0 * (size + 1.0),
++    };
++    // Past the top of the main edge the next edge turns inward by
++    // 180 minus the corner angle; it runs farther out only when that
++    // corner is more than 90 + KAPR degrees. Then take the safe bound:
++    // the tip corner's radius plus the longest chord.
++    let insert_r = if square {
++        0.5 * spec.dc
++    } else if max_corner(ins.shape) <= 90.0 + k {
++        0.5 * spec.dc + edge_hi * cos_k
++    } else {
++        0.5 * spec.dc + chord
++    };
++    let insert_d = (2.0 * insert_r).max(diameter);
++    if !insert_d.is_finite() || 0.5 * insert_d > MAX_BODY_RADIUS {
++        let why = format!("the inserts reach Ø{insert_d:.3} mm, past the {MAX_BODY_RADIUS} mm body radius cap");
++        return corner(why);
++    }
++    Ok(Shape { diameter, corner_r, flute_len, insert_d, insert_top: chord.max(edge_hi * sin_k) })
++}
++
++/// The largest corner angle of an insert shape (degrees).
++fn max_corner(shape: InsertShape) -> f64 {
++    use InsertShape as S;
++    let a = shape.corner_deg().unwrap_or(180.0);
++    match shape {
++        S::A | S::B | S::C | S::D | S::E | S::K | S::M | S::V => 180.0 - a,
++        S::W => 160.0,
++        _ => a,
++    }
++}
++
++impl MillingCutter {
++    /// The milling tool record: this cutter's geometry over `base`'s
++    /// running data (speed, feed, materials, cutting rows, catalog
++    /// facts, hand and holder stand-in). The fields of other kinds are
++    /// reset to their inert values. The tool law (`why_not_sane`) has
++    /// the last word.
++    pub fn tool(&self, base: &Tool) -> Result<Tool, MillingError> {
++        let t = Tool {
++            kind: self.kind,
++            diameter: self.diameter,
++            corner_r: self.corner_r,
++            tip_angle: 0.0,
++            pitch: 0.0,
++            pitch_min: 0.0,
++            nose_radius: 0.0,
++            width: 0.0,
++            flute_len: self.flute_len,
++            shank_d: self.insert_d,
++            shank_len: (self.insert_top - self.flute_len).max(0.0),
++            flutes: Some(self.flutes),
++            center_cutting: self.center_cutting,
++            orientation: None,
++            outline: Vec::new(),
++            turning: None,
++            tip_form: TaperTip::Sharp,
++            tip_diameter: 0.0,
++            form: None,
++            ..base.clone()
++        };
++        match t.why_not_sane() {
++            Some(why) => Err(MillingError::Tool { name: self.name.clone(), why }),
++            None => Ok(t),
++        }
++    }
++
++    /// The tool in its spindle assembly (`crate::tool_assembly`): the
++    /// seat geometry must put the cutting point on `DC`, and the judged
++    /// body is enclosed as the laws read it. A body inside the cutting
++    /// depth is held by the cutting cylinder when it stays inside it,
++    /// and refused by name when it stands outside.
++    pub fn assembled(&self, base: &Tool, r: &ResolvedAssembly) -> Result<Tool, MillingError> {
++        let seat_d = r.cutting.diameter;
++        if !seat_d.is_finite() || (seat_d - self.dc).abs() > SEAT_TOL {
++            return Err(MillingError::SeatDiameter { name: self.name.clone(), seat_d, dc: self.dc });
++        }
++        let tool = self.tool(base)?;
++        let Some(body) = &r.body else { return Ok(tool) };
++        let (fl, cut_r) = (tool.flute_len, 0.5 * tool.diameter);
++        let mut kept: Vec<HolderBand> = Vec::new();
++        for b in body.profile.bands() {
++            let top = b.above + b.len;
++            if b.above < fl - 1e-9 && b.r > cut_r + 1e-9 {
++                return Err(MillingError::BodyOutside { name: self.name.clone(), above: b.above, r: b.r, cut_r });
++            }
++            if top > fl + 1e-9 {
++                let lo = b.above.max(fl);
++                kept.push(HolderBand { above: lo, len: top - lo, r: b.r });
++            }
++        }
++        if kept.is_empty() {
++            return Ok(tool);
++        }
++        let why = || MillingError::Tool { name: self.name.clone(), why: "its body could not be enclosed".to_owned() };
++        HolderProfile::from_bands(kept).enclose(&tool).ok_or_else(why)
++    }
++}
+diff --git a/crates/tools/src/milling_cutter_error.rs b/crates/tools/src/milling_cutter_error.rs
+new file mode 100644
+index 000000000..b16507fde
+--- /dev/null
++++ b/crates/tools/src/milling_cutter_error.rs
+@@ -0,0 +1,84 @@
++//! #3646: why a multi-seat milling cutter is refused. Each refusal
++//! names the cutter body (and the seat) it is about. Our own wording.
++
++use crate::component_fit::FitError;
++
++/// Why a multi-seat milling cutter is refused.
++#[derive(Clone, Debug, PartialEq)]
++pub enum MillingError {
++    /// A stated number is NaN or infinite.
++    NonFinite { name: String, what: &'static str, value: f64 },
++    /// The cutting diameter `DC` is not over 0, or past the tool cap.
++    BadDiameter { name: String, dc: f64 },
++    /// The cutting edge angle is not over 0 and at most 90 degrees.
++    BadLeadAngle { name: String, deg: f64 },
++    /// The largest axial depth `APMX` is not over 0.
++    BadDepth { name: String, apmx: f64 },
++    /// The component is not a tool item (a cutter body with seats).
++    NotABody { name: String },
++    /// A stated seat count of 0.
++    NoSeats { name: String },
++    /// More seats than a tool record counts flutes.
++    TooManySeats { name: String, count: usize },
++    /// A stated seat count that the body's seat ports contradict.
++    SeatCount { name: String, stated: u32, ports: usize },
++    /// A seat that does not take the shared insert (#3642's check).
++    Fit(FitError),
++    /// The insert's corner does not fit the cutter.
++    Corner { name: String, why: String },
++    /// The tool record that the cutter gives fails the tool law.
++    Tool { name: String, why: String },
++    /// The seat geometry of the assembly puts the cutting point on a
++    /// diameter other than the stated `DC`.
++    SeatDiameter { name: String, seat_d: f64, dc: f64 },
++    /// A judged body stands outside the cutter inside the cutting depth.
++    BodyOutside { name: String, above: f64, r: f64, cut_r: f64 },
++}
++
++impl core::fmt::Display for MillingError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            Self::NonFinite { name, what, value } => write!(f, "the cutter '{name}' has a non-finite {what} ({value})"),
++            Self::BadDiameter { name, dc } => {
++                write!(f, "the cutter '{name}' has a cutting diameter of {dc} mm - it must be over 0 and at most 500 mm")
++            }
++            Self::BadLeadAngle { name, deg } => write!(
++                f,
++                "the cutter '{name}' has a cutting edge angle of {deg} degrees - it must be over 0 and at most 90"
++            ),
++            Self::BadDepth { name, apmx } => {
++                write!(f, "the cutter '{name}' has a largest cutting depth of {apmx} mm - it must be over 0")
++            }
++            Self::NotABody { name } => {
++                write!(f, "'{name}' is not a cutter body - a multi-seat cutter needs a tool item with insert seats")
++            }
++            Self::NoSeats { name } => write!(f, "the cutter '{name}' states 0 seats - it needs one at least"),
++            Self::TooManySeats { name, count } => {
++                write!(f, "the cutter '{name}' has {count} seats - a tool counts 32 cutting edges at most")
++            }
++            Self::SeatCount { name, stated, ports } => write!(
++                f,
++                "the cutter '{name}' states {stated} seats, but its body has {ports} seat ports - state one seat port for a seat count, or a port for each seat"
++            ),
++            Self::Fit(e) => write!(f, "{e}"),
++            Self::Corner { name, why } => write!(f, "the insert corner of the cutter '{name}' is refused: {why}"),
++            Self::Tool { name, why } => write!(f, "the cutter '{name}' gives a tool that is refused: {why}"),
++            Self::SeatDiameter { name, seat_d, dc } => write!(
++                f,
++                "the seats of the cutter '{name}' put the cutting point on Ø{seat_d:.3} mm, but the cutter states DC {dc} mm"
++            ),
++            Self::BodyOutside { name, above, r, cut_r } => write!(
++                f,
++                "a body of the cutter '{name}' reaches {r:.3} mm from the axis at {above:.3} mm above the tip - outside the {cut_r:.3} mm cutting radius, inside the cutting depth"
++            ),
++        }
++    }
++}
++
++impl std::error::Error for MillingError {}
++
++impl From<FitError> for MillingError {
++    fn from(e: FitError) -> Self {
++        Self::Fit(e)
++    }
++}
+diff --git a/crates/tools/src/milling_cutter_tests.rs b/crates/tools/src/milling_cutter_tests.rs
+new file mode 100644
+index 000000000..13d396314
+--- /dev/null
++++ b/crates/tools/src/milling_cutter_tests.rs
+@@ -0,0 +1,290 @@
++//! #3646: multi-seat indexable cutters resolved to the milling tool -
++//! pinned on a face mill and a shoulder end mill that share one insert,
++//! a round-insert end mill, the envelope that holds the real cutter,
++//! the assembled body, and the refusals by name.
++
++use crate::component::{ComponentKind, CuttingItem, InsertSeat, ToolComponent};
++use crate::component_fit::FitProperty;
++use crate::component_geometry::{ComponentBody, ComponentGeometry};
++use crate::connection_code::ConnectionCode;
++use crate::frame::Frame;
++use crate::insert_iso1832::InsertSpec;
++use crate::insert_seat::HolderDesignation;
++use crate::milling_cutter::{derive, MillingBody, MillingCutter, MillingError};
++use crate::spun::SpunPoint;
++use crate::tool_assembly::{resolve, AssemblyNode, Mount};
++use crate::tools::{catalog, Tool, ToolKind};
++
++fn made(id: &str, kind: ComponentKind) -> ToolComponent {
++    ToolComponent::new(id, id, kind).unwrap_or_else(|e| panic!("{id}: {e}"))
++}
++
++fn code(text: &str) -> ConnectionCode {
++    ConnectionCode::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"))
++}
++
++/// A cutter body whose `ports` all take the seat of the ISO 5608 code
++/// `holder`.
++fn body(name: &str, holder: &str, ports: &[&str]) -> ToolComponent {
++    let Ok(h) = HolderDesignation::parse(holder) else { panic!("{holder}") };
++    let seats = ports.iter().map(|p| InsertSeat { port: (*p).into(), spec: h.seat }).collect();
++    made(name, ComponentKind::ToolItem { mcs: code("CYL 20"), seats })
++}
++
++fn insert(text: &str) -> ToolComponent {
++    let Ok(spec) = InsertSpec::parse(text) else { panic!("{text}") };
++    made(text, ComponentKind::CuttingItem(CuttingItem::Insert(spec)))
++}
++
++const FOUR: [&str; 4] = ["CSW1_1", "CSW1_2", "CSW1_3", "CSW1_4"];
++
++fn spec(dc: f64, kapr_deg: f64, apmx: f64) -> MillingBody {
++    MillingBody { dc, kapr_deg, apmx, center_cutting: false, seat_count: None }
++}
++
++fn ok(b: &ToolComponent, s: &MillingBody, i: &ToolComponent) -> MillingCutter {
++    derive(b, s, i).unwrap_or_else(|e| panic!("refused: {e}"))
++}
++
++fn refused(b: &ToolComponent, s: &MillingBody, i: &ToolComponent) -> MillingError {
++    match derive(b, s, i) {
++        Ok(c) => panic!("accepted: {c:?}"),
++        Err(e) => e,
++    }
++}
++
++/// A catalog end mill: the running data under every derived tool.
++fn base() -> Tool {
++    catalog()
++        .into_iter()
++        .map(|(_, t)| t)
++        .find(|t| t.kind == ToolKind::EndMill)
++        .unwrap_or_else(|| panic!("the catalog has no end mill"))
++}
++
++fn near(a: f64, b: f64) -> bool {
++    (a - b).abs() < 1e-9
++}
++
++/// A 4-seat Ø50 90-degree face mill and a 2-seat Ø25 shoulder end mill
++/// share one square insert: the diameter is DC, the corner the insert's
++/// nose, the flutes the seats, the flute length APMX or the edge.
++#[test]
++fn a_face_mill_and_an_end_mill_share_one_insert() {
++    let ins = insert("SCMT120408");
++    let face = body("face mill", "SSDCN2525M12", &FOUR);
++    let c = ok(&face, &spec(50.0, 90.0, 8.0), &ins);
++    assert!(near(c.diameter, 50.0) && near(c.corner_r, 0.8) && near(c.flute_len, 8.0), "{c:?}");
++    assert_eq!((c.flutes, c.kind, c.center_cutting), (4, ToolKind::BullNose, false));
++    let t = c.tool(&base()).unwrap_or_else(|e| panic!("{e}"));
++    assert_eq!((t.flutes, t.center_cutting, t.kind), (Some(4), false, ToolKind::BullNose));
++    assert!(near(t.diameter, 50.0) && near(t.corner_r, 0.8) && near(t.flute_len, 8.0));
++    // APMX past the edge: the 12 mm edge (the size code) bounds the depth.
++    assert!(near(ok(&face, &spec(50.0, 90.0, 20.0), &ins).flute_len, 12.0));
++    let end = body("shoulder mill", "SSDCN2525M12", &["CSW1_1", "CSW1_2"]);
++    let e = ok(&end, &MillingBody { center_cutting: true, ..spec(25.0, 90.0, 10.0) }, &ins);
++    assert!(near(e.diameter, 25.0) && near(e.corner_r, 0.8) && e.center_cutting && e.flutes == 2);
++    // An edit of the shared insert reaches both cutters.
++    let edited = insert("SCMT120404");
++    assert!(near(ok(&face, &spec(50.0, 90.0, 8.0), &edited).corner_r, 0.4));
++    assert!(near(ok(&end, &spec(25.0, 90.0, 10.0), &edited).corner_r, 0.4));
++    let sharp = ok(&face, &spec(50.0, 90.0, 8.0), &insert("SCMT120400"));
++    assert_eq!(sharp.kind, ToolKind::EndMill);
++}
++
++/// Below 90 degrees the edge runs outward: the depth is the edge's rise
++/// at KAPR, and the cutting diameter is the edge's reach at that depth.
++#[test]
++fn a_45_degree_face_mill_cuts_its_edge_reach() {
++    let face = body("face mill", "SSDCN2525M12", &FOUR);
++    let ins = insert("SCMT120408");
++    let c = ok(&face, &spec(50.0, 45.0, 6.0), &ins);
++    assert!(near(c.flute_len, 6.0) && near(c.diameter, 62.0), "{c:?}");
++    let deep = ok(&face, &spec(50.0, 45.0, 30.0), &ins);
++    assert!(near(deep.flute_len, 12.0 * 45f64.to_radians().sin()), "{deep:?}");
++}
++
++/// A round-insert end mill with one seat port and a seat count: the
++/// corner is half the insert, the depth no more than that corner.
++#[test]
++fn a_round_insert_end_mill_takes_half_its_insert_as_corner() {
++    let b = body("button mill", "SRDCN2525M12", &["CSW1"]);
++    let s = MillingBody { seat_count: Some(3), ..spec(32.0, 90.0, 4.0) };
++    let c = ok(&b, &s, &insert("RCMT1204M0"));
++    assert!(near(c.diameter, 32.0) && near(c.corner_r, 6.0) && near(c.flute_len, 4.0), "{c:?}");
++    assert_eq!((c.flutes, c.kind), (3, ToolKind::BullNose));
++    let deep = ok(&b, &MillingBody { apmx: 9.0, ..s }, &insert("RCMT1204M0"));
++    assert!(near(deep.flute_len, 6.0));
++}
++
++/// The model radius of `t` at height `z`: the corner, the cutting
++/// cylinder, the shank; 0 above the shank.
++fn reach(t: &Tool, z: f64) -> f64 {
++    let (r, rc) = (0.5 * t.diameter, t.corner_r);
++    if z < -1e-9 || z > t.flute_len + t.shank_len + 1e-9 {
++        0.0
++    } else if z <= t.flute_len + 1e-9 {
++        if z < rc { r - rc + (rc * rc - (rc - z) * (rc - z)).max(0.0).sqrt() } else { r }
++    } else {
++        0.5 * t.shank_d
++    }
++}
++
++fn inside(t: &Tool, pts: &[[f64; 2]], what: &str) {
++    for p in pts {
++        assert!(p[0] <= reach(t, p[1]) + 1e-6, "{what}: ({:.4}, {:.4}) is outside the tool {:.4}", p[0], p[1], reach(t, p[1]));
++    }
++}
++
++/// The real meridian outline of a square insert of edge `e` and nose
++/// `rn` whose main edge leaves the tip point (`dc`/2, 0) at `kapr`.
++fn square_outline(dc: f64, kapr: f64, e: f64, rn: f64) -> Vec<[f64; 2]> {
++    let (s, c) = kapr.to_radians().sin_cos();
++    let (u, v) = ([c, s], [-s, c]);
++    let p0 = [0.5 * dc, 0.0];
++    let at = |p: [f64; 2], d: [f64; 2], k: f64| [p[0] + d[0] * k, p[1] + d[1] * k];
++    let corners = [at(p0, u, rn), at(p0, u, e), at(at(p0, u, e), v, e), at(p0, v, e), at(p0, v, rn)];
++    let mut pts = Vec::new();
++    for w in corners.windows(2) {
++        for i in 0..=200 {
++            let k = f64::from(i) / 200.0;
++            pts.push([w[0][0] + (w[1][0] - w[0][0]) * k, w[0][1] + (w[1][1] - w[0][1]) * k]);
++        }
++    }
++    // The nose arc at the tip: centre rn in from both edges.
++    let centre = at(at(p0, u, rn), v, rn);
++    for i in 0..=200 {
++        let a = std::f64::consts::FRAC_PI_2 * f64::from(i) / 200.0;
++        let (sa, ca) = a.sin_cos();
++        pts.push([centre[0] - rn * (v[0] * ca + u[0] * sa), centre[1] - rn * (v[1] * ca + u[1] * sa)]);
++    }
++    pts
++}
++
++/// The envelope pin: the derived tool holds every point of the real
++/// cutter - the edges, the nose, the rest of the insert above the
++/// cutting depth, a round insert of its metric or its inch size.
++#[test]
++fn the_tool_holds_the_real_cutter() {
++    let face = body("face mill", "SSDCN2525M12", &FOUR);
++    for (kapr, apmx) in [(90.0, 8.0), (75.0, 6.0), (45.0, 6.0), (45.0, 30.0), (20.0, 3.0)] {
++        for nose in ["SCMT120400", "SCMT120408"] {
++            let ins = insert(nose);
++            let t = ok(&face, &spec(50.0, kapr, apmx), &ins).tool(&base()).unwrap_or_else(|e| panic!("{e}"));
++            let rn = t.corner_r;
++            // SCMT12: a 12.7 mm inscribed circle, so a 12.7 mm square edge.
++            inside(&t, &square_outline(50.0, kapr, 12.7, rn), &format!("{nose} at {kapr} deg"));
++        }
++    }
++    let b = body("button mill", "SRDCN2525M12", &["CSW1"]);
++    let t = ok(&b, &MillingBody { seat_count: Some(3), ..spec(32.0, 90.0, 4.0) }, &insert("RCMT1204M0"))
++        .tool(&base())
++        .unwrap_or_else(|e| panic!("{e}"));
++    for ic in [12.0, 12.7] {
++        let r = 0.5 * ic;
++        let pts: Vec<[f64; 2]> = (0..=720)
++            .map(|i| {
++                let (s, c) = (std::f64::consts::TAU * f64::from(i) / 720.0).sin_cos();
++                [16.0 - r + r * c, r + r * s]
++            })
++            .collect();
++        inside(&t, &pts, &format!("a Ø{ic} round insert"));
++    }
++}
++
++/// A BT40 holder, a 4-seat face mill body (seats on Ø`seat_d`, 45 mm
++/// below its MCS; its own body a cylinder of `body_r` 40 mm long) and
++/// the insert in the first seat.
++fn assembly(seat_d: f64, body_r: f64) -> Vec<AssemblyNode> {
++    let p = SpunPoint::line;
++    let cyl = |len: f64, r: f64| {
++        ComponentBody::new(vec![p(0.0, 0.0), p(0.0, r), p(len, r), p(len, 0.0)], -len).unwrap_or_else(|e| panic!("{e}"))
++    };
++    let seats = FOUR
++        .iter()
++        .enumerate()
++        .map(|(i, port)| {
++            let (s, c) = (90.0 * i as f64).to_radians().sin_cos();
++            let f = Frame::new([0.5 * seat_d * c, 0.5 * seat_d * s, -45.0], [0.0, 0.0, 1.0], [c, s, 0.0]);
++            ((*port).to_owned(), f.unwrap_or_else(|e| panic!("{e}")))
++        })
++        .collect();
++    let geometry = ComponentGeometry::new(seats, Some(cyl(40.0, body_r)), None).unwrap_or_else(|e| panic!("{e}"));
++    let holder = made("BT40 CYL 20", ComponentKind::AdaptiveItem { mcs: code("BT40"), csw: code("CYL 20") });
++    let held = ComponentGeometry::axial("CSW", 50.0, Some(cyl(50.0, 25.0))).unwrap_or_else(|e| panic!("{e}"));
++    let on = |parent: usize, port: Option<&str>| {
++        Some(Mount { parent, port: port.map(str::to_owned), z_rot_deg: 0.0, projection_mm: None })
++    };
++    vec![
++        AssemblyNode { component: holder, geometry: held, mount: None },
++        AssemblyNode { component: body("face mill", "SSDCN2525M12", &FOUR), geometry, mount: on(0, None) },
++        AssemblyNode { component: insert("SCMT120408"), geometry: ComponentGeometry::default(), mount: on(1, Some("CSW1_1")) },
++    ]
++}
++
++/// The cutter in its assembly: the gauge length and the judged body of
++/// the holder and the cutter body, enclosed over the tool. The body
++/// inside the cutting depth stays inside the cutter; one that stands
++/// outside it, or seats off DC, are refused by name.
++#[test]
++fn the_assembled_face_mill_encloses_holder_and_body() {
++    let c = ok(&body("face mill", "SSDCN2525M12", &FOUR), &spec(50.0, 45.0, 6.0), &insert("SCMT120408"));
++    let r = resolve(&assembly(50.0, 20.0)).unwrap_or_else(|e| panic!("{e}"));
++    assert!(near(r.gauge_len, 95.0), "{}", r.gauge_len);
++    let alone = c.tool(&base()).unwrap_or_else(|e| panic!("{e}"));
++    let t = c.assembled(&base(), &r).unwrap_or_else(|e| panic!("{e}"));
++    assert!(near(t.diameter, 62.0) && near(t.flute_len, 6.0));
++    assert!(t.shank_d >= alone.shank_d && t.shank_d >= 40.0, "{t:?}");
++    assert!(near(t.holder_d, 50.0) && near(t.flute_len + t.shank_len + t.holder_len, 95.0), "{t:?}");
++    let r = resolve(&assembly(50.0, 40.0)).unwrap_or_else(|e| panic!("{e}"));
++    let Err(MillingError::BodyOutside { r: br, .. }) = c.assembled(&base(), &r) else { panic!("a wide body passed") };
++    assert!(near(br, 40.0));
++    let r = resolve(&assembly(48.0, 20.0)).unwrap_or_else(|e| panic!("{e}"));
++    assert!(matches!(c.assembled(&base(), &r), Err(MillingError::SeatDiameter { .. })));
++}
++
++#[test]
++fn seats_that_do_not_take_the_insert_are_refused_by_the_fit_checks() {
++    let face = body("face mill", "SSDCN2525M12", &FOUR);
++    let MillingError::Fit(e) = refused(&face, &spec(50.0, 90.0, 8.0), &insert("SCMT09T308")) else { panic!("size") };
++    assert_eq!((e.property, e.parent.as_str(), e.child.as_str()), (FitProperty::Size, "face mill", "SCMT09T308"));
++    let MillingError::Fit(e) = refused(&face, &spec(50.0, 90.0, 8.0), &insert("CCMT120408")) else { panic!("shape") };
++    assert_eq!(e.property, FitProperty::Shape);
++    let MillingError::Fit(e) = refused(&face, &spec(50.0, 90.0, 8.0), &face) else { panic!("kind") };
++    assert_eq!(e.property, FitProperty::Kind);
++}
++
++#[test]
++fn degenerate_cutters_are_refused_by_name() {
++    let face = body("face mill", "SSDCN2525M12", &FOUR);
++    let ins = insert("SCMT120408");
++    let s = spec(50.0, 90.0, 8.0);
++    for (bad, what) in [(MillingBody { dc: f64::NAN, ..s }, "DC"), (MillingBody { apmx: f64::INFINITY, ..s }, "APMX")] {
++        assert!(matches!(refused(&face, &bad, &ins), MillingError::NonFinite { what: w, .. } if w == what));
++    }
++    let nan = MillingBody { kapr_deg: f64::NAN, ..s };
++    assert!(matches!(refused(&face, &nan, &ins), MillingError::NonFinite { .. }));
++    for dc in [0.0, -10.0, 600.0] {
++        assert!(matches!(refused(&face, &MillingBody { dc, ..s }, &ins), MillingError::BadDiameter { .. }));
++    }
++    assert!(matches!(refused(&face, &MillingBody { apmx: 0.0, ..s }, &ins), MillingError::BadDepth { .. }));
++    for k in [0.0, -45.0, 95.0] {
++        assert!(matches!(refused(&face, &MillingBody { kapr_deg: k, ..s }, &ins), MillingError::BadLeadAngle { .. }));
++    }
++    assert!(matches!(refused(&face, &MillingBody { seat_count: Some(0), ..s }, &ins), MillingError::NoSeats { .. }));
++    let e = refused(&face, &MillingBody { seat_count: Some(5), ..s }, &ins);
++    assert!(matches!(e, MillingError::SeatCount { stated: 5, ports: 4, .. }), "{e}");
++    let one = body("one port", "SSDCN2525M12", &["CSW1"]);
++    let e = refused(&one, &MillingBody { seat_count: Some(33), ..s }, &ins);
++    assert!(matches!(e, MillingError::TooManySeats { count: 33, .. }), "{e}");
++    assert!(matches!(refused(&ins, &s, &ins), MillingError::NotABody { .. }));
++    // A nose larger than half DC, and one the 45-degree run-out cannot hold.
++    let small = MillingBody { dc: 1.0, ..s };
++    assert!(matches!(refused(&face, &small, &insert("SCMT120408")), MillingError::Corner { .. }));
++    let shallow = MillingBody { kapr_deg: 45.0, apmx: 0.5, ..s };
++    assert!(matches!(refused(&face, &shallow, &ins), MillingError::Corner { .. }));
++    let b = body("button mill", "SRDCN2525M12", &["CSW1"]);
++    let e = refused(&b, &MillingBody { dc: 10.0, ..s }, &insert("RCMT1204M0"));
++    assert!(matches!(e, MillingError::Corner { .. }), "{e}");
++    assert!(e.to_string().contains("button mill"), "{e}");
++}
+diff --git a/docs/decisions/3646-multi-seat-cutters.md b/docs/decisions/3646-multi-seat-cutters.md
+new file mode 100644
+index 000000000..8fbd65f0b
+--- /dev/null
++++ b/docs/decisions/3646-multi-seat-cutters.md
+@@ -0,0 +1,87 @@
++## #3646 - Multi-seat indexable face mills and end mills (tools slice)
++
++**What was decided.**
++- This PR is the `camcraft-tools` slice of #3646. It adds
++  `milling_cutter.rs` (with `milling_cutter_error.rs` and
++  `milling_cutter_tests.rs`). There is no new crate edge, no ECS and no
++  file I/O. `ComponentKind` does not change: the cutter facts are a
++  separate record (`MillingBody`) next to the #3642 tool item, as the
++  #3643 geometry is. #3644 decides where the document stores it.
++- `MillingBody` holds the catalog facts of the cutter body: `DC`, the
++  cutting edge angle `KAPR`, `APMX`, `center_cutting` and an optional
++  seat count. A seat count needs one seat port for all seats, or one
++  port for each seat. Without a count, the seat ports are counted.
++  Every seat must take the one shared insert (#3642 `check_insert_fit`,
++  the same named refusals).
++- `DC` is the diameter where the main cutting edges, carried past the
++  corner, meet the tip plane. On a round-insert cutter it is the largest
++  diameter that the round edges sweep (the outer diameter of the
++  bull-nose model).
++- The law: the derived tool is never smaller than the real cutter.
++  - At `KAPR` 90 the cutting diameter is `DC` and the corner is the
++    insert's nose radius (0 for a sharp corner or a wiper facet). The
++    model is exact.
++  - Below 90 degrees the edge runs outward as it rises. A `DC` cylinder
++    is smaller than the cutter there, so a gouge could pass. The cutting
++    diameter is therefore the edge's reach at the top of the cutting
++    depth: `DC + 2 * flute_len * cot(KAPR)`. The nose radius is kept only
++    while it is no larger than the depth and the edge's run-out over the
++    depth (then the bull corner on the wider diameter holds the real
++    corner); a larger nose is refused by name. The toolpath keeps the
++    cutter farther from a wall than the tip needs, and leaves stock. It
++    never gouges.
++  - A round insert: the corner is half the size code. The code cuts the
++    diameter to whole mm (an inch 12.7 mm insert is code 12), so the
++    model corner is never rounder than the insert. A smaller corner on
++    the same diameter is the larger shape.
++  - `flute_len` is `APMX`, no deeper than the shortest edge can rise:
++    the size code (whole mm, cut down) times `sin(KAPR)`, or half the
++    size on a round insert.
++  - The rest of the insert above the cutting depth is held by the
++    tool's shank: `shank_d` is the farthest the inserts reach, and the
++    shank runs up to the highest point of the inserts. The height bound
++    is the longest chord of the insert (from its inscribed circle and
++    its smallest corner, or twice the size code plus 1 mm when the code
++    states no circle). The radius bound is the top of the main edge
++    (longest true edge from the inscribed circle) when the next edge
++    turns inward, else the tip radius plus the longest chord. The
++    clearance behind the edges keeps the insert inside the circle that
++    its edges sweep (that is what the clearance is for).
++- In an assembly (`MillingCutter::assembled`) the seat frames must put
++  the cutting point on `DC` (0.001 mm). The judged body of the holder
++  and the cutter body (the #3643 resolver) is enclosed over the tool
++  (`HolderProfile::enclose`). A body part inside the cutting depth is
++  held by the cutting cylinder while it stays inside it, and refused by
++  name when it stands outside it.
++- The tool record takes the running data (speed, feed, materials,
++  cutting rows, catalog facts, hand, holder stand-in) from a base tool
++  that the caller gives. The fields of other kinds are reset to their
++  inert values. The tool law (`why_not_sane`) has the last word.
++
++**Why.** The issue asks for derived values that feed the gouge and
++collision laws (Prime Directive). A literal `diameter = DC` is smaller
++than a cutter with a lead angle, so the slice takes the enclosing
++diameter. The envelope pin (`the_tool_holds_the_real_cutter`) samples
++the real meridian outline (the edges, the nose arc, the whole insert,
++a round insert of its metric and its inch size) and asserts that each
++point is inside the tool.
++
++**Considered and dropped (left for later work).**
++- The app part (`crates/app/src/tool_assembly.rs`): the document
++  record, the edit of a shared insert that marks the milling operations
++  `Stale`, and the plunge refusal and collision tests on the operation.
++  Left for after #3644, which builds the document table and its
++  commands now.
++- `tool_material` and cutting rows inherited from the insert. Dropped:
++  the #3642 insert component carries no material and no cutting rows.
++  The caller gives them in the base tool until a component stores them.
++- A tapered model (a cone frustum) for a cutter below 90 degrees.
++  Dropped: an operation reads a milling kind (end, bull or ball mill);
++  a chamfer-mill kind would change which operations take the tool.
++- A check of `KAPR` against the seat's style letter. Dropped: the
++  ISO 5608 style letter is a turning-holder convention; a milling body
++  states `KAPR` itself.
++
++**Cost to change later.** Low. Nothing outside the new files reads the
++resolver yet. A changed rule changes the pins in
++`milling_cutter_tests.rs`.
+
+From 1366f4942ea925b12b839aabf109388f1de330df Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Thu, 26 Nov 2026 18:01:23 +0100
+Subject: [PATCH 2/2] fix(tools): check every seat, the real profile and one
+ source in the multi-seat assembly
+
+The #4192 review found three classes where the assembled cutter could
+be smaller than the real one:
+
+- A body inside the cutting depth was checked against diameter/2. It is
+  now checked against the tool profile at the band's lowest point, the
+  corner arc included (bull-nose and round-insert cutters).
+- Only the mounted seat was checked. Each seat port of the body is now
+  placed as the mounted insert is and must be on DC, in the tip plane
+  and turned as the mounted seat. A seat count's seats are copies of the
+  one port.
+- The derived cutter was not bound to the mounted insert. The cutter now
+  keeps the body and insert it was derived from, and `assembled` takes
+  the assembly nodes and refuses another body or insert by name.
+
+`MillingCutter::assembled` moves to milling_cutter_assembly.rs and takes
+`&[AssemblyNode]`; nothing outside the module read it.
+
+Refs #3646
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/tools/src/milling_cutter.rs          |  45 ++----
+ crates/tools/src/milling_cutter_assembly.rs | 169 ++++++++++++++++++++
+ crates/tools/src/milling_cutter_error.rs    |  21 ++-
+ crates/tools/src/milling_cutter_tests.rs    | 118 +++++++++++---
+ docs/decisions/3646-multi-seat-cutters.md   |  39 ++++-
+ 5 files changed, 328 insertions(+), 64 deletions(-)
+ create mode 100644 crates/tools/src/milling_cutter_assembly.rs
+
+diff --git a/crates/tools/src/milling_cutter.rs b/crates/tools/src/milling_cutter.rs
+index 3d64b52c0..bace00a95 100644
+--- a/crates/tools/src/milling_cutter.rs
++++ b/crates/tools/src/milling_cutter.rs
+@@ -11,17 +11,19 @@
+ //! cutting depth its cylinder holds every cutting edge, and its shank
+ //! holds the rest of the inserts above it. Each refusal names the
+ //! cutter body: bad numbers, a seat that does not take the insert, a
+-//! corner that does not fit, a body that stands outside the cutter.
++//! corner that does not fit, a body that stands outside the cutter, a
++//! seat that the tool does not hold, an assembly with other components.
+ 
+ use crate::component::{ComponentKind, ToolComponent};
+ use crate::component_fit::check_insert_fit;
+-use crate::holder_profile::{HolderBand, HolderProfile, MAX_BODY_RADIUS};
++use crate::holder_profile::MAX_BODY_RADIUS;
+ use crate::insert_codes::InsertShape;
+ use crate::insert_iso1832::{Corner, InsertSpec};
+ use crate::taper::TaperTip;
+-use crate::tool_assembly::ResolvedAssembly;
+ use crate::tools::{Tool, ToolKind};
+ 
++#[path = "milling_cutter_assembly.rs"]
++mod assembly;
+ #[path = "milling_cutter_error.rs"]
+ mod error;
+ pub use error::MillingError;
+@@ -78,6 +80,10 @@ pub struct MillingCutter {
+     pub insert_d: f64,
+     /// How high above the tip the inserts reach.
+     pub insert_top: f64,
++    /// The cutter body and the shared insert this cutter was derived
++    /// from: an assembly must mount exactly these (#3646 review).
++    body: ToolComponent,
++    insert: ToolComponent,
+ }
+ 
+ /// Resolve the cutter `body` with its facts `spec` and the shared
+@@ -126,6 +132,8 @@ pub fn derive(body: &ToolComponent, spec: &MillingBody, insert: &ToolComponent)
+         center_cutting: spec.center_cutting,
+         insert_d: shape.insert_d,
+         insert_top: shape.insert_top,
++        body: body.clone(),
++        insert: insert.clone(),
+     })
+ }
+ 
+@@ -284,35 +292,4 @@ impl MillingCutter {
+             None => Ok(t),
+         }
+     }
+-
+-    /// The tool in its spindle assembly (`crate::tool_assembly`): the
+-    /// seat geometry must put the cutting point on `DC`, and the judged
+-    /// body is enclosed as the laws read it. A body inside the cutting
+-    /// depth is held by the cutting cylinder when it stays inside it,
+-    /// and refused by name when it stands outside.
+-    pub fn assembled(&self, base: &Tool, r: &ResolvedAssembly) -> Result<Tool, MillingError> {
+-        let seat_d = r.cutting.diameter;
+-        if !seat_d.is_finite() || (seat_d - self.dc).abs() > SEAT_TOL {
+-            return Err(MillingError::SeatDiameter { name: self.name.clone(), seat_d, dc: self.dc });
+-        }
+-        let tool = self.tool(base)?;
+-        let Some(body) = &r.body else { return Ok(tool) };
+-        let (fl, cut_r) = (tool.flute_len, 0.5 * tool.diameter);
+-        let mut kept: Vec<HolderBand> = Vec::new();
+-        for b in body.profile.bands() {
+-            let top = b.above + b.len;
+-            if b.above < fl - 1e-9 && b.r > cut_r + 1e-9 {
+-                return Err(MillingError::BodyOutside { name: self.name.clone(), above: b.above, r: b.r, cut_r });
+-            }
+-            if top > fl + 1e-9 {
+-                let lo = b.above.max(fl);
+-                kept.push(HolderBand { above: lo, len: top - lo, r: b.r });
+-            }
+-        }
+-        if kept.is_empty() {
+-            return Ok(tool);
+-        }
+-        let why = || MillingError::Tool { name: self.name.clone(), why: "its body could not be enclosed".to_owned() };
+-        HolderProfile::from_bands(kept).enclose(&tool).ok_or_else(why)
+-    }
+ }
+diff --git a/crates/tools/src/milling_cutter_assembly.rs b/crates/tools/src/milling_cutter_assembly.rs
+new file mode 100644
+index 000000000..d2211ca68
+--- /dev/null
++++ b/crates/tools/src/milling_cutter_assembly.rs
+@@ -0,0 +1,169 @@
++//! #3646: a multi-seat cutter in its spindle assembly (#3643): the
++//! assembly must mount the components the cutter was derived from,
++//! every seat must be the mounted seat turned about the spindle axis,
++//! and every judged body must stand inside the tool's real profile.
++//! Our own design over rigid-frame algebra and the bull-nose meridian
++//! (a plane circle and a line); no vendor source or file consulted.
++
++use super::{MillingCutter, MillingError, SEAT_TOL};
++use crate::frame::Frame;
++use crate::holder_profile::{HolderBand, HolderProfile};
++use crate::tool_assembly::{resolve, AssemblyNode, ResolvedAssembly};
++use crate::tools::Tool;
++
++/// How far (unit length) a seat's axes may stand from the mounted
++/// seat's, each read in its own radial frame.
++const TURN_TOL: f64 = 1e-6;
++
++/// A seat's cutting point read in its own radial frame: the distance
++/// from the axis, the height above the tip, and its Z and X axes on
++/// (radial, tangential, axial).
++struct SeatPose {
++    r: f64,
++    z: f64,
++    axes: [f64; 6],
++}
++
++impl SeatPose {
++    /// `None` for a cutting point on the spindle axis.
++    fn of(f: &Frame) -> Option<Self> {
++        let o = f.origin();
++        let r = o[0].hypot(o[1]);
++        if !r.is_finite() || r <= SEAT_TOL {
++            return None;
++        }
++        let (er, et) = ([o[0] / r, o[1] / r], [-o[1] / r, o[0] / r]);
++        let on = |v: [f64; 3]| [v[0] * er[0] + v[1] * er[1], v[0] * et[0] + v[1] * et[1], v[2]];
++        let (z, x) = (on(f.z()), on(f.x()));
++        Some(Self { r, z: o[2], axes: [z[0], z[1], z[2], x[0], x[1], x[2]] })
++    }
++}
++
++impl MillingCutter {
++    /// The tool in its spindle assembly `nodes` (the module's law). The
++    /// assembly must mount this cutter's own body with its own insert;
++    /// a body or insert with other data is refused, even on the same
++    /// diameter. Each seat port of the body (one port also stands for
++    /// the seats of a seat count, which are its copies turned about the
++    /// axis) must put the cutting point on `DC`, in the tip plane, and
++    /// turn the insert as the mounted seat does. The judged body is
++    /// enclosed over the tool; a body inside the cutting depth must
++    /// stand inside the tool's profile there - the corner arc
++    /// included - and is refused by name when it does not.
++    pub fn assembled(&self, base: &Tool, nodes: &[AssemblyNode]) -> Result<Tool, MillingError> {
++        let r = resolve(nodes).map_err(|e| MillingError::Assembly { name: self.name.clone(), err: Box::new(e) })?;
++        let cut = self.mounted(nodes)?;
++        let seat_d = r.cutting.diameter;
++        if !seat_d.is_finite() || (seat_d - self.dc).abs() > SEAT_TOL {
++            return Err(MillingError::SeatDiameter { name: self.name.clone(), seat_d, dc: self.dc });
++        }
++        self.check_seats(nodes, &r, cut)?;
++        let tool = self.tool(base)?;
++        let Some(body) = &r.body else { return Ok(tool) };
++        let fl = tool.flute_len;
++        let mut kept: Vec<HolderBand> = Vec::new();
++        for b in body.profile.bands() {
++            let top = b.above + b.len;
++            // The profile widens from the tip up the corner arc, so the
++            // band's lowest point inside the cutting depth is where the
++            // tool is narrowest under it.
++            if b.above < fl - 1e-9 {
++                let cut_r = profile_r(&tool, b.above);
++                if b.r > cut_r + 1e-9 {
++                    return Err(MillingError::BodyOutside { name: self.name.clone(), above: b.above, r: b.r, cut_r });
++                }
++            }
++            if top > fl + 1e-9 {
++                let lo = b.above.max(fl);
++                kept.push(HolderBand { above: lo, len: top - lo, r: b.r });
++            }
++        }
++        if kept.is_empty() {
++            return Ok(tool);
++        }
++        let why = || MillingError::Tool { name: self.name.clone(), why: "its body could not be enclosed".to_owned() };
++        HolderProfile::from_bands(kept).enclose(&tool).ok_or_else(why)
++    }
++
++    /// The index of the mounted insert, after the check that it and its
++    /// parent are the very components this cutter was derived from.
++    fn mounted(&self, nodes: &[AssemblyNode]) -> Result<usize, MillingError> {
++        let no = |why: String| MillingError::Mismatch { name: self.name.clone(), why };
++        let Some(cut) = nodes.iter().position(|n| n.component.insert().is_some()) else {
++            return Err(no("the assembly cuts with no insert".to_owned()));
++        };
++        let n = &nodes[cut];
++        if n.component != self.insert {
++            let (got, want) = (n.component.name(), self.insert.name());
++            return Err(no(format!("it mounts the insert '{got}', but the cutter was derived from '{want}'")));
++        }
++        let parent = n.mount.as_ref().and_then(|m| nodes.get(m.parent)).map(|p| &p.component);
++        if parent != Some(&self.body) {
++            let got = parent.map_or("nothing", |p| p.name());
++            return Err(no(format!("the insert sits on '{got}', not on the cutter body it was derived from")));
++        }
++        Ok(cut)
++    }
++
++    /// Every seat port of the body against the mounted seat: on `DC`,
++    /// in the tip plane, the insert turned the same way.
++    fn check_seats(&self, nodes: &[AssemblyNode], r: &ResolvedAssembly, cut: usize) -> Result<(), MillingError> {
++        let n = &nodes[cut];
++        let Some(m) = &n.mount else { return Err(MillingError::NotABody { name: self.name.clone() }) };
++        let cip = n.geometry.cip().copied().unwrap_or(Frame::IDENTITY);
++        let (Some(bf), Some(cf)) = (r.frames.get(m.parent), r.frames.get(cut)) else {
++            return Err(MillingError::NotABody { name: self.name.clone() });
++        };
++        let geometry = &nodes[m.parent].geometry;
++        let off = |port: &str, what: &'static str, why: String| MillingError::SeatOff {
++            name: self.name.clone(),
++            port: port.to_owned(),
++            what,
++            why,
++        };
++        let mounted_port = m.port.as_deref().unwrap_or("");
++        let Some(home) = SeatPose::of(&cf.then(&cip)) else {
++            return Err(off(mounted_port, "radius", "its cutting point is on the spindle axis".to_owned()));
++        };
++        for port in self.body.ports() {
++            let Some(local) = geometry.port(port) else {
++                return Err(off(port, "frame", "the cutter body's geometry states no frame for it".to_owned()));
++            };
++            let turned = bf.then(local).turned(m.z_rot_deg);
++            let Ok(seat) = turned.map(|f| f.then(&cip)) else {
++                return Err(off(port, "frame", "its frame is not finite".to_owned()));
++            };
++            let Some(p) = SeatPose::of(&seat) else {
++                return Err(off(port, "radius", "its cutting point is on the spindle axis".to_owned()));
++            };
++            if (p.r - 0.5 * self.dc).abs() > SEAT_TOL {
++                let why = format!("its cutting point is on Ø{:.3} mm, but the cutter states DC {} mm", 2.0 * p.r, self.dc);
++                return Err(off(port, "radius", why));
++            }
++            if (p.z - home.z).abs() > SEAT_TOL {
++                let why = format!("its cutting point is {:.3} mm off the tip plane", p.z - home.z);
++                return Err(off(port, "height", why));
++            }
++            if p.axes.iter().zip(&home.axes).any(|(a, b)| (a - b).abs() > TURN_TOL) {
++                let why = format!("it turns the insert other than the mounted seat {mounted_port} does");
++                return Err(off(port, "orientation", why));
++            }
++        }
++        Ok(())
++    }
++}
++
++/// How far the tool `t` reaches from the axis at `z` above the tip,
++/// inside the cutting depth: the corner arc, then the cutting radius.
++/// Nothing of the tool is below the tip.
++fn profile_r(t: &Tool, z: f64) -> f64 {
++    let (r, rc) = (0.5 * t.diameter, t.corner_r.max(0.0));
++    if z < -1e-9 {
++        0.0
++    } else if z < rc {
++        let dz = rc - z.max(0.0);
++        r - rc + (rc * rc - dz * dz).max(0.0).sqrt()
++    } else {
++        r
++    }
++}
+diff --git a/crates/tools/src/milling_cutter_error.rs b/crates/tools/src/milling_cutter_error.rs
+index b16507fde..54c92d482 100644
+--- a/crates/tools/src/milling_cutter_error.rs
++++ b/crates/tools/src/milling_cutter_error.rs
+@@ -2,6 +2,7 @@
+ //! names the cutter body (and the seat) it is about. Our own wording.
+ 
+ use crate::component_fit::FitError;
++use crate::tool_assembly::AssemblyError;
+ 
+ /// Why a multi-seat milling cutter is refused.
+ #[derive(Clone, Debug, PartialEq)]
+@@ -31,8 +32,19 @@ pub enum MillingError {
+     /// The seat geometry of the assembly puts the cutting point on a
+     /// diameter other than the stated `DC`.
+     SeatDiameter { name: String, seat_d: f64, dc: f64 },
+-    /// A judged body stands outside the cutter inside the cutting depth.
++    /// A judged body stands outside the cutter inside the cutting depth:
++    /// `cut_r` is how far the tool reaches at the band's lowest point.
+     BodyOutside { name: String, above: f64, r: f64, cut_r: f64 },
++    /// The spindle assembly is refused by the resolver (#3643); boxed,
++    /// so that every result of this module stays small.
++    Assembly { name: String, err: Box<AssemblyError> },
++    /// The assembly mounts a cutter body or an insert other than the
++    /// ones the cutter was derived from.
++    Mismatch { name: String, why: String },
++    /// A seat of the assembly is not the mounted seat turned about the
++    /// spindle axis: `what` is "frame", "radius", "height" or
++    /// "orientation".
++    SeatOff { name: String, port: String, what: &'static str, why: String },
+ }
+ 
+ impl core::fmt::Display for MillingError {
+@@ -69,8 +81,13 @@ impl core::fmt::Display for MillingError {
+             ),
+             Self::BodyOutside { name, above, r, cut_r } => write!(
+                 f,
+-                "a body of the cutter '{name}' reaches {r:.3} mm from the axis at {above:.3} mm above the tip - outside the {cut_r:.3} mm cutting radius, inside the cutting depth"
++                "a body of the cutter '{name}' reaches {r:.3} mm from the axis at {above:.3} mm above the tip - outside the {cut_r:.3} mm that the tool reaches there, inside the cutting depth"
+             ),
++            Self::Assembly { name, err } => write!(f, "the assembly of the cutter '{name}' is refused: {err}"),
++            Self::Mismatch { name, why } => write!(f, "the assembly does not match the cutter '{name}': {why}"),
++            Self::SeatOff { name, port, why, .. } => {
++                write!(f, "the seat {port} of the cutter '{name}' is refused: {why}")
++            }
+         }
+     }
+ }
+diff --git a/crates/tools/src/milling_cutter_tests.rs b/crates/tools/src/milling_cutter_tests.rs
+index 13d396314..55e2a62f7 100644
+--- a/crates/tools/src/milling_cutter_tests.rs
++++ b/crates/tools/src/milling_cutter_tests.rs
+@@ -1,7 +1,8 @@
+ //! #3646: multi-seat indexable cutters resolved to the milling tool -
+ //! pinned on a face mill and a shoulder end mill that share one insert,
+ //! a round-insert end mill, the envelope that holds the real cutter,
+-//! the assembled body, and the refusals by name.
++//! the assembled body checked against the real profile and every seat,
++//! and the refusals by name.
+ 
+ use crate::component::{ComponentKind, CuttingItem, InsertSeat, ToolComponent};
+ use crate::component_fit::FitProperty;
+@@ -192,36 +193,55 @@ fn the_tool_holds_the_real_cutter() {
+     }
+ }
+ 
+-/// A BT40 holder, a 4-seat face mill body (seats on Ø`seat_d`, 45 mm
+-/// below its MCS; its own body a cylinder of `body_r` 40 mm long) and
+-/// the insert in the first seat.
+-fn assembly(seat_d: f64, body_r: f64) -> Vec<AssemblyNode> {
++/// A seat of the probe rig: its port, the diameter of its cutting
++/// point, its depth below the body MCS, and its yaw (degrees) off the
++/// radial direction.
++type Seat = (&'static str, f64, f64, f64);
++
++/// Four seats on Ø`d`, 45 mm below the body MCS, all radial.
++fn even(d: f64) -> Vec<Seat> {
++    FOUR.iter().map(|p| (*p, d, 45.0, 0.0)).collect()
++}
++
++/// A BT40 holder, a cutter body "face mill" (the seats of `holder` at
++/// `seats`, spaced evenly; its own body a cylinder of `body_r`,
++/// `body_len` long below its MCS) and the insert `ins` in the first
++/// seat.
++fn rig(holder: &str, seats: &[Seat], body_len: f64, body_r: f64, ins: &str) -> Vec<AssemblyNode> {
+     let p = SpunPoint::line;
+     let cyl = |len: f64, r: f64| {
+         ComponentBody::new(vec![p(0.0, 0.0), p(0.0, r), p(len, r), p(len, 0.0)], -len).unwrap_or_else(|e| panic!("{e}"))
+     };
+-    let seats = FOUR
++    let step = 360.0 / seats.len() as f64;
++    let frames = seats
+         .iter()
+         .enumerate()
+-        .map(|(i, port)| {
+-            let (s, c) = (90.0 * i as f64).to_radians().sin_cos();
+-            let f = Frame::new([0.5 * seat_d * c, 0.5 * seat_d * s, -45.0], [0.0, 0.0, 1.0], [c, s, 0.0]);
++        .map(|(i, (port, d, depth, yaw))| {
++            let (s, c) = (step * i as f64).to_radians().sin_cos();
++            let (sy, cy) = (step * i as f64 + yaw).to_radians().sin_cos();
++            let f = Frame::new([0.5 * d * c, 0.5 * d * s, -depth], [0.0, 0.0, 1.0], [cy, sy, 0.0]);
+             ((*port).to_owned(), f.unwrap_or_else(|e| panic!("{e}")))
+         })
+         .collect();
+-    let geometry = ComponentGeometry::new(seats, Some(cyl(40.0, body_r)), None).unwrap_or_else(|e| panic!("{e}"));
+-    let holder = made("BT40 CYL 20", ComponentKind::AdaptiveItem { mcs: code("BT40"), csw: code("CYL 20") });
++    let geometry = ComponentGeometry::new(frames, Some(cyl(body_len, body_r)), None).unwrap_or_else(|e| panic!("{e}"));
++    let bt40 = made("BT40 CYL 20", ComponentKind::AdaptiveItem { mcs: code("BT40"), csw: code("CYL 20") });
+     let held = ComponentGeometry::axial("CSW", 50.0, Some(cyl(50.0, 25.0))).unwrap_or_else(|e| panic!("{e}"));
+     let on = |parent: usize, port: Option<&str>| {
+         Some(Mount { parent, port: port.map(str::to_owned), z_rot_deg: 0.0, projection_mm: None })
+     };
++    let ports: Vec<&str> = seats.iter().map(|s| s.0).collect();
+     vec![
+-        AssemblyNode { component: holder, geometry: held, mount: None },
+-        AssemblyNode { component: body("face mill", "SSDCN2525M12", &FOUR), geometry, mount: on(0, None) },
+-        AssemblyNode { component: insert("SCMT120408"), geometry: ComponentGeometry::default(), mount: on(1, Some("CSW1_1")) },
++        AssemblyNode { component: bt40, geometry: held, mount: None },
++        AssemblyNode { component: body("face mill", holder, &ports), geometry, mount: on(0, None) },
++        AssemblyNode { component: insert(ins), geometry: ComponentGeometry::default(), mount: on(1, Some(ports[0])) },
+     ]
+ }
+ 
++/// The 4-seat face mill rig of the SCMT12 square insert.
++fn assembly(seat_d: f64, body_r: f64) -> Vec<AssemblyNode> {
++    rig("SSDCN2525M12", &even(seat_d), 40.0, body_r, "SCMT120408")
++}
++
+ /// The cutter in its assembly: the gauge length and the judged body of
+ /// the holder and the cutter body, enclosed over the tool. The body
+ /// inside the cutting depth stays inside the cutter; one that stands
+@@ -229,18 +249,76 @@ fn assembly(seat_d: f64, body_r: f64) -> Vec<AssemblyNode> {
+ #[test]
+ fn the_assembled_face_mill_encloses_holder_and_body() {
+     let c = ok(&body("face mill", "SSDCN2525M12", &FOUR), &spec(50.0, 45.0, 6.0), &insert("SCMT120408"));
+-    let r = resolve(&assembly(50.0, 20.0)).unwrap_or_else(|e| panic!("{e}"));
++    let nodes = assembly(50.0, 20.0);
++    let r = resolve(&nodes).unwrap_or_else(|e| panic!("{e}"));
+     assert!(near(r.gauge_len, 95.0), "{}", r.gauge_len);
+     let alone = c.tool(&base()).unwrap_or_else(|e| panic!("{e}"));
+-    let t = c.assembled(&base(), &r).unwrap_or_else(|e| panic!("{e}"));
++    let t = c.assembled(&base(), &nodes).unwrap_or_else(|e| panic!("{e}"));
+     assert!(near(t.diameter, 62.0) && near(t.flute_len, 6.0));
+     assert!(t.shank_d >= alone.shank_d && t.shank_d >= 40.0, "{t:?}");
+     assert!(near(t.holder_d, 50.0) && near(t.flute_len + t.shank_len + t.holder_len, 95.0), "{t:?}");
+-    let r = resolve(&assembly(50.0, 40.0)).unwrap_or_else(|e| panic!("{e}"));
+-    let Err(MillingError::BodyOutside { r: br, .. }) = c.assembled(&base(), &r) else { panic!("a wide body passed") };
++    let Err(MillingError::BodyOutside { r: br, .. }) = c.assembled(&base(), &assembly(50.0, 40.0)) else {
++        panic!("a wide body passed")
++    };
+     assert!(near(br, 40.0));
+-    let r = resolve(&assembly(48.0, 20.0)).unwrap_or_else(|e| panic!("{e}"));
+-    assert!(matches!(c.assembled(&base(), &r), Err(MillingError::SeatDiameter { .. })));
++    assert!(matches!(c.assembled(&base(), &assembly(48.0, 20.0)), Err(MillingError::SeatDiameter { .. })));
++}
++
++/// #4192 review 1: a body inside the cutting depth is checked against
++/// the tool's real profile, the corner arc included - on a bull-nose
++/// (square insert, 0.8 nose) and on a round-insert cutter. A body under
++/// the flat of the tip passes.
++#[test]
++fn a_body_outside_the_rounded_corner_is_refused() {
++    let c = ok(&body("face mill", "SSDCN2525M12", &FOUR), &spec(50.0, 90.0, 8.0), &insert("SCMT120408"));
++    // Down to the tip at r 24.8: the 0.8 corner reaches only 24.2 there.
++    let nodes = rig("SSDCN2525M12", &even(50.0), 45.0, 24.8, "SCMT120408");
++    let Err(MillingError::BodyOutside { r, cut_r, .. }) = c.assembled(&base(), &nodes) else { panic!("bull-nose body passed") };
++    assert!(near(r, 24.8) && near(cut_r, 24.2), "{r} {cut_r}");
++    let under = rig("SSDCN2525M12", &even(50.0), 45.0, 24.2, "SCMT120408");
++    assert!(c.assembled(&base(), &under).is_ok(), "a body under the flat of the tip was refused");
++    // A round insert: the Ø32 cutter with a 6 mm corner reaches r 10 at the tip.
++    let round = ok(&body("face mill", "SRDCN2525M12", &FOUR), &spec(32.0, 90.0, 4.0), &insert("RCMT1204M0"));
++    let nodes = rig("SRDCN2525M12", &even(32.0), 45.0, 15.0, "RCMT1204M0");
++    let Err(MillingError::BodyOutside { cut_r, .. }) = round.assembled(&base(), &nodes) else { panic!("round body passed") };
++    assert!(near(cut_r, 10.0), "{cut_r}");
++    let under = rig("SRDCN2525M12", &even(32.0), 45.0, 9.5, "RCMT1204M0");
++    assert!(round.assembled(&base(), &under).is_ok(), "a body under the round tip was refused");
++}
++
++/// #4192 review 2: every seat port is checked, not only the mounted
++/// one. The selected seat CSW1_1 is valid; a second seat off DC, off
++/// the tip plane or turned other than CSW1_1 is refused by port. A one
++/// port body with a seat count checks its one port.
++#[test]
++fn every_seat_is_checked_not_only_the_mounted_one() {
++    let c = ok(&body("face mill", "SSDCN2525M12", &FOUR), &spec(50.0, 90.0, 8.0), &insert("SCMT120408"));
++    for (i, edit, what) in [(1, (80.0, 45.0, 0.0), "radius"), (2, (50.0, 44.0, 0.0), "height"), (3, (50.0, 45.0, 10.0), "orientation")] {
++        let mut seats = even(50.0);
++        (seats[i].1, seats[i].2, seats[i].3) = edit;
++        let e = c.assembled(&base(), &rig("SSDCN2525M12", &seats, 40.0, 20.0, "SCMT120408"));
++        let Err(MillingError::SeatOff { port, what: w, .. }) = e else { panic!("{what}: {e:?}") };
++        assert_eq!((port.as_str(), w), (FOUR[i], what));
++    }
++    let one = MillingBody { seat_count: Some(4), ..spec(50.0, 90.0, 8.0) };
++    let c = ok(&body("face mill", "SSDCN2525M12", &["CSW1"]), &one, &insert("SCMT120408"));
++    let seat = [("CSW1", 50.0, 45.0, 0.0)];
++    let t = c.assembled(&base(), &rig("SSDCN2525M12", &seat, 40.0, 20.0, "SCMT120408"));
++    assert_eq!(t.map(|t| t.flutes), Ok(Some(4)));
++}
++
++/// #4192 review 3: the assembly must mount the insert and the body the
++/// cutter was derived from. An insert changed before assembly (a sharp
++/// SCMT120400 under a cutter derived with a 0.8 nose) and another body
++/// are refused, though both fit and cut on DC.
++#[test]
++fn an_assembly_with_other_components_is_refused() {
++    let c = ok(&body("face mill", "SSDCN2525M12", &FOUR), &spec(50.0, 90.0, 8.0), &insert("SCMT120408"));
++    let e = c.assembled(&base(), &rig("SSDCN2525M12", &even(50.0), 40.0, 20.0, "SCMT120400"));
++    assert!(matches!(&e, Err(MillingError::Mismatch { why, .. }) if why.contains("SCMT120400")), "{e:?}");
++    let other = ok(&body("other mill", "SSDCN2525M12", &FOUR), &spec(50.0, 90.0, 8.0), &insert("SCMT120408"));
++    let e = other.assembled(&base(), &assembly(50.0, 20.0));
++    assert!(matches!(&e, Err(MillingError::Mismatch { why, .. }) if why.contains("face mill")), "{e:?}");
+ }
+ 
+ #[test]
+diff --git a/docs/decisions/3646-multi-seat-cutters.md b/docs/decisions/3646-multi-seat-cutters.md
+index 8fbd65f0b..50d9a5f46 100644
+--- a/docs/decisions/3646-multi-seat-cutters.md
++++ b/docs/decisions/3646-multi-seat-cutters.md
+@@ -2,8 +2,8 @@
+ 
+ **What was decided.**
+ - This PR is the `camcraft-tools` slice of #3646. It adds
+-  `milling_cutter.rs` (with `milling_cutter_error.rs` and
+-  `milling_cutter_tests.rs`). There is no new crate edge, no ECS and no
++  `milling_cutter.rs` (with `milling_cutter_error.rs`,
++  `milling_cutter_assembly.rs` and `milling_cutter_tests.rs`). There is no new crate edge, no ECS and no
+   file I/O. `ComponentKind` does not change: the cutter facts are a
+   separate record (`MillingBody`) next to the #3642 tool item, as the
+   #3643 geometry is. #3644 decides where the document stores it.
+@@ -47,12 +47,35 @@
+     turns inward, else the tip radius plus the longest chord. The
+     clearance behind the edges keeps the insert inside the circle that
+     its edges sweep (that is what the clearance is for).
+-- In an assembly (`MillingCutter::assembled`) the seat frames must put
+-  the cutting point on `DC` (0.001 mm). The judged body of the holder
+-  and the cutter body (the #3643 resolver) is enclosed over the tool
+-  (`HolderProfile::enclose`). A body part inside the cutting depth is
+-  held by the cutting cylinder while it stays inside it, and refused by
+-  name when it stands outside it.
++- In an assembly (`MillingCutter::assembled`, `milling_cutter_assembly.rs`)
++  the cutter takes the assembly nodes and resolves them itself (#3643).
++  Three rules close the three classes that the #4192 review found:
++  - **One source.** The cutter keeps the body and the insert that it
++    was derived from. The assembly must mount exactly these two
++    components (full equality, not only the diameter). Another insert
++    (for example a sharp `SCMT120400` under a cutter derived from
++    `SCMT120408`) or another body is refused by name (`Mismatch`).
++    Dropped: derive again from the mounted insert inside `assembled`.
++    That hides a changed insert from the caller, who holds the old
++    cutter.
++  - **Every seat.** Each seat port of the body is placed as the
++    mounted insert is (the port frame, the mount turn, the insert's
++    cutting point). Its cutting point must be on `DC` and in the tip
++    plane (0.001 mm), and its axes, read in its own radial frame, must
++    be the mounted seat's (1e-6). Thus each seat is the mounted seat
++    turned about the spindle axis, and its insert sweeps the same
++    envelope. A seat port with no frame is refused. On a body with one
++    seat port and a seat count, the other seats are copies of that
++    port turned about the axis by definition, so the check of the one
++    port covers them. Dropped: a separate envelope for each seat. The
++    tool record has one cutter shape, so the seats must agree.
++  - **The real profile.** A body band inside the cutting depth must
++    stand inside the tool's profile at the band's lowest point: the
++    corner arc `r - rc + sqrt(rc^2 - (rc - z)^2)` below `rc`, else the
++    cutting radius. The profile widens from the tip up, so the lowest
++    point is the narrowest. This covers a bull-nose and a round-insert
++    cutter. The band part above the cutting depth is enclosed over the
++    tool (`HolderProfile::enclose`) as before.
+ - The tool record takes the running data (speed, feed, materials,
+   cutting rows, catalog facts, hand, holder stand-in) from a base tool
+   that the caller gives. The fields of other kinds are reset to their

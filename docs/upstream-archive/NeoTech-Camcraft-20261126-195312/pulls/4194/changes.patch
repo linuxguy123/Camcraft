@@ -1,0 +1,989 @@
+From 1e9af42ed23b83b07ae60ea1397151fe618a1dec Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Thu, 26 Nov 2026 17:00:38 +0100
+Subject: [PATCH 1/2] feat(tools): lathe tool assemblies - nose-centre tip,
+ orientation and clearance
+
+A turning holder or boring bar with its insert (and adapters) resolves
+to the nose centre as the tip of the turning frame, the derived
+LinuxCNC orientation (1-8), the nose radius and the seat and insert
+values, and one LatheClearance over all non-insert bodies. The spindle
+chain is shared through tool_assembly::placed. Refusals are named:
+fit, orientation, no nose radius, a revolved body, a body past the
+cutting lines near the nose, and the clearance errors on the whole
+stack.
+
+Refs #3643
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/tools/src/lathe_assembly.rs       | 306 +++++++++++++++++++++
+ crates/tools/src/lathe_assembly_error.rs |  82 ++++++
+ crates/tools/src/lathe_assembly_tests.rs | 326 +++++++++++++++++++++++
+ crates/tools/src/lathe_insert_zone.rs    |   2 +-
+ crates/tools/src/lib.rs                  |   5 +
+ crates/tools/src/tool_assembly.rs        |  44 +--
+ docs/decisions/3643-tool-assemblies.md   |  91 +++++++
+ 7 files changed, 838 insertions(+), 18 deletions(-)
+ create mode 100644 crates/tools/src/lathe_assembly.rs
+ create mode 100644 crates/tools/src/lathe_assembly_error.rs
+ create mode 100644 crates/tools/src/lathe_assembly_tests.rs
+
+diff --git a/crates/tools/src/lathe_assembly.rs b/crates/tools/src/lathe_assembly.rs
+new file mode 100644
+index 0000000000..6d00225b3f
+--- /dev/null
++++ b/crates/tools/src/lathe_assembly.rs
+@@ -0,0 +1,306 @@
++//! #3643: a lathe tool assembly - a turning holder or boring bar with
++//! its insert (and any adapters) - resolved to what the turning laws
++//! read: the nose centre as the tip of the turning tool frame, the
++//! orientation (LinuxCNC 1-8), the nose radius and the other turning
++//! values of the insert and seat, and the clearance bands of the
++//! holder body ([`LatheClearance`]). The frames come from the spindle
++//! chain ([`crate::tool_assembly`]); only the tip, the turning frame and
++//! the body differ. Our own design over the public ISO 13399 roles (MCS,
++//! CSW, the cutting reference point), the ISO 1832 / ISO 5608 codes and
++//! the LinuxCNC lathe orientation chart; no vendor source or file
++//! consulted.
++//!
++//! ## The tip
++//!
++//! An insert's cutting point (its stated CIP, else its seat frame) is
++//! its cutting reference point (CRP): the control point of the
++//! orientation chart, where the nose's tangent lines parallel to X and
++//! Z meet. The nose centre is that point less `r * tip_offset(q)`
++//! ([`orientation::tip_offset`]), read in the turning frame. The nose
++//! centre is the tip, as [`crate::lathe_holder`] states it.
++//!
++//! ## The law
++//!
++//! An assembly is resolved whole or refused by name: every refusal of
++//! the spindle chain (fits, frames, ports, cycles), a cutting item that
++//! is no insert, an insert with no nose radius, an orientation off 1-8
++//! or one that cannot be derived, a revolved body (a lathe body is a box
++//! or a mesh), a holder body that reaches past the insert's cutting
++//! lines within one insert of the nose (a wrong hand, orientation or
++//! seat frame), and every refusal of the clearance bands - on the bodies of
++//! all components together, never on one alone. The insert's own plate
++//! is left out of the bands: the turning laws judge it by its cut model.
++
++use crate::component::{ComponentKind, CuttingItem};
++use crate::connection_code::ConnectionCode;
++use crate::insert_codes::{Hand, InsertShape};
++use crate::insert_iso1832::Corner;
++use crate::lathe_holder::{LatheBodyError, LatheClearance, LathePlacement};
++use crate::lathe_insert_zone::{MAX_INSERT_REACH, clip_axis};
++use crate::orientation;
++use crate::tool_assembly::{AssemblyNode, placed};
++
++#[path = "lathe_assembly_error.rs"]
++mod error;
++pub use error::LatheAssemblyError;
++
++type Tri = [[f64; 3]; 3];
++
++/// How far (mm) a holder body may stand past the insert's cutting
++/// lines: float dust only.
++pub const EDGE_TOL: f64 = 1e-6;
++
++/// An axis-aligned box in a component's own frame.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct BodyBox {
++    pub lo: [f64; 3],
++    pub hi: [f64; 3],
++}
++
++/// A lathe component's body, as facets in its own frame.
++#[derive(Clone, Debug, PartialEq)]
++pub struct LatheBody {
++    tris: Vec<Tri>,
++}
++
++impl LatheBody {
++    /// The closed surface of `boxes` (twelve facets each). Refused by
++    /// name: no box, a non-finite corner, a box with no volume.
++    pub fn boxes(boxes: &[BodyBox]) -> Result<Self, LatheBodyError> {
++        if boxes.is_empty() {
++            return Err(LatheBodyError::Empty);
++        }
++        let mut tris = Vec::with_capacity(boxes.len() * 12);
++        for b in boxes {
++            if !b.lo.iter().chain(&b.hi).all(|v| v.is_finite()) {
++                return Err(LatheBodyError::NonFinite);
++            }
++            if (0..3).any(|k| b.hi[k] - b.lo[k] <= 1e-9) {
++                return Err(LatheBodyError::Degenerate);
++            }
++            tris.extend(box_facets(b));
++        }
++        Ok(Self { tris })
++    }
++
++    /// Facets as given. Refused by name: none, or a non-finite one.
++    pub fn mesh(tris: Vec<Tri>) -> Result<Self, LatheBodyError> {
++        if tris.is_empty() {
++            return Err(LatheBodyError::Empty);
++        }
++        if !tris.iter().flatten().flatten().all(|v| v.is_finite()) {
++            return Err(LatheBodyError::NonFinite);
++        }
++        Ok(Self { tris })
++    }
++
++    #[must_use]
++    pub fn facets(&self) -> &[Tri] {
++        &self.tris
++    }
++}
++
++/// One component of a lathe stack and its lathe body.
++#[derive(Clone, Debug, PartialEq)]
++pub struct LatheNode {
++    pub node: AssemblyNode,
++    pub body: Option<LatheBody>,
++}
++
++/// How the root's frame sits on the lathe: the root-frame directions
++/// that are +x (radial, away from the spindle axis) and +z (along the
++/// spindle, away from the chuck).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct LatheStation {
++    pub radial: [f64; 3],
++    pub along: [f64; 3],
++}
++
++impl LatheStation {
++    /// A shank across the spindle (an OD holder on a tool post): its
++    /// back end (the root's +Z) points away from the axis.
++    pub const RADIAL_SHANK: Self = Self { radial: [0.0, 0.0, 1.0], along: [1.0, 0.0, 0.0] };
++    /// A shank along the spindle (a boring bar): its back end points
++    /// away from the chuck.
++    pub const AXIAL_SHANK: Self = Self { radial: [1.0, 0.0, 0.0], along: [0.0, 0.0, 1.0] };
++}
++
++/// The turning values of the insert and its seat.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct LatheParams {
++    /// The nose radius (mm): the insert's corner, half a round insert.
++    pub nose_radius: f64,
++    /// The LinuxCNC orientation, 1-8.
++    pub orientation: u8,
++    /// Whether the caller stated the orientation (else it is derived).
++    pub stated: bool,
++    /// The seat's cutting edge angle (degrees, ISO 5608 position 3).
++    pub approach_deg: Option<f64>,
++    /// The seat's hand.
++    pub hand: Hand,
++    /// The insert's corner angle (degrees); `None` for a round insert.
++    pub insert_angle_deg: Option<f64>,
++    /// The insert's clearance angle (degrees).
++    pub clearance_deg: Option<f64>,
++    /// The insert's inscribed circle (mm), where the code states it.
++    pub ic_mm: Option<f64>,
++}
++
++/// A resolved lathe assembly.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ResolvedLathe {
++    pub params: LatheParams,
++    /// The root frame placed in the turning frame: `tip` is the nose
++    /// centre, in root coordinates.
++    pub placement: LathePlacement,
++    /// The CRP (the control point) in the turning frame.
++    pub crp: [f64; 3],
++    /// The clearance bands of every body but the insert's; `None` when
++    /// no component has a body.
++    pub clearance: Option<LatheClearance>,
++}
++
++/// Resolve `nodes` on `station` (the module's law). `orientation`
++/// overrides the derived code.
++pub fn resolve_lathe(
++    nodes: &[LatheNode],
++    station: LatheStation,
++    orientation: Option<u8>,
++) -> Result<ResolvedLathe, LatheAssemblyError> {
++    let plain: Vec<AssemblyNode> = nodes.iter().map(|n| n.node.clone()).collect();
++    let (frames, cut, cip) = placed(&plain)?;
++    let cutter = &nodes[cut].node;
++    let name = || cutter.component.name().to_owned();
++    let ComponentKind::CuttingItem(CuttingItem::Insert(spec)) = cutter.component.kind() else {
++        return Err(LatheAssemblyError::NotInsert { name: name() });
++    };
++    let seat = seat_of(&plain, cut).ok_or_else(|| LatheAssemblyError::NoSeat { name: name() })?;
++    // A round insert's size code is its diameter (mm).
++    let round = (spec.corner == Corner::Round).then(|| f64::from(spec.size));
++    let ic_mm = spec.inscribed_circle_mm().or(round);
++    let nose_radius = match spec.corner {
++        Corner::Radius(t) if t > 0 => f64::from(t) / 10.0,
++        Corner::Round => round.map_or(0.0, |d| d * 0.5),
++        _ => 0.0,
++    };
++    if !(nose_radius.is_finite() && nose_radius > 0.0) {
++        return Err(LatheAssemblyError::NoNose { name: name(), code: spec.to_string() });
++    }
++    let (q, stated) = match orientation {
++        Some(q) if (1..=8).contains(&q) => (q, true),
++        Some(q) => return Err(LatheAssemblyError::Orientation { q }),
++        None => (derive(&plain, seat.hand, spec.shape)?, false),
++    };
++    let (ox, oz) = orientation::tip_offset(q).ok_or(LatheAssemblyError::Orientation { q })?;
++    let axes = LathePlacement { radial: station.radial, along: station.along, tip: [0.0; 3] };
++    let [bx, _, bz] = axes.basis().map_err(LatheAssemblyError::Station)?;
++    let c = cip.origin();
++    let r = nose_radius;
++    let tip: [f64; 3] = core::array::from_fn(|k| c[k] - r * (ox * bx[k] + oz * bz[k]));
++    let placement = LathePlacement { tip, ..axes };
++    placement.basis().map_err(LatheAssemblyError::Station)?;
++    let mut all: Vec<Tri> = Vec::new();
++    for (i, (n, f)) in nodes.iter().zip(&frames).enumerate() {
++        if i == cut {
++            continue; // the insert plate: judged by its cut model
++        }
++        let named = || n.node.component.name().to_owned();
++        if n.node.geometry.body().is_some() {
++            return Err(LatheAssemblyError::SpunBody { name: named() });
++        }
++        let Some(body) = &n.body else { continue };
++        let root: Vec<Tri> = body.facets().iter().map(|t| t.map(|p| f.map_point(p))).collect();
++        let local = placement.place(&root).map_err(LatheAssemblyError::Station)?;
++        for p in local.iter().filter_map(near_tip).flatten() {
++            for (axis, o, v) in [('X', ox, p[0]), ('Z', oz, p[2])] {
++                if o != 0.0 && o * v > r + EDGE_TOL {
++                    return Err(LatheAssemblyError::BodyPastEdge { name: named(), axis, reach: o * v, nose: r });
++                }
++            }
++        }
++        all.extend(local);
++    }
++    let clearance =
++        if all.is_empty() { None } else { Some(LatheClearance::of(&all).map_err(LatheAssemblyError::Clearance)?) };
++    let params = LatheParams {
++        nose_radius,
++        orientation: q,
++        stated,
++        approach_deg: seat.style.approach_deg(),
++        hand: seat.hand,
++        insert_angle_deg: spec.shape.corner_deg(),
++        clearance_deg: spec.clearance.degrees(),
++        ic_mm,
++    };
++    Ok(ResolvedLathe { params, placement, crp: [r * ox, 0.0, r * oz], clearance })
++}
++
++/// The part of facet `t` within one insert of the nose centre in the
++/// turning plane (|x| and |z| up to [`MAX_INSERT_REACH`]): where the
++/// holder head stands behind the insert. Farther out (a turret block, a
++/// sleeve) a body may stand on either side of the cutting lines.
++fn near_tip(t: &Tri) -> Option<Vec<[f64; 3]>> {
++    let w = MAX_INSERT_REACH;
++    let mut poly = t.to_vec();
++    for k in [0, 2] {
++        poly = clip_axis(&clip_axis(&poly, k, -w, true), k, w, false);
++    }
++    (poly.len() >= 3).then_some(poly)
++}
++
++/// The seat the insert at `cut` sits in.
++fn seat_of(nodes: &[AssemblyNode], cut: usize) -> Option<crate::insert_seat::InsertSeatSpec> {
++    let m = nodes[cut].mount.as_ref()?;
++    let parent = &nodes.get(m.parent)?.component;
++    let port = match &m.port {
++        Some(p) => p.clone(),
++        None => (*parent.ports().first()?).to_owned(),
++    };
++    parent.seat(&port).copied()
++}
++
++/// The orientation from the root's shank (a rectangular shank is an OD
++/// holder, a round one a boring bar), the seat's hand (right cuts
++/// toward the chuck) and the insert (a round one is neutral).
++fn derive(nodes: &[AssemblyNode], hand: Hand, shape: InsertShape) -> Result<u8, LatheAssemblyError> {
++    let root = nodes
++        .iter()
++        .find(|n| n.mount.is_none())
++        .ok_or(LatheAssemblyError::Assembly(crate::tool_assembly::AssemblyError::NoRoot))?;
++    let outside = match root.component.mcs() {
++        Some(ConnectionCode::RectShank { .. }) => true,
++        Some(ConnectionCode::Cylindrical { .. } | ConnectionCode::Weldon { .. }) => false,
++        other => {
++            let coupling = other.map_or_else(|| "none".to_owned(), ToString::to_string);
++            return Err(LatheAssemblyError::NeedOrientation { name: root.component.name().to_owned(), coupling });
++        }
++    };
++    let hand = if shape == InsertShape::R { Hand::N } else { hand };
++    Ok(match (outside, hand) {
++        (true, Hand::R) => 2,
++        (true, Hand::L) => 1,
++        (true, Hand::N) => 6,
++        (false, Hand::R) => 3,
++        (false, Hand::L) => 4,
++        (false, Hand::N) => 8,
++    })
++}
++
++/// The twelve facets of a box.
++fn box_facets(b: &BodyBox) -> [Tri; 12] {
++    let p = |i: usize| -> [f64; 3] {
++        [
++            if i & 1 == 0 { b.lo[0] } else { b.hi[0] },
++            if i & 2 == 0 { b.lo[1] } else { b.hi[1] },
++            if i & 4 == 0 { b.lo[2] } else { b.hi[2] },
++        ]
++    };
++    let quad = |a, b, c, d| [[p(a), p(b), p(c)], [p(a), p(c), p(d)]];
++    let faces =
++        [quad(0, 2, 3, 1), quad(4, 5, 7, 6), quad(0, 1, 5, 4), quad(2, 6, 7, 3), quad(0, 4, 6, 2), quad(1, 3, 7, 5)];
++    let mut out = [[[0.0; 3]; 3]; 12];
++    for (k, f) in faces.iter().flatten().enumerate() {
++        out[k] = *f;
++    }
++    out
++}
+diff --git a/crates/tools/src/lathe_assembly_error.rs b/crates/tools/src/lathe_assembly_error.rs
+new file mode 100644
+index 0000000000..993443c1e4
+--- /dev/null
++++ b/crates/tools/src/lathe_assembly_error.rs
+@@ -0,0 +1,82 @@
++//! #3643: why a lathe tool assembly is refused. Each refusal names the
++//! component, or the value, that it is about. Our own wording.
++
++use crate::lathe_holder::LatheBodyError;
++use crate::tool_assembly::AssemblyError;
++
++/// Why a lathe assembly is refused.
++#[derive(Clone, Debug, PartialEq)]
++pub enum LatheAssemblyError {
++    /// A refusal of the component chain (fits, frames, ports, cycles).
++    Assembly(AssemblyError),
++    NotInsert {
++        name: String,
++    },
++    NoSeat {
++        name: String,
++    },
++    NoNose {
++        name: String,
++        code: String,
++    },
++    Orientation {
++        q: u8,
++    },
++    NeedOrientation {
++        name: String,
++        coupling: String,
++    },
++    Station(LatheBodyError),
++    SpunBody {
++        name: String,
++    },
++    /// A body point stands `reach` mm along the cutting direction on
++    /// `axis`, past the insert's cutting line at `nose` mm.
++    BodyPastEdge {
++        name: String,
++        axis: char,
++        reach: f64,
++        nose: f64,
++    },
++    Clearance(LatheBodyError),
++}
++
++impl core::fmt::Display for LatheAssemblyError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            Self::Assembly(e) => write!(f, "{e}"),
++            Self::NotInsert { name } => {
++                write!(f, "the cutting item '{name}' is not an insert - a lathe assembly cuts with an insert in a seat")
++            }
++            Self::NoSeat { name } => write!(f, "the insert '{name}' does not sit in an insert seat"),
++            Self::NoNose { name, code } => write!(
++                f,
++                "the insert '{name}' ({code}) states no nose radius - a turning insert needs a corner radius more than 0 mm"
++            ),
++            Self::Orientation { q } => write!(f, "the lathe orientation {q} is not valid - it takes 1 to 8"),
++            Self::NeedOrientation { name, coupling } => write!(
++                f,
++                "the orientation of '{name}' cannot be derived from its coupling {coupling} - state the orientation (1 to 8)"
++            ),
++            Self::Station(e) => write!(f, "the lathe station is refused: {e}"),
++            Self::SpunBody { name } => write!(
++                f,
++                "'{name}' has a revolved body - a lathe component's body is a box or a mesh, because it does not turn"
++            ),
++            Self::BodyPastEdge { name, axis, reach, nose } => write!(
++                f,
++                "the body of '{name}' reaches {reach:.3} mm from the nose centre along the cutting direction in {axis}, \
++                 past the insert's cutting line at {nose:.3} mm - check the hand, the orientation or the seat frame"
++            ),
++            Self::Clearance(e) => write!(f, "the lathe assembly's body is refused: {e}"),
++        }
++    }
++}
++
++impl std::error::Error for LatheAssemblyError {}
++
++impl From<AssemblyError> for LatheAssemblyError {
++    fn from(e: AssemblyError) -> Self {
++        Self::Assembly(e)
++    }
++}
+diff --git a/crates/tools/src/lathe_assembly_tests.rs b/crates/tools/src/lathe_assembly_tests.rs
+new file mode 100644
+index 0000000000..b90f7b21a5
+--- /dev/null
++++ b/crates/tools/src/lathe_assembly_tests.rs
+@@ -0,0 +1,326 @@
++//! #3643: lathe tool assemblies resolved to the nose-centre tip, the
++//! orientation, the turning values and the clearance bands - pinned
++//! against today's placed-mesh lathe body and the tool record, stacked
++//! in a sleeve, and refused by name.
++
++use crate::component::{ComponentKind, CuttingItem, InsertSeat, ToolComponent};
++use crate::component_fit::FitProperty;
++use crate::component_geometry::{ComponentBody, ComponentGeometry};
++use crate::connection_code::ConnectionCode;
++use crate::frame::Frame;
++use crate::insert_codes::{Clamping, Hand};
++use crate::insert_iso1832::InsertSpec;
++use crate::insert_seat::{HolderDesignation, HolderStyle, InsertSeatSpec};
++use crate::lathe_assembly::{
++    BodyBox, LatheAssemblyError, LatheBody, LatheNode, LatheStation, ResolvedLathe, resolve_lathe,
++};
++use crate::lathe_holder::{LatheBodyError, LatheClearance, LathePlacement};
++use crate::spun::SpunPoint;
++use crate::tool_assembly::{AssemblyError, AssemblyNode, Mount};
++use crate::tools::{Tool, ToolKind, catalog};
++
++fn made(id: &str, kind: ComponentKind) -> ToolComponent {
++    ToolComponent::new(id, id, kind).unwrap_or_else(|e| panic!("{id}: {e}"))
++}
++
++fn insert(code: &str) -> ToolComponent {
++    let spec = InsertSpec::parse(code).unwrap_or_else(|e| panic!("{code}: {e}"));
++    made(code, ComponentKind::CuttingItem(CuttingItem::Insert(spec)))
++}
++
++/// An ISO 5608 holder on its rectangular shank, one seat `CSW1`.
++fn holder(code: &str) -> ToolComponent {
++    let h = HolderDesignation::parse(code).unwrap_or_else(|e| panic!("{code}: {e}"));
++    let mcs = ConnectionCode::RectShank { h: u16::from(h.shank_h), b: u16::from(h.shank_b) };
++    made(code, ComponentKind::ToolItem { mcs, seats: vec![InsertSeat { port: "CSW1".into(), spec: h.seat }] })
++}
++
++fn bx(lo: [f64; 3], hi: [f64; 3]) -> BodyBox {
++    BodyBox { lo, hi }
++}
++
++fn body(boxes: &[BodyBox]) -> LatheBody {
++    LatheBody::boxes(boxes).unwrap_or_else(|e| panic!("{e}"))
++}
++
++/// The CRP of the 2525M holders below, in the holder frame: tool length
++/// l1 = 150 mm (M), f1 = 32 mm from the shank's +X side face.
++const CRP: [f64; 3] = [12.5 - 32.0, 0.0, -150.0];
++
++/// A 2525M holder: the MCS on the shank's back face, +Z out of the
++/// back, +X along the spindle away from the chuck; the shank below
++/// centre height, and a head set 1 mm back from the CRP, under the
++/// insert (5 mm below its top face).
++fn holder_boxes() -> Vec<BodyBox> {
++    vec![bx([-12.5, -25.0, -125.0], [12.5, 0.0, 0.0]), bx([CRP[0] + 1.0, -25.0, -149.0], [12.5, -5.0, -125.0])]
++}
++
++fn seat_at(crp: [f64; 3]) -> ComponentGeometry {
++    let f = Frame::new(crp, [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]).unwrap_or_else(|e| panic!("{e}"));
++    ComponentGeometry::new(vec![("CSW1".into(), f)], None, None).unwrap_or_else(|e| panic!("{e}"))
++}
++
++fn node(
++    component: ToolComponent,
++    geometry: ComponentGeometry,
++    mount: Option<Mount>,
++    body: Option<LatheBody>,
++) -> LatheNode {
++    LatheNode { node: AssemblyNode { component, geometry, mount }, body }
++}
++
++fn on(parent: usize) -> Option<Mount> {
++    Some(Mount { parent, port: None, z_rot_deg: 0.0, projection_mm: None })
++}
++
++/// `holder_code` with `insert_code` in its seat at [`CRP`].
++fn turning(holder_code: &str, insert_code: &str) -> Vec<LatheNode> {
++    vec![
++        node(holder(holder_code), seat_at(CRP), None, Some(body(&holder_boxes()))),
++        node(insert(insert_code), ComponentGeometry::default(), on(0), None),
++    ]
++}
++
++fn ok(nodes: &[LatheNode], station: LatheStation, q: Option<u8>) -> ResolvedLathe {
++    resolve_lathe(nodes, station, q).unwrap_or_else(|e| panic!("refused: {e}"))
++}
++
++fn refused(nodes: &[LatheNode], station: LatheStation, q: Option<u8>) -> LatheAssemblyError {
++    match resolve_lathe(nodes, station, q) {
++        Ok(r) => panic!("accepted: orientation {}", r.params.orientation),
++        Err(e) => e,
++    }
++}
++
++fn near(a: [f64; 3], b: [f64; 3]) -> bool {
++    (0..3).all(|k| (a[k] - b[k]).abs() < 1e-9)
++}
++
++/// Every corner of `boxes` (holder frame) inside the bands, placed by
++/// `place`: the envelope holds the holder.
++fn assert_encloses(clear: &LatheClearance, place: &LathePlacement, boxes: &[BodyBox]) {
++    for b in boxes {
++        for i in 0..8 {
++            let c = [
++                if i & 1 == 0 { b.lo[0] } else { b.hi[0] },
++                if i & 2 == 0 { b.lo[1] } else { b.hi[1] },
++                if i & 4 == 0 { b.lo[2] } else { b.hi[2] },
++            ];
++            let tri = [c, c, c];
++            let p = place.place(&[tri]).unwrap_or_else(|e| panic!("{e}"))[0][0];
++            let r = clear.over(p[2], p[2]).unwrap_or_else(|| panic!("no band at z {}", p[2]));
++            assert!(r.x_lo <= p[0] && p[0] <= r.x_hi, "x {} outside {r:?}", p[0]);
++            assert!(p[1].abs() <= r.y_hi, "|y| {} outside {r:?}", p[1]);
++        }
++    }
++}
++
++#[test]
++fn a_cnmg_in_a_pclnr_has_its_nose_centre_at_the_tip() {
++    let r = ok(&turning("PCLNR2525M12", "CNMG120408"), LatheStation::RADIAL_SHANK, None);
++    let p = r.params;
++    assert_eq!((p.orientation, p.stated, p.hand), (2, false, Hand::R));
++    assert!((p.nose_radius - 0.8).abs() < 1e-12, "{}", p.nose_radius);
++    assert_eq!(p.approach_deg, Some(95.0));
++    assert_eq!(p.insert_angle_deg, Some(80.0));
++    assert_eq!(p.clearance_deg, Some(0.0));
++    assert_eq!(p.ic_mm, Some(12.7));
++    // Orientation 2: the control point is at -X, -Z of the nose centre,
++    // so the centre is 0.8 mm up the radial (root +Z) and 0.8 mm along
++    // the spindle (root +X) from the CRP.
++    assert!(near(r.placement.tip, [CRP[0] + 0.8, 0.0, CRP[2] + 0.8]), "{:?}", r.placement.tip);
++    assert!(near(r.crp, [-0.8, 0.0, -0.8]), "{:?}", r.crp);
++    let c = r.placement.place(&[[CRP, CRP, CRP]]).unwrap_or_else(|e| panic!("{e}"))[0][0];
++    assert!(near(c, r.crp), "the CRP maps to {c:?}");
++}
++
++#[test]
++fn the_derived_values_equal_todays_tool_record_and_placed_mesh_body() {
++    let r = ok(&turning("PCLNR2525M12", "CNMG120408"), LatheStation::RADIAL_SHANK, None);
++    // The tool record a user types today for the same insert.
++    let base = catalog().into_iter().map(|(_, t)| t).next().unwrap_or_else(|| panic!("empty catalog"));
++    let tool = Tool { kind: ToolKind::Turning, nose_radius: 0.8, orientation: None, ..base };
++    assert_eq!(tool.lathe_orientation(), Some(r.params.orientation));
++    assert!((tool.nose_radius - r.params.nose_radius).abs() < 1e-12);
++    // The same holder as a mesh placed by hand on today's lathe body
++    // path: the nose centre typed as the tip.
++    let tris: Vec<_> = body(&holder_boxes()).facets().to_vec();
++    let place =
++        LathePlacement { radial: [0.0, 0.0, 1.0], along: [1.0, 0.0, 0.0], tip: [CRP[0] + 0.8, 0.0, CRP[2] + 0.8] };
++    let today =
++        LatheClearance::of(&place.place(&tris).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
++    let got = r.clearance.unwrap_or_else(|| panic!("no clearance"));
++    let (a, b): (Vec<f64>, Vec<f64>) = (got.words().collect(), today.words().collect());
++    assert_eq!(a.len(), b.len());
++    assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-9), "{a:?} vs {b:?}");
++}
++
++#[test]
++fn the_clearance_envelope_encloses_the_holder() {
++    let r = ok(&turning("PCLNR2525M12", "CNMG120408"), LatheStation::RADIAL_SHANK, None);
++    let clear = r.clearance.unwrap_or_else(|| panic!("no clearance"));
++    assert_encloses(&clear, &r.placement, &holder_boxes());
++    // The shank reaches 149.2 mm out from the nose, the head starts
++    // 0.2 mm behind it.
++    let span = clear.spans();
++    let x_hi = span.iter().map(|s| s.2.x_hi).fold(f64::NEG_INFINITY, f64::max);
++    assert!((x_hi - 149.2).abs() < 1e-5, "{x_hi}");
++    assert!((clear.z_lo() - 0.2).abs() < 1e-9, "{}", clear.z_lo());
++}
++
++#[test]
++fn the_insert_plate_is_left_out_of_the_bands() {
++    let bare = ok(&turning("PCLNR2525M12", "CNMG120408"), LatheStation::RADIAL_SHANK, None);
++    let mut nodes = turning("PCLNR2525M12", "CNMG120408");
++    nodes[1].body = Some(body(&[bx([-12.0, -1.0, -1.0], [1.0, 4.76, 12.0])]));
++    let plated = ok(&nodes, LatheStation::RADIAL_SHANK, None);
++    assert_eq!(bare.clearance, plated.clearance);
++}
++
++#[test]
++fn hand_and_shape_give_the_orientation_and_a_stated_one_wins() {
++    // Left hand: cuts away from the chuck, so the seat is on the +X
++    // side and the head with it.
++    let mirror = |b: &BodyBox| bx([-b.hi[0], b.lo[1], b.lo[2]], [-b.lo[0], b.hi[1], b.hi[2]]);
++    let left: Vec<BodyBox> = holder_boxes().iter().map(mirror).collect();
++    let crp = [-CRP[0], 0.0, CRP[2]];
++    let nodes = vec![
++        node(holder("PCLNL2525M12"), seat_at(crp), None, Some(body(&left))),
++        node(insert("CNMG120408"), ComponentGeometry::default(), on(0), None),
++    ];
++    let r = ok(&nodes, LatheStation::RADIAL_SHANK, None);
++    assert_eq!(r.params.orientation, 1);
++    assert!(near(r.placement.tip, [crp[0] - 0.8, 0.0, crp[2] + 0.8]), "{:?}", r.placement.tip);
++    // A round insert in a neutral holder points -X: orientation 6.
++    let mut round = turning("SRDCN2525M12", "RCMT1204M0");
++    round[0].body = Some(body(&[bx([-12.5, -25.0, -125.0], [12.5, 0.0, 0.0])]));
++    let r = ok(&round, LatheStation::RADIAL_SHANK, None);
++    assert_eq!((r.params.orientation, r.params.nose_radius, r.params.insert_angle_deg), (6, 6.0, None));
++    assert!(near(r.placement.tip, [CRP[0], 0.0, CRP[2] + 6.0]), "{:?}", r.placement.tip);
++    // A stated orientation wins and is reported as stated.
++    let r = ok(&round, LatheStation::RADIAL_SHANK, Some(6));
++    assert!(r.params.stated);
++}
++
++/// A VDI sleeve (a body 60 mm deep, 30 mm about its axis) with a
++/// 25 mm boring bar 200 mm long and its insert 17 mm off the bar axis.
++fn bar_in_sleeve(z_rot_deg: f64) -> Vec<LatheNode> {
++    let sleeve = made(
++        "VDI40 sleeve",
++        ComponentKind::AdaptiveItem {
++            mcs: ConnectionCode::Vdi { d: 40 },
++            csw: ConnectionCode::Cylindrical { d: 25.0 },
++        },
++    );
++    let seat = InsertSeatSpec {
++        clamping: Clamping::P,
++        shape: crate::insert_codes::InsertShape::C,
++        style: HolderStyle::from_letter('L').unwrap_or_else(|| panic!("style")),
++        clearance: crate::insert_codes::Clearance::N,
++        hand: Hand::R,
++        size: 12,
++        thickness: None,
++    };
++    let bar = made(
++        "S25 bar",
++        ComponentKind::ToolItem {
++            mcs: ConnectionCode::Cylindrical { d: 25.0 },
++            seats: vec![InsertSeat { port: "CSW1".into(), spec: seat }],
++        },
++    );
++    let sleeve_geo = ComponentGeometry::axial("CSW", 60.0, None).unwrap_or_else(|e| panic!("{e}"));
++    let mount = Some(Mount { z_rot_deg, ..on(0).unwrap_or_else(|| unreachable!()) });
++    vec![
++        node(sleeve, sleeve_geo, None, Some(body(&[bx([-30.0, -30.0, -60.0], [30.0, 30.0, 0.0])]))),
++        node(bar, seat_at([17.0, 0.0, -201.0]), mount, Some(body(&[bx([-12.5, -12.5, -200.0], [12.5, 12.5, 0.0])]))),
++        node(insert("CNMG120408"), ComponentGeometry::default(), on(1), None),
++    ]
++}
++
++#[test]
++fn a_boring_bar_in_a_sleeve_is_judged_as_one_body() {
++    let nodes = bar_in_sleeve(0.0);
++    // A VDI root says nothing of OD or ID: the orientation is stated.
++    assert!(matches!(
++        refused(&nodes, LatheStation::AXIAL_SHANK, None),
++        LatheAssemblyError::NeedOrientation { ref name, .. } if name == "VDI40 sleeve"
++    ));
++    let r = ok(&nodes, LatheStation::AXIAL_SHANK, Some(3));
++    // The bar's MCS sits 60 mm down the sleeve; orientation 3 puts the
++    // nose centre 0.8 mm in from the CRP and 0.8 mm away from the chuck.
++    assert!(near(r.placement.tip, [16.2, 0.0, -260.2]), "{:?}", r.placement.tip);
++    let clear = r.clearance.unwrap_or_else(|| panic!("no clearance"));
++    assert!((clear.z_hi() - 260.2).abs() < 1e-6, "the sleeve is in the bands: {}", clear.z_hi());
++    // The sleeve alone stands 200 mm from the tip: the tip gap is read
++    // on the whole stack, never on the sleeve by itself.
++    let sleeve = body(&[bx([-30.0, -30.0, -60.0], [30.0, 30.0, 0.0])]);
++    let alone = r.placement.place(sleeve.facets()).unwrap_or_else(|e| panic!("{e}"));
++    assert_eq!(LatheClearance::of(&alone), Err(LatheBodyError::TipAway));
++    // Turned half a turn, the insert stands behind the bar.
++    assert!(matches!(
++        refused(&bar_in_sleeve(180.0), LatheStation::AXIAL_SHANK, Some(3)),
++        LatheAssemblyError::BodyPastEdge { ref name, axis: 'X', .. } if name == "S25 bar"
++    ));
++}
++
++#[test]
++fn a_mismatch_a_wrong_hand_and_degenerate_input_are_refused_by_name() {
++    let st = LatheStation::RADIAL_SHANK;
++    // The #3642 fit check names the size.
++    match refused(&turning("PCLNR2525M12", "CNMG090308"), st, None) {
++        LatheAssemblyError::Assembly(AssemblyError::Fit(e)) => assert_eq!(e.property, FitProperty::Size),
++        e => panic!("{e}"),
++    }
++    // A left-hand code on a right-hand geometry: the head stands ahead
++    // of the cutting line in Z.
++    let wrong = turning("PCLNL2525M12", "CNMG120408");
++    assert!(matches!(refused(&wrong, st, None), LatheAssemblyError::BodyPastEdge { axis: 'Z', .. }));
++    // A stated orientation that disagrees with the geometry too.
++    let r = refused(&turning("PCLNR2525M12", "CNMG120408"), st, Some(1));
++    assert!(r.to_string().contains("check the hand"), "{r}");
++    for q in [0, 9, 10] {
++        assert_eq!(refused(&turning("PCLNR2525M12", "CNMG120408"), st, Some(q)), LatheAssemblyError::Orientation { q });
++    }
++    assert!(matches!(refused(&turning("PCLNR2525M12", "CNMG120400"), st, None), LatheAssemblyError::NoNose { .. }));
++    let bad = LatheStation { radial: [0.0; 3], ..st };
++    assert_eq!(
++        refused(&turning("PCLNR2525M12", "CNMG120408"), bad, None),
++        LatheAssemblyError::Station(LatheBodyError::Direction)
++    );
++    let skew = LatheStation { along: [1.0, 0.0, 0.5], ..st };
++    assert_eq!(
++        refused(&turning("PCLNR2525M12", "CNMG120408"), skew, None),
++        LatheAssemblyError::Station(LatheBodyError::NotSquare)
++    );
++    // A revolved body is never dropped in silence.
++    let mut spun = turning("PCLNR2525M12", "CNMG120408");
++    let p = SpunPoint::line;
++    let outline = ComponentBody::new(vec![p(0.0, 0.0), p(0.0, 5.0), p(10.0, 5.0), p(10.0, 0.0)], -10.0)
++        .unwrap_or_else(|e| panic!("{e}"));
++    spun[0].node.geometry = ComponentGeometry::new(vec![("CSW1".into(), Frame::IDENTITY)], Some(outline), None)
++        .unwrap_or_else(|e| panic!("{e}"));
++    assert!(matches!(refused(&spun, st, None), LatheAssemblyError::SpunBody { ref name } if name == "PCLNR2525M12"));
++    // A lone end mill is no lathe assembly.
++    let base = catalog()
++        .into_iter()
++        .map(|(_, t)| t)
++        .find(|t| t.kind == ToolKind::EndMill)
++        .unwrap_or_else(|| panic!("no end mill"));
++    let mcs = ConnectionCode::Cylindrical { d: base.shank_d };
++    let mill = made("mill", ComponentKind::CuttingItem(CuttingItem::Solid { tool: Box::new(base), mcs }));
++    let lone = vec![node(mill, ComponentGeometry::default(), None, None)];
++    assert!(matches!(refused(&lone, st, None), LatheAssemblyError::NotInsert { .. }));
++    // A body far from the nose is refused on the whole stack.
++    let mut far = turning("PCLNR2525M12", "CNMG120408");
++    far[0].body = Some(body(&[bx([-12.5, -25.0, -60.0], [12.5, 0.0, 0.0])]));
++    assert_eq!(refused(&far, st, None), LatheAssemblyError::Clearance(LatheBodyError::TipAway));
++    // Degenerate bodies.
++    assert_eq!(LatheBody::boxes(&[]), Err(LatheBodyError::Empty));
++    assert_eq!(LatheBody::boxes(&[bx([0.0; 3], [1.0, 1.0, f64::NAN])]), Err(LatheBodyError::NonFinite));
++    assert_eq!(LatheBody::boxes(&[bx([0.0; 3], [1.0, 0.0, 1.0])]), Err(LatheBodyError::Degenerate));
++    assert_eq!(LatheBody::mesh(Vec::new()), Err(LatheBodyError::Empty));
++    assert_eq!(
++        LatheBody::mesh(vec![[[0.0; 3], [1.0, 0.0, 0.0], [0.0, f64::INFINITY, 0.0]]]),
++        Err(LatheBodyError::NonFinite)
++    );
++}
+diff --git a/crates/tools/src/lathe_insert_zone.rs b/crates/tools/src/lathe_insert_zone.rs
+index df2497a59a..b46719a47b 100644
+--- a/crates/tools/src/lathe_insert_zone.rs
++++ b/crates/tools/src/lathe_insert_zone.rs
+@@ -96,7 +96,7 @@ impl InsertZone {
+ 
+ /// One Sutherland-Hodgman pass on axis `k`: keep `p[k] >= c`
+ /// (`keep_above`) or `p[k] <= c`.
+-fn clip_axis(poly: &[[f64; 3]], k: usize, c: f64, keep_above: bool) -> Vec<[f64; 3]> {
++pub(crate) fn clip_axis(poly: &[[f64; 3]], k: usize, c: f64, keep_above: bool) -> Vec<[f64; 3]> {
+     let inside = |p: &[f64; 3]| if keep_above { p[k] >= c } else { p[k] <= c };
+     let mut out = Vec::with_capacity(poly.len() + 2);
+     for (i, p) in poly.iter().enumerate() {
+diff --git a/crates/tools/src/lib.rs b/crates/tools/src/lib.rs
+index 72a4b52afa..1ace665164 100644
+--- a/crates/tools/src/lib.rs
++++ b/crates/tools/src/lib.rs
+@@ -91,6 +91,11 @@ pub mod frame;
+ pub mod tool_assembly;
+ #[cfg(test)]
+ mod tool_assembly_tests;
++// #3643: lathe tool assemblies - the nose centre as the tip, the
++// orientation, the turning values and the clearance bands.
++pub mod lathe_assembly;
++#[cfg(test)]
++mod lathe_assembly_tests;
+ 
+ // #743: DXF half-profile parsing and projection into validated holder profiles.
+ pub mod tool_profile_dxf;
+diff --git a/crates/tools/src/tool_assembly.rs b/crates/tools/src/tool_assembly.rs
+index 7073926440..7ec7e62bd0 100644
+--- a/crates/tools/src/tool_assembly.rs
++++ b/crates/tools/src/tool_assembly.rs
+@@ -11,7 +11,8 @@
+ //! The law: an assembly is resolved whole or refused by name - a fit
+ //! the component checks refuse, a missing frame, an ambiguous port, a
+ //! cycle, a non-finite transform, or a body that reaches into the
+-//! flutes. Lathe assemblies are not resolved here yet.
++//! flutes. Lathe assemblies reuse this chain ([`placed`]) and are
++//! resolved in [`crate::lathe_assembly`].
+ 
+ use crate::component::{ComponentKind, CuttingItem, ToolComponent};
+ use crate::component_fit::{check_fit, FitError};
+@@ -94,22 +95,7 @@ pub struct ResolvedAssembly {
+ 
+ /// Resolve `nodes` (the module's law).
+ pub fn resolve(nodes: &[AssemblyNode]) -> Result<ResolvedAssembly, AssemblyError> {
+-    if nodes.is_empty() {
+-        return Err(AssemblyError::Empty);
+-    }
+-    if nodes.len() > MAX_NODES {
+-        return Err(AssemblyError::TooMany { count: nodes.len() });
+-    }
+-    let root = find_root(nodes)?;
+-    let ports = check_links(nodes)?;
+-    let cut = find_cutter(nodes)?;
+-    let mut frames: Vec<Option<Frame>> = vec![None; nodes.len()];
+-    frames[root] = Some(Frame::IDENTITY);
+-    for i in 0..nodes.len() {
+-        place(nodes, &ports, i, &mut frames)?;
+-    }
+-    let frames: Vec<Frame> = frames.into_iter().map(|f| f.unwrap_or(Frame::IDENTITY)).collect();
+-    let cip = frames[cut].then(&cip_local(&nodes[cut])?);
++    let (frames, cut, cip) = placed(nodes)?;
+     let gauge_len = -cip.origin()[2];
+     if !gauge_len.is_finite() || gauge_len <= 0.0 || gauge_len > crate::holder_profile::MAX_BODY_HEIGHT {
+         return Err(AssemblyError::BadGauge { gauge_len });
+@@ -129,6 +115,30 @@ pub fn resolve(nodes: &[AssemblyNode]) -> Result<ResolvedAssembly, AssemblyError
+     Ok(ResolvedAssembly { gauge_len, cutting, tool, body, frames })
+ }
+ 
++/// The checked stack placed in the root's frame (the root's MCS is the
++/// identity): each node's MCS frame, the cutting item's index, and its
++/// cutting point. The same checks as [`resolve`] up to the gauge length:
++/// the lathe resolver (#3643) reads its own tip from here.
++pub(crate) fn placed(nodes: &[AssemblyNode]) -> Result<(Vec<Frame>, usize, Frame), AssemblyError> {
++    if nodes.is_empty() {
++        return Err(AssemblyError::Empty);
++    }
++    if nodes.len() > MAX_NODES {
++        return Err(AssemblyError::TooMany { count: nodes.len() });
++    }
++    let root = find_root(nodes)?;
++    let ports = check_links(nodes)?;
++    let cut = find_cutter(nodes)?;
++    let mut frames: Vec<Option<Frame>> = vec![None; nodes.len()];
++    frames[root] = Some(Frame::IDENTITY);
++    for i in 0..nodes.len() {
++        place(nodes, &ports, i, &mut frames)?;
++    }
++    let frames: Vec<Frame> = frames.into_iter().map(|f| f.unwrap_or(Frame::IDENTITY)).collect();
++    let cip = frames[cut].then(&cip_local(&nodes[cut])?);
++    Ok((frames, cut, cip))
++}
++
+ fn find_root(nodes: &[AssemblyNode]) -> Result<usize, AssemblyError> {
+     let mut roots = nodes.iter().enumerate().filter(|(_, n)| n.mount.is_none()).map(|(i, _)| i);
+     let root = roots.next().ok_or(AssemblyError::NoRoot)?;
+diff --git a/docs/decisions/3643-tool-assemblies.md b/docs/decisions/3643-tool-assemblies.md
+index 6895ffd4b2..6697d2c426 100644
+--- a/docs/decisions/3643-tool-assemblies.md
++++ b/docs/decisions/3643-tool-assemblies.md
+@@ -94,3 +94,94 @@ concepts. No standard text is copied.
+ **Cost to change later.** Low. Nothing outside the new files reads the
+ resolver yet. A changed rule changes the pins in
+ `tool_assembly_tests.rs`.
++
++## #3643 - Lathe tool assemblies: the nose-centre tip, the orientation and the clearance bands (lathe slice)
++
++**What was decided.**
++- This PR is the lathe slice of #3643. It is pure domain code in
++  `camcraft-tools`, in three new files: `lathe_assembly.rs` (the
++  resolver and its types), `lathe_assembly_error.rs` (the refusals) and
++  `lathe_assembly_tests.rs`. There is no new crate edge, no ECS and no
++  file I/O.
++- The lathe resolver reuses the spindle chain. `tool_assembly::placed`
++  (new, `pub(crate)`) holds the steps that `resolve` had before the
++  gauge length: the root, the links and fits, the one cutting item and
++  the frames. `resolve` now calls it. Thus a lathe stack gets the same
++  #3642 fit refusals, port refusals, cycle refusals and frame
++  refusals by name.
++- The turning frame is the frame of `lathe_holder` (+x radial, +z along
++  the spindle away from the chuck, the tip at the origin). The caller
++  states how the root's frame sits on the lathe (`LatheStation`: the
++  root directions that are radial and along the spindle). Two constants
++  name the usual cases: `RADIAL_SHANK` (an OD holder on a tool post) and
++  `AXIAL_SHANK` (a boring bar). The resolver gives a `LathePlacement`
++  whose tip is the nose centre, so today's lathe body path reads it
++  without change.
++- The tip: the insert's cutting point (its stated CIP, else its seat
++  frame) is its CRP. We define the CRP as the control point of the
++  LinuxCNC orientation chart: the point where the nose's tangent lines
++  parallel to X and Z meet. The nose centre is the CRP less
++  `r * tip_offset(q)`, read in the turning frame. This makes the nose
++  centre independent of the insert's corner angle and of the approach
++  angle.
++- The nose radius is the insert's corner radius, or half the size code
++  of a round insert (the size code is its diameter). A sharp corner or
++  a wiper facet is refused by name, as `tool_sanity` refuses a turning
++  tool with a zero nose.
++- The orientation, when the caller states none, comes from three facts:
++  - the root's coupling: a rectangular shank (ISO 5608) is an OD holder,
++    a round shank (cylindrical or Weldon) is a boring bar;
++  - the seat's hand: right cuts toward the chuck, left away from it,
++    neutral points along X;
++  - the insert's shape: a round insert is neutral.
++  The result is 2/1/6 for OD and 3/4/8 for ID. Any other root coupling
++  (VDI, BMT, a custom code) is refused by name with "state the
++  orientation". A stated orientation must be 1 to 8; 9 states nothing
++  about the insert and is refused. The approach angle is reported but it
++  does not change the code.
++- The geometry must agree with the orientation. Within one insert of
++  the nose (`MAX_INSERT_REACH`, in X and Z), no holder body may stand
++  past the insert's cutting lines (`x = ox * r`, `z = oz * r`). A
++  wrong hand, a wrong stated orientation or a wrong seat frame is thus
++  refused by name, not posted with the wrong compensation side. Farther
++  out (a turret block, a sleeve) a body may stand on either side. The
++  window is clipped exactly (Sutherland-Hodgman), so a large facet
++  whose corners are outside the window is still checked.
++- The body: a lathe component's body is a set of boxes or a mesh
++  (`LatheBody`) in its own frame, because a lathe tool does not turn.
++  A revolved (`ComponentBody`) body on a lathe component is refused by
++  name, never dropped. All bodies but the insert's are placed and given
++  to `LatheClearance::of` as one set. Thus the size cap and
++  `MAX_TIP_GAP` read the whole stack, never one adapter alone (pinned:
++  the sleeve alone gives `TipAway`, the stack passes). The insert's own
++  plate is left out of the bands, as an `InsertZone` leaves it out
++  today: the turning laws judge the insert by its cut model. No manual
++  insert zone is needed.
++- Overhang of a boring bar in a sleeve (`projection_mm` on a bar) is
++  not part of this slice. The spindle rule holds: only a solid tool
++  takes a stickout, and a bar sits on the sleeve's port.
++
++**Why.** The turning laws read a `LatheClearance` and a nose-centre
++tip today. A second shape would need its own proof. The equivalence
++pin (`the_derived_values_equal_todays_tool_record_and_placed_mesh_body`)
++shows that the same holder, placed by hand on today's mesh path with
++the nose centre typed as the tip, gives the same bands, and that the
++derived nose radius and orientation equal today's turning tool record.
++The orientation chart is the public LinuxCNC lathe documentation; the
++codes are the public ISO 1832 and ISO 5608 position layouts. No
++standard text is copied.
++
++**Considered and dropped.**
++- Derive the CRP as the theoretical sharp corner of the insert. Dropped:
++  for a neutral V insert the sharp corner stands about 3 r ahead of the
++  nose, so the nose centre would be wrong by about 2 r. The tangent
++  point is what the orientation chart and the control read.
++- Derive OD or ID from the body shape. Dropped: it would make the edge
++  check prove itself. The coupling is a stated catalog fact.
++- Mesh bodies from STEP, STL or OBJ files, `MCS_INSERT` in
++  `step_csys.rs`, and `crates/app/src/tool_assembly.rs`. Left on
++  #3643 and #3644: they are app code.
++
++**Cost to change later.** Low. Nothing outside the new files reads the
++lathe resolver yet. A changed rule changes the pins in
++`lathe_assembly_tests.rs`.
+
+From 27f9f0da32829b9066b6178eb56b7bfd5d484f1a Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Thu, 26 Nov 2026 17:07:15 +0100
+Subject: [PATCH 2/2] test(tools): import Clamping from insert_seat
+
+Refs #3643
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/tools/src/lathe_assembly_tests.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/tools/src/lathe_assembly_tests.rs b/crates/tools/src/lathe_assembly_tests.rs
+index b90f7b21a5..e0eac29e93 100644
+--- a/crates/tools/src/lathe_assembly_tests.rs
++++ b/crates/tools/src/lathe_assembly_tests.rs
+@@ -8,9 +8,9 @@ use crate::component_fit::FitProperty;
+ use crate::component_geometry::{ComponentBody, ComponentGeometry};
+ use crate::connection_code::ConnectionCode;
+ use crate::frame::Frame;
+-use crate::insert_codes::{Clamping, Hand};
++use crate::insert_codes::Hand;
+ use crate::insert_iso1832::InsertSpec;
+-use crate::insert_seat::{HolderDesignation, HolderStyle, InsertSeatSpec};
++use crate::insert_seat::{Clamping, HolderDesignation, HolderStyle, InsertSeatSpec};
+ use crate::lathe_assembly::{
+     BodyBox, LatheAssemblyError, LatheBody, LatheNode, LatheStation, ResolvedLathe, resolve_lathe,
+ };

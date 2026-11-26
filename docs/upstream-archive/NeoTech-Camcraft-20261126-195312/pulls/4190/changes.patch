@@ -1,0 +1,538 @@
+From 5b8c998a4fa96b211be5c27aafe47d1439308381 Mon Sep 17 00:00:00 2001
+From: Scott Miller <152090551+seelesturm@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:52:40 -0600
+Subject: [PATCH] fix(mcp): configure the live client idle timeout
+
+Keep the 300-second default. Let startup options disable idle expiry or set a longer window without changing hello deadlines or framing limits.
+
+Co-Authored-By: OpenAI <noreply@openai.com>
+
+Fixes #3940
+---
+ .claude/skills/camcraft-mcp/SKILL.md      |  11 +++
+ crates/app/src/mcp/listen.rs              |  49 ++++++----
+ crates/app/src/mcp/mod.rs                 |   4 +-
+ crates/app/src/mcp/port_flag.rs           |  33 ++++++-
+ crates/app/tests/mcp_live.rs              |   2 +
+ crates/app/tests/mcp_live/idle_timeout.rs | 106 ++++++++++++++++++++++
+ crates/app/tests/mcp_live/ui_link.rs      |  13 ++-
+ crates/ui/src/cli_options.rs              |   8 ++
+ crates/ui/src/cli_options_tests.rs        |  19 ++++
+ crates/ui/src/egui_app/mod.rs             |  16 +++-
+ crates/ui/src/egui_app/shell_window.rs    |   6 +-
+ docs/decisions/3940-mcp-idle-timeout.md   |  23 +++++
+ docs/user-guide/start-options.md          |   1 +
+ site/content/guide/automate/mcp.md        |  14 ++-
+ 14 files changed, 271 insertions(+), 34 deletions(-)
+ create mode 100644 crates/app/tests/mcp_live/idle_timeout.rs
+ create mode 100644 docs/decisions/3940-mcp-idle-timeout.md
+
+diff --git a/.claude/skills/camcraft-mcp/SKILL.md b/.claude/skills/camcraft-mcp/SKILL.md
+index feabdcde07..6856cc1fa9 100644
+--- a/.claude/skills/camcraft-mcp/SKILL.md
++++ b/.claude/skills/camcraft-mcp/SKILL.md
+@@ -7,6 +7,17 @@ description: Guide and reference for driving CamCraft headlessly via its Model C
+ 
+ CamCraft exposes a Model Context Protocol (MCP) server on stdio (`camcraft-cli mcp`, #128), allowing an AI agent to drive a complete CAM programming session headlessly: importing models, defining setups and stock, selecting tools, creating and editing operations, selecting geometric features, simulating/verifying, and posting NC programs.
+ 
++## Live MCP idle window
++
++Start `camcraft-ui --mcp-port 7777 --mcp-idle-timeout 1800` to allow
++1800 seconds without a complete request line. The default is 300 seconds.
++`CAMCRAFT_MCP_IDLE_TIMEOUT` is the environment fallback; the option wins.
++Use non-negative whole seconds that fit `u64`. Zero disables idle expiry
++for live TCP clients and authenticated UI link clients. It does not disable
++the UI link's five-second hello deadline or the line limits.
++Set the option on the app, not on `camcraft-cli mcp --connect`.
++The stdio bridge does not reconnect automatically after a drop.
++
+ ## Architecture & Principles
+ 
+ - **Transport & Protocol:** Standard JSON-RPC 2.0 over newline-delimited stdio (`initialize`, `tools/list`, `tools/call`, `ping`).
+diff --git a/crates/app/src/mcp/listen.rs b/crates/app/src/mcp/listen.rs
+index f6202471ec..3666abf658 100644
+--- a/crates/app/src/mcp/listen.rs
++++ b/crates/app/src/mcp/listen.rs
+@@ -13,8 +13,8 @@
+ //! connection before reaching the app. Reads are bounded to [`MAX_LINE`]
+ //! ([`MAX_HELLO_LINE`] before hello, #3873) and writes time out.
+ //! **An idle client lets go** (#567, #3873): a client idle for
+-//! [`IDLE_TIMEOUT`] ([`HELLO_TIMEOUT`] before hello) is dropped so the
+-//! next client can be served.
++//! [`IDLE_TIMEOUT`] by default ([`HELLO_TIMEOUT`] before hello) is dropped
++//! so the next client can be served. A zero idle window disables only idle expiry.
+ 
+ use std::io::{Read, Write};
+ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+@@ -134,12 +134,13 @@ impl Inbox {
+ 
+     /// [`Inbox::listen`] with its own idle window: a client sending no
+     /// complete line for `idle` is dropped (a window shorter than the
+-    /// poll step is read as the poll step). Tests use a short one.
++    /// poll step is read as the poll step). Zero disables idle expiry.
++    /// Tests use a short window.
+     ///
+     /// # Errors
+     /// The bind (port in use, no permission) or the thread spawn failed.
+     pub fn listen_with_idle(port: u16, wake: Wake, idle: Duration) -> std::io::Result<Self> {
+-        let idle = idle.max(POLL);
++        let idle = if idle.is_zero() { idle } else { idle.max(POLL) };
+         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+         listener.set_nonblocking(true)?;
+         let addr = listener.local_addr()?;
+@@ -149,7 +150,11 @@ impl Inbox {
+         let thread = std::thread::Builder::new()
+             .name("camcraft-mcp".into())
+             .spawn(move || accept_loop(&Listener::Tcp(listener), &tx, &flag, &wake, idle, None, HELLO_TIMEOUT))?;
+-        tracing::info!("mcp: listening on {addr} (an idle client is dropped after {}s)", idle.as_secs());
++        if idle.is_zero() {
++            tracing::info!("mcp: listening on {addr} (idle expiry disabled)");
++        } else {
++            tracing::info!("mcp: listening on {addr} (an idle client is dropped after {}s)", idle.as_secs());
++        }
+         Ok(Self { rx, addr: Some(addr), stop, thread: Some(thread), link: None })
+     }
+ 
+@@ -264,20 +269,26 @@ fn serve_client(
+             return Ok(End::Closed);
+         }
+         let cap = if gate.is_some() { MAX_HELLO_LINE } else { MAX_LINE };
+-        let deadline = if gate.is_some() { hello } else { idle };
+-        let quiet = active.elapsed();
+-        let Some(left) = deadline.checked_sub(quiet).filter(|d| !d.is_zero()) else {
+-            if gate.is_some() {
+-                let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
+-                return Ok(End::Refused);
+-            }
+-            let note = format!(
+-                r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
+-                quiet.as_secs()
+-            );
+-            // Best effort: the write times out, and the client goes either way.
+-            let _ = writeln!(writer, "{note}").and_then(|()| writer.flush());
+-            return Ok(End::Idle(quiet));
++        // Zero disables only the authenticated/live idle window, never hello.
++        let left = if gate.is_none() && idle.is_zero() {
++            POLL
++        } else {
++            let deadline = if gate.is_some() { hello } else { idle };
++            let quiet = active.elapsed();
++            let Some(left) = deadline.checked_sub(quiet).filter(|d| !d.is_zero()) else {
++                if gate.is_some() {
++                    let _ = writeln!(writer, "{}", link::HELLO_REFUSED).and_then(|()| writer.flush());
++                    return Ok(End::Refused);
++                }
++                let note = format!(
++                    r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"warning","logger":"camcraft","data":"idle for {}s with no complete message - the connection is closed"}}}}"#,
++                    quiet.as_secs()
++                );
++                // Best effort: the write times out, and the client goes either way.
++                let _ = writeln!(writer, "{note}").and_then(|()| writer.flush());
++                return Ok(End::Idle(quiet));
++            };
++            left
+         };
+         // Never wait past the idle deadline (nor a poll step, for the
+         // stop flag). A zero timeout is refused by the OS API; `left`
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index fdd83e4153..d22391f00c 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -106,8 +106,8 @@ mod recipe_tools;
+ // loopback socket, against the app's own document and History.
+ pub use bridge::bridge;
+ pub use link_client::{bridge as link_bridge, call as link_call, connect as link_connect, LinkError, Select};
+-pub use listen::{Inbox, Request, Wake, IDLE_TIMEOUT};
+-pub use port_flag::port_from;
++pub use listen::{Inbox, Request, Wake, HELLO_TIMEOUT, IDLE_TIMEOUT};
++pub use port_flag::{idle_timeout_from, port_from};
+ pub use live::{
+     answer_live, answer_live_with, requires_approval, ApprovedCall, GateKind, LiveAnswer,
+     LiveGate, LiveOptions,
+diff --git a/crates/app/src/mcp/port_flag.rs b/crates/app/src/mcp/port_flag.rs
+index 47e00f0d70..454913ba1d 100644
+--- a/crates/app/src/mcp/port_flag.rs
++++ b/crates/app/src/mcp/port_flag.rs
+@@ -1,8 +1,37 @@
+-//! The `--mcp-port` flag of the app (#183), moved out of listen.rs
+-//! (#3751) to keep that file under the 400-line law.
++//! The app's live MCP startup options (#183, #3940), moved out of
++//! listen.rs (#3751) to keep that file under the 400-line law.
+ //!
+ //! Provenance: our own argv parsing. Clean-room, public sources only.
+ 
++use std::time::Duration;
++
++/// The live MCP idle window (#3940): CLI wins over the environment.
++/// Zero disables idle expiry. An absent or blank environment uses 300 s.
++///
++/// # Errors
++/// A missing value, or seconds that are not a non-negative `u64` integer.
++pub fn idle_timeout_from(args: &[String], env: Option<&str>) -> Result<Duration, String> {
++    const FLAG: &str = "--mcp-idle-timeout";
++    let flag = args.iter().enumerate().find_map(|(i, a)| {
++        if a == FLAG {
++            Some(args.get(i + 1).map(String::as_str))
++        } else {
++            a.strip_prefix("--mcp-idle-timeout=").map(Some)
++        }
++    });
++    let text = match flag {
++        Some(None) => return Err(format!("{FLAG} needs non-negative whole seconds (0 disables idle expiry)")),
++        Some(Some(v)) => v,
++        None => match env.map(str::trim).filter(|v| !v.is_empty()) {
++            Some(v) => v,
++            None => return Ok(super::IDLE_TIMEOUT),
++        },
++    };
++    text.trim().parse::<u64>().map(Duration::from_secs).map_err(|_| {
++        format!("{FLAG} / CAMCRAFT_MCP_IDLE_TIMEOUT must be non-negative whole seconds fitting u64 (0 disables idle expiry), got '{text}'")
++    })
++}
++
+ /// `--mcp-port <n>` / `--mcp-port=<n>` over `CAMCRAFT_MCP_PORT`: `None`
+ /// when neither asks for the server (it is off by default).
+ ///
+diff --git a/crates/app/tests/mcp_live.rs b/crates/app/tests/mcp_live.rs
+index 1d3b348e41..c369fe10be 100644
+--- a/crates/app/tests/mcp_live.rs
++++ b/crates/app/tests/mcp_live.rs
+@@ -5,6 +5,8 @@
+ //! Gate map (M4.4): covers app::mcp (live, listen, bridge, link,
+ //! link_client, link_owner) and app::cli_ui (the `--ui` lane, #3751).
+ 
++#[path = "mcp_live/idle_timeout.rs"]
++mod idle_timeout;
+ #[path = "mcp_live/ui_link.rs"]
+ mod ui_link;
+ #[path = "mcp_live/ui_link_owner.rs"]
+diff --git a/crates/app/tests/mcp_live/idle_timeout.rs b/crates/app/tests/mcp_live/idle_timeout.rs
+new file mode 100644
+index 0000000000..e0b92544b8
+--- /dev/null
++++ b/crates/app/tests/mcp_live/idle_timeout.rs
+@@ -0,0 +1,106 @@
++//! Idle-window configuration (#3940), over synthetic local sockets.
++//! Gate map (M4.4): covers app::mcp::listen and app::mcp::port_flag.
++
++use camcraft_app::mcp::{IDLE_TIMEOUT, Inbox, idle_timeout_from};
++use std::io::{BufRead, BufReader, Write};
++use std::net::TcpStream;
++use std::time::{Duration, Instant};
++
++fn argv(args: &[&str]) -> Vec<String> {
++    args.iter().map(|s| (*s).to_owned()).collect()
++}
++
++#[test]
++fn idle_timeout_configuration_defaults_overrides_and_refuses_bad_values() {
++    assert_eq!(IDLE_TIMEOUT, Duration::from_secs(300));
++    assert_eq!(idle_timeout_from(&[], None), Ok(IDLE_TIMEOUT));
++    assert_eq!(idle_timeout_from(&[], Some("  ")), Ok(IDLE_TIMEOUT));
++    assert_eq!(
++        idle_timeout_from(&[], Some(" 600 ")),
++        Ok(Duration::from_secs(600))
++    );
++    assert_eq!(
++        idle_timeout_from(&argv(&["--mcp-idle-timeout", "900"]), Some("600")),
++        Ok(Duration::from_secs(900))
++    );
++    assert_eq!(
++        idle_timeout_from(&argv(&["--mcp-idle-timeout=0"]), Some("bad")),
++        Ok(Duration::ZERO)
++    );
++    assert_eq!(idle_timeout_from(&[], Some("0")), Ok(Duration::ZERO));
++    assert_eq!(
++        idle_timeout_from(&[], Some("18446744073709551615")),
++        Ok(Duration::from_secs(u64::MAX))
++    );
++    for value in ["", "-1", "NaN", "inf", "1.5", "bad", "18446744073709551616"] {
++        let err = idle_timeout_from(
++            &argv(&[&format!("--mcp-idle-timeout={value}")]),
++            Some("600"),
++        )
++        .expect_err(value);
++        assert!(
++            err.contains("--mcp-idle-timeout") && err.contains("whole seconds"),
++            "{err}"
++        );
++        if !value.is_empty() {
++            let err = idle_timeout_from(&[], Some(value)).expect_err(value);
++            assert!(err.contains("CAMCRAFT_MCP_IDLE_TIMEOUT"), "{err}");
++        }
++    }
++    assert!(idle_timeout_from(&argv(&["--mcp-idle-timeout"]), Some("600")).is_err());
++    assert!(idle_timeout_from(&argv(&["--mcp-idle-timeout", "-1"]), None).is_err());
++}
++
++#[test]
++fn a_configured_finite_window_expires_on_the_listener() {
++    let idle = idle_timeout_from(&argv(&["--mcp-idle-timeout=1"]), None).expect("seconds");
++    let inbox = Inbox::listen_with_idle(0, Box::new(|| {}), idle).expect("listen");
++    let client = TcpStream::connect(inbox.addr().expect("addr")).expect("connect");
++    client
++        .set_read_timeout(Some(Duration::from_secs(3)))
++        .expect("timeout");
++    let start = Instant::now();
++    let mut reader = BufReader::new(client);
++    let mut line = String::new();
++    reader.read_line(&mut line).expect("idle notice");
++    assert!(
++        line.contains("notifications/message") && line.contains("idle"),
++        "{line}"
++    );
++    assert!(start.elapsed() >= Duration::from_millis(900));
++    line.clear();
++    assert_eq!(reader.read_line(&mut line).expect("closed"), 0);
++}
++
++#[test]
++fn zero_idle_window_keeps_a_silent_client_and_stops_promptly() {
++    let idle = idle_timeout_from(&argv(&["--mcp-idle-timeout=0"]), None).expect("disabled");
++    let inbox = Inbox::listen_with_idle(0, Box::new(|| {}), idle).expect("listen");
++    let mut client = TcpStream::connect(inbox.addr().expect("addr")).expect("connect");
++    client
++        .set_read_timeout(Some(Duration::from_secs(2)))
++        .expect("timeout");
++    std::thread::sleep(Duration::from_millis(250));
++    writeln!(client, r#"{{"jsonrpc":"2.0","id":3940,"method":"ping"}}"#).expect("send");
++    let end = Instant::now() + Duration::from_secs(2);
++    loop {
++        if let Some(req) = inbox.next() {
++            req.answer(Some(r#"{"jsonrpc":"2.0","id":3940,"result":{}}"#.into()));
++            break;
++        }
++        assert!(
++            Instant::now() < end,
++            "zero must disable idle expiry, not clamp it to the poll step"
++        );
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    let mut line = String::new();
++    BufReader::new(client).read_line(&mut line).expect("reply");
++    assert!(line.contains("\"id\":3940"), "{line}");
++    let start = Instant::now();
++    drop(inbox);
++    assert!(
++        start.elapsed() < Duration::from_secs(1),
++        "stop stays bounded"
++    );
++}
+diff --git a/crates/app/tests/mcp_live/ui_link.rs b/crates/app/tests/mcp_live/ui_link.rs
+index 868f711ca7..f376019568 100644
+--- a/crates/app/tests/mcp_live/ui_link.rs
++++ b/crates/app/tests/mcp_live/ui_link.rs
+@@ -263,9 +263,18 @@ fn false_server_on_stale_entry_is_refused_with_no_tool_calls_sent() {
+ 
+ #[test]
+ fn an_unauthenticated_client_holding_the_link_times_out_and_releases_it() {
+-    let dir = fresh_dir("hello-timeout");
++    hello_deadline_releases_link("hello-timeout", Duration::from_secs(60));
++}
++
++#[test]
++fn disabling_idle_expiry_keeps_the_hello_deadline() {
++    hello_deadline_releases_link("hello-no-idle", Duration::ZERO);
++}
++
++fn hello_deadline_releases_link(tag: &str, idle: Duration) {
++    let dir = fresh_dir(tag);
+     // Short hello deadline (150 ms) so the test is quick.
+-    let inbox = Inbox::link_with_timeouts(&dir, Box::new(|| {}), Duration::from_secs(60), Duration::from_millis(150))
++    let inbox = Inbox::link_with_timeouts(&dir, Box::new(|| {}), idle, Duration::from_millis(150))
+         .expect("open the link");
+     let entry = inbox.link_entry().expect("a link entry").clone();
+ 
+diff --git a/crates/ui/src/cli_options.rs b/crates/ui/src/cli_options.rs
+index 1aa8883c67..c16046f1cf 100644
+--- a/crates/ui/src/cli_options.rs
++++ b/crates/ui/src/cli_options.rs
+@@ -80,6 +80,14 @@ pub const OPTIONS: &[Opt] = &[
+         default: "off",
+         help: "Open the MCP server for AI agents on this local port (0 to 65535).",
+     },
++    Opt {
++        flag: "--mcp-idle-timeout",
++        short: None,
++        value: Some("<seconds>"),
++        env: Some("CAMCRAFT_MCP_IDLE_TIMEOUT"),
++        default: "300 seconds",
++        help: "Drop an idle live MCP client after this many whole seconds. Zero disables idle expiry; the UI link hello deadline stays in force.",
++    },
+     Opt {
+         flag: "--no-activate",
+         short: None,
+diff --git a/crates/ui/src/cli_options_tests.rs b/crates/ui/src/cli_options_tests.rs
+index f5854c35e7..046285e444 100644
+--- a/crates/ui/src/cli_options_tests.rs
++++ b/crates/ui/src/cli_options_tests.rs
+@@ -55,6 +55,25 @@ fn help_and_version_are_found_in_any_place() {
+     assert_eq!(parse(&argv(&[])), Ok(Parsed::Run));
+ }
+ 
++#[test]
++fn idle_timeout_is_a_start_option_not_a_file() {
++    let args = argv(&["--mcp-idle-timeout", "0", "job.camproj"]);
++    assert_eq!(parse(&args), Ok(Parsed::Run));
++    assert_eq!(files(&args), ["job.camproj"]);
++    assert_eq!(parse(&argv(&["--mcp-idle-timeout=0"])), Ok(Parsed::Run));
++    let text = help_text();
++    assert!(text.contains("CAMCRAFT_MCP_IDLE_TIMEOUT"));
++    assert!(text.contains("300"));
++}
++
++#[test]
++fn invalid_idle_timeout_stops_before_a_window_opens() {
++    for value in ["bad", "-1", "NaN", "inf", "1.5", "18446744073709551616", ""] {
++        assert_eq!(crate::run(&argv(&[&format!("--mcp-idle-timeout={value}")])), 2, "{value}");
++    }
++    assert_eq!(crate::run(&argv(&["--mcp-idle-timeout"])), 2);
++}
++
+ #[test]
+ fn unknown_option_gives_an_error_that_names_it() {
+     let err = parse(&argv(&["--gpu-bakend", "dx12"])).unwrap_err();
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index 5b5a042e53..c071996a1d 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -458,6 +458,14 @@ pub fn run(args: &[String]) -> i32 {
+             return 2;
+         }
+     };
++    let idle_env = std::env::var("CAMCRAFT_MCP_IDLE_TIMEOUT").ok();
++    let mcp_idle = match camcraft_app::mcp::idle_timeout_from(args, idle_env.as_deref()) {
++        Ok(idle) => idle,
++        Err(err) => {
++            diag_warn!("mcp: {err}");
++            return 2;
++        }
++    };
+     if args.iter().any(|a| a == "--headless") {
+         if pick != gpu::GpuPick::Auto || want.is_some() {
+             diag_info!("gpu: --headless pins the fallback adapter for determinism; backend and adapter picks ignored");
+@@ -474,7 +482,7 @@ pub fn run(args: &[String]) -> i32 {
+     } else {
+         // #2462: the file named on the command line opens in the window;
+         // #3609: read-only with `--read-only`.
+-        run_windowed(pick, want, mcp_port, &crate::cli_options::files(args), crate::cli_options::start_mode(args), crate::cli_options::read_only(args))
++        run_windowed(pick, want, mcp_port, mcp_idle, &crate::cli_options::files(args), crate::cli_options::start_mode(args), crate::cli_options::read_only(args))
+     }
+ }
+ 
+@@ -501,15 +509,15 @@ fn run_headless(_open: Option<crate::state::CommandKind>) -> i32 {
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+-fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: Option<u16>, files: &[String], start: crate::cli_options::StartMode, read_only: bool) -> i32 {
+-    shell_window::run_windowed(pick, want, mcp_port, files, start, read_only)
++fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: Option<u16>, mcp_idle: std::time::Duration, files: &[String], start: crate::cli_options::StartMode, read_only: bool) -> i32 {
++    shell_window::run_windowed(pick, want, mcp_port, mcp_idle, files, start, read_only)
+ }
+ 
+ /// #31: the browser build has no winit window to open - its shell is the
+ /// web runner still owed on that issue - so the windowed entry refuses by
+ /// name instead of pretending.
+ #[cfg(target_arch = "wasm32")]
+-fn run_windowed(_pick: gpu::GpuPick, _want: Option<String>, _mcp_port: Option<u16>, _files: &[String], _start: crate::cli_options::StartMode, _read_only: bool) -> i32 {
++fn run_windowed(_pick: gpu::GpuPick, _want: Option<String>, _mcp_port: Option<u16>, _mcp_idle: std::time::Duration, _files: &[String], _start: crate::cli_options::StartMode, _read_only: bool) -> i32 {
+     diag_warn!("{WASM_NO_WINDOW}");
+     2
+ }
+diff --git a/crates/ui/src/egui_app/shell_window.rs b/crates/ui/src/egui_app/shell_window.rs
+index 7adfbd4087..79dd0f3a21 100644
+--- a/crates/ui/src/egui_app/shell_window.rs
++++ b/crates/ui/src/egui_app/shell_window.rs
+@@ -33,7 +33,7 @@ mod start;
+ 
+ /// The windowed shell (the `--ui egui` entry without `--headless`); returns
+ /// the process exit code.
+-pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: Option<u16>, files: &[String], start: crate::cli_options::StartMode, read_only: bool) -> i32 {
++pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: Option<u16>, mcp_idle: std::time::Duration, files: &[String], start: crate::cli_options::StartMode, read_only: bool) -> i32 {
+     let event_loop = match EventLoop::new() {
+         Ok(el) => el,
+         Err(err) => {
+@@ -70,7 +70,7 @@ pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: O
+         let wake: camcraft_app::mcp::Wake = Box::new(move || {
+             let _ = proxy.send_event(());
+         });
+-        match camcraft_app::mcp::Inbox::listen(port, wake) {
++        match camcraft_app::mcp::Inbox::listen_with_idle(port, wake, mcp_idle) {
+             Ok(inbox) => {
+                 if let Some(addr) = inbox.addr() {
+                     diag_warn!("mcp: listening on {addr} (connect with: camcraft-cli mcp --connect {addr})");
+@@ -93,7 +93,7 @@ pub(crate) fn run_windowed(pick: gpu::GpuPick, want: Option<String>, mcp_port: O
+                 let wake: camcraft_app::mcp::Wake = Box::new(move || {
+                     let _ = proxy.send_event(());
+                 });
+-                match camcraft_app::mcp::Inbox::link(&dir, wake) {
++                match camcraft_app::mcp::Inbox::link_with_timeouts(&dir, wake, mcp_idle, camcraft_app::mcp::HELLO_TIMEOUT) {
+                     Ok(inbox) => shell.state.ui_link = Some(inbox),
+                     Err(err) => {
+                         diag_warn!("ui link: cannot open in {}: {err}", dir.display());
+diff --git a/docs/decisions/3940-mcp-idle-timeout.md b/docs/decisions/3940-mcp-idle-timeout.md
+new file mode 100644
+index 0000000000..486cf2da9f
+--- /dev/null
++++ b/docs/decisions/3940-mcp-idle-timeout.md
+@@ -0,0 +1,23 @@
++## #3940 - Configure the live MCP idle window
++
++**Decided:** Accept `--mcp-idle-timeout <seconds>` and
++`CAMCRAFT_MCP_IDLE_TIMEOUT` at app startup. The option wins. Use whole
++seconds that fit `u64`, like the existing integer port parser. An absent
++or blank environment value keeps 300 seconds. Invalid values stop startup
++with a named usage error. Zero disables idle expiry.
++
++**Why:** The stdio bridge exits when the app drops its client. A user can
++keep a long CAM session connected without changing the default for others.
++Use the same window for the live TCP listener and the authenticated UI
++link. Keep the five-second pre-hello deadline, framing limits, cancellation
++and one-client ownership unchanged. Poll for shutdown even with no idle
++expiry. No document or machining behavior changes.
++
++**Dropped:** Automatic bridge reconnection is a separate protocol change.
++Floating-point seconds add parsing rules that this startup option does not
++need. An infinite duration sentinel can overflow deadline arithmetic; use
++an explicit zero check and keep elapsed-duration subtraction instead.
++
++**Cost to change later:** Small. Parsing stays with the MCP startup options.
++The listener already accepts a duration. Fractional seconds could be added
++without changing the wire protocol.
+diff --git a/docs/user-guide/start-options.md b/docs/user-guide/start-options.md
+index 3d0e02afa1..16f3e1be48 100644
+--- a/docs/user-guide/start-options.md
++++ b/docs/user-guide/start-options.md
+@@ -18,6 +18,7 @@ gives an error that names it. The program does not start in that case.
+ | `--gpu-backend` | `dx12`, `metal`, `vulkan` or `gl` | `CAMCRAFT_GPU_BACKEND` | automatic | Try this graphics system first. |
+ | `--gpu` | part of an adapter name | `CAMCRAFT_GPU` | automatic | Use the graphics card whose name holds this text. |
+ | `--mcp-port` | port number | `CAMCRAFT_MCP_PORT` | off | Open the MCP server for AI agents on this local port. |
++| `--mcp-idle-timeout` | whole seconds (u64) | `CAMCRAFT_MCP_IDLE_TIMEOUT` | `300` | Idle window for live MCP clients and authenticated UI link clients. `0` disables idle expiry. The UI link hello still has its five-second deadline. |
+ | `--no-activate` | none | none | off | Show the window but do not make it the foreground window. The window that has the focus keeps it. |
+ | `--minimized` | none | none | off | Start with the window minimized. It does not take the focus and it covers no other window. This also sets `--no-activate`. |
+ | `--read-only` | none | none | off | Open the project file read-only. Save does not write over the file: it opens Save As, which writes your own copy. The title bar says read-only. Changes are allowed. A model file is imported as usual. |
+diff --git a/site/content/guide/automate/mcp.md b/site/content/guide/automate/mcp.md
+index ba1afe4632..896e28539a 100644
+--- a/site/content/guide/automate/mcp.md
++++ b/site/content/guide/automate/mcp.md
+@@ -34,8 +34,18 @@ process and talks to it.
+ 
+ The attached mode is off unless you ask for it. The app listens on the
+ loopback address (127.0.0.1) only, serves one client at a time, and
+-disconnects a client that sends nothing for five minutes so the next one
+-can connect. Port `0` picks a free port.
++disconnects a client that sends no complete line for 300 seconds by default.
++Port `0` picks a free port.
++
++Set `camcraft-ui --mcp-port 7777 --mcp-idle-timeout 1800` for a longer
++idle window. `CAMCRAFT_MCP_IDLE_TIMEOUT` supplies the same value; the option
++wins. Use non-negative whole seconds that fit a 64-bit unsigned integer.
++`0` disables idle expiry, including after authentication on the UI link.
++A blank environment variable uses the default. An invalid value stops startup
++with a named error. The UI link still requires a valid hello within five
++seconds. Line limits, one-client ownership and shutdown remain unchanged.
++Set this option on the app, not on the stdio bridge. The bridge does not
++reconnect automatically when the app closes a connection.
+ 
+ ### Setting up an MCP client
+ 
