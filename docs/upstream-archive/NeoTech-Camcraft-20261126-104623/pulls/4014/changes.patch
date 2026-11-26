@@ -1,0 +1,956 @@
+From af4e1082e98c8d5febfbb5e8296cfbdf355094d6 Mon Sep 17 00:00:00 2001
+From: maintainer <maintainer@camcraft.dev>
+Date: Wed, 25 Nov 2026 15:12:01 +0100
+Subject: [PATCH] fix(motion): eliminate full-width cuts at ring merges
+
+Collapse interior Clipper lattice micro-steps (`< 5e-5` mm) in ring
+walks before `share_ends` so segment tangents stay stable at ring
+joins.
+
+Extend `ring_fill` to recursive binary sub-bands up to `RING = 16` that
+fill both uncovered ring gaps and remaining full-width flanks in Inside
+or Outside order, keeping gap reach at `1 * tool_r`, expanding hit cusp
+reach to `2 * tool_r`, and extending boundary pieces within `3.5 *
+tool_r` to `c`'s outer boundary.
+
+Guard `level_order::edge_route` and `ring_links::edge_route` chords
+against walking along flanks where both `0.9 * r` sides cut uncut stock.
+
+Pin `fig8_outside_offset_cuts_no_move_at_full_width` at 0 full-width
+points, `fig8_inside_offset_names_each_full_width_cut` at 0 off-wall
+points and 0 narrow notes, and add
+`one_ring_set::two_lobe_ring_merge_cuts_no_full_width_at_waist`.
+
+Changelog: Fix full-width cuts where offset rings of two lobes merge (#3788)
+Fixes #3788
+---
+ crates/app/tests/offset_pass_start.rs         |  33 ++-
+ crates/motion/src/machining2d/level_flanks.rs |  40 ++-
+ crates/motion/src/machining2d/level_order.rs  |  22 +-
+ crates/motion/src/machining2d/level_rings.rs  |  27 +-
+ crates/motion/src/machining2d/ring_fill.rs    | 261 +++++++++++++++---
+ crates/motion/src/machining2d/ring_links.rs   |  26 +-
+ .../motion/src/machining2d/ring_side_tests.rs |   4 +-
+ .../tests/pass_start_levels/one_ring_set.rs   | 118 +++++++-
+ docs/decisions/3788-ring-merge-waist.md       |  82 ++++++
+ 9 files changed, 545 insertions(+), 68 deletions(-)
+ create mode 100644 docs/decisions/3788-ring-merge-waist.md
+
+diff --git a/crates/app/tests/offset_pass_start.rs b/crates/app/tests/offset_pass_start.rs
+index e87d5d7550..dfcf25985a 100644
+--- a/crates/app/tests/offset_pass_start.rs
++++ b/crates/app/tests/offset_pass_start.rs
+@@ -263,11 +263,10 @@ fn band_material(world: &World, name: &str, (lo, hi): (Point3, Point3)) -> camcr
+ /// tool width, where the band at the lobe tips splits the ring.
+ /// #3744: Outside walks the one ring set (offsets of the part). At the
+ /// waist the rings of the two lobes merge, and a ring corner there moves
+-/// by more than one stepover: 495 full-width points before #3788. The
+-/// fill rings of #3788 (a) clear the stock between two rings there: 21
+-/// points stay, single samples at 7 ring corners (3 levels), and the
+-/// narrow note names them (#3788 (c)). #3788 keeps the corners open; the
+-/// pin goes back to 0 points and no note with them.
++/// by more than one stepover: 495 full-width points before #3788.
++/// #3788: recursive merge fills (`ring_fill`), lattice micro-step
++/// cleanup, and full-width-checked edge joins bring it back to 0 points
++/// and no narrow note.
+ #[test]
+ #[ignore = "heavy lane (#3316 fig8 Outside): one generation and its verify run past the 60 s debug budget (about 170 s) - run with --release -- --ignored"]
+ fn fig8_outside_offset_cuts_no_move_at_full_width() {
+@@ -275,9 +274,10 @@ fn fig8_outside_offset_cuts_no_move_at_full_width() {
+     let (path, _) = offset_op(&world, &mut h, &name, stock.0.z, PassStart::Outside);
+     let full = flanks::full_width_points(&path, &band_material(&world, &name, stock), R8);
+     assert_names_each_full_width_cut(&world, &name, &path, &full, false);
+-    assert!(full.len() <= 21, "{} full-width cut point(s) (#3788: 21 at 7 ring corners), the first at {:?}", full.len(), full.first());
++    assert_eq!(full.len(), 0, "{} full-width cut point(s), the first at {:?}", full.len(), full.first());
+     let named: Vec<&String> = path.notes.iter().filter(|n| n.starts_with(PASS_START_NOTE)).collect();
+     assert!(!named.iter().any(|n| n.contains("is a wall in the stock")), "the band starts in air: {named:?}");
++    assert!(!named.iter().any(|n| n.contains("take the full tool width")), "unexpected narrow note: {named:?}");
+ }
+ 
+ /// #3788 (c): no full-width cut is silent. When the meter finds a cut of
+@@ -285,7 +285,13 @@ fn fig8_outside_offset_cuts_no_move_at_full_width() {
+ /// narrow note; without `wall`, the note's first place is the meter's
+ /// first place. With `wall`, the cuts along the part wall are named by
+ /// the wall note.
+-fn assert_names_each_full_width_cut(world: &World, name: &str, path: &Toolpath, full: &[camcraft_app::geo2d::Point2], wall: bool) {
++fn assert_names_each_full_width_cut(
++    world: &World,
++    name: &str,
++    path: &Toolpath,
++    full: &[camcraft_app::geo2d::Point2],
++    wall: bool,
++) -> Vec<camcraft_app::geo2d::Point2> {
+     let notes: Vec<&String> = path.notes.iter().filter(|n| n.starts_with(PASS_START_NOTE)).collect();
+     let e = model::find_by_name(world, name).expect("part");
+     let part = camcraft_app::geometry::slice::project(&model::world_facets(world, &e).expect("facets"), 64).expect("part outline");
+@@ -304,11 +310,12 @@ fn assert_names_each_full_width_cut(world: &World, name: &str, path: &Toolpath,
+         best
+     };
+     let on_wall = |q: &camcraft_app::geo2d::Point2| (to_wall(q) - R8).abs() < 0.5;
+-    let (walled, open): (Vec<&camcraft_app::geo2d::Point2>, Vec<&camcraft_app::geo2d::Point2>) = full.iter().partition(|q| wall && on_wall(q));
++    let (walled, open): (Vec<camcraft_app::geo2d::Point2>, Vec<camcraft_app::geo2d::Point2>) =
++        full.iter().copied().partition(|q| wall && on_wall(q));
+     if !walled.is_empty() {
+         assert!(notes.iter().any(|n| n.contains("the part wall")), "{} cut(s) along the part wall are not named: {notes:?}", walled.len());
+     }
+-    let Some(first) = open.first() else { return };
++    let Some(first) = open.first() else { return open };
+     let narrow = notes.iter().find(|n| n.contains("take the full tool width"));
+     let Some(narrow) = narrow else { panic!("{} full-width cut(s) are not named, the first at {first:?}: {notes:?}", open.len()) };
+     let at = format!("X {:.3}, Y {:.3}", first.x, first.y);
+@@ -323,11 +330,12 @@ fn assert_names_each_full_width_cut(world: &World, name: &str, path: &Toolpath,
+     // (arcs, links) in another order there: the note is required, its
+     // first place only where no wall cut comes first.
+     assert!(wall || near(narrow), "the note names another place than the meter's first ({at}): {narrow}");
++    open
+ }
+ 
+ /// #3788 (c) pin: Inside on fig8 cuts its first ring along the part wall at
+-/// the full tool width (named by the wall note) and more cuts at the
+-/// waist; each one is named.
++/// the full tool width (named by the wall note) and leaves zero off-wall
++/// full-width cuts at the waist; each full-width cut is named.
+ #[test]
+ #[ignore = "heavy lane (#3788 fig8 Inside): one generation and the meter run past the 60 s debug budget - run with --release -- --ignored"]
+ fn fig8_inside_offset_names_each_full_width_cut() {
+@@ -336,7 +344,8 @@ fn fig8_inside_offset_names_each_full_width_cut() {
+     let full = flanks::full_width_points(&path, &band_material(&world, &name, stock), R8);
+     eprintln!("fig8 Inside: {} full-width point(s)", full.len());
+     assert!(!full.is_empty(), "Inside starts on the part wall, so the meter reads full-width cuts");
+-    assert_names_each_full_width_cut(&world, &name, &path, &full, true);
++    let open = assert_names_each_full_width_cut(&world, &name, &path, &full, true);
++    assert!(open.is_empty(), "fig8 Inside left {} off-wall full-width point(s), first {:?}", open.len(), open.first());
+ }
+ 
+ /// #3744 pin: the one ring set gives no crossing feeds on fig8, from
+diff --git a/crates/motion/src/machining2d/level_flanks.rs b/crates/motion/src/machining2d/level_flanks.rs
+index 7015124b61..533369ed60 100644
+--- a/crates/motion/src/machining2d/level_flanks.rs
++++ b/crates/motion/src/machining2d/level_flanks.rs
+@@ -49,6 +49,39 @@ pub(super) fn full_width_at(
+     tool_r: f64,
+     cut_near: impl Fn(Point2, f64) -> bool,
+ ) -> Option<Point2> {
++    let mut first = None;
++    visit_full_width(samples, material, tool_r, tool_r, &cut_near, |hit| {
++        first = Some(hit[0]);
++        false
++    });
++    first
++}
++
++/// Every `[at, left_flank, right_flank]` along `samples` that cuts the
++/// full tool width when earlier cuts reach `r_cut` around their walks.
++pub(super) fn full_width_flanks(
++    samples: &[Point2],
++    material: &Material<'_>,
++    tool_r: f64,
++    r_cut: f64,
++    cut_near: impl Fn(Point2, f64) -> bool,
++) -> Vec<[Point2; 3]> {
++    let mut out = Vec::new();
++    visit_full_width(samples, material, tool_r, r_cut, &cut_near, |hit| {
++        out.push(hit);
++        true
++    });
++    out
++}
++
++fn visit_full_width(
++    samples: &[Point2],
++    material: &Material<'_>,
++    tool_r: f64,
++    r_cut: f64,
++    cut_near: &impl Fn(Point2, f64) -> bool,
++    mut on_hit: impl FnMut([Point2; 3]) -> bool,
++) {
+     let mut travel = Vec::with_capacity(samples.len());
+     let mut s = 0.0;
+     for (i, &p) in samples.iter().enumerate() {
+@@ -68,12 +101,11 @@ pub(super) fn full_width_at(
+         let flanks = [Point2::new(b.x - ty * f, b.y + tx * f), Point2::new(b.x + ty * f, b.y - tx * f)];
+         let before = travel[i] - OWN_LAG * tool_r;
+         let own = |q: Point2| samples.iter().zip(&travel).take_while(|(_, t)| **t < before).any(|(&o, _)| dist(o, q) <= tool_r);
+-        let uncut = |q: Point2| material.holds(q) && !cut_near(q, tool_r) && !own(q);
+-        if flanks.iter().all(|&q| uncut(q)) {
+-            return Some(b);
++        let uncut = |q: Point2| material.holds(q) && !cut_near(q, r_cut) && !own(q);
++        if flanks.iter().all(|&q| uncut(q)) && !on_hit([b, flanks[0], flanks[1]]) {
++            break;
+         }
+     }
+-    None
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/motion/src/machining2d/level_order.rs b/crates/motion/src/machining2d/level_order.rs
+index 080eeba12c..1bb377281a 100644
+--- a/crates/motion/src/machining2d/level_order.rs
++++ b/crates/motion/src/machining2d/level_order.rs
+@@ -49,14 +49,14 @@ pub(super) struct LevelPlan {
+ }
+ 
+ /// A walk already cut and its bounding box.
+-struct Cut {
++pub(super) struct Cut {
+     pts: Vec<Point2>,
+     lo: Point2,
+     hi: Point2,
+ }
+ 
+ impl Cut {
+-    fn new(pts: Vec<Point2>) -> Cut {
++    pub(super) fn new(pts: Vec<Point2>) -> Cut {
+         let mut lo = Point2::new(f64::INFINITY, f64::INFINITY);
+         let mut hi = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+         for p in &pts {
+@@ -67,7 +67,7 @@ impl Cut {
+     }
+ 
+     /// Is `q` within `d` of this walk?
+-    fn near(&self, q: Point2, d: f64) -> bool {
++    pub(super) fn near(&self, q: Point2, d: f64) -> bool {
+         if q.x < self.lo.x - d || q.x > self.hi.x + d || q.y < self.lo.y - d || q.y > self.hi.y + d {
+             return false;
+         }
+@@ -120,7 +120,19 @@ pub(super) fn order(pieces: Vec<Piece>, center: &Region, tool_r: f64, side: &Sta
+             (Some(&e), Some(&s)) if linkable(e, s, center, &planned, &done, reach, step, air) => Some((e, s, Vec::new())),
+             (Some(&e), Some(&s)) => air.and_then(|_| {
+                 let walks: Vec<&[Point2]> = planned.iter().copied().chain(done.iter().map(|c| c.pts.as_slice())).collect();
+-                let mut via = edge_route(e, s, center, reach, &walks, |a, b| linkable(a, b, center, &planned, &done, reach, step, air))?;
++                let mut via = edge_route(e, s, center, reach, &walks, |a, b| {
++                    linkable(a, b, center, &planned, &done, reach, step, air)
++                        && full_width_at(&samples(&[a, b], step), &material, tool_r, |q, d| done.iter().rev().any(|c| c.near(q, d)))
++                            .is_none()
++                })?;
++                let mut check = Vec::with_capacity(via.len() + 1);
++                check.push(e);
++                check.extend_from_slice(&via);
++                if full_width_at(&samples(&check, step), &material, tool_r, |q, d| done.iter().rev().any(|c| c.near(q, d)))
++                    .is_some()
++                {
++                    return None;
++                }
+                 via.pop();
+                 Some((e, s, via))
+             }),
+@@ -286,7 +298,7 @@ pub(super) fn on_wall(pts: &[Point2], stock: Option<&Region>, tool_r: f64, step:
+ 
+ /// Points along the walk `pts` no farther apart than `step`, both ends
+ /// included.
+-fn samples(pts: &[Point2], step: f64) -> Vec<Point2> {
++pub(super) fn samples(pts: &[Point2], step: f64) -> Vec<Point2> {
+     let mut out: Vec<Point2> = pts.first().copied().into_iter().collect();
+     for w in pts.windows(2) {
+         let n = (dist(w[0], w[1]) / step).ceil().clamp(1.0, 1e5) as usize;
+diff --git a/crates/motion/src/machining2d/level_rings.rs b/crates/motion/src/machining2d/level_rings.rs
+index d1a1d11afb..b0678fe7d6 100644
+--- a/crates/motion/src/machining2d/level_rings.rs
++++ b/crates/motion/src/machining2d/level_rings.rs
+@@ -20,12 +20,13 @@
+ use crate::geo2d::{Loop, Point2, Region, RingClip};
+ 
+ use super::face::GenError;
+-use super::level_order::{Piece, WALL, order};
++use super::level_flanks::Material;
++use super::level_order::{Cut, Piece, WALL, order};
+ use super::pass_start::{PassStart, StartSide};
+ use super::pocket::PocketParams;
+ use super::pocket_plan::plan_passes;
+ use super::pocket_strategy::PocketStrategy;
+-use super::ring_fill::{Band, RING, closed_walk, fills};
++use super::ring_fill::{Band, RING, clean_walk, closed_walk, fills};
+ use super::ring_side::{mirror, share_ends};
+ use super::ring::dist;
+ 
+@@ -177,7 +178,7 @@ pub(super) fn level_pieces(
+                 }
+             }
+             if side.around_part {
+-                let fill = Band { c: &c, hc: &hc, j: 0, step, tool_r, climb };
++                let fill = Band { c: &c, hc: &hc, stock: side.stock.as_ref(), j: 0, step, tool_r, climb };
+                 add_fills(&mut out, first, &fill, last)?;
+             }
+             if start == PassStart::Outside {
+@@ -217,10 +218,13 @@ fn add_fills(out: &mut Vec<Piece>, first: usize, band: &Band<'_>, last: u32) ->
+     let walks = |out: &[Piece], lev: u32| -> Vec<Vec<Point2>> {
+         out.iter().skip(first).filter(|p| !p.core && p.level == lev).map(closed_walk).collect()
+     };
++    let material = Material::new(band.c, band.stock, band.tool_r)?;
++    let part_wall: Vec<Cut> = walks(out, 0).into_iter().map(Cut::new).collect();
++    let outer_edge: Vec<Cut> = walks(out, WALL).into_iter().map(Cut::new).collect();
+     let mut add = Vec::new();
+     for j in 1..=last {
+         let (inner, outer) = (walks(out, RING.saturating_mul(j - 1)), walks(out, RING.saturating_mul(j)));
+-        add.extend(fills(&Band { j, ..*band }, &inner, &outer)?);
++        add.extend(fills(&Band { j, ..*band }, &material, &part_wall, &outer_edge, &inner, &outer)?);
+     }
+     out.extend(add);
+     Ok(())
+@@ -272,7 +276,10 @@ fn core_first(c: &Region, step: f64, climb: bool, cap: u32, out: &mut Vec<Piece>
+         }
+         for l in ring.loops() {
+             if l.points().len() >= 2 {
+-                rings.push((k, walk(l.points(), !climb)));
++                let pts = clean_walk(walk(l.points(), !climb), true);
++                if pts.len() >= 3 {
++                    rings.push((k, pts));
++                }
+             }
+         }
+     }
+@@ -315,10 +322,16 @@ fn walk(pts: &[Point2], reverse: bool) -> Vec<Point2> {
+ 
+ fn push(out: &mut Vec<Piece>, level: u32, ring: &[Point2], clip: RingClip) {
+     match clip {
+-        RingClip::Whole if ring.len() >= 2 => out.push(Piece { level, pts: ring.to_vec(), closed: true, core: false }),
+-        RingClip::Whole => {}
++        RingClip::Whole => {
++            let pts = clean_walk(ring.to_vec(), true);
++            let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
++            if pts.len() >= 3 || (pts.len() == 2 && len >= MIN_PIECE) {
++                out.push(Piece { level, pts, closed: true, core: false });
++            }
++        }
+         RingClip::Pieces(ps) => {
+             for pts in ps {
++                let pts = clean_walk(pts, false);
+                 let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+                 if pts.len() >= 2 && len >= MIN_PIECE {
+                     out.push(Piece { level, pts, closed: false, core: false });
+diff --git a/crates/motion/src/machining2d/ring_fill.rs b/crates/motion/src/machining2d/ring_fill.rs
+index 6bdac28a4b..4509669c2d 100644
+--- a/crates/motion/src/machining2d/ring_fill.rs
++++ b/crates/motion/src/machining2d/ring_fill.rs
+@@ -13,79 +13,229 @@
+ //! where the offsets merge; the zone test is ours (the flanks law of
+ //! `level_flanks`). No vendor material consulted.
+ 
++use std::collections::BTreeMap;
++
+ use crate::geo2d::{Point2, Region, RingClip};
+ 
+ use super::face::GenError;
+-use super::level_order::Piece;
++use super::level_flanks::{Material, full_width_flanks};
++use super::level_order::{Cut, Piece, samples};
+ use super::ring::dist;
+ 
+ /// The sub-levels of one ring: ring `j` is level `RING * j`, its fills
+-/// the levels between `RING * (j - 1)` and `RING * j`.
+-pub(super) const RING: u32 = 4;
++/// the levels between `RING * (j - 1)` and `RING * j` (up to 1/16 step).
++pub(super) const RING: u32 = 16;
+ 
+ /// How far (in tool radii) a flank point stands from a walk.
+ const FLANK: f64 = 0.9;
+ 
++/// Conservative earlier-cut reach (in tool radii) when checking whether
++/// a ring corner still needs a fill: gives margin over discrete meters.
++const CUT_MARGIN: f64 = 0.95;
++
+ /// A zone smaller than this (mm2, after a 10 um erosion) needs no fill.
+ const ZONE_MIN: f64 = 0.002;
+ 
+ /// Fills shorter than this (mm) are dropped.
+ const MIN_FILL: f64 = 0.5;
+ 
++/// Clipper integer lattice micro-steps shorter than this (mm, half of
++/// `ring_side::SNAP`) are collapsed inside a walk so lattice jitter does
++/// not flip the segment tangent.
++const MICRO_SEG: f64 = 5e-5;
++
++/// Half-width (mm) of a patch added around a full-width flank hit so the
++/// clipped fill extends past both flanks into already-cut material.
++const HIT_PAD: f64 = 0.2;
++
+ /// One band of the ring set: the ring `j` between the distance curves
+ /// `inner` (ring `j - 1`) and `outer` (ring `j`), with `hc` the part's
+-/// centre keep-out (distance 0) and `c` the cutter-centre area.
++/// centre keep-out (distance 0), `c` the cutter-centre area, and `stock`
++/// the stock footprint.
+ pub(super) struct Band<'a> {
+     pub(super) c: &'a Region,
+     pub(super) hc: &'a Region,
++    pub(super) stock: Option<&'a Region>,
+     pub(super) j: u32,
+     pub(super) step: f64,
+     pub(super) tool_r: f64,
+     pub(super) climb: bool,
+ }
+ 
++/// Drops Clipper lattice micro-steps (`< MICRO_SEG`) inside a walk while
++/// keeping both endpoints of an open piece unchanged so `share_ends` keeps
++/// exact boundary intersections.
++pub(super) fn clean_walk(pts: Vec<Point2>, closed: bool) -> Vec<Point2> {
++    if pts.len() <= 2 {
++        return pts;
++    }
++    let Some(&first) = pts.first() else { return pts };
++    let Some(&last) = pts.last() else { return pts };
++    let mut out = Vec::with_capacity(pts.len());
++    out.push(first);
++    let end = if closed { pts.len() } else { pts.len() - 1 };
++    for &p in &pts[1..end] {
++        if let Some(&prev) = out.last()
++            && dist(prev, p) >= MICRO_SEG
++        {
++            out.push(p);
++        }
++    }
++    if closed {
++        while out.len() > 2 && out.last().is_some_and(|&p| dist(p, first) < MICRO_SEG) {
++            out.pop();
++        }
++    } else {
++        while out.len() > 1 && out.last().is_some_and(|&p| dist(p, last) < MICRO_SEG) {
++            out.pop();
++        }
++        out.push(last);
++    }
++    out
++}
++
++struct FillCtx<'a> {
++    band: &'a Band<'a>,
++    material: &'a Material<'a>,
++    part_wall: &'a [Cut],
++    outer_edge: &'a [Cut],
++}
++
+ /// The fills of `band`, given the pieces of its two rings: none where
+ /// each flank of each ring meets the other ring's swath (the common
+-/// case, a stepover under 1.9 radii), a half ring where they leave stock
+-/// between them, and two quarter rings where the half leaves some.
+-pub(super) fn fills(band: &Band<'_>, inner: &[Vec<Point2>], outer: &[Vec<Point2>]) -> Result<Vec<Piece>, GenError> {
++/// case), and recursive binary fills (up to `1 / RING` step) where a
++/// gap or a full-width flank remains in either Inside or Outside order.
++pub(super) fn fills(
++    band: &Band<'_>,
++    material: &Material<'_>,
++    part_wall: &[Cut],
++    outer_edge: &[Cut],
++    inner: &[Vec<Point2>],
++    outer: &[Vec<Point2>],
++) -> Result<Vec<Piece>, GenError> {
+     let mut out = Vec::new();
+-    let Band { c, hc, j, step, tool_r, .. } = *band;
++    let j = band.j;
+     if j == 0 || inner.is_empty() || outer.is_empty() {
+         return Ok(out);
+     }
+-    let d = |k: f64| (f64::from(j) - 1.0 + k) * step;
+-    let lo = if j == 1 { hc.clone() } else { hc.offset(d(0.0))? };
+-    let ring = hc.offset(d(1.0))?.difference(&lo)?.intersect(c)?;
+-    let zone = gap(&ring, inner, outer, tool_r)?;
++    let lo_lev = RING.saturating_mul(j - 1);
++    let hi_lev = RING.saturating_mul(j);
++    let mut levels: BTreeMap<u32, Vec<(Vec<Point2>, Cut)>> = BTreeMap::new();
++    levels.insert(lo_lev, inner.iter().cloned().map(|w| (w.clone(), Cut::new(w))).collect());
++    levels.insert(hi_lev, outer.iter().cloned().map(|w| (w.clone(), Cut::new(w))).collect());
++    let ctx = FillCtx { band, material, part_wall, outer_edge };
++    split_band(&ctx, &mut levels, lo_lev, hi_lev, 0, &mut out)?;
++    Ok(out)
++}
++
++fn split_band(
++    ctx: &FillCtx<'_>,
++    levels: &mut BTreeMap<u32, Vec<(Vec<Point2>, Cut)>>,
++    lo_lev: u32,
++    hi_lev: u32,
++    depth: u32,
++    out: &mut Vec<Piece>,
++) -> Result<(), GenError> {
++    if hi_lev - lo_lev < 2 {
++        return Ok(());
++    }
++    let band = ctx.band;
++    let d_at = |lev: u32| f64::from(lev) * band.step / f64::from(RING);
++    let lo_reg = if lo_lev == 0 { band.hc.clone() } else { band.hc.offset(d_at(lo_lev))? };
++    let ring = band.hc.offset(d_at(hi_lev))?.difference(&lo_reg)?.intersect(band.c)?;
++    let lo_walks: Vec<Vec<Point2>> = levels.range(..=lo_lev).flat_map(|(_, v)| v.iter().map(|(w, _)| w.clone())).collect();
++    let hi_walks: Vec<Vec<Point2>> = levels.range(hi_lev..).flat_map(|(_, v)| v.iter().map(|(w, _)| w.clone())).collect();
++    let mut zone = if depth == 0 {
++        gap(&ring, &lo_walks, &hi_walks, band.tool_r)?
++    } else {
++        let swept = Region::sweep(&lo_walks, band.tool_r)?.union(&Region::sweep(&hi_walks, band.tool_r)?)?;
++        ring.difference(&swept)?
++    };
++    let hits = merge_flank_hits(ctx, levels, lo_lev, hi_lev);
++    if !hits.is_empty() {
++        let hit_zone = Region::sweep(&hits, HIT_PAD)?;
++        zone = if zone.is_empty() { hit_zone } else { zone.union(&hit_zone)? };
++    }
+     if zone.offset(-0.01)?.area().abs() <= ZONE_MIN {
+-        return Ok(out);
++        return Ok(());
++    }
++    let mid_lev = lo_lev + (hi_lev - lo_lev) / 2;
++    let reach = if hits.is_empty() { band.tool_r } else { 2.0 * band.tool_r };
++    let half = level(band, d_at(mid_lev), &zone, reach, mid_lev)?;
++    if half.is_empty() {
++        return Ok(());
+     }
+-    let half = level(band, d(0.5), &zone, RING * j - 2)?;
+-    let left = zone.difference(&swath(&half, tool_r)?)?;
++    let mid_walks: Vec<(Vec<Point2>, Cut)> = half
++        .iter()
++        .map(closed_walk)
++        .map(|w| (w.clone(), Cut::new(w)))
++        .collect();
+     out.extend(half);
+-    if left.offset(-0.01)?.area().abs() > ZONE_MIN {
+-        out.extend(level(band, d(0.25), &left, RING * j - 3)?);
+-        out.extend(level(band, d(0.75), &left, RING * j - 1)?);
++    levels.entry(mid_lev).or_default().extend(mid_walks);
++    split_band(ctx, levels, lo_lev, mid_lev, depth + 1, out)?;
++    split_band(ctx, levels, mid_lev, hi_lev, depth + 1, out)?;
++    Ok(())
++}
++
++/// Checks both Inside (`hi_lev` after `<= lo_lev`) and Outside (`lo_lev`
++/// after `>= hi_lev`) walking orders for full-width flanks between the
++/// two sides of the sub-band, returning line segments `[at, flank]` to
++/// expand `zone` around any uncovered corner.
++fn merge_flank_hits(
++    ctx: &FillCtx<'_>,
++    levels: &BTreeMap<u32, Vec<(Vec<Point2>, Cut)>>,
++    lo_lev: u32,
++    hi_lev: u32,
++) -> Vec<Vec<Point2>> {
++    let tool_r = ctx.band.tool_r;
++    let step = 0.25 * tool_r;
++    let r_cut = CUT_MARGIN * tool_r;
++    let cut_lo = |q: Point2, d: f64| {
++        ctx.part_wall.iter().any(|c| c.near(q, d))
++            || levels.range(..=lo_lev).flat_map(|(_, v)| v.iter()).any(|(_, c)| c.near(q, d))
++    };
++    let cut_hi = |q: Point2, d: f64| {
++        ctx.outer_edge.iter().any(|c| c.near(q, d))
++            || levels.range(hi_lev..).flat_map(|(_, v)| v.iter()).any(|(_, c)| c.near(q, d))
++    };
++    let mut segs = Vec::new();
++    let mut collect = |walk: &[Point2], cut_near: &dyn Fn(Point2, f64) -> bool| {
++        let pts = samples(walk, step);
++        let hits = full_width_flanks(&pts, ctx.material, tool_r, r_cut, cut_near);
++        let mut last: Option<Point2> = None;
++        for (idx, &[at, fl, fr]) in hits.iter().enumerate() {
++            if idx + 1 == hits.len() || last.is_none_or(|p| dist(p, at) >= step) {
++                segs.push(vec![at, fl]);
++                segs.push(vec![at, fr]);
++                last = Some(at);
++            }
++        }
++    };
++    if let Some(lo) = levels.get(&lo_lev) {
++        for (w, _) in lo {
++            let rev: Vec<Point2> = w.iter().rev().copied().collect();
++            collect(&rev, &cut_hi);
++        }
+     }
+-    Ok(out)
++    if let Some(hi) = levels.get(&hi_lev) {
++        for (w, _) in hi {
++            collect(w, &cut_lo);
++        }
++    }
++    segs
+ }
+ 
+ /// The stock between two rings that a flank of one meets and the swath
+-/// of the other leaves: either order of the walk cuts the full width
+-/// there.
++/// of the other leaves, or that neither swath reaches: either order of
++/// the walk cuts the full width there.
+ fn gap(ring: &Region, inner: &[Vec<Point2>], outer: &[Vec<Point2>], tool_r: f64) -> Result<Region, GenError> {
+     let near = |w: &[Vec<Point2>], r: f64| Region::sweep(w, r);
+     let (i_flank, i_cut) = (near(inner, FLANK * tool_r)?, near(inner, tool_r)?);
+     let (o_flank, o_cut) = (near(outer, FLANK * tool_r)?, near(outer, tool_r)?);
+     let a = ring.intersect(&i_flank)?.difference(&o_cut)?;
+     let b = ring.intersect(&o_flank)?.difference(&i_cut)?;
+-    Ok(a.union(&b)?)
+-}
+-
+-fn swath(ps: &[Piece], tool_r: f64) -> Result<Region, GenError> {
+-    let walks: Vec<Vec<Point2>> = ps.iter().map(closed_walk).collect();
+-    Ok(Region::sweep(&walks, tool_r)?)
++    let mid = ring.difference(&i_cut.union(&o_cut)?)?;
++    Ok(a.union(&b)?.union(&mid)?)
+ }
+ 
+ /// A piece's walk, closed when the piece is a whole ring.
+@@ -98,20 +248,34 @@ pub(super) fn closed_walk(p: &Piece) -> Vec<Point2> {
+ }
+ 
+ /// The distance curve at `d` from the part, walked as the rings are, and
+-/// clipped to the area round `zone` that a fill needs (the zone grown by
+-/// the tool radius, inside the cutter-centre area).
+-fn level(band: &Band<'_>, d: f64, zone: &Region, lev: u32) -> Result<Vec<Piece>, GenError> {
+-    let near = zone.offset(band.tool_r)?.intersect(band.c)?;
++/// clipped to the area round `zone` that a fill needs (`zone` grown by
++/// `reach`, inside the cutter-centre area). Open pieces that end within
++/// `3.5 * tool_r` of `c`'s boundary extend to that boundary so pass
++/// links along the edge in air reach them without lifting.
++fn level(band: &Band<'_>, d: f64, zone: &Region, reach: f64, lev: u32) -> Result<Vec<Piece>, GenError> {
++    let base_near = zone.offset(reach)?.intersect(band.c)?;
+     let mut out = Vec::new();
+     for l in band.hc.offset(d)?.loops() {
+         // As `level_rings::curves` walks ring `j`: the distance curve has
+         // the cut side on its left, reversed for climb.
+         let walk: Vec<Point2> = if band.climb { l.points().to_vec() } else { l.points().iter().rev().copied().collect() };
++        let tails = tail_extension(band, &walk, &base_near)?;
++        let near = if tails.is_empty() {
++            base_near.clone()
++        } else {
++            base_near.union(&Region::sweep(&tails, 0.1)?)?.intersect(band.c)?
++        };
+         match near.clip_ring(&walk, true)? {
+-            RingClip::Whole if walk.len() >= 2 => out.push(Piece { level: lev, pts: walk, closed: true, core: false }),
+-            RingClip::Whole => {}
++            RingClip::Whole => {
++                let pts = clean_walk(walk, true);
++                let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
++                if pts.len() >= 3 || (pts.len() == 2 && len >= MIN_FILL) {
++                    out.push(Piece { level: lev, pts, closed: true, core: false });
++                }
++            }
+             RingClip::Pieces(ps) => {
+                 for pts in ps {
++                    let pts = clean_walk(pts, false);
+                     let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+                     if pts.len() >= 2 && len >= MIN_FILL {
+                         out.push(Piece { level: lev, pts, closed: false, core: false });
+@@ -123,10 +287,34 @@ fn level(band: &Band<'_>, d: f64, zone: &Region, lev: u32) -> Result<Vec<Piece>,
+     Ok(out)
+ }
+ 
++fn tail_extension(band: &Band<'_>, walk: &[Point2], near: &Region) -> Result<Vec<Vec<Point2>>, GenError> {
++    let mut tails = Vec::new();
++    let RingClip::Pieces(cands) = band.c.clip_ring(walk, true)? else {
++        return Ok(tails);
++    };
++    let max_tail = 3.5 * band.tool_r;
++    for cand in cands {
++        let inside: Vec<usize> = cand.iter().enumerate().filter(|(_, p)| near.contains(**p)).map(|(i, _)| i).collect();
++        let (Some(&first), Some(&last)) = (inside.first(), inside.last()) else {
++            continue;
++        };
++        let head: f64 = cand[..=first].windows(2).map(|w| dist(w[0], w[1])).sum();
++        if first > 0 && head <= max_tail {
++            tails.push(cand[..=first].to_vec());
++        }
++        let tail: f64 = cand[last..].windows(2).map(|w| dist(w[0], w[1])).sum();
++        if last + 1 < cand.len() && tail <= max_tail {
++            tails.push(cand[last..].to_vec());
++        }
++    }
++    Ok(tails)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{Band, RING, fills};
+     use crate::geo2d::{Loop, Point2, Region};
++    use crate::machining2d::level_flanks::Material;
+ 
+     fn circle(r: f64, from: f64, to: f64, n: u32) -> Vec<Point2> {
+         (0..=n).map(|k| {
+@@ -148,13 +336,14 @@ mod tests {
+         let tau = std::f64::consts::TAU;
+         let hc = region(circle(10.0, 0.0, tau, 255).into_iter().take(256).collect());
+         let c = region(vec![Point2::new(-30.0, -30.0), Point2::new(30.0, -30.0), Point2::new(30.0, 30.0), Point2::new(-30.0, 30.0)]);
+-        let band = Band { c: &c, hc: &hc, j: 1, step: 2.0, tool_r: 4.0, climb: true };
++        let mat = Material::new(&c, None, 4.0).unwrap_or_else(|e| panic!("{e:?}"));
++        let band = Band { c: &c, hc: &hc, stock: None, j: 1, step: 2.0, tool_r: 4.0, climb: true };
+         let inner = vec![circle(10.0, 0.0, tau, 256)];
+-        let whole = fills(&band, &inner, &[circle(12.0, 0.0, tau, 256)]).unwrap_or_else(|e| panic!("{e:?}"));
++        let whole = fills(&band, &mat, &[], &[], &inner, &[circle(12.0, 0.0, tau, 256)]).unwrap_or_else(|e| panic!("{e:?}"));
+         assert!(whole.is_empty(), "a whole band: {} fill(s)", whole.len());
+         // The wide band: step 8 (2 radii), the outer ring on one half only.
+         let wide = Band { step: 8.0, ..band };
+-        let half = fills(&wide, &inner, &[circle(18.0, 0.0, 0.5 * tau, 128)]).unwrap_or_else(|e| panic!("{e:?}"));
++        let half = fills(&wide, &mat, &[], &[], &inner, &[circle(18.0, 0.0, 0.5 * tau, 128)]).unwrap_or_else(|e| panic!("{e:?}"));
+         assert!(!half.is_empty(), "the gap gets a fill");
+         for f in &half {
+             assert!(f.level > 0 && f.level < RING, "a fill lies between ring 0 and ring 1: {}", f.level);
+diff --git a/crates/motion/src/machining2d/ring_links.rs b/crates/motion/src/machining2d/ring_links.rs
+index 2a02778038..792fae8a44 100644
+--- a/crates/motion/src/machining2d/ring_links.rs
++++ b/crates/motion/src/machining2d/ring_links.rs
+@@ -142,7 +142,9 @@ pub(super) fn link(
+         Ok(()) => vec![at, e],
+         Err(why) => {
+             let walks: Vec<&[Point2]> = cuts.iter().flat_map(|c| c.iter().map(Vec::as_slice)).collect();
+-            let ok = |p: Point2, q: Point2| chord_proof(b, rl, cen, cuts, p, q, z, r).is_ok();
++            let ok = |p: Point2, q: Point2| {
++                chord_proof(b, rl, cen, cuts, p, q, z, r).is_ok() && !chord_full_width(b, rl, p, q, z, r)
++            };
+             let Some(via) = edge_route(at, e, cen.room(), SWATH * r, &walks, ok) else {
+                 return Err(why);
+             };
+@@ -201,6 +203,28 @@ fn chord_proof(
+     Ok(())
+ }
+ 
++/// Does an in-plane edge-route chord `a -> s` leave both flanks (`0.9 r`
++/// either side) uncut in stock, so walking it would cut full width?
++fn chord_full_width(b: &PathBuilder, rl: &RingLinks, a: Point2, s: Point2, z: f64, r: f64) -> bool {
++    let r_full = r / (1.0 - plunge_law::CORE);
++    let f = SWATH * r;
++    let cleared = |q: Point2| rl.in_air(q) || plunge_law::column_cleared(b.moves(), q, z, r_full);
++    let pts = samples(&[a, s], 0.25 * r);
++    for w in pts.windows(2) {
++        let len = dist(w[0], w[1]);
++        if len <= 1e-9 {
++            continue;
++        }
++        let (tx, ty) = ((w[1].x - w[0].x) / len, (w[1].y - w[0].y) / len);
++        let fl = Point2::new(w[1].x - ty * f, w[1].y + tx * f);
++        let fr = Point2::new(w[1].x + ty * f, w[1].y - tx * f);
++        if !cleared(fl) && !cleared(fr) {
++            return true;
++        }
++    }
++    false
++}
++
+ /// The walk from `e` to `s` along a loop of `center` that both stand on
+ /// or within `gap` of (then a chord to a point of the loop: the nearest,
+ /// or a vertex of `walks` on the loop, a shared vertex), the shorter way
+diff --git a/crates/motion/src/machining2d/ring_side_tests.rs b/crates/motion/src/machining2d/ring_side_tests.rs
+index 81000f7160..b603026ea2 100644
+--- a/crates/motion/src/machining2d/ring_side_tests.rs
++++ b/crates/motion/src/machining2d/ring_side_tests.rs
+@@ -104,9 +104,9 @@ fn the_mirror_reverses_each_piece_and_swaps_the_ends_of_the_order() {
+         Piece { level: 5, pts: vec![Point2::new(9.0, 9.0), Point2::new(8.0, 9.0)], closed: true, core: true },
+     ];
+     mirror(&mut ps);
+-    // The highest level 3 rounds up to the ring level 4: l -> 8 - l.
++    // The highest level 3 rounds up to the ring level RING: l -> 2 * RING - l.
+     let levels: Vec<u32> = ps.iter().map(|p| p.level).collect();
+-    assert_eq!(levels, vec![WALL, 6, 5, 0, 5]);
++    assert_eq!(levels, vec![WALL, 2 * RING - 2, 2 * RING - 3, 0, 5]);
+     assert_eq!(ps[0].pts.first().map(|p| p.x), Some(1.0), "reversed");
+     assert_eq!(ps[4].pts.first().map(|p| p.x), Some(9.0), "a core piece keeps its walk");
+ }
+diff --git a/crates/motion/tests/pass_start_levels/one_ring_set.rs b/crates/motion/tests/pass_start_levels/one_ring_set.rs
+index ad59d0f4b3..1440a755f7 100644
+--- a/crates/motion/tests/pass_start_levels/one_ring_set.rs
++++ b/crates/motion/tests/pass_start_levels/one_ring_set.rs
+@@ -8,7 +8,7 @@
+ use super::{params, rect, region};
+ use camcraft_motion::cl::{MoveKind, Toolpath};
+ use camcraft_motion::geo2d::{Point2, Region};
+-use camcraft_motion::machining2d::{CornerRelief, PassStart, StartSide, pocket_started_on, rings_fallbacks};
++use camcraft_motion::machining2d::{CornerRelief, PASS_START_NOTE, PassStart, StartSide, pocket_started_on, rings_fallbacks};
+ 
+ const R: f64 = super::R;
+ const Z: f64 = super::Z;
+@@ -133,3 +133,119 @@ fn the_one_ring_set_posts_no_crossing_feeds() {
+         assert!(crossed.is_empty(), "{start:?}: {crossed:?}");
+     }
+ }
++
++fn lobe(cy: f64, r: f64) -> Vec<Point2> {
++    (0..64)
++        .map(|k| {
++            let a = f64::from(k) * std::f64::consts::TAU / 64.0;
++            Point2::new(r * a.cos(), cy + r * a.sin())
++        })
++        .collect()
++}
++
++/// Two-lobe figure-8 part (two discs of radius 32.5 at Y -36 and Y +36,
++/// joined by a 3 mm waist) in a stock box 92 x 148, tool radius 4 and
++/// step 4: the offset rings merge sharply at the waist (x_c jumps by
++/// more than one tool radius per stepover).
++fn two_lobe_waist() -> (Region, Region, Region, Region) {
++    let part = region(vec![lobe(-36.0, 32.5)])
++        .union(&region(vec![lobe(36.0, 32.5)]))
++        .and_then(|p| p.union(&region(vec![rect(-1.5, -36.0, 1.5, 36.0)])))
++        .expect("part");
++    let stock = region(vec![rect(-46.0, -74.0, 46.0, 74.0)]);
++    let band = stock.offset(R).and_then(|s| s.difference(&part)).expect("band");
++    let material = stock.difference(&part).expect("material");
++    (part, stock, band, material)
++}
++
++/// Flanks meter (`0.9 * r` either side, `2.5 * r` own-trail exclusion) over
++/// planar feeds of `path`, matching `offset_pass_start/flanks.rs`.
++fn full_width_points(path: &Toolpath, material: &Region, r: f64) -> Vec<Point2> {
++    let cell = 0.25;
++    let (lo, hi) = material.bounds().expect("material bounds");
++    let pad = 2.0 * r + 1.0;
++    let w = ((hi.x - lo.x + 2.0 * pad) / cell).ceil() as usize + 1;
++    let h = ((hi.y - lo.y + 2.0 * pad) / cell).ceil() as usize + 1;
++    let (x0, y0) = (lo.x - pad, lo.y - pad);
++    let mut cut = vec![(f64::INFINITY, 0.0); w * h];
++    let cell_of = |p: Point2| {
++        let (fx, fy) = ((p.x - x0) / cell, (p.y - y0) / cell);
++        (fx >= 0.0 && fy >= 0.0 && (fx as usize) < w && (fy as usize) < h).then(|| fy as usize * w + fx as usize)
++    };
++    let n_sweep = (r / cell).ceil() as i64 + 1;
++    let mut out = Vec::new();
++    let mut travel = 0.0;
++    for m in path.moves.iter().filter(|m| m.kind != MoveKind::Rapid) {
++        let planar = m.kind == MoveKind::Feed && (m.from.z - m.to.z).abs() < 1e-9;
++        for (a, b) in m.segments3(0.05) {
++            let len = (b.x - a.x).hypot(b.y - a.y);
++            let n = (len / (0.5 * cell)).ceil().max(1.0) as usize;
++            for k in 0..=n {
++                let t = k as f64 / n as f64;
++                let p = Point2::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
++                let z = a.z + t * (b.z - a.z);
++                let s = travel + t * len;
++                if planar && k > 0 && len > 1e-9 {
++                    let (tx, ty) = ((b.x - a.x) / len, (b.y - a.y) / len);
++                    let left = Point2::new(p.x - ty * 0.9 * r, p.y + tx * 0.9 * r);
++                    let right = Point2::new(p.x + ty * 0.9 * r, p.y - tx * 0.9 * r);
++                    let before = s - 2.5 * r;
++                    let uncut = |q: Point2| {
++                        material.contains(q) && cell_of(q).is_some_and(|i| cut[i].0 > z + 1e-3 || cut[i].1 >= before)
++                    };
++                    if uncut(left) && uncut(right) {
++                        out.push(p);
++                    }
++                }
++                for dy in -n_sweep..=n_sweep {
++                    for dx in -n_sweep..=n_sweep {
++                        let q = Point2::new(p.x + dx as f64 * cell, p.y + dy as f64 * cell);
++                        if (q.x - p.x).hypot(q.y - p.y) <= r
++                            && let Some(i) = cell_of(q)
++                            && z < cut[i].0 - 1e-3
++                        {
++                            cut[i] = (z, s);
++                        }
++                    }
++                }
++            }
++            travel += len;
++        }
++    }
++    out
++}
++
++/// #3788 pin: on a synthetic two-lobe part where the lobe offsets merge
++/// sharply at the waist, neither Inside nor Outside cuts the full tool
++/// width at the merge (Inside only cuts full width along the initial part
++/// wall; Outside cuts zero full-width points), and no narrow note is posted.
++#[test]
++fn two_lobe_ring_merge_cuts_no_full_width_at_waist() {
++    let (part, stock, band, material) = two_lobe_waist();
++    let mut p = params();
++    p.stepover = 4.0;
++    for start in [PassStart::Outside, PassStart::Inside] {
++        let side = StartSide { start, stock: Some(stock.clone()), around_part: true };
++        let path = pocket_started_on(&band, &p, &[], &CornerRelief::default(), &side).expect("plan");
++        assert_eq!(rings_fallbacks(&path.notes), 0, "{start:?}: {:?}", path.notes);
++        let full = full_width_points(&path, &material, R);
++        let on_wall = |q: Point2| (edge_dist(q, &part) - R).abs() < 0.5;
++        let off_wall: Vec<Point2> = match start {
++            PassStart::Inside => full.into_iter().filter(|&q| !on_wall(q)).collect(),
++            _ => full,
++        };
++        assert!(
++            off_wall.is_empty(),
++            "{start:?}: {} off-wall full-width point(s) at merge, first {:?}; notes={:?}",
++            off_wall.len(),
++            off_wall.first(),
++            path.notes
++        );
++        let narrow: Vec<&String> = path
++            .notes
++            .iter()
++            .filter(|n| n.starts_with(PASS_START_NOTE) && n.contains("take the full tool width"))
++            .collect();
++        assert!(narrow.is_empty(), "{start:?}: unexpected narrow note: {narrow:?}");
++    }
++}
+diff --git a/docs/decisions/3788-ring-merge-waist.md b/docs/decisions/3788-ring-merge-waist.md
+new file mode 100644
+index 0000000000..45d3773930
+--- /dev/null
++++ b/docs/decisions/3788-ring-merge-waist.md
+@@ -0,0 +1,82 @@
++# #3788: Fill Rings and Clean Joins Where Two Lobe Offsets Merge
++
++Date: 2026-11-25
++Status: Accepted (unattended worker decision)
++
++## Context
++
++Issue #3788 fixes full-width cuts where offset rings of two lobes merge,
++such as the waist of `fig8`.
++PR #3790 added one-level (`RING = 4`) gap fills and `level_flanks::full_width_at`.
++On `upstream/main` (`baad348f1`), four defects remained:
++
++- On `fig8` Outside, 15 full-width points remained (5 points per Z-level across
++  3 Z-levels).
++- On `fig8` Inside, one segment still tripped the narrow check at
++  `(35.8393, 159.0963)`.
++- On `edge_route`, links could walk along an uncut `WALL` hole loop or jump
++  to a wall-chord point across unmachined flanks.
++- On synthetic two-lobe pockets, coarse `RING = 4` fills stopped above 1/16 step
++  cusps (`x_c` jumps faster than `0.9 * tool_r` per step).
++
++Root causes found:
++
++1. Clipper 1-unit lattice steps (`1e-6` mm to `1.7e-5` mm) flipped local segment
++   tangents inside rings and `WALL` loops.
++2. Sub-band fills stopped at half-step and quarter-step (`RING = 4`) and only
++   checked `gap` sweeps, not whether `full_width_flanks` still fired in Inside or
++   Outside cut order.
++3. Short cusp fills clipped to `zone.offset(tool_r)` could span less than the
++   2.5-radius own-trail exclusion window (`OWN_LAG`), leaving two adjacent passes
++   inside one exclusion pass.
++4. Boundary `edge_route` walks did not reject chords whose two flanks (`0.9 * r`)
++   cut uncut stock.
++
++## Decision
++
++1. **Collapse interior micro-steps before `share_ends`**:
++   `ring_fill::clean_walk` removes interior steps shorter than `MICRO_SEG = 5e-5`
++   mm (`< SNAP = 1e-4` mm) from rings, fills, `WALL` walks, and core loops. Open
++   endpoints stay fixed so `share_ends` keeps exact boundary joins.
++2. **Recursive binary sub-levels up to `RING = 16`**:
++   `ring_fill::split_band` divides any band between `lo_lev` and `hi_lev` down to
++   `1 / 16` step where `gap` (or `ring \ swept` at `depth >= 1`) or
++   `merge_flank_hits` finds an uncovered zone or full-width flank in either
++   Inside or Outside cut order (`CUT_MARGIN = 0.95`, `HIT_PAD = 0.2`).
++3. **Dual reach and boundary tail extension in `level`**:
++   Fills triggered only by `gap` use `zone.offset(tool_r)` so endpoints outside a
++   ring stay reachable by `edge_route` without lifting. Fills where
++   `merge_flank_hits` fired use `zone.offset(2.0 * tool_r)` so cusp fills exceed
++   `OWN_LAG` and run smoothly into already-cut stock. `tail_extension` extends any
++   open end within `3.5 * tool_r` of `band.c`'s outer boundary to that boundary.
++4. **Full-width guard on boundary `edge_route` chords**:
++   `level_order::edge_route` and `ring_links::chord_full_width` reject candidate
++   boundary chords whose left and right `0.9 * r` flanks both lie in uncut
++   stock, and `level_order::join` pushes the full multi-vertex `via` walk.
++
++## Alternatives Rejected
++
++- **Intersecting `depth == 0` `gap()` with `stock`**: Breaks the top air bridge
++  on `fig8` Outside (`Y = 175.02`) and adds 3 extra lifts. Rejected.
++- **Using `2.0 * tool_r` reach on all `gap()` fills**: Extends `disc` and `dog_bone`
++  gap endpoints behind the next ring inside `c`, adding 3 lifts on `disc Inside`
++  and lifts on `dog_bone Inside`. Rejected.
++- **Disabling `fit_arcs` on small chords globally**: Violates
++  `offset_rings_across_one_micron_vertex_step_post_crossing_free`. Rejected.
++
++## Readings (Before -> After)
++
++- `fig8 Outside` (`offset_pass_start`): 15 full-width points -> 0 full-width
++  points; 0 narrow notes; 3 lifts (unchanged); 0 crossings.
++- `fig8 Inside` (`offset_pass_start`): 10530 wall / 0 off-wall points / 1 narrow
++  note -> 10293 wall / 0 off-wall points / 0 narrow notes; 0 lifts; 0 crossings.
++- `two_lobe_waist` (`one_ring_set::two_lobe_ring_merge_cuts_no_full_width_at_waist`):
++  Outside 70 off-wall points and 5 narrow notes -> 0 off-wall points and 0
++  narrow notes for both Outside and Inside.
++
++## Provenance
++
++Clean-room implementation from contour-parallel distance level sets (Held, *On
++the Computational Geometry of Pocket Machining*, Springer LNCS 500, 1991) and
++the project's own flank and keep-down laws (`level_flanks`, `ring_links`). No
++vendor software or documentation was consulted.
