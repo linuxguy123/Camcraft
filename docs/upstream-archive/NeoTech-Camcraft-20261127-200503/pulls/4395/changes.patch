@@ -1,0 +1,932 @@
+From 4a43c825d07e96da56571cf2b4db5881e9d506f2 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 17:02:37 +0100
+Subject: [PATCH 1/2] feat(post): the Klartext post writes cycles 200, 206, 207
+ and the cycle 9 dwell (wip)
+
+Refs #4227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ assets/posts/heidenhain-klartext.cps          | 195 +++++++++++++++++-
+ crates/post/tests/klartext/cycle_tests.rs     | 143 +++++++++++++
+ crates/post/tests/klartext/cycles.cnc         | 179 ++++++++++++++++
+ .../post/tests/script_heidenhain_klartext.rs  |   3 +
+ 4 files changed, 515 insertions(+), 5 deletions(-)
+ create mode 100644 crates/post/tests/klartext/cycle_tests.rs
+ create mode 100644 crates/post/tests/klartext/cycles.cnc
+
+diff --git a/assets/posts/heidenhain-klartext.cps b/assets/posts/heidenhain-klartext.cps
+index aa362f280..d2a5e22ad 100644
+--- a/assets/posts/heidenhain-klartext.cps
++++ b/assets/posts/heidenhain-klartext.cps
+@@ -14,7 +14,7 @@ serves = ["mill"];
+ programUnits = "mm";
+ coolantModes = true;
+ failOnWarning = true;
+-workOffsetIndex = true;
++workOffsetIndex = true; floatingTapping = true; // #4227: cycle 206 needs the explicit floating-holder choice
+ workOffsetMax = 6; manualToolChange = ["manual-retract-top"]; // #4085: it writes the stop and checks for this change
+ 
+ var blockNumber = 0;
+@@ -179,8 +179,9 @@ function onToolChange(number, name) {
+ var toolDefinitions = Object.create(null);
+ function checkToolDefinition() {
+   var kind = typeof section.ToolKind === "string" ? section.ToolKind.toLowerCase() : "";
+-  if (["flat end mill", "ball-nose", "bull-nose", "chamfer mill"].indexOf(kind) === -1) {
+-    refuse("unsupported milling tool kind " + (kind || "(unstated)"));
++  // #4227: a drill or a tap cuts only in a drilling cycle (axialOnly).
++  if (["flat end mill", "ball-nose", "bull-nose", "chamfer mill", "drill", "tap"].indexOf(kind) === -1) {
++    refuse("unsupported tool kind " + (kind || "(unstated)"));
+   }
+   var diameter = required(section.ToolDiameter, "ToolDiameter");
+   var cornerRadius = section.ToolCornerRadius === undefined ? 0 : section.ToolCornerRadius;
+@@ -312,12 +313,18 @@ function motion() {
+   return p;
+ }
+ function onRapid() {
++  if (!inSection) refuse("motion outside an operation section");
++  if (holeMove(true)) return;
+   var p = motion();
+   block("L " + xyz(p.X, p.Y, p.Z) + " R0 FMAX");
+ }
+ function onLinear() {
++  if (!inSection) refuse("motion outside an operation section");
++  if (holeMove(false)) return;
++  axialOnly("feed");
+   var p = motion();
+   block("L " + xyz(p.X, p.Y, p.Z) + " R0 F" + rate(p.FeedRate, machine.feedRateMax, "feed"));
++  dwellAtDepth();
+ }
+ function onCircular() {
+   // #3442: an arc whose written ends coincide is no C block (arcFate,
+@@ -326,6 +333,8 @@ function onCircular() {
+   var fate = arcFate(function (k, v) { return local(v, k); });
+   if (fate === "linear") { onLinear(); return; }
+   if (fate === "none") { motion(); return; }
++  closeHole();
++  axialOnly("arc");
+   var p = motion();
+   if (p.CircularPlane !== "XY" || p.Z !== p.StartZ) refuse("only constant-Z XY arcs are supported");
+   var centre = p.IJKIncrement || {};
+@@ -361,6 +370,9 @@ function onCircular() {
+ }
+ function onSectionEnd() {
+   if (!inSection || !moved) refuse("operation section is empty or has no start");
++  closeHole();
++  owedDwell();
++  cycleSig = "";
+   if (lastPoint[2] < section.ClearancePlane ||
+       local(lastPoint[2], "Z") < local(section.ClearancePlane, "Z")) {
+     refuse("operation ends below ClearancePlane; provide a verified retract before stopping the spindle");
+@@ -376,10 +388,183 @@ function onClose() {
+   block("END PGM " + programName + " MM");
+ }
+ 
++// ------------------------------------------------------------ cycles
++// #4227: iTNC 530 Cycle Programming (NC 340 49x): cycles 9 DWELL TIME,
++// 200 DRILLING, 206 TAPPING NEW and 207 RIGID TAPPING NEW, at the
++// parameter set of the resolver's drillC200 "q211" level (no Q395).
++// A native cycle replaces only the hole chain that it does itself, and
++// each replaced move is compared with the cycle's own motion:
++// - DRILL / SPOT, cycle 200 with Q202 = the whole depth: one feed to the
++//   depth, the dwell Q211, FMAX back to Q200 (= R). Q204 = Q200, so the
++//   second clearance move is no move.
++// - TAP, cycle 207 (rigid) or 206 (floating): feed to the depth at the
++//   pitch feed, the spindle reverses, feed back to Q200 (= R).
++// PECK and DEEP post the checked chain as L blocks: the native peck
++// re-approach is not provably the chain (#4224,
++// docs/decisions/4224-heidenhain-peck-chain.md). Their dwell, and only
++// theirs, is cycle 9 after the last feed to the depth.
++// docs/decisions/4227-klartext-cycles.md records the choices.
++var CYCLE_TOL = 1e-6;
++var hole = null;          // the open hole: {x, y, r, steps, native, name}
++var cycleSig = "";        // the last CYCL DEF written in this section
++var pendingDwell = null;  // {z, s}: cycle 9 owed after the feed to the depth
++var dwellTaken = 0;       // the dwell the open cycle wrote (Q211 or cycle 9)
++function qword(n, v) {
++  // Increments and Q values carry four decimals, with an explicit sign.
++  var s = Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
++  if (s === "-0" || !s) s = "0";
++  return "Q" + n + "=" + (s.charAt(0) === "-" ? s : "+" + s);
++}
++function toolKindWord() {
++  return typeof section.ToolKind === "string" ? section.ToolKind.toLowerCase() : "";
++}
++function cycleDef(text, words) {
++  block("CYCL DEF " + text + " ~");
++  for (var i = 0; i < words.length; ++i) writeln("  " + words[i] + (i + 1 < words.length ? " ~" : ""));
++}
++function sameHole(p) {
++  return hole !== null && Math.abs(p.X - hole.x) < CYCLE_TOL && Math.abs(p.Y - hole.y) < CYCLE_TOL;
++}
++// A move of the open hole's chain. Native: compare it with the cycle's next
++// own move and write nothing (true). Explicit chain: false, the caller posts it.
++function holeMove(rapid) {
++  var p = properties;
++  if (hole === null) return false;
++  if (!sameHole(p) || p.Z > hole.r + CYCLE_TOL) {
++    if (hole.steps.length) refuse(hole.name + " ends before the hole chain returns to R");
++    hole = null;
++    return false;
++  }
++  if (!hole.native) return false;
++  // The tool stands at R after the cycle: a rapid there (the hop when the
++  // hop plane is R) moves nothing.
++  if (!hole.steps.length && rapid && Math.abs(p.Z - hole.r) <= CYCLE_TOL) { motion(); return true; }
++  var step = hole.steps.shift();
++  var feed = rapid ? null : p.FeedRate;
++  if (!step || step.rapid !== rapid || Math.abs(p.Z - step.z) > CYCLE_TOL ||
++      (!rapid && !(Math.abs(feed - step.f) <= CYCLE_TOL * Math.max(1, step.f)))) {
++    refuse("the hole chain is not the motion of " + hole.name);
++  }
++  motion();
++  return true;
++}
++function closeHole() {
++  if (hole !== null && hole.steps.length) refuse(hole.name + " ends before the hole chain returns to R");
++  hole = null;
++}
++// A drill or tap cuts only along the axis of a drilling cycle's hole.
++function axialOnly(what) {
++  var kind = toolKindWord();
++  if (kind !== "drill" && kind !== "tap") return;
++  var p = properties;
++  if (kind === "tap" || !sameHole(p) || Math.abs(p.StartX - p.X) > CYCLE_TOL ||
++      Math.abs(p.StartY - p.Y) > CYCLE_TOL || what === "arc") {
++    refuse("a " + kind + " tool cuts only inside its drilling cycle (" + what + ")");
++  }
++}
++function dwellWords(s) {
++  if (dialect.dwell !== "cycle9") {
++    refuse("controller profile " + dialect.profile + " does not confirm cycle 9 DWELL TIME, which this post writes");
++  }
++  var t = Number(s.toFixed(3));
++  if (!(t > 0) || t > 3600) refuse("dwell " + s + " s is outside 0.001 to 3600 s");
++  block("CYCL DEF 9.0 DWELL TIME");
++  block("CYCL DEF 9.1 DWELL " + t);
++  cycleSig = ""; // define the machining cycle again before its next call
++}
++function dwellAtDepth() {
++  var p = properties;
++  if (pendingDwell === null || !sameHole(p) || Math.abs(p.Z - pendingDwell.z) > CYCLE_TOL) return;
++  dwellWords(pendingDwell.s);
++  pendingDwell = null;
++}
++function owedDwell() {
++  if (pendingDwell !== null) refuse("drilling dwell without a feed move to the hole bottom");
++}
++function onCycle() {
++  if (!inSection) refuse("drilling cycle outside an operation section");
++  closeHole();
++  owedDwell();
++  dwellTaken = 0;
++  var p = properties, type = String(p.CycleType);
++  var tap = type === "TAP", floating = tap && p.TappingMode === "floating";
++  var name = tap ? (floating ? "cycle 206" : "cycle 207") : (type === "PECK" || type === "DEEP" ? type + " chain" : "cycle 200");
++  function bad(why) { refuse("drilling cycle " + type + ": " + why); }
++  if (["SPOT", "DRILL", "PECK", "DEEP", "TAP"].indexOf(type) === -1) bad("unsupported cycle kind");
++  var kind = toolKindWord();
++  if (tap !== (kind === "tap")) bad(tap ? "a tapping cycle requires a tap tool" : "a tap tool cuts only in a tapping cycle");
++  if (p.A !== undefined || p.B !== undefined || p.C !== undefined) bad("rotary or tilted hole");
++  var x = required(p.X, "hole X"), y = required(p.Y, "hole Y"), r = required(p.R, "hole R");
++  var bottom = required(p.Z, "hole depth"), entry = required(p.EntryZ, "hole entry");
++  // The tool stands over the hole at R: the stream rapids there first.
++  if (Math.abs(lastPoint[0] - x) > CYCLE_TOL || Math.abs(lastPoint[1] - y) > CYCLE_TOL ||
++      Math.abs(lastPoint[2] - r) > CYCLE_TOL) {
++    bad("the tool is not at the hole's R plane when the cycle starts");
++  }
++  var clearance = r - entry, depth = bottom - entry;
++  if (clearance < 0 || clearance > 99999.9999 || depth >= 0 || depth < -99999.9999) {
++    bad("needs a nonnegative R clearance and a negative depth below the hole entry");
++  }
++  if (finite(p.ChainBottomZ) && Math.abs(p.ChainBottomZ - bottom) > CYCLE_TOL) bad("the depth disagrees with the hole chain bottom");
++  var dwell = finite(p.P) ? Number(p.P) : 0;
++  if (!(dwell >= 0) || dwell > 3600) bad("invalid dwell");
++  if (type === "PECK" || type === "DEEP") {
++    // #4224: the checked chain posts as L blocks; cycle 9 dwells at its depth.
++    hole = { x: x, y: y, r: r, steps: [], native: false, name: name };
++    if (dwell > 0) pendingDwell = { z: bottom, s: dwell };
++    dwellTaken = dwell;
++    return;
++  }
++  var feedIn = finite(p.FeedRate) ? p.FeedRate : p.ChainFeedRate;
++  var feed = rate(feedIn, machine.feedRateMax, "cycle feed");
++  var words = [qword(200, clearance), qword(201, depth)];
++  var text;
++  if (tap) {
++    var rpm = rate(section.SpindleSpeed, machine.spindleMax, "SpindleSpeed");
++    if (rpm !== Math.round(rpm)) bad("tapping needs an integral spindle speed to state the pitch");
++    if (floating) {
++      if (Math.abs(feedIn - feed) > 0.0000005) bad("the floating tapping feed cannot be written at the control's feed resolution");
++      if (dwell > 0.5) bad("cycle 206 dwell must be at most 0.5 s to avoid wedging the tap");
++      text = "206 TAPPING NEW";
++      words.push(qword(206, feed), qword(211, dwell));
++    } else {
++      var pitch = feedIn / rpm;
++      if (pitch < 0.0001 || pitch > 99.9999 || Math.abs(pitch - Math.round(pitch * 10000) / 10000) > 0.0000005) {
++        bad("the tapping feed and spindle speed give no pitch at the control's resolution");
++      }
++      if (machine.rigidTapping === false) bad("rigid tapping is unavailable on this machine; select a floating holder explicitly if installed");
++      if (dwell !== 0) bad("cycle 207 has no dwell parameter");
++      text = "207 RIGID TAPPING NEW";
++      words.push(qword(239, pitch));
++    }
++  } else {
++    if (dialect.drillC200 !== "q211") {
++      bad("controller profile " + dialect.profile + " has cycle 200 level " + dialect.drillC200 + ", not the q211 level that this post writes");
++    }
++    // One plunge: the plunging depth is the whole depth.
++    text = "200 DRILLING";
++    words.push(qword(206, feed), qword(202, -depth), qword(210, 0));
++  }
++  words.push(qword(203, local(entry, "Z")), qword(204, clearance));
++  if (!tap) words.push(qword(211, dwell));
++  dwellTaken = tap && !floating ? 0 : dwell;
++  var sig = text + "|" + words.join("|");
++  if (sig !== cycleSig) { cycleDef(text, words); cycleSig = sig; }
++  block("CYCL CALL");
++  hole = {
++    x: x, y: y, r: r, native: true, name: name,
++    steps: [{ rapid: false, z: bottom, f: feedIn }, tap ? { rapid: false, z: r, f: feedIn } : { rapid: true, z: r }]
++  };
++}
++// The engine sends the cycle's dwell after onCycle: the cycle wrote it.
++function onDwell(seconds) {
++  if (!(Math.abs(Number(seconds) - dwellTaken) <= CYCLE_TOL)) refuse("dwell " + seconds + " s outside a drilling cycle that writes it");
++  dwellTaken = 0;
++}
++function finite(v) { return typeof v === "number" && isFinite(v); }
++
+ // Refuse before the host can substitute an ordinary motion or comment for a
+ // record that requests a material change, spindle synchronization or probing.
+-function onCycle() { refuse("unsupported drilling cycle " + properties.CycleType); }
+-function onDwell() { refuse("unsupported dwell"); }
+ function onRadiusCompensation() { refuse("unsupported control cutter compensation"); }
+ function onThreadCycle() { refuse("unsupported threading cycle"); }
+ function onThreadCycleEnd() { refuse("unsupported threading cycle"); }
+diff --git a/crates/post/tests/klartext/cycle_tests.rs b/crates/post/tests/klartext/cycle_tests.rs
+new file mode 100644
+index 000000000..000c15312
+--- /dev/null
++++ b/crates/post/tests/klartext/cycle_tests.rs
+@@ -0,0 +1,143 @@
++//! #4227: the Klartext post writes cycles 200, 206 and 207 and the cycle 9
++//! dwell for the iTNC 530 NC 340490-03 (Cycle Programming manual, NC software
++//! 340 49x). PECK and DEEP post the checked chain as L blocks (#4224). Each
++//! native cycle replaces only the hole chain that it does itself.
++
++use super::*;
++
++const CYCLES: &str = include_str!("cycles.cnc");
++
++fn cycles(stream: &str) -> Result<String, String> {
++    post(MCH, stream, &Value::Null)
++}
++
++/// Replace one exact text of the stream; the variant must differ.
++fn variant(from: &str, to: &str) -> String {
++    let out = CYCLES.replacen(from, to, 1);
++    assert_ne!(out, CYCLES, "the variant must change the stream: {from}");
++    out
++}
++
++/// The blocks of `nc` without their block numbers (continuation lines stay).
++fn blocks(nc: &str) -> Vec<String> {
++    nc.lines()
++        .map(|l| match l.split_once(' ') {
++            Some((n, rest)) if n.parse::<u32>().is_ok() => rest.to_string(),
++            _ => l.trim().to_string(),
++        })
++        .collect()
++}
++
++/// The text of one operation, from its comment to the next one.
++fn operation<'a>(nc: &'a str, name: &str) -> &'a str {
++    let start = nc.find(&format!("; OPERATION {name}")).unwrap_or_else(|| panic!("{name}: {nc}"));
++    let rest = &nc[start + 1..];
++    let end = rest.find("; OPERATION ").map_or(nc.len(), |e| start + 1 + e);
++    &nc[start..end]
++}
++
++#[test]
++fn klartext_cycles_post_on_the_picomax_golden() {
++    let nc = cycles(CYCLES).expect("the cycle stream posts");
++    recorded::compare(SCRIPT, "picomax_cycles", "nc", &nc);
++}
++
++#[test]
++fn drill_posts_cycle_200_with_the_whole_depth_and_the_dwell_at_depth() {
++    let nc = cycles(CYCLES).unwrap();
++    let drill = blocks(operation(&nc, "Drill"));
++    let def = drill.iter().position(|b| b == "CYCL DEF 200 DRILLING ~").expect("cycle 200");
++    assert_eq!(
++        drill[def + 1..def + 9],
++        [
++            "Q200=+1 ~", "Q201=-10 ~", "Q206=+100 ~", "Q202=+10 ~", "Q210=+0 ~", "Q203=+5 ~",
++            "Q204=+1 ~", "Q211=+0.5",
++        ]
++    );
++    // One definition, one call at each hole, each at R over its hole.
++    assert_eq!(drill.iter().filter(|b| b.starts_with("CYCL DEF")).count(), 1, "{nc}");
++    let calls: Vec<_> = drill.iter().enumerate().filter(|(_, b)| *b == "CYCL CALL").map(|(i, _)| i).collect();
++    assert_eq!(calls.len(), 2, "{nc}");
++    assert_eq!(drill[calls[1] - 1], "L X+15 Y+5 Z+6 R0 FMAX", "{nc}");
++    // The chain that the cycle does is not written again.
++    assert!(!drill.iter().any(|b| b.starts_with("L ") && !b.ends_with("FMAX")), "{nc}");
++    assert!(!drill.iter().any(|b| b.contains("DWELL TIME")), "{nc}");
++}
++
++#[test]
++fn peck_and_deep_post_the_checked_chain_and_deep_dwells_with_cycle_9() {
++    let nc = cycles(CYCLES).unwrap();
++    assert!(!nc.contains("CYCL DEF 205") && !nc.contains("CYCL DEF 203"), "{nc}");
++    let peck = blocks(operation(&nc, "Peck"));
++    let cuts: Vec<_> = peck.iter().filter(|b| b.ends_with("R0 F100")).cloned().collect();
++    assert_eq!(cuts, ["L X+5 Y-5 Z+2 R0 F100", "L X+5 Y-5 Z-2 R0 F100", "L X+5 Y-5 Z-5 R0 F100"]);
++    assert!(peck.iter().any(|b| b == "L X+5 Y-5 Z+3 R0 FMAX"), "the chip-break hop: {nc}");
++    assert!(!peck.iter().any(|b| b.starts_with("CYCL")), "{nc}");
++    let deep = blocks(operation(&nc, "Deep"));
++    let bottom = deep.iter().position(|b| b == "L X+15 Y-5 Z-5 R0 F100").expect("the last feed");
++    assert_eq!(deep[bottom + 1..bottom + 3], ["CYCL DEF 9.0 DWELL TIME", "CYCL DEF 9.1 DWELL 0.3"]);
++    assert_eq!(deep.iter().filter(|b| b.starts_with("CYCL DEF 9.0")).count(), 1, "{nc}");
++}
++
++#[test]
++fn rigid_and_floating_taps_post_cycles_207_and_206() {
++    let nc = cycles(CYCLES).unwrap();
++    let rigid = blocks(operation(&nc, "Rigid tap"));
++    let def = rigid.iter().position(|b| b == "CYCL DEF 207 RIGID TAPPING NEW ~").expect("cycle 207");
++    assert_eq!(rigid[def + 1..def + 6], ["Q200=+1 ~", "Q201=-8 ~", "Q239=+1 ~", "Q203=+5 ~", "Q204=+1"]);
++    assert_eq!(rigid[def + 6], "CYCL CALL");
++    let floating = blocks(operation(&nc, "Floating tap"));
++    let def = floating.iter().position(|b| b == "CYCL DEF 206 TAPPING NEW ~").expect("cycle 206");
++    assert_eq!(
++        floating[def + 1..def + 7],
++        ["Q200=+1 ~", "Q201=-8 ~", "Q206=+500 ~", "Q211=+0.2 ~", "Q203=+5 ~", "Q204=+1"]
++    );
++    for op in [&rigid, &floating] {
++        assert!(!op.iter().any(|b| b.starts_with("L ") && !b.ends_with("FMAX")), "{nc}");
++    }
++}
++
++#[test]
++fn each_klartext_cycle_refusal_names_its_cause() {
++    let bore = variant("CYCLE DRILL X 105000 Y 30000", "CYCLE BORE X 105000 Y 30000");
++    let off_r = variant(
++        "Rapid X 105000 Y 30000 Z 11000\nCYCLE DRILL",
++        "Rapid X 105000 Y 30000 Z 12000\nCYCLE DRILL",
++    );
++    let extra_peck = variant(
++        "Plunge X 105000 Y 30000 Z 0 F 100000\nRapid X 105000 Y 30000 Z 11000",
++        "Plunge X 105000 Y 30000 Z 5000 F 100000\nRapid X 105000 Y 30000 Z 6000\nPlunge X 105000 Y 30000 Z 0 F 100000\nRapid X 105000 Y 30000 Z 11000",
++    );
++    let tap_by_drill = variant("PARAM ToolKind tap\n", "PARAM ToolKind drill\n");
++    let rigid_dwell = variant("CYCLE TAP X 105000 Y 30000 Z 2000 R 11000 ENTRY 10000 Q 0 P 0", "CYCLE TAP X 105000 Y 30000 Z 2000 R 11000 ENTRY 10000 Q 0 P 100");
++    let floating_dwell = variant("Q 0 P 200 F 500000", "Q 0 P 600 F 500000");
++    let lateral = variant(
++        "Rapid X 105000 Y 20000 Z 15000\nENDSECTION",
++        "Feed X 106000 Y 20000 Z 15000 F 100000\nENDSECTION",
++    );
++    let no_bottom = variant(
++        "Plunge X 115000 Y 20000 Z 0 F 100000\nRapid X 115000 Y 20000 Z 12000",
++        "Plunge X 115000 Y 20000 Z 500 F 100000\nRapid X 115000 Y 20000 Z 12000",
++    );
++    for (stream, diagnostic) in [
++        (bore, "drilling cycle BORE: unsupported cycle kind"),
++        (off_r, "the tool is not at the hole's R plane when the cycle starts"),
++        (extra_peck, "the hole chain is not the motion of cycle 200"),
++        (tap_by_drill, "a tapping cycle requires a tap tool"),
++        (rigid_dwell, "cycle 207 has no dwell parameter"),
++        (floating_dwell, "cycle 206 dwell must be at most 0.5 s"),
++        (lateral, "a drill tool cuts only inside its drilling cycle (feed)"),
++        (no_bottom, "the depth disagrees with the hole chain bottom"),
++    ] {
++        let why = cycles(&stream).expect_err(diagnostic);
++        assert!(why.contains(diagnostic), "{diagnostic}: {why}");
++    }
++}
++
++#[test]
++fn rigid_tapping_is_refused_on_a_machine_without_it() {
++    let mut machine: Value = serde_json::from_str(MCH).unwrap();
++    machine["kinematics"]["default"]["parts"][1]["parts"][0]["spindle"]["rigid_tapping"] = Value::Bool(false);
++    let why = post(&machine.to_string(), CYCLES, &Value::Null).expect_err("no rigid tapping");
++    assert!(why.contains("rigid tapping is unavailable on this machine"), "{why}");
++}
+diff --git a/crates/post/tests/klartext/cycles.cnc b/crates/post/tests/klartext/cycles.cnc
+new file mode 100644
+index 000000000..7244139dd
+--- /dev/null
++++ b/crates/post/tests/klartext/cycles.cnc
+@@ -0,0 +1,179 @@
++; HSMW-CNC v1
++PARAM SetupName Setup1
++PARAM OperationName Drill
++PARAM OperationKind Drilling
++PARAM StartX 105
++PARAM StartY 30
++PARAM StartZ 15
++PARAM ToolKind drill
++PARAM ToolDiameter 6
++PARAM SpindleSpeed 1500
++PARAM WorkOffset 2
++PARAM OriginX 100
++PARAM OriginY 25
++PARAM OriginZ 5
++PARAM ClearancePlane 15
++PARAM RetractPlane 12
++PARAM TopOfStock 10
++PARAM StockXYLeft 80
++PARAM StockXYRight 120
++PARAM StockXYFront 10
++PARAM StockXYBack 40
++PARAM StockZTop 10
++PARAM StockZBottom -3
++PARAM Coolant off
++TOOL 3 DRILL-6
++SECTION
++Rapid X 105000 Y 30000 Z 15000
++Rapid X 105000 Y 30000 Z 11000
++CYCLE DRILL X 105000 Y 30000 Z 0 R 11000 ENTRY 10000 Q 0 P 500 F 100000
++Plunge X 105000 Y 30000 Z 0 F 100000
++Rapid X 105000 Y 30000 Z 11000
++Rapid X 105000 Y 30000 Z 12000
++Rapid X 115000 Y 30000 Z 12000
++Rapid X 115000 Y 30000 Z 11000
++CYCLE DRILL X 115000 Y 30000 Z 0 R 11000 ENTRY 10000 Q 0 P 500 F 100000
++Plunge X 115000 Y 30000 Z 0 F 100000
++Rapid X 115000 Y 30000 Z 11000
++Rapid X 115000 Y 30000 Z 12000
++Rapid X 115000 Y 30000 Z 15000
++ENDSECTION
++PARAM SetupName Setup1
++PARAM OperationName Peck
++PARAM OperationKind Drilling
++PARAM StartX 105
++PARAM StartY 20
++PARAM StartZ 15
++PARAM ToolKind drill
++PARAM ToolDiameter 6
++PARAM SpindleSpeed 1500
++PARAM WorkOffset 2
++PARAM OriginX 100
++PARAM OriginY 25
++PARAM OriginZ 5
++PARAM ClearancePlane 15
++PARAM RetractPlane 12
++PARAM TopOfStock 10
++PARAM StockXYLeft 80
++PARAM StockXYRight 120
++PARAM StockXYFront 10
++PARAM StockXYBack 40
++PARAM StockZTop 10
++PARAM StockZBottom -3
++PARAM Coolant off
++TOOL 3 DRILL-6
++SECTION
++Rapid X 105000 Y 20000 Z 15000
++Rapid X 105000 Y 20000 Z 11000
++CYCLE PECK X 105000 Y 20000 Z 0 R 11000 ENTRY 10000 Q 4000 P 0 F 100000
++Plunge X 105000 Y 20000 Z 7000 F 100000
++Rapid X 105000 Y 20000 Z 8000
++Plunge X 105000 Y 20000 Z 3000 F 100000
++Rapid X 105000 Y 20000 Z 4000
++Plunge X 105000 Y 20000 Z 0 F 100000
++Rapid X 105000 Y 20000 Z 11000
++Rapid X 105000 Y 20000 Z 12000
++Rapid X 105000 Y 20000 Z 15000
++ENDSECTION
++PARAM SetupName Setup1
++PARAM OperationName Deep
++PARAM OperationKind Drilling
++PARAM StartX 115
++PARAM StartY 20
++PARAM StartZ 15
++PARAM ToolKind drill
++PARAM ToolDiameter 6
++PARAM SpindleSpeed 1500
++PARAM WorkOffset 2
++PARAM OriginX 100
++PARAM OriginY 25
++PARAM OriginZ 5
++PARAM ClearancePlane 15
++PARAM RetractPlane 12
++PARAM TopOfStock 10
++PARAM StockXYLeft 80
++PARAM StockXYRight 120
++PARAM StockXYFront 10
++PARAM StockXYBack 40
++PARAM StockZTop 10
++PARAM StockZBottom -3
++PARAM Coolant off
++TOOL 3 DRILL-6
++SECTION
++Rapid X 115000 Y 20000 Z 15000
++Rapid X 115000 Y 20000 Z 11000
++CYCLE DEEP X 115000 Y 20000 Z 0 R 11000 ENTRY 10000 Q 5000 P 300 F 100000
++Plunge X 115000 Y 20000 Z 6000 F 100000
++Rapid X 115000 Y 20000 Z 11000
++Plunge X 115000 Y 20000 Z 1000 F 100000
++Rapid X 115000 Y 20000 Z 11000
++Plunge X 115000 Y 20000 Z 0 F 100000
++Rapid X 115000 Y 20000 Z 12000
++Rapid X 115000 Y 20000 Z 15000
++ENDSECTION
++PARAM SetupName Setup1
++PARAM OperationName Rigid tap
++PARAM OperationKind Drilling
++PARAM StartX 105
++PARAM StartY 30
++PARAM StartZ 15
++PARAM ToolKind tap
++PARAM ToolDiameter 6
++PARAM SpindleSpeed 500
++PARAM WorkOffset 2
++PARAM OriginX 100
++PARAM OriginY 25
++PARAM OriginZ 5
++PARAM ClearancePlane 15
++PARAM RetractPlane 12
++PARAM TopOfStock 10
++PARAM StockXYLeft 80
++PARAM StockXYRight 120
++PARAM StockXYFront 10
++PARAM StockXYBack 40
++PARAM StockZTop 10
++PARAM StockZBottom -3
++PARAM Coolant off
++TOOL 4 TAP-M6
++SECTION
++Rapid X 105000 Y 30000 Z 15000
++Rapid X 105000 Y 30000 Z 11000
++CYCLE TAP X 105000 Y 30000 Z 2000 R 11000 ENTRY 10000 Q 0 P 0 F 500000
++Feed X 105000 Y 30000 Z 2000 F 500000
++Feed X 105000 Y 30000 Z 11000 F 500000
++Rapid X 105000 Y 30000 Z 12000
++Rapid X 105000 Y 30000 Z 15000
++ENDSECTION
++PARAM SetupName Setup1
++PARAM OperationName Floating tap
++PARAM OperationKind Drilling
++PARAM StartX 115
++PARAM StartY 30
++PARAM StartZ 15
++PARAM ToolKind tap
++PARAM ToolDiameter 6
++PARAM SpindleSpeed 500
++PARAM WorkOffset 2
++PARAM OriginX 100
++PARAM OriginY 25
++PARAM OriginZ 5
++PARAM ClearancePlane 15
++PARAM RetractPlane 12
++PARAM TopOfStock 10
++PARAM StockXYLeft 80
++PARAM StockXYRight 120
++PARAM StockXYFront 10
++PARAM StockXYBack 40
++PARAM StockZTop 10
++PARAM StockZBottom -3
++PARAM Coolant off
++TOOL 5 TAP-M6-FLOAT
++SECTION
++Rapid X 115000 Y 30000 Z 15000
++Rapid X 115000 Y 30000 Z 11000
++CYCLE FLOATINGTAP X 115000 Y 30000 Z 2000 R 11000 ENTRY 10000 Q 0 P 200 F 500000
++Feed X 115000 Y 30000 Z 2000 F 500000
++Feed X 115000 Y 30000 Z 11000 F 500000
++Rapid X 115000 Y 30000 Z 12000
++Rapid X 115000 Y 30000 Z 15000
++ENDSECTION
+diff --git a/crates/post/tests/script_heidenhain_klartext.rs b/crates/post/tests/script_heidenhain_klartext.rs
+index ce956bb68..061674f91 100644
+--- a/crates/post/tests/script_heidenhain_klartext.rs
++++ b/crates/post/tests/script_heidenhain_klartext.rs
+@@ -382,5 +382,8 @@ fn successive_sections_with_the_same_tool_recheck_transfer_without_another_excha
+ #[path = "klartext/arc_tests.rs"]
+ mod arc_tests;
+ 
++#[path = "klartext/cycle_tests.rs"]
++mod cycle_tests;
++
+ #[path = "klartext/dialect_tests.rs"]
+ mod dialect_tests;
+
+From 0ea1e7701f51886461703aa61a80b52f920112dd Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 17:06:45 +0100
+Subject: [PATCH 2/2] feat(post): the Klartext post writes cycles 200, 206, 207
+ and the cycle 9 dwell
+
+The Heidenhain Klartext post writes the drilling cycles of the iTNC 530
+NC 340490-03 at the q211 parameter level: cycle 200 with Q202 = the
+whole depth for DRILL and SPOT, cycle 207 for a rigid tap, cycle 206 for
+a floating tap, and cycle 9 for the dwell of PECK and DEEP. PECK and
+DEEP keep the checked chain as L blocks (#4224). Each replaced chain
+move is compared with the cycle's own motion; a chain that differs is
+refused by name. A drill or a tap cuts only inside its drilling cycle.
+
+Fixes #4227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/post/tests/klartext/cycle_tests.rs     |   4 +-
+ .../heidenhain-klartext/picomax_cycles.nc     | 156 ++++++++++++++++++
+ .../post/tests/script_heidenhain_klartext.rs  |   9 +-
+ docs/decisions/4227-klartext-cycles.md        |  80 +++++++++
+ 4 files changed, 245 insertions(+), 4 deletions(-)
+ create mode 100644 crates/post/tests/recorded/golden/heidenhain-klartext/picomax_cycles.nc
+ create mode 100644 docs/decisions/4227-klartext-cycles.md
+
+diff --git a/crates/post/tests/klartext/cycle_tests.rs b/crates/post/tests/klartext/cycle_tests.rs
+index 000c15312..2bc17a52a 100644
+--- a/crates/post/tests/klartext/cycle_tests.rs
++++ b/crates/post/tests/klartext/cycle_tests.rs
+@@ -60,7 +60,7 @@ fn drill_posts_cycle_200_with_the_whole_depth_and_the_dwell_at_depth() {
+     assert_eq!(calls.len(), 2, "{nc}");
+     assert_eq!(drill[calls[1] - 1], "L X+15 Y+5 Z+6 R0 FMAX", "{nc}");
+     // The chain that the cycle does is not written again.
+-    assert!(!drill.iter().any(|b| b.starts_with("L ") && !b.ends_with("FMAX")), "{nc}");
++    assert!(!drill.iter().any(|b| b.contains(" R0 F") && !b.ends_with("FMAX")), "{nc}");
+     assert!(!drill.iter().any(|b| b.contains("DWELL TIME")), "{nc}");
+ }
+ 
+@@ -93,7 +93,7 @@ fn rigid_and_floating_taps_post_cycles_207_and_206() {
+         ["Q200=+1 ~", "Q201=-8 ~", "Q206=+500 ~", "Q211=+0.2 ~", "Q203=+5 ~", "Q204=+1"]
+     );
+     for op in [&rigid, &floating] {
+-        assert!(!op.iter().any(|b| b.starts_with("L ") && !b.ends_with("FMAX")), "{nc}");
++        assert!(!op.iter().any(|b| b.contains(" R0 F") && !b.ends_with("FMAX")), "{nc}");
+     }
+ }
+ 
+diff --git a/crates/post/tests/recorded/golden/heidenhain-klartext/picomax_cycles.nc b/crates/post/tests/recorded/golden/heidenhain-klartext/picomax_cycles.nc
+new file mode 100644
+index 000000000..afc96fc32
+--- /dev/null
++++ b/crates/post/tests/recorded/golden/heidenhain-klartext/picomax_cycles.nc
+@@ -0,0 +1,156 @@
++0 BEGIN PGM CAMCRAFT MM
++1 BLK FORM 0.1 Z X-20 Y-15 Z-8
++2 BLK FORM 0.2 X+20 Y+15 Z+5
++3 ; CONFIRM XYZ MODE - QUILL COUPLED - W FIXED
++4 ; CONFIRM SPINDLE STOPPED - NO TILT
++5 ; CANCEL ACTIVE COORDINATE TRANSFORMATIONS
++6 ; CONFIRM QUILL AT UPPER CHANGE POSITION
++7 ; VERIFY +Z RETRACT PATH AND CHANGE SPACE
++8 ; CHECK FULL-RETRACT XY PATH FOR ALL TOOLS
++9 ; VERIFY TOOL TABLE AND PRESET 2
++10 ; CHECK PRESET X Y Z FILLED AND ROTATION ZERO
++11 M0
++12 CYCL DEF 247 DATUM SETTING ~
++  Q339=+2
++13 M137
++14 ; OPERATION Drill
++15 ; CHECK DRIVES OFF BEFORE TOUCHING TOOL
++16 ; CHECK QUILL AT PHYSICAL CHANGE POSITION
++17 ; ABORT IF EITHER CHECK FAILS
++18 ; THEN INSTALL TOOL 3 DRILL-6
++19 M0
++20 TOOL CALL 3 Z S1500
++21 L M140 MB MAX
++22 ; CHECK ACTUAL TIP HEIGHT AND ENTIRE XY PATH
++23 ; ABORT IF TOOL OR HOLDER CANNOT CLEAR
++24 M0
++25 M3
++26 M9
++27 L X+5 Y+5 R0 FMAX
++28 L Z+10 R0 FMAX
++29 L X+5 Y+5 Z+10 R0 FMAX
++30 L X+5 Y+5 Z+6 R0 FMAX
++31 CYCL DEF 200 DRILLING ~
++  Q200=+1 ~
++  Q201=-10 ~
++  Q206=+100 ~
++  Q202=+10 ~
++  Q210=+0 ~
++  Q203=+5 ~
++  Q204=+1 ~
++  Q211=+0.5
++32 CYCL CALL
++33 L X+5 Y+5 Z+7 R0 FMAX
++34 L X+15 Y+5 Z+7 R0 FMAX
++35 L X+15 Y+5 Z+6 R0 FMAX
++36 CYCL CALL
++37 L X+15 Y+5 Z+7 R0 FMAX
++38 L X+15 Y+5 Z+10 R0 FMAX
++39 M9
++40 M5
++41 ; OPERATION Peck
++42 TOOL CALL 3 Z S1500
++43 L M140 MB MAX
++44 ; CHECK ACTUAL TIP HEIGHT AND ENTIRE XY PATH
++45 ; ABORT IF TOOL OR HOLDER CANNOT CLEAR
++46 M0
++47 M3
++48 M9
++49 L X+5 Y-5 R0 FMAX
++50 L Z+10 R0 FMAX
++51 L X+5 Y-5 Z+10 R0 FMAX
++52 L X+5 Y-5 Z+6 R0 FMAX
++53 L X+5 Y-5 Z+2 R0 F100
++54 L X+5 Y-5 Z+3 R0 FMAX
++55 L X+5 Y-5 Z-2 R0 F100
++56 L X+5 Y-5 Z-1 R0 FMAX
++57 L X+5 Y-5 Z-5 R0 F100
++58 L X+5 Y-5 Z+6 R0 FMAX
++59 L X+5 Y-5 Z+7 R0 FMAX
++60 L X+5 Y-5 Z+10 R0 FMAX
++61 M9
++62 M5
++63 ; OPERATION Deep
++64 TOOL CALL 3 Z S1500
++65 L M140 MB MAX
++66 ; CHECK ACTUAL TIP HEIGHT AND ENTIRE XY PATH
++67 ; ABORT IF TOOL OR HOLDER CANNOT CLEAR
++68 M0
++69 M3
++70 M9
++71 L X+15 Y-5 R0 FMAX
++72 L Z+10 R0 FMAX
++73 L X+15 Y-5 Z+10 R0 FMAX
++74 L X+15 Y-5 Z+6 R0 FMAX
++75 L X+15 Y-5 Z+1 R0 F100
++76 L X+15 Y-5 Z+6 R0 FMAX
++77 L X+15 Y-5 Z-4 R0 F100
++78 L X+15 Y-5 Z+6 R0 FMAX
++79 L X+15 Y-5 Z-5 R0 F100
++80 CYCL DEF 9.0 DWELL TIME
++81 CYCL DEF 9.1 DWELL 0.3
++82 L X+15 Y-5 Z+7 R0 FMAX
++83 L X+15 Y-5 Z+10 R0 FMAX
++84 M9
++85 M5
++86 ; OPERATION Rigid tap
++87 L M140 MB MAX
++88 ; CHECK DRIVES OFF BEFORE TOUCHING TOOL
++89 ; CHECK QUILL AT PHYSICAL CHANGE POSITION
++90 ; ABORT IF EITHER CHECK FAILS
++91 ; THEN INSTALL TOOL 4 TAP-M6
++92 M0
++93 TOOL CALL 4 Z S500
++94 L M140 MB MAX
++95 ; CHECK ACTUAL TIP HEIGHT AND ENTIRE XY PATH
++96 ; ABORT IF TOOL OR HOLDER CANNOT CLEAR
++97 M0
++98 M3
++99 M9
++100 L X+5 Y+5 R0 FMAX
++101 L Z+10 R0 FMAX
++102 L X+5 Y+5 Z+10 R0 FMAX
++103 L X+5 Y+5 Z+6 R0 FMAX
++104 CYCL DEF 207 RIGID TAPPING NEW ~
++  Q200=+1 ~
++  Q201=-8 ~
++  Q239=+1 ~
++  Q203=+5 ~
++  Q204=+1
++105 CYCL CALL
++106 L X+5 Y+5 Z+7 R0 FMAX
++107 L X+5 Y+5 Z+10 R0 FMAX
++108 M9
++109 M5
++110 ; OPERATION Floating tap
++111 L M140 MB MAX
++112 ; CHECK DRIVES OFF BEFORE TOUCHING TOOL
++113 ; CHECK QUILL AT PHYSICAL CHANGE POSITION
++114 ; ABORT IF EITHER CHECK FAILS
++115 ; THEN INSTALL TOOL 5 TAP-M6-FLOAT
++116 M0
++117 TOOL CALL 5 Z S500
++118 L M140 MB MAX
++119 ; CHECK ACTUAL TIP HEIGHT AND ENTIRE XY PATH
++120 ; ABORT IF TOOL OR HOLDER CANNOT CLEAR
++121 M0
++122 M3
++123 M9
++124 L X+15 Y+5 R0 FMAX
++125 L Z+10 R0 FMAX
++126 L X+15 Y+5 Z+10 R0 FMAX
++127 L X+15 Y+5 Z+6 R0 FMAX
++128 CYCL DEF 206 TAPPING NEW ~
++  Q200=+1 ~
++  Q201=-8 ~
++  Q206=+500 ~
++  Q211=+0.2 ~
++  Q203=+5 ~
++  Q204=+1
++129 CYCL CALL
++130 L X+15 Y+5 Z+7 R0 FMAX
++131 L X+15 Y+5 Z+10 R0 FMAX
++132 M9
++133 M5
++134 M2
++135 END PGM CAMCRAFT MM
+diff --git a/crates/post/tests/script_heidenhain_klartext.rs b/crates/post/tests/script_heidenhain_klartext.rs
+index 061674f91..1241073a2 100644
+--- a/crates/post/tests/script_heidenhain_klartext.rs
++++ b/crates/post/tests/script_heidenhain_klartext.rs
+@@ -294,9 +294,14 @@ fn milling_cutter_kinds_are_explicit_and_incompatible_tools_refuse_the_cli_save(
+         let stream = STREAM.replace("Flat end mill", kind);
+         assert!(post(MCH, &stream, &Value::Null).is_ok(), "{kind}");
+     }
+-    for kind in ["wire", "turning insert", "tap", "touch probe"] {
++    for kind in ["wire", "turning insert", "touch probe"] {
+         let stream = STREAM.replace("Flat end mill", kind);
+-        assert_cli_keeps_destination("non-mill", &stream, "unsupported milling tool kind");
++        assert_cli_keeps_destination("non-mill", &stream, "unsupported tool kind");
++    }
++    // #4227: a drill or a tap is a tool of this post, but only in a drilling cycle.
++    for kind in ["drill", "tap"] {
++        let stream = STREAM.replace("Flat end mill", kind);
++        assert_cli_keeps_destination("axial", &stream, "tool cuts only inside its drilling cycle");
+     }
+ }
+ 
+diff --git a/docs/decisions/4227-klartext-cycles.md b/docs/decisions/4227-klartext-cycles.md
+new file mode 100644
+index 000000000..9e37627c8
+--- /dev/null
++++ b/docs/decisions/4227-klartext-cycles.md
+@@ -0,0 +1,80 @@
++## #4227 - Heidenhain Klartext: cycles 200, 206, 207 and the cycle 9 dwell
++
++**Decided.** The Klartext post (`assets/posts/heidenhain-klartext.cps`)
++writes the drilling cycles of the iTNC 530 NC 340490-03 (the only profile
++that the post accepts), at the parameter set of the resolver's
++`drillC200` level `q211` (no Q395):
++
++| Stream cycle | Posted |
++|---|---|
++| DRILL, SPOT | `CYCL DEF 200 DRILLING` with Q202 = the whole depth, Q210 = 0, Q204 = Q200, the dwell in Q211, then `CYCL CALL` |
++| PECK, DEEP | the checked chain as `L` blocks, as #4224 decided for DIN/ISO; no cycle 205 or 203 |
++| TAP (rigid) | `CYCL DEF 207 RIGID TAPPING NEW`: Q200, Q201, Q239 (pitch = feed / rpm), Q203, Q204 = Q200 |
++| TAP (floating holder) | `CYCL DEF 206 TAPPING NEW`: Q200, Q201, Q206, Q211, Q203, Q204 = Q200 |
++| a dwell of PECK or DEEP | `CYCL DEF 9.0 DWELL TIME` / `CYCL DEF 9.1 DWELL <s>` after the feed to the depth |
++
++The cycle is defined again only when its words change (one definition
++for a row of equal holes). Each hole gets one `CYCL CALL`, with the tool
++at R over the hole: the stream rapids there first, and the post refuses a
++cycle that starts elsewhere.
++
++**Why: the native cycle must do the checked motion.** The simulation and
++the gouge check read the stream's hole chain. The post writes a native
++cycle only where the cycle's own motion (iTNC 530 Cycle Programming, NC
++software 340 49x) is the chain, and it compares each replaced move with
++that motion. A chain that differs is refused by name ("the hole chain is
++not the motion of cycle 200").
++- Cycle 200 with Q202 = the whole depth: one feed to the depth at Q206,
++  the dwell Q211, FMAX to Q200 above the surface (= R). Q204 = Q200, so
++  the move to the second set-up clearance is no move. The DRILL / SPOT
++  chain is: feed to the bottom, rapid to R.
++- Cycles 206 and 207: feed to the depth, the spindle reverses, feed back
++  to Q200 (= R); Q204 = Q200 again. The TAP chain is: feed to the bottom,
++  feed to R, both at the pitch feed. Cycle 206 feeds out at Q206; the
++  207 retract is synchronized with the spindle at the same pitch. The
++  path is the same vertical line in the same hole, so a difference in the
++  retract speed cannot move the tool to another position.
++- PECK and DEEP: #4224 applies without change. The native peck
++  re-approach is not provably the chain, and the 340 49x cycle 205 has no
++  Q208 (its retract rate is not stated). The chain is the checked motion
++  by construction.
++- The dwell: the engine sends a dwell only for a cycle. For DRILL, SPOT
++  and the floating tap it is Q211 of the cycle. For PECK and DEEP it is
++  cycle 9, which the resolver's `dwell` flag confirms (`cycle9`) for this
++  profile. A dwell that the cycle did not write is refused.
++
++**Refusals that stay (each pinned in
++`crates/post/tests/klartext/cycle_tests.rs`):**
++- BORE, BACKBORE, REAM and FINEBORE (no cycle of this issue).
++- A tapping cycle with a tool that is not a tap; a tap or a drill that
++  cuts outside its drilling cycle (a drill feeds only along the hole axis).
++- A cycle that does not start at R over its hole; a chain whose depth or
++  moves differ from the cycle.
++- A rigid tap with a dwell (cycle 207 has none); a floating tap dwell
++  above 0.5 s (as the DIN/ISO post); a rigid tap on a machine that states
++  `rigid_tapping: false`.
++- A cycle 200 level other than `q211`, and a dwell form other than cycle 9
++  (not reachable while the post accepts only NC 340490-03).
++
++**The Picomax machine file states no `rigid_tapping`.** The post writes
++cycle 207 when the machine does not say `false`, the same as the DIN/ISO
++post's G207 on this machine. If the spindle cannot tap rigidly, set
++`rigid_tapping: false` in the machine file: the app then refuses the tap
++path, and the post refuses cycle 207 by name.
++
++**Dropped.**
++- `L X.. Y.. Z.. R0 FMAX M99` as the call. The tool is already at R over
++  the hole, so `CYCL CALL` alone adds no positioning block.
++- A native cycle 205 or 203 for PECK and DEEP (#4224).
++- The control's own parameter comments (`;SET-UP CLEARANCE`): the control
++  adds them; the post writes the Q values only, as its cycle 247 does.
++
++**Not exercised.** The program was not run on the control. The open
++Klartext reader (PR #4361) reads cycle 200 and `CYCL CALL`, but it is not
++on `main`, so there is no round-trip test yet. It does not read cycles
++206, 207 or the old-style cycle 9 blocks.
++
++**Cost to change later.** A native peck needs the proof that #4224 asks
++for; then only the PECK / DEEP branch of `onCycle` changes. Another
++control level (Q395) needs its own Q list in `onCycle` and a profile that
++the manual quill procedure accepts.
