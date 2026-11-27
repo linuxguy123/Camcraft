@@ -1,0 +1,411 @@
+From 29ff02f4bf1743579ef80a61a7f7e5c274f72631 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Thu, 26 Nov 2026 11:16:36 -0800
+Subject: [PATCH] fix(rest): simulate the program ahead in the generation job,
+ not at staging
+
+A rest operation (3D Pocket, Multi-Axis Rough, a rest 2D Pocket or
+2D Adaptive) simulated every operation ahead inside collect_job. The
+MCP session and the GUI stage a generation on their own thread, so a
+long simulation blocked every other call even with the #3860 worker.
+
+rest::prior_state is now two halves: stage_prior does the world reads,
+StagedPrior::simulate cuts the moves and reads no world. collect_job
+keeps the staged half; run_job settles it first, on the job's thread.
+
+Pinned by generate_staged::a_rest_reading_pocket_simulates_the_program_ahead_in_its_job_not_at_staging.
+
+Refs #3035
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/corner_relief_sim.rs |  2 +
+ crates/app/src/operation/generate.rs          |  1 +
+ crates/app/src/operation/generate/run_job.rs  |  2 +
+ crates/app/src/operation/job.rs               | 35 ++++---
+ crates/app/src/rest.rs                        | 49 +--------
+ crates/app/src/rest/staged.rs                 | 99 +++++++++++++++++++
+ crates/app/tests/generate_staged.rs           | 33 +++++++
+ docs/decisions/3035-rest-staging-worker.md    | 40 ++++++++
+ 8 files changed, 206 insertions(+), 55 deletions(-)
+ create mode 100644 crates/app/src/rest/staged.rs
+ create mode 100644 docs/decisions/3035-rest-staging-worker.md
+
+diff --git a/crates/app/src/operation/corner_relief_sim.rs b/crates/app/src/operation/corner_relief_sim.rs
+index 64f1c3a6e7..eaf4fb413a 100644
+--- a/crates/app/src/operation/corner_relief_sim.rs
++++ b/crates/app/src/operation/corner_relief_sim.rs
+@@ -41,6 +41,8 @@ pub(crate) fn zones_for_op(world: &World, op: &Operation, op_name: &str) -> Vec<
+     {
+         return Vec::new();
+     }
++    // #3035: the rest grid, cut here as the yaw turn below reads it.
++    job.settle_prior();
+     let yaw = job.wcs_yaw.take();
+     if let Some(yw) = yaw
+         && yw
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 371275d8bf..86393d34d2 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -90,6 +90,7 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+         mut slot_bound,
+         mut rotary_picks,
+         mut prior,
++        prior_staged: _,
+         verify_prior,
+         mut drills_ahead,
+         turned_ahead,
+diff --git a/crates/app/src/operation/generate/run_job.rs b/crates/app/src/operation/generate/run_job.rs
+index 4e4303f603..80520a74be 100644
+--- a/crates/app/src/operation/generate/run_job.rs
++++ b/crates/app/src/operation/generate/run_job.rs
+@@ -9,6 +9,8 @@ use super::*;
+ /// exist. The reach preflight refuses unsupported depths before any
+ /// generator builds a path.
+ pub fn run_job(mut job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
++    // #3035: the rest grid's stock simulation, on this (the job's) thread.
++    job.settle_prior();
+     // The spindle law's set-aside note (issue #71 review) rides the
+     // path whichever arm cut it: a note, never a warning - the post
+     // is not held for features the op honestly leaves standing.
+diff --git a/crates/app/src/operation/job.rs b/crates/app/src/operation/job.rs
+index c14865d307..128e364ace 100644
+--- a/crates/app/src/operation/job.rs
++++ b/crates/app/src/operation/job.rs
+@@ -67,7 +67,11 @@ pub struct GenJob {
+     pub(super) slot_bound: Option<Result<crate::machining2d::SlotBound, GenError>>,
+     /// #2848: a rotary op's picked faces, read here; the rotary arms keep to them or refuse by name.
+     pub(super) rotary_picks: Option<Result<super::rotary_picks::Picked, GenError>>,
++    /// The rest grid, once [`GenJob::settle_prior`] has cut `prior_staged`.
+     pub(super) prior: Option<Result<Arc<crate::rest::PriorState>, GenError>>,
++    /// #3035: the rest grid's world reads, done at collect; its stock
++    /// simulation runs in the job, off the collecting thread.
++    pub(super) prior_staged: Option<Result<crate::rest::StagedPrior, GenError>>,
+     /// The program ahead of this op in its setup, uncut (issue #96
+     /// review): verify's vertical-dive convictions are re-read against
+     /// the stock it leaves standing. `None` is nothing ahead cut, a
+@@ -367,17 +371,15 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+         analytic_stock = true;
+     }
+     let carried_overhang = carried.overhang;
+-    let prior = match &op.params {
++    let prior_staged = match &op.params {
+         OpParams::Pocket3D { .. } | OpParams::MultiAxisRough { .. } => {
+-            // The mask the rest laws stand on, resolved NOW on the
+-            // caller's thread; the Arc is so a run never clones a
+-            // height field (Dexel is big, and borrowed anyway).
++            // The mask the rest laws stand on: its world reads NOW, on
++            // the caller's thread; its simulation in the job (#3035).
+             Some(
+-                crate::rest::prior_state(world, op_name, setup, tool.diameter * 0.5)
++                crate::rest::stage_prior(world, op_name, setup, tool.diameter * 0.5)
+                     // #319: declared material past the carried grid is
+                     // present - no mask, the declared stock is cut.
+-                    .map(|p| if carried.distrust_prior { crate::rest::PriorState { grid: None, ..p } } else { p })
+-                    .map(Arc::new),
++                    .map(|p| if carried.distrust_prior { p.without_grid() } else { p }),
+             )
+         }
+         // #2033: a 2D Pocket whose rest area is read from the previous
+@@ -393,9 +395,8 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+                 return Err(GenError::Invalid(format!("{op_name}: {why}")));
+             }
+             Some(
+-                crate::rest::prior_state(world, op_name, setup, tool.diameter * 0.5)
+-                    .map(|p| if carried.distrust_prior { crate::rest::PriorState { grid: None, ..p } } else { p })
+-                    .map(Arc::new),
++                crate::rest::stage_prior(world, op_name, setup, tool.diameter * 0.5)
++                    .map(|p| if carried.distrust_prior { p.without_grid() } else { p }),
+             )
+         }
+         _ => None,
+@@ -524,7 +525,8 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+         drive_chains,
+         slot_bound,
+         rotary_picks: super::rotary_picks::picks_of(world, op),
+-        prior,
++        prior: None,
++        prior_staged,
+         verify_prior,
+         drills_ahead,
+         turned_ahead,
+@@ -562,6 +564,17 @@ pub fn collect_job(world: &World, op: &Operation, op_name: &str) -> Result<GenJo
+     })
+ }
+ 
++impl GenJob {
++    /// #3035: cut the staged rest grid into `prior`. `run_job` calls it
++    /// first, so the stock simulation runs on the job's own thread; an
++    /// error stays stored for the arm that reads the grid.
++    pub(super) fn settle_prior(&mut self) {
++        if let Some(staged) = self.prior_staged.take() {
++            self.prior = Some(staged.and_then(crate::rest::StagedPrior::simulate).map(Arc::new));
++        }
++    }
++}
++
+ /// The old `region_for_src`'s law told without a world: the picks' answer when
+ /// the picks drive, otherwise the pure region build with the section
+ /// height `section_z_of` already resolved. The `take`s mean a stored
+diff --git a/crates/app/src/rest.rs b/crates/app/src/rest.rs
+index d2f92d2dfa..a1c8f02f0d 100644
+--- a/crates/app/src/rest.rs
++++ b/crates/app/src/rest.rs
+@@ -58,8 +58,10 @@ mod across;
+ mod ahead;
+ mod carried_cache;
+ mod pilots;
++mod staged;
+ 
+ pub use pilots::{drills_ahead, turned_ahead, DrillAhead, TurnedAhead};
++pub use staged::{prior_simulations, stage as stage_prior, StagedPrior};
+ 
+ pub use across::{REST_CARRY_REFUSAL, carried_digest, carried_stock_block, carried_stock_body, entered_body};
+ pub use carried_cache::{CAP as CARRIED_CACHE_CAP, clear as clear_carried_cache, computes as carried_body_computes};
+@@ -156,50 +158,9 @@ pub fn prior_state(
+     setup: Option<&str>,
+     tool_r: f64,
+ ) -> Result<PriorState, GenError> {
+-    let chain = chain_of(world, name, setup, true).map_err(GenError::Invalid)?;
+-    if chain.crosses() {
+-        // The stock this setup starts from is what the earlier setups
+-        // left, carried (#318) - a mask even when nothing ahead cut.
+-        let digest = prior_digest(world, name, setup);
+-        let min_r = chain.ops().filter(|a| a.cut && a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
+-        let grid = carried_grid(world, &chain, min_r, true)
+-            .map_err(|e| GenError::Invalid(format!("rest from previous setups: {e}")))?;
+-        return Ok(PriorState { grid: Some(grid), digest });
+-    }
+-    let ahead = chain.into_ops();
+-    if ahead.is_empty() {
+-        return Ok(PriorState {
+-            grid: None,
+-            digest: None,
+-        });
+-    }
+-    let digest = digest_of(&ahead);
+-    if !ahead.iter().any(|a| a.cut) {
+-        // Nothing cut before us: the stock as it came is the rest as
+-        // it stands, and no mask is a cheaper way to say that.
+-        return Ok(PriorState {
+-            grid: None,
+-            digest: Some(digest),
+-        });
+-    }
+-    let min_r = ahead
+-        .iter()
+-        .filter(|a| a.cut && a.radius > 0.0)
+-        .map(|a| a.radius)
+-        .fold(tool_r, f64::min);
+-    let refused = |e: String| GenError::Invalid(format!("rest from previous operations: {e}"));
+-    // #637: the stock on this thread's engine (the column grid by default).
+-    let mut held = stock_sim::carry::first_held(world, setup, min_r).map_err(refused)?;
+-    let runs: Vec<(SimOp, bool)> = ahead
+-        .iter()
+-        .filter(|a| a.cut)
+-        .map(|a| (SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner }, a.drill))
+-        .collect();
+-    simulate_ahead(&mut held, &runs).map_err(refused)?;
+-    Ok(PriorState {
+-        grid: Some(held.into_tops().map_err(refused)?),
+-        digest: Some(digest),
+-    })
++    // #3035: the world reads, then the simulation - one thread here;
++    // a generation job runs the second half on its worker.
++    staged::stage(world, name, setup, tool_r)?.simulate()
+ }
+ 
+ /// The program ahead of one operation, collected but not yet cut
+diff --git a/crates/app/src/rest/staged.rs b/crates/app/src/rest/staged.rs
+new file mode 100644
+index 0000000000..93a1c4deb9
+--- /dev/null
++++ b/crates/app/src/rest/staged.rs
+@@ -0,0 +1,99 @@
++//! #3035: the rest grid in two halves - the world reads (`stage`) and
++//! the stock simulation (`StagedPrior::simulate`), which reads no world
++//! and so runs in the generation job, off the session's thread.
++//! Provenance: our own design (the #2257 / M5.3 B collect-run seam).
++
++use std::cell::Cell;
++
++use super::ahead::{Ahead, digest_of};
++use super::{PriorState, carried_grid, chain_of, prior_digest, simulate_ahead};
++use crate::machining2d::GenError;
++use crate::stock_sim::carry::{self, Held};
++use crate::stock_sim::SimOp;
++use flecs_ecs::prelude::World;
++
++thread_local! {
++    static SIMULATIONS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// How many same-setup rest grids this thread has simulated - the pin
++/// that staging a rest operation simulates none (#3035).
++#[must_use]
++pub fn prior_simulations() -> u64 {
++    SIMULATIONS.with(Cell::get)
++}
++
++/// A rest grid whose world reads are done: ready, or the stock and the
++/// cached moves ahead, still to be cut.
++pub struct StagedPrior {
++    ready: Option<PriorState>,
++    ahead: Option<(Held, Vec<Ahead>, u64)>,
++    keep_grid: bool,
++}
++
++impl StagedPrior {
++    fn ready(p: PriorState) -> Self {
++        Self { ready: Some(p), ahead: None, keep_grid: true }
++    }
++
++    /// #319: declared material past a carried grid - no mask. The
++    /// simulation still runs, so its refusal still refuses.
++    #[must_use]
++    pub fn without_grid(self) -> Self {
++        Self { keep_grid: false, ..self }
++    }
++
++    /// Cut the moves ahead into the stock; no world is read here.
++    pub fn simulate(self) -> Result<PriorState, GenError> {
++        let mut state = match (self.ready, self.ahead) {
++            (Some(p), _) => p,
++            (None, Some((mut held, ahead, digest))) => {
++                SIMULATIONS.with(|n| n.set(n.get().saturating_add(1)));
++                let refused = |e: String| GenError::Invalid(format!("rest from previous operations: {e}"));
++                let runs: Vec<(SimOp, bool)> = ahead
++                    .iter()
++                    .filter(|a| a.cut)
++                    .map(|a| (SimOp { moves: &a.moves, radius: a.radius, ball: a.ball, cone: a.cone, corner: a.corner }, a.drill))
++                    .collect();
++                simulate_ahead(&mut held, &runs).map_err(refused)?;
++                PriorState { grid: Some(held.into_tops().map_err(refused)?), digest: Some(digest) }
++            }
++            (None, None) => return Err(GenError::Invalid("internal: a staged rest grid holds nothing".into())),
++        };
++        if !self.keep_grid {
++            state.grid = None;
++        }
++        Ok(state)
++    }
++}
++
++/// Every world read of [`super::prior_state`], in its order and with its
++/// refusals; the same-setup simulation is left to [`StagedPrior::simulate`].
++/// A carried chain (#318) stays whole here: its body is cached per thread.
++pub fn stage(world: &World, name: &str, setup: Option<&str>, tool_r: f64) -> Result<StagedPrior, GenError> {
++    let chain = chain_of(world, name, setup, true).map_err(GenError::Invalid)?;
++    if chain.crosses() {
++        // The stock this setup starts from is what the earlier setups
++        // left, carried (#318) - a mask even when nothing ahead cut.
++        let digest = prior_digest(world, name, setup);
++        let min_r = chain.ops().filter(|a| a.cut && a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
++        let grid = carried_grid(world, &chain, min_r, true)
++            .map_err(|e| GenError::Invalid(format!("rest from previous setups: {e}")))?;
++        return Ok(StagedPrior::ready(PriorState { grid: Some(grid), digest }));
++    }
++    let ahead = chain.into_ops();
++    if ahead.is_empty() {
++        return Ok(StagedPrior::ready(PriorState { grid: None, digest: None }));
++    }
++    let digest = digest_of(&ahead);
++    if !ahead.iter().any(|a| a.cut) {
++        // Nothing cut before us: the stock as it came is the rest as
++        // it stands, and no mask is a cheaper way to say that.
++        return Ok(StagedPrior::ready(PriorState { grid: None, digest: Some(digest) }));
++    }
++    let min_r = ahead.iter().filter(|a| a.cut && a.radius > 0.0).map(|a| a.radius).fold(tool_r, f64::min);
++    let refused = |e: String| GenError::Invalid(format!("rest from previous operations: {e}"));
++    // #637: the stock on this thread's engine (the column grid by default).
++    let held = carry::first_held(world, setup, min_r).map_err(refused)?;
++    Ok(StagedPrior { ready: None, ahead: Some((held, ahead, digest)), keep_grid: true })
++}
+diff --git a/crates/app/tests/generate_staged.rs b/crates/app/tests/generate_staged.rs
+index e8f4479454..73f2775a89 100644
+--- a/crates/app/tests/generate_staged.rs
++++ b/crates/app/tests/generate_staged.rs
+@@ -59,3 +59,36 @@ fn a_result_is_stale_after_an_edit_a_generation_or_a_delete() {
+     h.execute(&world, DeleteOperation::new(&world, OP).expect("delete"));
+     assert!(!done.still_current(&world), "a deleted operation takes nothing");
+ }
++
++/// #3035: staging a 3D Pocket after a cut reads the world only. The
++/// stock simulation of the program ahead runs in `finish`, on the
++/// worker's thread, so an MCP session or the GUI stays free while it
++/// runs. The finished path is the path the one-shot command lands.
++#[test]
++fn a_rest_reading_pocket_simulates_the_program_ahead_in_its_job_not_at_staging() {
++    let (world, mut h) = world_with_face();
++    h.execute(&world, GenerateOperation::new(&world, OP).expect("the face cuts"));
++    let p3d = operation::retype_params(&pocket(10.0, 5.0), OpType::Pocket3D as usize);
++    let src = SrcRef::Entity("part".into());
++    h.execute(&world, CreateOperation::new(&world, "Rough3D", TOOL, src, p3d).expect("create"));
++
++    let before = camcraft_app::rest::prior_simulations();
++    let staged = StagedGeneration::new(&world, "Rough3D").expect("stages");
++    assert_eq!(camcraft_app::rest::prior_simulations(), before, "staging simulates nothing");
++    let (done, simulated) = std::thread::spawn(move || {
++        let n = camcraft_app::rest::prior_simulations();
++        let done = staged.finish();
++        (done, camcraft_app::rest::prior_simulations() - n)
++    })
++    .join()
++    .expect("the worker thread");
++    assert_eq!(simulated, 1, "the job simulates the face ahead once");
++    let done = done.expect("finishes");
++    assert!(done.still_current(&world));
++    h.execute(&world, done);
++    let staged_path = model::find_by_name(&world, "Rough3D").and_then(|e| model::toolpath_of(&world, &e)).expect("a path");
++    assert!(h.undo(&world));
++    h.execute(&world, GenerateOperation::new(&world, "Rough3D").expect("one shot"));
++    let one_shot = model::find_by_name(&world, "Rough3D").and_then(|e| model::toolpath_of(&world, &e)).expect("a path");
++    assert_eq!(staged_path, one_shot, "the same path either way");
++}
+diff --git a/docs/decisions/3035-rest-staging-worker.md b/docs/decisions/3035-rest-staging-worker.md
+new file mode 100644
+index 0000000000..bed1df6470
+--- /dev/null
++++ b/docs/decisions/3035-rest-staging-worker.md
+@@ -0,0 +1,40 @@
++## #3035 - the rest grid's stock simulation runs in the generation job
++
++**Decided.** `rest::prior_state` is split in two halves:
++
++- `rest::stage_prior` does every world read. It reads the chain of
++  operations ahead, the digest and the stock grid. It has the same order and
++  the same refusals as before.
++- `StagedPrior::simulate` cuts the cached moves ahead into the stock. It
++  reads no world.
++
++`collect_job` keeps the staged half in a new `GenJob::prior_staged` field.
++`run_job` calls `GenJob::settle_prior` first, so the simulation runs on the
++thread of the job. For an MCP `generate` and a GUI generation, that thread
++is the worker. The session thread stays free to answer other calls.
++`prior_state` keeps its signature and calls the two halves in sequence.
++
++**Why.** The MCP worker of PR #3860 took the generator off the session
++thread. But the staging of a rest operation (3D Pocket, Multi-Axis Rough,
++and a 2D Pocket or 2D Adaptive whose rest reads the previous operations)
++still simulated the program ahead on the session thread. On a large part
++this simulation takes a long time, and no other call got an answer.
++
++**Kept the same.** An `#319` distrusted grid still runs the simulation and
++then drops the grid. A simulation refusal therefore still refuses the
++operation, as before. The skip would be faster, but it would let an
++operation pass that refuses today. A stored error surfaces at the same arm
++statement as before. The corner-relief reader (`zones_for_op`) settles the
++grid before the WCS yaw turn reads it, so its result does not change.
++
++**Dropped.**
++
++- A carried chain across setups (#318) stays eager. Its body comes from a
++  per-thread cache (`carried_cache`). A move to the worker would make each
++  job miss that cache.
++- The stock grid (`first_held`) is still built at staging. It needs the
++  world. It costs one allocation and no simulation.
++- Verify's `PriorPlan` was already deferred (#96 review) and does not change.
++
++**Cost to change later.** Low. `StagedPrior` is one type in
++`crates/app/src/rest/staged.rs`; the job has one extra field.

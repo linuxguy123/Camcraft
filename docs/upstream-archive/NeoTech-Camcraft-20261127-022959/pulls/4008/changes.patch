@@ -1,0 +1,1686 @@
+From b0169b4d1b8b7934ebdd9c67a245667c5420117c Mon Sep 17 00:00:00 2001
+From: maintainer <maintainer@camcraft.dev>
+Date: Wed, 25 Nov 2026 09:53:36 +0100
+Subject: [PATCH 1/4] fix(motion): check trochoidal clean-up engagement with
+ step-down and advisory warning
+
+Measures 2D and 3D Adaptive (Trochoidal) clean-up passes against the
+post-lane stock across every max_engagement setting, steps down the
+peel step along CLEANUP_LADDER when needed, and surfaces an advisory
+Warning::EngagementExceeded if reduced steps still exceed the limit.
+
+Fixes #3849
+---
+ crates/app/src/mcp/job.rs                     |   1 +
+ crates/app/src/operation/generate.rs          |  14 ++
+ crates/app/src/warned_moves.rs                |   4 +-
+ crates/app/tests/adaptive_trochoid.rs         |  41 +++++
+ .../motion/src/machining2d/adaptive_troch.rs  |  35 ++--
+ .../src/machining2d/adaptive_troch_clean.rs   | 171 +++++++++++++++++-
+ .../src/machining2d/adaptive_troch_level.rs   |  32 +++-
+ .../src/machining2d/adaptive_troch_tests.rs   |  23 +++
+ crates/motion/src/machining2d/mod.rs          |   3 +
+ crates/motion/src/machining3d/troch.rs        |   3 +
+ crates/motion/tests/adaptive_troch_clean.rs   |  65 +++++++
+ crates/sim/src/verify/types.rs                |  14 +-
+ crates/ui/src/operations.rs                   |  18 +-
+ 13 files changed, 394 insertions(+), 30 deletions(-)
+ create mode 100644 crates/motion/tests/adaptive_troch_clean.rs
+
+diff --git a/crates/app/src/mcp/job.rs b/crates/app/src/mcp/job.rs
+index 1f8d8930f9..0dc59035a2 100644
+--- a/crates/app/src/mcp/job.rs
++++ b/crates/app/src/mcp/job.rs
+@@ -345,6 +345,7 @@ pub(super) fn finding(op: &str, w: &Warning) -> Value {
+         Warning::EntryNotRecommended { at, .. } => ("entry_not_recommended", *at),
+         Warning::EntryStandIn { at, .. } => ("entry_stand_in", *at),
+         Warning::PlungeIntoStock { at } => ("plunge_into_stock", *at),
++        Warning::EngagementExceeded { at, .. } => ("engagement_exceeded", *at),
+     };
+     json!({
+         "op": op,
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 11d2d3c4c7..0e7697e692 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -64,6 +64,17 @@ pub fn entry_not_recommended(path: &Toolpath) -> Option<Warning> {
+     Some(Warning::EntryNotRecommended { at, entry, inside })
+ }
+ 
++/// #3849: a trochoidal clean-up pass whose radial engagement remained
++/// above `limit_deg` after peel step-down - one advisory warning on the
++/// operation and status line so an overloaded clean-up cut never passes
++/// silently.
++#[must_use]
++pub fn cleanup_engagement_warning(path: &Toolpath) -> Option<Warning> {
++    let (measured_deg, limit_deg) = crate::machining2d::cleanup_engagement_exceeded(&path.notes)?;
++    let at = path.moves.iter().position(|m| m.kind != crate::cl::MoveKind::Rapid).unwrap_or(0);
++    Some(Warning::EngagementExceeded { at, measured_deg, limit_deg })
++}
++
+ /// [`run_job`]'s body: every arm, unchanged.
+ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+     let GenJob {
+@@ -4121,6 +4132,9 @@ fn run_job_arms(job: GenJob) -> Result<(Toolpath, Vec<Warning>), GenError> {
+             // #3035: Adaptive areas cut by Offset rings - a warning, not
+             // only a note; advisory (the rings are verified above).
+             warns.extend(strategy_fallback(&path));
++            // #3849: trochoidal clean-up passes that still exceed the
++            // engagement limit - advisory (verified path, load risk).
++            warns.extend(cleanup_engagement_warning(&path));
+             // #3748: a selected entry that is not the recommended Arc on a
+             // start-side pass - one advisory warning, the entry kept.
+             let advice = entry_not_recommended(&path);
+diff --git a/crates/app/src/warned_moves.rs b/crates/app/src/warned_moves.rs
+index ee018ef26d..7bcf4627a7 100644
+--- a/crates/app/src/warned_moves.rs
++++ b/crates/app/src/warned_moves.rs
+@@ -49,7 +49,9 @@ pub fn moves_named(w: &Warning) -> [Option<usize>; 2] {
+         // #3748: the first cut of the selected entry.
+         | Warning::EntryNotRecommended { at, .. }
+         // #3884: the plunge is the user's entry; its first cut.
+-        | Warning::PlungeIntoStock { at } => [Some(*at), None],
++        | Warning::PlungeIntoStock { at }
++        // #3849: clean-up pass above the engagement limit.
++        | Warning::EngagementExceeded { at, .. } => [Some(*at), None],
+         // #3035: the fallback names areas in the notes, not one move;
+         // #3884: so do the stand-in entries.
+         Warning::RestUnjudged { .. } | Warning::StrategyFallback { .. } | Warning::EntryStandIn { .. } => [None, None],
+diff --git a/crates/app/tests/adaptive_trochoid.rs b/crates/app/tests/adaptive_trochoid.rs
+index aa60659fc7..902a2d417c 100644
+--- a/crates/app/tests/adaptive_trochoid.rs
++++ b/crates/app/tests/adaptive_trochoid.rs
+@@ -437,3 +437,44 @@ fn merged_arc_and_trochoidal_parameters_round_trip_and_keep_the_arc_refusal() {
+     let err = operation::generate(&world, &op, "A1").map(|_| ()).expect_err("generation refuses arc turns").to_string();
+     assert!(err.contains("arc turns") && err.contains("Trochoidal"), "{err}");
+ }
++
++/// #3849: an over-limit clean-up engagement note is promoted to an advisory
++/// `Warning::EngagementExceeded` that never holds the post, and a clean-up
++/// cut under a tighter custom engagement limit (`60 deg`) steps down and posts.
++#[test]
++fn cleanup_engagement_warning_is_advisory_and_custom_limit_generates_clean() {
++    use camcraft_app::cl::{Move, Toolpath};
++    use camcraft_app::geometry::Point3;
++    use camcraft_app::machining2d::cleanup_engagement_note;
++    use camcraft_app::verify::Warning;
++
++    let synth = Toolpath {
++        moves: vec![
++            Move::new(MoveKind::Rapid, Point3::new(0.0, 0.0, 10.0), Point3::new(0.0, 0.0, 2.0), None),
++            Move::new(MoveKind::Feed, Point3::new(0.0, 0.0, 2.0), Point3::new(10.0, 0.0, 0.0), Some(800.0)),
++        ],
++        notes: vec![cleanup_engagement_note(102.5, Point3::new(5.0, -3.0, 0.0), 90.0)],
++        ..Default::default()
++    };
++    let w = operation::cleanup_engagement_warning(&synth).expect("warning promoted from note");
++    assert_eq!(w, Warning::EngagementExceeded { at: 1, measured_deg: 102.5, limit_deg: 90.0 });
++    assert!(!w.blocks_post(), "tool-load warning must remain advisory");
++    let text = w.to_string();
++    assert!(text.contains("102.5 deg") && text.contains("90.0 deg") && text.contains("move 1"), "{text}");
++
++    let (world, mut h) = job_mesh(
++        block_with_pocket(40.0, 30.0, &rounded_rect(15.0, 12.0, 0.0, 1), 17.0, 20.0),
++        90.0,
++        70.0,
++        AdaptiveMethod::Trochoidal,
++    );
++    let mut custom = adaptive(AdaptiveMethod::Trochoidal);
++    if let OpParams::Adaptive2D { troch, .. } = &mut custom {
++        troch.max_engagement = 60.0;
++    }
++    h.execute(&world, EditOperationParams::new(&world, "A1", custom).expect("edit 60 deg"));
++    h.execute(&world, GenerateOperation::new(&world, "A1").expect("generates with 60 deg limit"));
++    let e = model::find_by_name(&world, "A1").expect("op");
++    let c = model::toolpath_of(&world, &e).expect("cached");
++    assert!(c.warnings.iter().all(|w| !w.blocks_post()), "advisory only: {:?}", c.warnings);
++}
+diff --git a/crates/motion/src/machining2d/adaptive_troch.rs b/crates/motion/src/machining2d/adaptive_troch.rs
+index a288c2d7c8..124831ed85 100644
+--- a/crates/motion/src/machining2d/adaptive_troch.rs
++++ b/crates/motion/src/machining2d/adaptive_troch.rs
+@@ -32,7 +32,7 @@ use crate::geo2d::{Point2, Region};
+ use crate::geometry::Point3;
+ 
+ use super::adaptive::{Spine, medial_spine, widest_point};
+-use super::adaptive_troch_clean::{emit_cleanup, plan_cleanup};
++use super::adaptive_troch_clean::{cleanup_engagement_note, emit_cleanup, plan_cleanup_checked};
+ use super::adaptive_troch_lanes::{clearance, narrow_err, plan_all_lanes, rest_share, straightened, trochoid_params};
+ use super::face::GenError;
+ use super::pocket::{PocketParams, PocketStrategy};
+@@ -171,8 +171,9 @@ pub(super) fn trochoidal_inside(
+     }
+     let planned = plan_all_lanes(region, &center, p, t)?;
+     let reach = if p.stock_to_leave > 0.0 { region.offset(-p.stock_to_leave)? } else { region.clone() };
+-    let (clean, final_cleared) =
+-        plan_cleanup(&center, &reach, &planned.used_center, &planned.cleared, p.tool_diameter, p.optimal_load, p.climb, t)?;
++    let clean =
++        plan_cleanup_checked(region, &center, &reach, &planned.layouts, &planned.used_center, &planned.cleared, p, t)?;
++    let final_cleared = clean.cleared;
+ 
+     let zs = super::equal_steps::cut_levels_for(p.top_z, &p.links.approach,p.bottom_z, p.stepdown)?;
+     let hop = p.retract_z.unwrap_or(p.clearance_z);
+@@ -196,7 +197,7 @@ pub(super) fn trochoidal_inside(
+             bld.push(MoveKind::Rapid, p3(lay.entry, from), None);
+             emit_level(&mut bld, &lay.lay, &lay.tp, z, from, true, lay.open).map_err(|e| renamed(e).with_ghost_moves(bld.moves()))?;
+         }
+-        emit_cleanup(&mut bld, &clean, p, z, above, hop);
++        emit_cleanup(&mut bld, &clean.chains, p, z, above, hop);
+         above = z;
+     }
+     let at = bld.at();
+@@ -223,8 +224,17 @@ pub(super) fn trochoidal_inside(
+             t.max_engagement
+         ));
+     }
+-    if !clean.is_empty() {
+-        bld.note(format!("{WHO}: {} corner/wall clean-up pass(es) emitted", clean.len()));
++    if !clean.chains.is_empty() {
++        bld.note(format!("{WHO}: {} corner/wall clean-up pass(es) emitted", clean.chains.len()));
++    }
++    if clean.step_reduced {
++        bld.note(format!(
++            "{WHO}: clean-up peel step was reduced to hold the {:.1} deg engagement limit (measured {:.1} deg)",
++            t.max_engagement, clean.max_deg
++        ));
++    }
++    if let Some((deg, at)) = clean.exceeded {
++        bld.note(cleanup_engagement_note(deg, at, t.max_engagement));
+     }
+     let rest = rest_share(&reach, &final_cleared);
+     if rest > REST_NOTE {
+@@ -240,19 +250,6 @@ pub(super) fn trochoidal_inside(
+ 
+     let path = bld.finish();
+     check_path(&path, &center)?;
+-    if t.max_engagement != DEFAULT_MAX_ENGAGEMENT {
+-        let spec = crate::quality::QualitySpec::new(p.tool_diameter);
+-        let mut stock = crate::quality::stock_for(region, p.top_z, p.bottom_z, p.tool_diameter, &spec)
+-            .map_err(|e| GenError::Invalid(format!("{WHO}: measuring stock: {e}")))?;
+-        let quality =
+-            crate::quality::measure(&path, &mut stock, &spec).map_err(|e| GenError::Invalid(format!("{WHO}: measuring stock: {e}")))?;
+-        if quality.max_deg > t.max_engagement {
+-            return Err(GenError::Invalid(format!(
+-                "{WHO}: cleanup and lanes exceed the {:.1} deg engagement limit (measured {:.1} deg)",
+-                t.max_engagement, quality.max_deg
+-            )));
+-        }
+-    }
+     Ok(path)
+ }
+ 
+diff --git a/crates/motion/src/machining2d/adaptive_troch_clean.rs b/crates/motion/src/machining2d/adaptive_troch_clean.rs
+index 1ea78eff1e..0704dee3d1 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_clean.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_clean.rs
+@@ -12,18 +12,65 @@ use super::adaptive::corner_radius;
+ use super::adaptive_troch::AdaptiveTrochParams;
+ use super::face::GenError;
+ use super::pocket::PocketParams;
++use super::trochoid_level::emit_level;
++use super::trochoid_slot::LaneLayout;
+ 
+ const MIN_REMOVED_AREA: f64 = 0.02;
+ const UNCUT_SKIN_ERODE: f64 = 0.025;
+ const MAX_PEEL_STEPS: usize = 64;
++const CLEANUP_LADDER: &[f64] = &[1.0, 0.75, 0.5, 0.35, 0.25];
++
++/// Note prefix emitted when trochoidal clean-up passes exceed the engagement limit (#3849).
++pub const CLEANUP_ENGAGEMENT_NOTE_PREFIX: &str = "2D Adaptive (Trochoidal): clean-up engagement measured ";
++const CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D: &str = "3D Adaptive (Trochoidal): clean-up engagement measured ";
++
++/// Named note for a clean-up pass exceeding `limit_deg` (#3849).
++#[must_use]
++pub fn cleanup_engagement_note(measured_deg: f64, at: Point3, limit_deg: f64) -> String {
++    format!(
++        "{CLEANUP_ENGAGEMENT_NOTE_PREFIX}{measured_deg:.1} deg at ({:.3}, {:.3}), above the {limit_deg:.1} deg limit",
++        at.x, at.y
++    )
++}
++
++/// Extract `(measured_deg, limit_deg)` when any note reports an over-limit clean-up pass (#3849).
++#[must_use]
++pub fn cleanup_engagement_exceeded(notes: &[String]) -> Option<(f64, f64)> {
++    for note in notes {
++        let rest = note
++            .strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX)
++            .or_else(|| note.strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D));
++        let Some(rest) = rest else { continue };
++        let Some((m_str, tail)) = rest.split_once(" deg") else { continue };
++        let Some((_, l_tail)) = tail.split_once("above the ") else { continue };
++        let Some((l_str, _)) = l_tail.split_once(" deg limit") else { continue };
++        if let (Ok(measured), Ok(limit)) = (m_str.trim().parse::<f64>(), l_str.trim().parse::<f64>())
++            && measured.is_finite()
++            && limit.is_finite()
++        {
++            return Some((measured, limit));
++        }
++    }
++    None
++}
+ 
+ /// One clean-up chain at a level: plunge into cut air at `pts[0]` and feed along `pts`.
+ pub(super) struct CleanChain {
+     pub(super) pts: Vec<Point2>,
+ }
+ 
++/// Checked clean-up plan for a level: chains, swept region, and engagement status.
++pub(super) struct CleanPlan {
++    pub(super) chains: Vec<CleanChain>,
++    pub(super) cleared: Region,
++    pub(super) max_deg: f64,
++    pub(super) step_reduced: bool,
++    pub(super) exceeded: Option<(f64, Point3)>,
++}
++
+ /// Peel outward from `cleared.offset(-(r + 0.02))` inside `center` up to `step <= 0.6*r`
+ /// per ring, keeping only chains that remove real uncut stock inside `reach`.
++#[cfg(test)]
+ #[allow(clippy::too_many_arguments)]
+ pub(super) fn plan_cleanup(
+     center: &Region,
+@@ -34,6 +81,21 @@ pub(super) fn plan_cleanup(
+     optimal_load: f64,
+     climb: bool,
+     t: &AdaptiveTrochParams,
++) -> Result<(Vec<CleanChain>, Region), GenError> {
++    plan_cleanup_step(center, reach, used_center, cleared, d, optimal_load, climb, t, 1.0)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn plan_cleanup_step(
++    center: &Region,
++    reach: &Region,
++    used_center: &Region,
++    cleared: &Region,
++    d: f64,
++    optimal_load: f64,
++    climb: bool,
++    t: &AdaptiveTrochParams,
++    step_scale: f64,
+ ) -> Result<(Vec<CleanChain>, Region), GenError> {
+     let r = 0.5 * d;
+     let raw_center = center.offset(-0.5e-3)?;
+@@ -57,14 +119,15 @@ pub(super) fn plan_cleanup(
+     let safe_center = round_acute_corners(&raw_center, rho_acute, 0.20 * r)?.union(&air0)?.intersect(&raw_center)?;
+     let mut prev_safe = air0.clone();
+     // 0.18*r peel steps with 0.20*r 90-deg rounding hold <= 90 deg even into tight neck corners.
+-    let step = load_step(d, optimal_load).min(0.18 * r);
++    let base_step = load_step(d, optimal_load).min(0.18 * r);
+     // A custom contact-angle limit must also bound the cleanup front.
+     let angle_scale = if t.max_engagement < 90.0 { 1.0 - t.max_engagement.to_radians().cos() } else { 1.0 };
+     let engagement_step = 0.18 * r * angle_scale;
+-    let step = step.min(engagement_step);
++    let step = (base_step.min(engagement_step) * step_scale).max(1e-4);
++    let max_peel_steps = ((MAX_PEEL_STEPS as f64) / step_scale).ceil().max(1.0) as usize;
+     let mut chains = Vec::new();
+ 
+-    for k in 1..=MAX_PEEL_STEPS {
++    for k in 1..=max_peel_steps {
+         if uncut.offset(-UNCUT_SKIN_ERODE)?.is_empty() || safe_center.difference(&prev_safe)?.area() < 0.02 {
+             break;
+         }
+@@ -106,6 +169,108 @@ pub(super) fn plan_cleanup(
+     Ok((chains, cur_cleared))
+ }
+ 
++/// Plan clean-up passes and measure their radial engagement against a single-level
++/// post-lane stock model. If clean-up exceeds `t.max_engagement`, steps down along
++/// [`CLEANUP_LADDER`] and, if still above the limit, records `exceeded` so callers
++/// surface a named diagnostic rather than overloading silently (#3849).
++#[allow(clippy::too_many_arguments)]
++pub(super) fn plan_cleanup_checked(
++    region: &Region,
++    center: &Region,
++    reach: &Region,
++    layouts: &[LaneLayout],
++    used_center: &Region,
++    cleared: &Region,
++    p: &PocketParams,
++    t: &AdaptiveTrochParams,
++) -> Result<CleanPlan, GenError> {
++    let mut base = Some(plan_cleanup_step(
++        center,
++        reach,
++        used_center,
++        cleared,
++        p.tool_diameter,
++        p.optimal_load,
++        p.climb,
++        t,
++        1.0,
++    )?);
++    if base.as_ref().is_some_and(|(chains, _)| chains.is_empty()) {
++        let (chains, cleared) = base.take().expect("checked non-empty");
++        return Ok(CleanPlan { chains, cleared, max_deg: 0.0, step_reduced: false, exceeded: None });
++    }
++
++    let spec = crate::quality::QualitySpec::new(p.tool_diameter);
++    let one_p = PocketParams { top_z: 1.0, bottom_z: 0.0, stepdown: 1.0, clearance_z: 3.0, retract_z: Some(2.0), ..*p };
++    let mut lane_bld = PathBuilder::approached(Point3::new(
++        layouts.first().map_or(0.0, |l| l.entry.x),
++        layouts.first().map_or(0.0, |l| l.entry.y),
++        3.0,
++    ));
++    if !layouts.is_empty() {
++        let p3 = |q: Point2, zz: f64| Point3::new(lattice(q.x), lattice(q.y), lattice(zz));
++        let hop = 2.0;
++        let above = 1.0;
++        let from = (above + crate::approach::DEFAULT_PLUNGE_HEIGHT).min(hop).max(above);
++        for (li, lay) in layouts.iter().enumerate() {
++            if li > 0 {
++                let at = lane_bld.at();
++                if (at.z - hop).abs() > 1e-6 {
++                    lane_bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
++                }
++                lane_bld.push(MoveKind::Rapid, p3(lay.entry, hop), None);
++            }
++            lane_bld.push(MoveKind::Rapid, p3(lay.entry, from), None);
++            emit_level(&mut lane_bld, &lay.lay, &lay.tp, 0.0, from, true, lay.open)?;
++        }
++        let at = lane_bld.at();
++        lane_bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
++    }
++    let lane_path = lane_bld.finish();
++    let make_post_lane_stock = || -> Result<crate::stock_sim::Stock, GenError> {
++        let mut stock = crate::quality::stock_for(region, 1.0, 0.0, p.tool_diameter, &spec)
++            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring stock: {e}")))?;
++        crate::quality::measure(&lane_path, &mut stock, &spec)
++            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring stock: {e}")))?;
++        Ok(stock)
++    };
++
++    let mut best: Option<(Vec<CleanChain>, Region, f64, Point3, bool)> = None;
++    for (idx, &scale) in CLEANUP_LADDER.iter().enumerate() {
++        let (chains, cur_cleared) = if idx == 0 {
++            base.take().expect("baseline cleanup")
++        } else {
++            plan_cleanup_step(center, reach, used_center, cleared, p.tool_diameter, p.optimal_load, p.climb, t, scale)?
++        };
++        if chains.is_empty() {
++            continue;
++        }
++        let start_xy = chains[0].pts[0];
++        let mut cb = PathBuilder::approached(Point3::new(lattice(start_xy.x), lattice(start_xy.y), 2.0));
++        emit_cleanup(&mut cb, &chains, &one_p, 0.0, 1.0, 2.0);
++        let clean_path = cb.finish();
++        let mut stock = make_post_lane_stock()?;
++        let q = crate::quality::measure(&clean_path, &mut stock, &spec)
++            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring clean-up stock: {e}")))?;
++        let reduced = idx > 0;
++        if q.max_deg <= t.max_engagement {
++            return Ok(CleanPlan {
++                chains,
++                cleared: cur_cleared,
++                max_deg: q.max_deg,
++                step_reduced: reduced,
++                exceeded: None,
++            });
++        }
++        if best.as_ref().is_none_or(|(_, _, d, _, _)| q.max_deg < *d) {
++            best = Some((chains, cur_cleared, q.max_deg, q.max_at, reduced));
++        }
++    }
++
++    let (chains, cleared, max_deg, max_at, step_reduced) = best.expect("at least baseline candidate existed");
++    Ok(CleanPlan { chains, cleared, max_deg, step_reduced, exceeded: Some((max_deg, max_at)) })
++}
++
+ /// Emit `chains` at level `z`: rapid over cut stock (`near >= above`) to `pts[0]`,
+ /// plunge vertically to `z` outside prior cutter-centre sweeps, feed along `pts`, and retract.
+ pub(super) fn emit_cleanup(bld: &mut PathBuilder, chains: &[CleanChain], p: &PocketParams, z: f64, above: f64, hop: f64) {
+diff --git a/crates/motion/src/machining2d/adaptive_troch_level.rs b/crates/motion/src/machining2d/adaptive_troch_level.rs
+index 365bca1f0a..987a6072d2 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_level.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_level.rs
+@@ -26,7 +26,7 @@ use crate::geo2d::{Point2, Region};
+ use crate::geometry::Point3;
+ 
+ use super::adaptive_troch::{AdaptiveTrochParams, confined};
+-use super::adaptive_troch_clean::{CleanChain, emit_cleanup, plan_cleanup};
++use super::adaptive_troch_clean::{CleanChain, cleanup_engagement_note, emit_cleanup, plan_cleanup_checked};
+ use super::adaptive_troch_lanes::{plan_all_lanes, rest_share};
+ use super::face::GenError;
+ use super::pocket::{PocketParams, PocketStrategy};
+@@ -55,6 +55,7 @@ pub(crate) struct TrochLevel {
+     cleared: Region,
+     reach_area: f64,
+     rest: f64,
++    clean_notes: Vec<String>,
+ }
+ 
+ /// A planner's message under the 3D method's name.
+@@ -99,13 +100,34 @@ pub(crate) fn plan_troch_level(center: &Region, p: &PocketParams, t: &AdaptiveTr
+     let reach = center.offset(r)?;
+     let region = if p.stock_to_leave > 0.0 { center.offset(r + p.stock_to_leave)? } else { reach.clone() };
+     let planned = plan_all_lanes(&region, center, p, t)?;
+-    let (clean, cleared) =
+-        plan_cleanup(center, &reach, &planned.used_center, &planned.cleared, p.tool_diameter, p.optimal_load, p.climb, t)?;
+-    let rest = rest_share(&reach, &cleared);
+-    Ok(TrochLevel { layouts: planned.layouts, clean, cleared, reach_area: reach.area(), rest })
++    let clean =
++        plan_cleanup_checked(&region, center, &reach, &planned.layouts, &planned.used_center, &planned.cleared, p, t)?;
++    let rest = rest_share(&reach, &clean.cleared);
++    let mut clean_notes = Vec::new();
++    if clean.step_reduced {
++        clean_notes.push(rename(&format!(
++            "2D Adaptive (Trochoidal): clean-up peel step was reduced to hold the {:.1} deg engagement limit (measured {:.1} deg)",
++            t.max_engagement, clean.max_deg
++        )));
++    }
++    if let Some((deg, at)) = clean.exceeded {
++        clean_notes.push(rename(&cleanup_engagement_note(deg, at, t.max_engagement)));
++    }
++    Ok(TrochLevel {
++        layouts: planned.layouts,
++        clean: clean.chains,
++        cleared: clean.cleared,
++        reach_area: reach.area(),
++        rest,
++        clean_notes,
++    })
+ }
+ 
+ impl TrochLevel {
++    /// Notes about clean-up engagement adjustment or over-limit cuts (#3849).
++    pub(crate) fn clean_notes(&self) -> &[String] {
++        &self.clean_notes
++    }
+     /// The area the level's cuts sweep clear, down to its plane.
+     pub(crate) fn cleared(&self) -> &Region {
+         &self.cleared
+diff --git a/crates/motion/src/machining2d/adaptive_troch_tests.rs b/crates/motion/src/machining2d/adaptive_troch_tests.rs
+index d8863515c2..1d0ae32e37 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_tests.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_tests.rs
+@@ -214,6 +214,29 @@ fn cleanup_front_respects_custom_engagement_limit() {
+     assert!(first_extent <= 1.98 + angle_step + 2e-3, "custom angle cleanup advanced too far: {first_extent}");
+ }
+ 
++#[test]
++fn plan_cleanup_checked_reports_exceeded_when_even_stepdown_cannot_hold_limit() {
++    let center = rect(-3.0, -3.0, 3.0, 3.0);
++    let cleared = rect(-5.0, -5.0, 5.0, 5.0);
++    let reach = rect(-6.0, -6.0, 6.0, 6.0);
++    let used = rect(-1.98, -1.98, 1.98, 1.98);
++    let t = AdaptiveTrochParams { max_engagement: 30.0, ..AdaptiveTrochParams::default() };
++    let plan = super::super::adaptive_troch_clean::plan_cleanup_checked(
++        &reach,
++        &center,
++        &reach,
++        &[],
++        &used,
++        &cleared,
++        &PocketParams { bottom_z: -3.0, ..params() },
++        &t,
++    )
++    .expect("checked cleanup");
++    assert!(!plan.chains.is_empty(), "expected cleanup chains");
++    let (deg, _) = plan.exceeded.expect("expected exceeded measurement at 30 deg limit");
++    assert!(deg > 30.0, "expected > 30 deg, got {deg}");
++}
++
+ // The slow tests of this module and their light twins (#3514).
+ #[path = "adaptive_troch_heavy_tests.rs"]
+ mod heavy;
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 0024436f51..627391eea5 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -221,6 +221,9 @@ pub use adaptive::{rest_adaptive, rest_levels, RestStock, StockFloor, REST_STOCK
+ pub use adaptive_method::AdaptiveMethod;
+ pub use pocket_hsm_start::trochoidal_pass_start_refusal;
+ pub use adaptive_troch::{AdaptiveTrochParams, adaptive_trochoidal, adaptive_trochoidal_with};
++pub use adaptive_troch_clean::{
++    CLEANUP_ENGAGEMENT_NOTE_PREFIX, cleanup_engagement_exceeded, cleanup_engagement_note,
++};
+ pub use adaptive_avoid::{adaptive_spiral_avoid, adaptive_spiral_avoid_on, adaptive_trochoidal_avoid};
+ pub use trochoid_air::lifted_cut;
+ pub use trochoid_slot::{
+diff --git a/crates/motion/src/machining3d/troch.rs b/crates/motion/src/machining3d/troch.rs
+index 60aec28fc4..8af1985e11 100644
+--- a/crates/motion/src/machining3d/troch.rs
++++ b/crates/motion/src/machining3d/troch.rs
+@@ -143,6 +143,9 @@ impl Run {
+                         share * 100.0
+                     ));
+                 }
++                for n in lvl.clean_notes() {
++                    b.note_once(n);
++                }
+                 let (n, deg) = lvl.loops();
+                 self.loops += n;
+                 self.deg = self.deg.max(deg);
+diff --git a/crates/motion/tests/adaptive_troch_clean.rs b/crates/motion/tests/adaptive_troch_clean.rs
+new file mode 100644
+index 0000000000..db02fe1258
+--- /dev/null
++++ b/crates/motion/tests/adaptive_troch_clean.rs
+@@ -0,0 +1,65 @@
++//! Issue #3849: 2D Adaptive (Trochoidal) clean-up passes are checked against
++//! `max_engagement` (including the 90 deg default), stepped down when needed,
++//! and surfaced with a named diagnostic when even reduced steps exceed it.
++
++#[path = "common/adaptive_troch.rs"]
++mod fixtures;
++
++use camcraft_motion::geo2d::Region;
++use camcraft_motion::geometry::Point3;
++use camcraft_motion::machining2d::{
++    AdaptiveTrochParams, CLEANUP_ENGAGEMENT_NOTE_PREFIX, PocketParams, adaptive_trochoidal_with,
++    cleanup_engagement_exceeded, cleanup_engagement_note,
++};
++use camcraft_motion::quality::{QualitySpec, measure, stock_for};
++use fixtures::*;
++
++fn assert_cleanup_checked(name: &str, region: &Region, p: &PocketParams, max_engagement: f64) {
++    let t = AdaptiveTrochParams { max_engagement, ..AdaptiveTrochParams::default() };
++    let path = adaptive_trochoidal_with(region, p, &t).unwrap_or_else(|e| panic!("{name}: {e}"));
++    let spec = QualitySpec::new(p.tool_diameter);
++    let mut stock = stock_for(region, p.top_z, p.bottom_z, p.tool_diameter, &spec).expect("stock");
++    let q = measure(&path, &mut stock, &spec).expect("measure");
++    let warned = cleanup_engagement_exceeded(&path.notes);
++    if q.max_deg > max_engagement + 0.5 {
++        let (measured, limit) = warned.unwrap_or_else(|| {
++            panic!(
++                "{name}: engagement {:.1} deg exceeds {:.1} deg without a named warning; notes={:?}",
++                q.max_deg, max_engagement, path.notes
++            )
++        });
++        assert!(measured > limit && (limit - max_engagement).abs() < 0.2, "{name}: {warned:?}");
++    } else {
++        assert!(warned.is_none(), "{name}: unexpected warning {warned:?} at {:.1} deg", q.max_deg);
++    }
++}
++
++#[test]
++fn cleanup_engagement_is_checked_on_default_and_custom_limits() {
++    let p = PocketParams { bottom_z: -3.0, ..params() };
++    // Default 90 deg limit on #1587 face fixture stays <= 90 deg cleanly.
++    assert_cleanup_checked("face 34x16 D6 (90 deg)", &face(), &p, 90.0);
++
++    // Regression (#3849): on upstream/main prior to this fix, wide 30x24 D6 and
++    // L-shape D10 at 60 deg passed lanes <= 60 deg, hit 64.0 and 62.5 deg in
++    // unstepped cleanup, and never stepped cleanup down or surfaced a warning.
++    let wide = rect(0.0, 0.0, 30.0, 24.0);
++    assert_cleanup_checked("wide 30x24 D6 (60 deg)", &wide, &p, 60.0);
++
++    let l_shape = Region::new(vec![poly(&[
++        (0.0, 0.0), (60.0, 0.0), (60.0, 30.0), (30.0, 30.0), (30.0, 60.0), (0.0, 60.0),
++    ])])
++    .expect("L-shape");
++    assert_cleanup_checked("L-shape D10 (60 deg)", &l_shape, &PocketParams { tool_diameter: 10.0, ..p }, 60.0);
++}
++
++#[test]
++fn cleanup_engagement_note_round_trips_for_2d_and_3d() {
++    let note_2d = cleanup_engagement_note(102.5, Point3::new(1.25, -2.5, 0.0), 90.0);
++    assert!(note_2d.starts_with(CLEANUP_ENGAGEMENT_NOTE_PREFIX), "{note_2d}");
++    assert_eq!(cleanup_engagement_exceeded(&[note_2d.clone()]), Some((102.5, 90.0)));
++
++    let note_3d = note_2d.replacen("2D Adaptive (Trochoidal):", "3D Adaptive (Trochoidal):", 1);
++    assert_eq!(cleanup_engagement_exceeded(&[note_3d]), Some((102.5, 90.0)));
++    assert_eq!(cleanup_engagement_exceeded(&["2D Adaptive (Trochoidal): 16 corner/wall clean-up pass(es) emitted".into()]), None);
++}
+diff --git a/crates/sim/src/verify/types.rs b/crates/sim/src/verify/types.rs
+index bba79bdf11..4ca3924314 100644
+--- a/crates/sim/src/verify/types.rs
++++ b/crates/sim/src/verify/types.rs
+@@ -465,6 +465,12 @@ pub enum Warning {
+     /// stock at a pass start that no earlier cut cleared, from the first
+     /// cut at `at`. Advisory: the entry is the user's and is verified.
+     PlungeIntoStock { at: usize },
++    /// #3849: a trochoidal clean-up pass measured `measured_deg` of radial
++    /// engagement, above the operation's `limit_deg` ceiling, even after
++    /// reducing the clean-up peel step. Advisory (tool load risk, not a
++    /// gouge): shown on the operation and status line; does not hold the
++    /// post.
++    EngagementExceeded { at: usize, measured_deg: f64, limit_deg: f64 },
+ }
+ 
+ impl Warning {
+@@ -484,7 +490,8 @@ impl Warning {
+                 | Warning::PlungeTooDeep { .. }
+                 | Warning::EntryNotRecommended { .. }
+                 | Warning::EntryStandIn { .. }
+-                | Warning::PlungeIntoStock { .. })
++                | Warning::PlungeIntoStock { .. }
++                | Warning::EngagementExceeded { .. })
+     }
+ 
+     /// The envelope report's unjudged hidden half, as the warning that
+@@ -663,6 +670,11 @@ impl core::fmt::Display for Warning {
+                  from move {at}: Arc is recommended, because it enters from the air outside the stock where it fits \
+                  (the post is not held: the cut is verified)"
+             ),
++            Warning::EngagementExceeded { at, measured_deg, limit_deg } => write!(
++                f,
++                "clean-up engagement measured {measured_deg:.1} deg from move {at}, above the {limit_deg:.1} deg limit - \
++                 reduce optimal load or increase the engagement limit (the post is not held: the risk is the tool load)"
++            ),
+         }
+     }
+ }
+diff --git a/crates/ui/src/operations.rs b/crates/ui/src/operations.rs
+index a554a9f41b..b120de4594 100644
+--- a/crates/ui/src/operations.rs
++++ b/crates/ui/src/operations.rs
+@@ -320,6 +320,8 @@ pub fn fold_warnings_located(warnings: &[Warning]) -> Vec<(String, Option<usize>
+             // uncut stock of a start-side pass - advisory, own lines.
+             Warning::EntryStandIn { .. } => (228, false),
+             Warning::PlungeIntoStock { .. } => (229, false),
++            // #3849: trochoidal clean-up engagement above limit - advisory.
++            Warning::EngagementExceeded { .. } => (230, false),
+             // A lathe holder's rub (#369) splits part from stock too.
+             Warning::HolderHit { part, .. } => (212 + *part as u8, false),
+         }
+@@ -352,7 +354,8 @@ pub fn fold_warnings_located(warnings: &[Warning]) -> Vec<(String, Option<usize>
+             | Warning::PlungeTooDeep { at, .. }
+             | Warning::EntryNotRecommended { at, .. }
+             | Warning::EntryStandIn { at, .. }
+-            | Warning::PlungeIntoStock { at } => *at,
++            | Warning::PlungeIntoStock { at }
++            | Warning::EngagementExceeded { at, .. } => *at,
+         }
+     }
+     let mut lines: Vec<(String, Option<usize>)> = Vec::new();
+@@ -740,4 +743,17 @@ mod warning_fold_tests {
+         assert_eq!(at, [Some(10), Some(500), Some(3), Some(4)]);
+         assert!(w[5].blocks_post(), "a part rapid remains a blocking warning");
+     }
++
++    #[test]
++    fn engagement_exceeded_surfaces_as_advisory_status_line_and_keeps_own_group() {
++        let w = [
++            Warning::PlungeIntoStock { at: 2 },
++            Warning::EngagementExceeded { at: 9, measured_deg: 102.5, limit_deg: 90.0 },
++        ];
++        assert!(!w[1].blocks_post());
++        let located = super::fold_warnings_located(&w);
++        assert_eq!(located.len(), 2, "{located:?}");
++        assert_eq!(located[1].1, Some(9));
++        assert!(located[1].0.contains("102.5 deg") && located[1].0.contains("90.0 deg"), "{:?}", located[1]);
++    }
+ }
+
+From b05f1318caa69da1c4313987955f8f2a636d0e30 Mon Sep 17 00:00:00 2001
+From: maintainer <maintainer@camcraft.dev>
+Date: Wed, 25 Nov 2026 11:09:29 +0100
+Subject: [PATCH 2/4] test(motion): use slice::from_ref in adaptive_troch_clean
+
+Fixes clippy::cloned_ref_to_slice_refs.
+
+Fixes #3849
+---
+ crates/motion/tests/adaptive_troch_clean.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/motion/tests/adaptive_troch_clean.rs b/crates/motion/tests/adaptive_troch_clean.rs
+index db02fe1258..a4ae99e347 100644
+--- a/crates/motion/tests/adaptive_troch_clean.rs
++++ b/crates/motion/tests/adaptive_troch_clean.rs
+@@ -57,7 +57,7 @@ fn cleanup_engagement_is_checked_on_default_and_custom_limits() {
+ fn cleanup_engagement_note_round_trips_for_2d_and_3d() {
+     let note_2d = cleanup_engagement_note(102.5, Point3::new(1.25, -2.5, 0.0), 90.0);
+     assert!(note_2d.starts_with(CLEANUP_ENGAGEMENT_NOTE_PREFIX), "{note_2d}");
+-    assert_eq!(cleanup_engagement_exceeded(&[note_2d.clone()]), Some((102.5, 90.0)));
++    assert_eq!(cleanup_engagement_exceeded(std::slice::from_ref(&note_2d)), Some((102.5, 90.0)));
+ 
+     let note_3d = note_2d.replacen("2D Adaptive (Trochoidal):", "3D Adaptive (Trochoidal):", 1);
+     assert_eq!(cleanup_engagement_exceeded(&[note_3d]), Some((102.5, 90.0)));
+
+From 947b907a71e6b3015d94d8b52691d63a34b7b641 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Wed, 25 Nov 2026 22:50:28 +0100
+Subject: [PATCH 3/4] fix(motion): keep the custom-limit refusal, pin the
+ trochoidal clean-up check
+
+Review fixes for PR #4008 (head b05f1318c):
+
+1. Restore main's whole-path refusal for a custom max_engagement. The
+   clean-up check only steps the peel down first. Decision in
+   docs/decisions/3849-trochoidal-cleanup-engagement.md.
+2. No expect() or unchecked index in the clean-up check: the baseline is
+   a plain value, the first chain point is read with first().
+3. End-to-end pins: a 2D and a 3D Trochoidal operation on a notch pocket
+   carry Warning::EngagementExceeded in the cached warnings.
+4. Step-down pins: wide 30x24 D6 and L-shape D10 at 60 deg step down,
+   post, carry the "peel step was reduced" note and no warning.
+5. A pin that is red on upstream/main: the notch pocket at the 90 deg
+   default (118.5 deg on main, no note). The test comment is corrected.
+6. The warning names the clean-up feed through the measured peak (the
+   note carries the level Z), not the first lane cut.
+
+The check and its notes move to adaptive_troch_check.rs (400-line rule).
+
+Refs #3849
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/operation/generate.rs          |   6 +-
+ crates/app/tests/adaptive_trochoid.rs         |  77 +++++-
+ crates/app/tests/pocket3d_trochoid.rs         |  35 +++
+ .../motion/src/machining2d/adaptive_troch.rs  |  19 +-
+ .../src/machining2d/adaptive_troch_check.rs   | 235 ++++++++++++++++++
+ .../src/machining2d/adaptive_troch_clean.rs   | 152 +----------
+ .../src/machining2d/adaptive_troch_level.rs   |   3 +-
+ .../src/machining2d/adaptive_troch_tests.rs   |   2 +-
+ crates/motion/src/machining2d/mod.rs          |   5 +-
+ crates/motion/tests/adaptive_troch_clean.rs   |  75 +++++-
+ .../3849-trochoidal-cleanup-engagement.md     |  37 +++
+ 11 files changed, 472 insertions(+), 174 deletions(-)
+ create mode 100644 crates/motion/src/machining2d/adaptive_troch_check.rs
+ create mode 100644 docs/decisions/3849-trochoidal-cleanup-engagement.md
+
+diff --git a/crates/app/src/operation/generate.rs b/crates/app/src/operation/generate.rs
+index 0e7697e692..b5adb8438d 100644
+--- a/crates/app/src/operation/generate.rs
++++ b/crates/app/src/operation/generate.rs
+@@ -67,11 +67,11 @@ pub fn entry_not_recommended(path: &Toolpath) -> Option<Warning> {
+ /// #3849: a trochoidal clean-up pass whose radial engagement remained
+ /// above `limit_deg` after peel step-down - one advisory warning on the
+ /// operation and status line so an overloaded clean-up cut never passes
+-/// silently.
++/// silently. `at` is the clean-up feed through the measured peak, not
++/// the path's first cut.
+ #[must_use]
+ pub fn cleanup_engagement_warning(path: &Toolpath) -> Option<Warning> {
+-    let (measured_deg, limit_deg) = crate::machining2d::cleanup_engagement_exceeded(&path.notes)?;
+-    let at = path.moves.iter().position(|m| m.kind != crate::cl::MoveKind::Rapid).unwrap_or(0);
++    let (at, measured_deg, limit_deg) = crate::machining2d::cleanup_engagement_move(path)?;
+     Some(Warning::EngagementExceeded { at, measured_deg, limit_deg })
+ }
+ 
+diff --git a/crates/app/tests/adaptive_trochoid.rs b/crates/app/tests/adaptive_trochoid.rs
+index 902a2d417c..94b3f73415 100644
+--- a/crates/app/tests/adaptive_trochoid.rs
++++ b/crates/app/tests/adaptive_trochoid.rs
+@@ -438,29 +438,82 @@ fn merged_arc_and_trochoidal_parameters_round_trip_and_keep_the_arc_refusal() {
+     assert!(err.contains("arc turns") && err.contains("Trochoidal"), "{err}");
+ }
+ 
+-/// #3849: an over-limit clean-up engagement note is promoted to an advisory
+-/// `Warning::EngagementExceeded` that never holds the post, and a clean-up
+-/// cut under a tighter custom engagement limit (`60 deg`) steps down and posts.
++/// #3849: an over-limit clean-up note is promoted to an advisory
++/// `Warning::EngagementExceeded` on the feed through the noted peak - at
++/// the noted level's Z, the last of equal ones - not on the first cut.
+ #[test]
+-fn cleanup_engagement_warning_is_advisory_and_custom_limit_generates_clean() {
++fn cleanup_engagement_warning_names_the_feed_through_the_peak() {
+     use camcraft_app::cl::{Move, Toolpath};
+     use camcraft_app::geometry::Point3;
+     use camcraft_app::machining2d::cleanup_engagement_note;
+     use camcraft_app::verify::Warning;
+ 
++    let feed = |a: (f64, f64, f64), b: (f64, f64, f64)| {
++        Move::new(MoveKind::Feed, Point3::new(a.0, a.1, a.2), Point3::new(b.0, b.1, b.2), Some(800.0))
++    };
+     let synth = Toolpath {
+         moves: vec![
+             Move::new(MoveKind::Rapid, Point3::new(0.0, 0.0, 10.0), Point3::new(0.0, 0.0, 2.0), None),
+-            Move::new(MoveKind::Feed, Point3::new(0.0, 0.0, 2.0), Point3::new(10.0, 0.0, 0.0), Some(800.0)),
++            // The first cut (a lane), far from the peak.
++            feed((0.0, 0.0, 0.0), (10.0, 0.0, 0.0)),
++            // A cut through the peak at another level.
++            feed((0.0, 5.0, -3.0), (10.0, 5.0, -3.0)),
++            // Two cuts through the peak at its level: the later one is named.
++            feed((0.0, 5.0, 0.0), (10.0, 5.0, 0.0)),
++            feed((5.0, 0.0, 0.0), (5.0, 10.0, 0.0)),
++            feed((20.0, 20.0, 0.0), (30.0, 20.0, 0.0)),
+         ],
+-        notes: vec![cleanup_engagement_note(102.5, Point3::new(5.0, -3.0, 0.0), 90.0)],
++        notes: vec![cleanup_engagement_note(102.5, Point3::new(5.0, 5.0, 0.0), 90.0)],
+         ..Default::default()
+     };
+     let w = operation::cleanup_engagement_warning(&synth).expect("warning promoted from note");
+-    assert_eq!(w, Warning::EngagementExceeded { at: 1, measured_deg: 102.5, limit_deg: 90.0 });
++    assert_eq!(w, Warning::EngagementExceeded { at: 4, measured_deg: 102.5, limit_deg: 90.0 });
+     assert!(!w.blocks_post(), "tool-load warning must remain advisory");
+     let text = w.to_string();
+-    assert!(text.contains("102.5 deg") && text.contains("90.0 deg") && text.contains("move 1"), "{text}");
++    assert!(text.contains("102.5 deg") && text.contains("90.0 deg") && text.contains("move 4"), "{text}");
++}
++
++/// A 20 x 14 pocket with a 7 mm notch in its +Y wall, centred on the
++/// origin (#3849): the 6 mm tool's clean-up into the notch reads about
++/// 97.5 deg at the 90 deg default even at the smallest peel step.
++fn notch_ring() -> Vec<(f64, f64)> {
++    vec![(-10.0, -7.0), (10.0, -7.0), (10.0, 7.0), (3.5, 7.0), (3.5, 14.0), (-3.5, 14.0), (-3.5, 7.0), (-10.0, 7.0)]
++}
++
++/// #3849 end to end: the real generator cuts the notch pocket at the
++/// default 90 deg limit, the clean-up still exceeds it after step-down,
++/// and the cached warnings carry `EngagementExceeded` on a clean-up feed
++/// in the notch - advisory, the post is not held. On `upstream/main` the
++/// clean-up was never measured at 90 deg: no note, no warning.
++#[test]
++fn an_over_limit_cleanup_warns_on_its_own_move_through_the_real_generator() {
++    use camcraft_app::verify::Warning;
++
++    let (world, mut h) = job_mesh(block_with_pocket(20.0, 20.0, &notch_ring(), 17.0, 20.0), 40.0, 40.0, AdaptiveMethod::Trochoidal);
++    h.execute(&world, GenerateOperation::new(&world, "A1").expect("generates at the 90 deg default"));
++    let e = model::find_by_name(&world, "A1").expect("op");
++    let c = model::toolpath_of(&world, &e).expect("cached");
++    let Some(&Warning::EngagementExceeded { at, measured_deg, limit_deg }) =
++        c.warnings.iter().find(|w| matches!(w, Warning::EngagementExceeded { .. }))
++    else {
++        panic!("no EngagementExceeded: warnings={:?} notes={:?}", c.warnings, c.path.notes);
++    };
++    assert!(measured_deg > limit_deg && (limit_deg - 90.0).abs() < 1e-9, "{measured_deg} / {limit_deg}");
++    assert!(c.warnings.iter().all(|w| !w.blocks_post()), "advisory only: {:?}", c.warnings);
++    let first_cut = c.path.moves.iter().position(|m| m.kind != MoveKind::Rapid).expect("a cut");
++    let m = &c.path.moves[at];
++    assert!(at > first_cut, "the warning names the first lane cut {first_cut}, not the clean-up");
++    assert_eq!(m.kind, MoveKind::Feed, "move {at}: {m:?}");
++    assert!((m.to.z - 17.0).abs() < 1e-6 && m.from.y.max(m.to.y) > 7.0, "move {at} is not a clean-up feed in the notch: {m:?}");
++}
++
++/// #3849 step-down: the 30 x 24 pocket under a 60 deg limit reads about
++/// 64 deg in its clean-up at the full peel step (main refused it). The
++/// peel steps down, the path holds the limit and posts, with the "peel
++/// step was reduced" note and no `EngagementExceeded`.
++#[test]
++fn a_custom_limit_cleanup_steps_down_and_posts_without_a_warning() {
++    use camcraft_app::verify::Warning;
+ 
+     let (world, mut h) = job_mesh(
+         block_with_pocket(40.0, 30.0, &rounded_rect(15.0, 12.0, 0.0, 1), 17.0, 20.0),
+@@ -475,6 +528,12 @@ fn cleanup_engagement_warning_is_advisory_and_custom_limit_generates_clean() {
+     h.execute(&world, EditOperationParams::new(&world, "A1", custom).expect("edit 60 deg"));
+     h.execute(&world, GenerateOperation::new(&world, "A1").expect("generates with 60 deg limit"));
+     let e = model::find_by_name(&world, "A1").expect("op");
+-    let c = model::toolpath_of(&world, &e).expect("cached");
++    let c = model::toolpath_of(&world, &e).expect("cached: the stepped-down path is not refused");
++    assert!(
++        c.path.notes.iter().any(|n| n.contains("clean-up peel step was reduced to hold the 60.0 deg engagement limit")),
++        "no step-down note: {:?}",
++        c.path.notes
++    );
++    assert!(!c.warnings.iter().any(|w| matches!(w, Warning::EngagementExceeded { .. })), "{:?}", c.warnings);
+     assert!(c.warnings.iter().all(|w| !w.blocks_post()), "advisory only: {:?}", c.warnings);
+ }
+diff --git a/crates/app/tests/pocket3d_trochoid.rs b/crates/app/tests/pocket3d_trochoid.rs
+index 3d04e43900..6a7be911da 100644
+--- a/crates/app/tests/pocket3d_trochoid.rs
++++ b/crates/app/tests/pocket3d_trochoid.rs
+@@ -237,3 +237,38 @@ fn mcp_sets_the_method_generates_verifies_and_refuses_an_unknown_word() {
+     assert!(ops.contains("trochoidal"), "undo restores the method: {ops}");
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++/// #3849 end to end in 3D: a 20 x 14 pocket with a 7 mm notch in its +Y
++/// wall, 6 mm deep, roughed by trochoidal levels at the 90 deg default.
++/// The 6 mm tool's clean-up into the notch still exceeds the limit after
++/// step-down, so the cached warnings carry `EngagementExceeded` on a
++/// clean-up feed in the notch - advisory, the post is not held.
++#[test]
++fn an_over_limit_cleanup_level_warns_on_its_own_move() {
++    use camcraft_app::verify::Warning;
++
++    let ring = [(-10.0, -7.0), (10.0, -7.0), (10.0, 7.0), (3.5, 7.0), (3.5, 14.0), (-3.5, 14.0), (-3.5, 7.0), (-10.0, 7.0)];
++    let world = new_world();
++    let mut h = History::default();
++    h.execute(&world, ImportModel::from_mesh("part", block_with_pocket(20.0, 20.0, &ring, 14.0, 20.0)));
++    h.execute(&world, SetStock::new(&world, StockShape::Box { dx: 40.0, dy: 40.0, dz: 20.0 }, Default::default()).expect("stock"));
++    let t = catalog().into_iter().find(|(n, _)| *n == TOOL).map(|(_, t)| t).expect("catalog");
++    h.execute(&world, AddTool::new(&world, TOOL, t).expect("tool"));
++    let op = adaptive(AdaptiveMethod::Trochoidal);
++    h.execute(&world, CreateOperation::new(&world, "R1", TOOL, SrcRef::Entity("part".into()), op).expect("create"));
++    h.execute(&world, GenerateOperation::new(&world, "R1").expect("generates"));
++    let e = model::find_by_name(&world, "R1").expect("op");
++    let c = model::toolpath_of(&world, &e).expect("cached path");
++    let Some(&Warning::EngagementExceeded { at, measured_deg, limit_deg }) =
++        c.warnings.iter().find(|w| matches!(w, Warning::EngagementExceeded { .. }))
++    else {
++        panic!("no EngagementExceeded: warnings={:?} notes={:?}", c.warnings, c.path.notes);
++    };
++    assert!(measured_deg > limit_deg && (limit_deg - 90.0).abs() < 1e-9, "{measured_deg} / {limit_deg}");
++    assert!(c.warnings.iter().all(|w| !w.blocks_post()), "advisory only: {:?}", c.warnings);
++    let first_cut = c.path.moves.iter().position(|m| m.kind != MoveKind::Rapid).expect("a cut");
++    let m = &c.path.moves[at];
++    assert!(at > first_cut, "the warning names the first lane cut {first_cut}, not the clean-up");
++    assert_eq!(m.kind, MoveKind::Feed, "move {at}: {m:?}");
++    assert!(m.from.y.max(m.to.y) > 7.0, "move {at} is not a clean-up feed in the notch: {m:?}");
++}
+diff --git a/crates/motion/src/machining2d/adaptive_troch.rs b/crates/motion/src/machining2d/adaptive_troch.rs
+index 124831ed85..d07dfdce2f 100644
+--- a/crates/motion/src/machining2d/adaptive_troch.rs
++++ b/crates/motion/src/machining2d/adaptive_troch.rs
+@@ -32,7 +32,8 @@ use crate::geo2d::{Point2, Region};
+ use crate::geometry::Point3;
+ 
+ use super::adaptive::{Spine, medial_spine, widest_point};
+-use super::adaptive_troch_clean::{cleanup_engagement_note, emit_cleanup, plan_cleanup_checked};
++use super::adaptive_troch_check::{cleanup_engagement_note, plan_cleanup_checked};
++use super::adaptive_troch_clean::emit_cleanup;
+ use super::adaptive_troch_lanes::{clearance, narrow_err, plan_all_lanes, rest_share, straightened, trochoid_params};
+ use super::face::GenError;
+ use super::pocket::{PocketParams, PocketStrategy};
+@@ -250,6 +251,22 @@ pub(super) fn trochoidal_inside(
+ 
+     let path = bld.finish();
+     check_path(&path, &center)?;
++    // A custom limit is held by the WHOLE path - lanes, links, clean-up,
++    // every level - or the path is refused (#3849 keeps this refusal; the
++    // clean-up check above only steps the peel down first).
++    if t.max_engagement != DEFAULT_MAX_ENGAGEMENT {
++        let spec = crate::quality::QualitySpec::new(p.tool_diameter);
++        let mut stock = crate::quality::stock_for(region, p.top_z, p.bottom_z, p.tool_diameter, &spec)
++            .map_err(|e| GenError::Invalid(format!("{WHO}: measuring stock: {e}")))?;
++        let quality =
++            crate::quality::measure(&path, &mut stock, &spec).map_err(|e| GenError::Invalid(format!("{WHO}: measuring stock: {e}")))?;
++        if quality.max_deg > t.max_engagement {
++            return Err(GenError::Invalid(format!(
++                "{WHO}: cleanup and lanes exceed the {:.1} deg engagement limit (measured {:.1} deg)",
++                t.max_engagement, quality.max_deg
++            )));
++        }
++    }
+     Ok(path)
+ }
+ 
+diff --git a/crates/motion/src/machining2d/adaptive_troch_check.rs b/crates/motion/src/machining2d/adaptive_troch_check.rs
+new file mode 100644
+index 0000000000..97742db279
+--- /dev/null
++++ b/crates/motion/src/machining2d/adaptive_troch_check.rs
+@@ -0,0 +1,235 @@
++//! The engagement check of `adaptive_troch`'s clean-up passes (#3849):
++//! the planned chains are measured against a post-lane stock model, the
++//! peel step steps down while they exceed the limit, and a pass that
++//! still exceeds it gets a named note that the operation turns into a
++//! warning on the clean-up move. Radial engagement by the stock model of
++//! `crate::quality` (our own law, after Otkur & Lazoglu 2007).
++
++use crate::cl::{MoveKind, PathBuilder, Toolpath, lattice};
++use crate::geo2d::{Point2, Region};
++use crate::geometry::Point3;
++
++use super::adaptive_troch::AdaptiveTrochParams;
++use super::adaptive_troch_clean::{CleanChain, emit_cleanup, plan_cleanup_step};
++use super::face::GenError;
++use super::pocket::PocketParams;
++use super::trochoid_level::emit_level;
++use super::trochoid_slot::LaneLayout;
++
++/// The peel-step scales tried, in order, until the clean-up holds the limit.
++pub(super) const CLEANUP_LADDER: &[f64] = &[1.0, 0.75, 0.5, 0.35, 0.25];
++
++/// Note prefix emitted when trochoidal clean-up passes exceed the engagement limit (#3849).
++pub const CLEANUP_ENGAGEMENT_NOTE_PREFIX: &str = "2D Adaptive (Trochoidal): clean-up engagement measured ";
++const CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D: &str = "3D Adaptive (Trochoidal): clean-up engagement measured ";
++
++/// Checked clean-up plan for a level: chains, swept region, and engagement status.
++pub(super) struct CleanPlan {
++    pub(super) chains: Vec<CleanChain>,
++    pub(super) cleared: Region,
++    pub(super) max_deg: f64,
++    pub(super) step_reduced: bool,
++    /// The measured engagement and the cutter centre where it peaked,
++    /// at the level's Z (`p.bottom_z`), when no ladder step held the limit.
++    pub(super) exceeded: Option<(f64, Point3)>,
++}
++
++/// Named note for a clean-up pass exceeding `limit_deg` at `at` (#3849).
++#[must_use]
++pub fn cleanup_engagement_note(measured_deg: f64, at: Point3, limit_deg: f64) -> String {
++    format!(
++        "{CLEANUP_ENGAGEMENT_NOTE_PREFIX}{measured_deg:.1} deg at ({:.3}, {:.3}, {:.3}), above the {limit_deg:.1} deg limit",
++        at.x, at.y, at.z
++    )
++}
++
++/// `(measured_deg, limit_deg, at)` of the first note that reports an
++/// over-limit clean-up pass.
++fn parse_note(notes: &[String]) -> Option<(f64, f64, Option<Point3>)> {
++    for note in notes {
++        let rest = note
++            .strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX)
++            .or_else(|| note.strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D));
++        let Some(rest) = rest else { continue };
++        let Some((m_str, tail)) = rest.split_once(" deg") else { continue };
++        let Some((at_str, l_tail)) = tail.split_once("above the ") else { continue };
++        let Some((l_str, _)) = l_tail.split_once(" deg limit") else { continue };
++        if let (Ok(measured), Ok(limit)) = (m_str.trim().parse::<f64>(), l_str.trim().parse::<f64>())
++            && measured.is_finite()
++            && limit.is_finite()
++        {
++            return Some((measured, limit, parse_point(at_str)));
++        }
++    }
++    None
++}
++
++/// The `(x, y, z)` of the note's ` at (x, y, z), ` tail.
++fn parse_point(s: &str) -> Option<Point3> {
++    let inner = s.split_once('(')?.1.split_once(')')?.0;
++    let v: Vec<f64> = inner.split(',').map(|c| c.trim().parse::<f64>()).collect::<Result<_, _>>().ok()?;
++    match v[..] {
++        [x, y, z] if x.is_finite() && y.is_finite() && z.is_finite() => Some(Point3::new(x, y, z)),
++        _ => None,
++    }
++}
++
++/// Extract `(measured_deg, limit_deg)` when any note reports an over-limit clean-up pass (#3849).
++#[must_use]
++pub fn cleanup_engagement_exceeded(notes: &[String]) -> Option<(f64, f64)> {
++    parse_note(notes).map(|(m, l, _)| (m, l))
++}
++
++/// `(move, measured_deg, limit_deg)` of an over-limit clean-up pass
++/// (#3849): the move is the feed at the noted level's Z that passes
++/// nearest the noted cutter centre; of equal ones the last, because the
++/// clean-up is cut after the lanes of its level.
++#[must_use]
++pub fn cleanup_engagement_move(path: &Toolpath) -> Option<(usize, f64, f64)> {
++    let (measured, limit, at) = parse_note(&path.notes)?;
++    let at = at.and_then(|q| nearest_feed(path, q)).unwrap_or(0);
++    Some((at, measured, limit))
++}
++
++fn nearest_feed(path: &Toolpath, q: Point3) -> Option<usize> {
++    let mut best: Option<(usize, f64)> = None;
++    for (i, m) in path.moves.iter().enumerate() {
++        let level = (m.from.z - q.z).abs() <= 1e-3 && (m.to.z - q.z).abs() <= 1e-3;
++        if m.kind != MoveKind::Feed || !level {
++            continue;
++        }
++        let d = m.segments3(0.01).iter().map(|&(a, b)| seg_dist(q, a, b)).fold(f64::INFINITY, f64::min);
++        match best {
++            _ if !d.is_finite() => {}
++            None => best = Some((i, d)),
++            // Within 1 um of the nearest so far: the later move wins.
++            Some((_, bd)) if d <= bd + 1e-3 => best = Some((i, d.min(bd))),
++            Some(_) => {}
++        }
++    }
++    best.map(|(i, _)| i)
++}
++
++/// XY distance from `q` to the segment `a`-`b`.
++fn seg_dist(q: Point3, a: Point3, b: Point3) -> f64 {
++    let (dx, dy) = (b.x - a.x, b.y - a.y);
++    let len2 = dx * dx + dy * dy;
++    let t = if len2 > 1e-18 { (((q.x - a.x) * dx + (q.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
++    (q.x - (a.x + t * dx)).hypot(q.y - (a.y + t * dy))
++}
++
++/// Plan clean-up passes and measure their radial engagement against a single-level
++/// post-lane stock model. If clean-up exceeds `t.max_engagement`, steps down along
++/// [`CLEANUP_LADDER`] and, if still above the limit, records `exceeded` so callers
++/// surface a named diagnostic rather than overloading silently (#3849).
++#[allow(clippy::too_many_arguments)]
++pub(super) fn plan_cleanup_checked(
++    region: &Region,
++    center: &Region,
++    reach: &Region,
++    layouts: &[LaneLayout],
++    used_center: &Region,
++    cleared: &Region,
++    p: &PocketParams,
++    t: &AdaptiveTrochParams,
++) -> Result<CleanPlan, GenError> {
++    plan_cleanup_on(CLEANUP_LADDER, region, center, reach, layouts, used_center, cleared, p, t)
++}
++
++/// One measured ladder step.
++struct Candidate {
++    chains: Vec<CleanChain>,
++    cleared: Region,
++    deg: f64,
++    at: Point3,
++    reduced: bool,
++}
++
++/// [`plan_cleanup_checked`] over the scales of `ladder` (the first is the
++/// baseline).
++#[allow(clippy::too_many_arguments)]
++pub(super) fn plan_cleanup_on(
++    ladder: &[f64],
++    region: &Region,
++    center: &Region,
++    reach: &Region,
++    layouts: &[LaneLayout],
++    used_center: &Region,
++    cleared: &Region,
++    p: &PocketParams,
++    t: &AdaptiveTrochParams,
++) -> Result<CleanPlan, GenError> {
++    let plan = |scale: f64| {
++        plan_cleanup_step(center, reach, used_center, cleared, p.tool_diameter, p.optimal_load, p.climb, t, scale)
++    };
++    let (chains, base_cleared) = plan(ladder.first().copied().unwrap_or(1.0))?;
++    let Some(start) = first_point(&chains) else {
++        return Ok(CleanPlan { chains, cleared: base_cleared, max_deg: 0.0, step_reduced: false, exceeded: None });
++    };
++    let spec = crate::quality::QualitySpec::new(p.tool_diameter);
++    let lane_path = lane_model(layouts)?;
++    let measure = |chains: &[CleanChain], start: Point2| -> Result<(f64, Point3), GenError> {
++        let err = |e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring clean-up stock: {e}"));
++        let mut stock = crate::quality::stock_for(region, 1.0, 0.0, p.tool_diameter, &spec).map_err(err)?;
++        crate::quality::measure(&lane_path, &mut stock, &spec).map_err(err)?;
++        let one_p = PocketParams { top_z: 1.0, bottom_z: 0.0, stepdown: 1.0, clearance_z: 3.0, retract_z: Some(2.0), ..*p };
++        let mut cb = PathBuilder::approached(Point3::new(lattice(start.x), lattice(start.y), 2.0));
++        emit_cleanup(&mut cb, chains, &one_p, 0.0, 1.0, 2.0);
++        let q = crate::quality::measure(&cb.finish(), &mut stock, &spec).map_err(err)?;
++        Ok((q.max_deg, Point3::new(q.max_at.x, q.max_at.y, p.bottom_z)))
++    };
++    let (deg, at) = measure(&chains, start)?;
++    let mut best = Candidate { chains, cleared: base_cleared, deg, at, reduced: false };
++    if best.deg <= t.max_engagement {
++        return Ok(CleanPlan { chains: best.chains, cleared: best.cleared, max_deg: deg, step_reduced: false, exceeded: None });
++    }
++    for &scale in ladder.iter().skip(1) {
++        let (chains, cur_cleared) = plan(scale)?;
++        let Some(start) = first_point(&chains) else { continue };
++        let (deg, at) = measure(&chains, start)?;
++        if deg <= t.max_engagement {
++            return Ok(CleanPlan { chains, cleared: cur_cleared, max_deg: deg, step_reduced: true, exceeded: None });
++        }
++        if deg < best.deg {
++            best = Candidate { chains, cleared: cur_cleared, deg, at, reduced: true };
++        }
++    }
++    Ok(CleanPlan {
++        chains: best.chains,
++        cleared: best.cleared,
++        max_deg: best.deg,
++        step_reduced: best.reduced,
++        exceeded: Some((best.deg, best.at)),
++    })
++}
++
++/// The first point of the first chain; `None` when there is none to cut.
++fn first_point(chains: &[CleanChain]) -> Option<Point2> {
++    chains.iter().find_map(|c| c.pts.first().copied())
++}
++
++/// The level's lanes alone, on the unit-level model of the measurement.
++fn lane_model(layouts: &[LaneLayout]) -> Result<Toolpath, GenError> {
++    let first = layouts.first().map_or(Point2::new(0.0, 0.0), |l| l.entry);
++    let mut bld = PathBuilder::approached(Point3::new(first.x, first.y, 3.0));
++    if layouts.is_empty() {
++        return Ok(bld.finish());
++    }
++    let p3 = |q: Point2, zz: f64| Point3::new(lattice(q.x), lattice(q.y), lattice(zz));
++    let (hop, above) = (2.0, 1.0);
++    let from = (above + crate::approach::DEFAULT_PLUNGE_HEIGHT).min(hop).max(above);
++    for (li, lay) in layouts.iter().enumerate() {
++        if li > 0 {
++            let at = bld.at();
++            if (at.z - hop).abs() > 1e-6 {
++                bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
++            }
++            bld.push(MoveKind::Rapid, p3(lay.entry, hop), None);
++        }
++        bld.push(MoveKind::Rapid, p3(lay.entry, from), None);
++        emit_level(&mut bld, &lay.lay, &lay.tp, 0.0, from, true, lay.open)?;
++    }
++    let at = bld.at();
++    bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
++    Ok(bld.finish())
++}
+diff --git a/crates/motion/src/machining2d/adaptive_troch_clean.rs b/crates/motion/src/machining2d/adaptive_troch_clean.rs
+index 0704dee3d1..65aaee9e46 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_clean.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_clean.rs
+@@ -12,62 +12,16 @@ use super::adaptive::corner_radius;
+ use super::adaptive_troch::AdaptiveTrochParams;
+ use super::face::GenError;
+ use super::pocket::PocketParams;
+-use super::trochoid_level::emit_level;
+-use super::trochoid_slot::LaneLayout;
+ 
+ const MIN_REMOVED_AREA: f64 = 0.02;
+ const UNCUT_SKIN_ERODE: f64 = 0.025;
+ const MAX_PEEL_STEPS: usize = 64;
+-const CLEANUP_LADDER: &[f64] = &[1.0, 0.75, 0.5, 0.35, 0.25];
+-
+-/// Note prefix emitted when trochoidal clean-up passes exceed the engagement limit (#3849).
+-pub const CLEANUP_ENGAGEMENT_NOTE_PREFIX: &str = "2D Adaptive (Trochoidal): clean-up engagement measured ";
+-const CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D: &str = "3D Adaptive (Trochoidal): clean-up engagement measured ";
+-
+-/// Named note for a clean-up pass exceeding `limit_deg` (#3849).
+-#[must_use]
+-pub fn cleanup_engagement_note(measured_deg: f64, at: Point3, limit_deg: f64) -> String {
+-    format!(
+-        "{CLEANUP_ENGAGEMENT_NOTE_PREFIX}{measured_deg:.1} deg at ({:.3}, {:.3}), above the {limit_deg:.1} deg limit",
+-        at.x, at.y
+-    )
+-}
+-
+-/// Extract `(measured_deg, limit_deg)` when any note reports an over-limit clean-up pass (#3849).
+-#[must_use]
+-pub fn cleanup_engagement_exceeded(notes: &[String]) -> Option<(f64, f64)> {
+-    for note in notes {
+-        let rest = note
+-            .strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX)
+-            .or_else(|| note.strip_prefix(CLEANUP_ENGAGEMENT_NOTE_PREFIX_3D));
+-        let Some(rest) = rest else { continue };
+-        let Some((m_str, tail)) = rest.split_once(" deg") else { continue };
+-        let Some((_, l_tail)) = tail.split_once("above the ") else { continue };
+-        let Some((l_str, _)) = l_tail.split_once(" deg limit") else { continue };
+-        if let (Ok(measured), Ok(limit)) = (m_str.trim().parse::<f64>(), l_str.trim().parse::<f64>())
+-            && measured.is_finite()
+-            && limit.is_finite()
+-        {
+-            return Some((measured, limit));
+-        }
+-    }
+-    None
+-}
+ 
+ /// One clean-up chain at a level: plunge into cut air at `pts[0]` and feed along `pts`.
+ pub(super) struct CleanChain {
+     pub(super) pts: Vec<Point2>,
+ }
+ 
+-/// Checked clean-up plan for a level: chains, swept region, and engagement status.
+-pub(super) struct CleanPlan {
+-    pub(super) chains: Vec<CleanChain>,
+-    pub(super) cleared: Region,
+-    pub(super) max_deg: f64,
+-    pub(super) step_reduced: bool,
+-    pub(super) exceeded: Option<(f64, Point3)>,
+-}
+-
+ /// Peel outward from `cleared.offset(-(r + 0.02))` inside `center` up to `step <= 0.6*r`
+ /// per ring, keeping only chains that remove real uncut stock inside `reach`.
+ #[cfg(test)]
+@@ -85,8 +39,10 @@ pub(super) fn plan_cleanup(
+     plan_cleanup_step(center, reach, used_center, cleared, d, optimal_load, climb, t, 1.0)
+ }
+ 
++/// [`plan_cleanup`] with its peel step scaled by `step_scale` (#3849:
++/// the engagement check's step-down ladder).
+ #[allow(clippy::too_many_arguments)]
+-fn plan_cleanup_step(
++pub(super) fn plan_cleanup_step(
+     center: &Region,
+     reach: &Region,
+     used_center: &Region,
+@@ -169,108 +125,6 @@ fn plan_cleanup_step(
+     Ok((chains, cur_cleared))
+ }
+ 
+-/// Plan clean-up passes and measure their radial engagement against a single-level
+-/// post-lane stock model. If clean-up exceeds `t.max_engagement`, steps down along
+-/// [`CLEANUP_LADDER`] and, if still above the limit, records `exceeded` so callers
+-/// surface a named diagnostic rather than overloading silently (#3849).
+-#[allow(clippy::too_many_arguments)]
+-pub(super) fn plan_cleanup_checked(
+-    region: &Region,
+-    center: &Region,
+-    reach: &Region,
+-    layouts: &[LaneLayout],
+-    used_center: &Region,
+-    cleared: &Region,
+-    p: &PocketParams,
+-    t: &AdaptiveTrochParams,
+-) -> Result<CleanPlan, GenError> {
+-    let mut base = Some(plan_cleanup_step(
+-        center,
+-        reach,
+-        used_center,
+-        cleared,
+-        p.tool_diameter,
+-        p.optimal_load,
+-        p.climb,
+-        t,
+-        1.0,
+-    )?);
+-    if base.as_ref().is_some_and(|(chains, _)| chains.is_empty()) {
+-        let (chains, cleared) = base.take().expect("checked non-empty");
+-        return Ok(CleanPlan { chains, cleared, max_deg: 0.0, step_reduced: false, exceeded: None });
+-    }
+-
+-    let spec = crate::quality::QualitySpec::new(p.tool_diameter);
+-    let one_p = PocketParams { top_z: 1.0, bottom_z: 0.0, stepdown: 1.0, clearance_z: 3.0, retract_z: Some(2.0), ..*p };
+-    let mut lane_bld = PathBuilder::approached(Point3::new(
+-        layouts.first().map_or(0.0, |l| l.entry.x),
+-        layouts.first().map_or(0.0, |l| l.entry.y),
+-        3.0,
+-    ));
+-    if !layouts.is_empty() {
+-        let p3 = |q: Point2, zz: f64| Point3::new(lattice(q.x), lattice(q.y), lattice(zz));
+-        let hop = 2.0;
+-        let above = 1.0;
+-        let from = (above + crate::approach::DEFAULT_PLUNGE_HEIGHT).min(hop).max(above);
+-        for (li, lay) in layouts.iter().enumerate() {
+-            if li > 0 {
+-                let at = lane_bld.at();
+-                if (at.z - hop).abs() > 1e-6 {
+-                    lane_bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
+-                }
+-                lane_bld.push(MoveKind::Rapid, p3(lay.entry, hop), None);
+-            }
+-            lane_bld.push(MoveKind::Rapid, p3(lay.entry, from), None);
+-            emit_level(&mut lane_bld, &lay.lay, &lay.tp, 0.0, from, true, lay.open)?;
+-        }
+-        let at = lane_bld.at();
+-        lane_bld.push(MoveKind::Rapid, Point3::new(at.x, at.y, hop), None);
+-    }
+-    let lane_path = lane_bld.finish();
+-    let make_post_lane_stock = || -> Result<crate::stock_sim::Stock, GenError> {
+-        let mut stock = crate::quality::stock_for(region, 1.0, 0.0, p.tool_diameter, &spec)
+-            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring stock: {e}")))?;
+-        crate::quality::measure(&lane_path, &mut stock, &spec)
+-            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring stock: {e}")))?;
+-        Ok(stock)
+-    };
+-
+-    let mut best: Option<(Vec<CleanChain>, Region, f64, Point3, bool)> = None;
+-    for (idx, &scale) in CLEANUP_LADDER.iter().enumerate() {
+-        let (chains, cur_cleared) = if idx == 0 {
+-            base.take().expect("baseline cleanup")
+-        } else {
+-            plan_cleanup_step(center, reach, used_center, cleared, p.tool_diameter, p.optimal_load, p.climb, t, scale)?
+-        };
+-        if chains.is_empty() {
+-            continue;
+-        }
+-        let start_xy = chains[0].pts[0];
+-        let mut cb = PathBuilder::approached(Point3::new(lattice(start_xy.x), lattice(start_xy.y), 2.0));
+-        emit_cleanup(&mut cb, &chains, &one_p, 0.0, 1.0, 2.0);
+-        let clean_path = cb.finish();
+-        let mut stock = make_post_lane_stock()?;
+-        let q = crate::quality::measure(&clean_path, &mut stock, &spec)
+-            .map_err(|e| GenError::Invalid(format!("2D Adaptive (Trochoidal): measuring clean-up stock: {e}")))?;
+-        let reduced = idx > 0;
+-        if q.max_deg <= t.max_engagement {
+-            return Ok(CleanPlan {
+-                chains,
+-                cleared: cur_cleared,
+-                max_deg: q.max_deg,
+-                step_reduced: reduced,
+-                exceeded: None,
+-            });
+-        }
+-        if best.as_ref().is_none_or(|(_, _, d, _, _)| q.max_deg < *d) {
+-            best = Some((chains, cur_cleared, q.max_deg, q.max_at, reduced));
+-        }
+-    }
+-
+-    let (chains, cleared, max_deg, max_at, step_reduced) = best.expect("at least baseline candidate existed");
+-    Ok(CleanPlan { chains, cleared, max_deg, step_reduced, exceeded: Some((max_deg, max_at)) })
+-}
+-
+ /// Emit `chains` at level `z`: rapid over cut stock (`near >= above`) to `pts[0]`,
+ /// plunge vertically to `z` outside prior cutter-centre sweeps, feed along `pts`, and retract.
+ pub(super) fn emit_cleanup(bld: &mut PathBuilder, chains: &[CleanChain], p: &PocketParams, z: f64, above: f64, hop: f64) {
+diff --git a/crates/motion/src/machining2d/adaptive_troch_level.rs b/crates/motion/src/machining2d/adaptive_troch_level.rs
+index 987a6072d2..5f69d4d6c0 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_level.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_level.rs
+@@ -26,7 +26,8 @@ use crate::geo2d::{Point2, Region};
+ use crate::geometry::Point3;
+ 
+ use super::adaptive_troch::{AdaptiveTrochParams, confined};
+-use super::adaptive_troch_clean::{CleanChain, cleanup_engagement_note, emit_cleanup, plan_cleanup_checked};
++use super::adaptive_troch_check::{cleanup_engagement_note, plan_cleanup_checked};
++use super::adaptive_troch_clean::{CleanChain, emit_cleanup};
+ use super::adaptive_troch_lanes::{plan_all_lanes, rest_share};
+ use super::face::GenError;
+ use super::pocket::{PocketParams, PocketStrategy};
+diff --git a/crates/motion/src/machining2d/adaptive_troch_tests.rs b/crates/motion/src/machining2d/adaptive_troch_tests.rs
+index 1d0ae32e37..bd4f9c6cff 100644
+--- a/crates/motion/src/machining2d/adaptive_troch_tests.rs
++++ b/crates/motion/src/machining2d/adaptive_troch_tests.rs
+@@ -221,7 +221,7 @@ fn plan_cleanup_checked_reports_exceeded_when_even_stepdown_cannot_hold_limit()
+     let reach = rect(-6.0, -6.0, 6.0, 6.0);
+     let used = rect(-1.98, -1.98, 1.98, 1.98);
+     let t = AdaptiveTrochParams { max_engagement: 30.0, ..AdaptiveTrochParams::default() };
+-    let plan = super::super::adaptive_troch_clean::plan_cleanup_checked(
++    let plan = super::super::adaptive_troch_check::plan_cleanup_checked(
+         &reach,
+         &center,
+         &reach,
+diff --git a/crates/motion/src/machining2d/mod.rs b/crates/motion/src/machining2d/mod.rs
+index 627391eea5..79351ca09f 100644
+--- a/crates/motion/src/machining2d/mod.rs
++++ b/crates/motion/src/machining2d/mod.rs
+@@ -107,6 +107,7 @@ mod adaptive;
+ mod adaptive_method;
+ mod adaptive_troch;
+ mod adaptive_avoid;
++mod adaptive_troch_check;
+ mod adaptive_troch_clean;
+ mod adaptive_troch_lanes;
+ mod adaptive_troch_level;
+@@ -221,8 +222,8 @@ pub use adaptive::{rest_adaptive, rest_levels, RestStock, StockFloor, REST_STOCK
+ pub use adaptive_method::AdaptiveMethod;
+ pub use pocket_hsm_start::trochoidal_pass_start_refusal;
+ pub use adaptive_troch::{AdaptiveTrochParams, adaptive_trochoidal, adaptive_trochoidal_with};
+-pub use adaptive_troch_clean::{
+-    CLEANUP_ENGAGEMENT_NOTE_PREFIX, cleanup_engagement_exceeded, cleanup_engagement_note,
++pub use adaptive_troch_check::{
++    CLEANUP_ENGAGEMENT_NOTE_PREFIX, cleanup_engagement_exceeded, cleanup_engagement_move, cleanup_engagement_note,
+ };
+ pub use adaptive_avoid::{adaptive_spiral_avoid, adaptive_spiral_avoid_on, adaptive_trochoidal_avoid};
+ pub use trochoid_air::lifted_cut;
+diff --git a/crates/motion/tests/adaptive_troch_clean.rs b/crates/motion/tests/adaptive_troch_clean.rs
+index a4ae99e347..fccc303316 100644
+--- a/crates/motion/tests/adaptive_troch_clean.rs
++++ b/crates/motion/tests/adaptive_troch_clean.rs
+@@ -5,6 +5,7 @@
+ #[path = "common/adaptive_troch.rs"]
+ mod fixtures;
+ 
++use camcraft_motion::cl::Toolpath;
+ use camcraft_motion::geo2d::Region;
+ use camcraft_motion::geometry::Point3;
+ use camcraft_motion::machining2d::{
+@@ -14,7 +15,7 @@ use camcraft_motion::machining2d::{
+ use camcraft_motion::quality::{QualitySpec, measure, stock_for};
+ use fixtures::*;
+ 
+-fn assert_cleanup_checked(name: &str, region: &Region, p: &PocketParams, max_engagement: f64) {
++fn assert_cleanup_checked(name: &str, region: &Region, p: &PocketParams, max_engagement: f64) -> Toolpath {
+     let t = AdaptiveTrochParams { max_engagement, ..AdaptiveTrochParams::default() };
+     let path = adaptive_trochoidal_with(region, p, &t).unwrap_or_else(|e| panic!("{name}: {e}"));
+     let spec = QualitySpec::new(p.tool_diameter);
+@@ -32,30 +33,88 @@ fn assert_cleanup_checked(name: &str, region: &Region, p: &PocketParams, max_eng
+     } else {
+         assert!(warned.is_none(), "{name}: unexpected warning {warned:?} at {:.1} deg", q.max_deg);
+     }
++    path
++}
++
++/// The step-down note, and no over-limit note: the ladder held the limit.
++fn assert_stepped_down(name: &str, path: &Toolpath, max_engagement: f64) {
++    let held = format!("clean-up peel step was reduced to hold the {max_engagement:.1} deg engagement limit");
++    assert!(path.notes.iter().any(|n| n.contains(&held)), "{name}: no step-down note: {:?}", path.notes);
++    assert_eq!(cleanup_engagement_exceeded(&path.notes), None, "{name}: {:?}", path.notes);
+ }
+ 
+ #[test]
+-fn cleanup_engagement_is_checked_on_default_and_custom_limits() {
++fn cleanup_engagement_is_checked_on_the_default_limit() {
+     let p = PocketParams { bottom_z: -3.0, ..params() };
+     // Default 90 deg limit on #1587 face fixture stays <= 90 deg cleanly.
+     assert_cleanup_checked("face 34x16 D6 (90 deg)", &face(), &p, 90.0);
++}
+ 
+-    // Regression (#3849): on upstream/main prior to this fix, wide 30x24 D6 and
+-    // L-shape D10 at 60 deg passed lanes <= 60 deg, hit 64.0 and 62.5 deg in
+-    // unstepped cleanup, and never stepped cleanup down or surfaced a warning.
++// #3849 step-down: at the full peel step the clean-up of wide 30x24 D6
++// and of L-shape D10 reads 64.0 and 62.5 deg against a 60 deg limit;
++// upstream/main refused both paths (GenError::Invalid). The peel now
++// steps down, holds the limit, and the paths post.
++#[test]
++fn cleanup_steps_down_to_a_custom_limit_wide() {
++    let p = PocketParams { bottom_z: -3.0, ..params() };
+     let wide = rect(0.0, 0.0, 30.0, 24.0);
+-    assert_cleanup_checked("wide 30x24 D6 (60 deg)", &wide, &p, 60.0);
++    let path = assert_cleanup_checked("wide 30x24 D6 (60 deg)", &wide, &p, 60.0);
++    assert_stepped_down("wide 30x24 D6 (60 deg)", &path, 60.0);
++}
+ 
++#[test]
++fn cleanup_steps_down_to_a_custom_limit_l_shape() {
++    let p = PocketParams { bottom_z: -3.0, ..params() };
+     let l_shape = Region::new(vec![poly(&[
+         (0.0, 0.0), (60.0, 0.0), (60.0, 30.0), (30.0, 30.0), (30.0, 60.0), (0.0, 60.0),
+     ])])
+     .expect("L-shape");
+-    assert_cleanup_checked("L-shape D10 (60 deg)", &l_shape, &PocketParams { tool_diameter: 10.0, ..p }, 60.0);
++    let p10 = PocketParams { tool_diameter: 10.0, ..p };
++    let path = assert_cleanup_checked("L-shape D10 (60 deg)", &l_shape, &p10, 60.0);
++    assert_stepped_down("L-shape D10 (60 deg)", &path, 60.0);
++}
++
++/// A 20 x 14 pocket with a 7 mm notch in its +Y wall (#3849).
++fn notch() -> Region {
++    Region::new(vec![poly(&[
++        (-10.0, -7.0), (10.0, -7.0), (10.0, 7.0), (3.5, 7.0), (3.5, 14.0), (-3.5, 14.0), (-3.5, 7.0), (-10.0, 7.0),
++    ])])
++    .expect("notch")
++}
++
++/// #3849, red on upstream/main: the notch pocket, a 6 mm tool, the 90
++/// deg default. The clean-up into the notch reads about 97.5 deg even at
++/// the smallest peel step (118.5 deg at main's full step). Main never
++/// measured the clean-up at the default limit, so the path posted with no
++/// note. Now it carries the named note (the operation's warning).
++#[test]
++fn cleanup_over_the_default_limit_is_named() {
++    let p = PocketParams { bottom_z: -3.0, ..params() };
++    let path = assert_cleanup_checked("notch 20x14 D6 (90 deg)", &notch(), &p, 90.0);
++    let (measured, limit) = cleanup_engagement_exceeded(&path.notes).expect("the over-limit clean-up is named");
++    assert!(measured > 90.0 && (limit - 90.0).abs() < 1e-9, "{measured} / {limit}");
++}
++
++/// #3849 keeps main's refusal: under a custom limit the WHOLE path
++/// (lanes, links, clean-up, every level) is measured. The notch pocket
++/// that warns at the 90 deg default reads about 95.5 deg against a 75
++/// deg limit: the step-down cannot hold it, so the path is refused by
++/// name - never posted with an advisory warning.
++#[test]
++fn a_custom_limit_the_whole_path_cannot_hold_is_refused() {
++    let p = PocketParams { bottom_z: -3.0, ..params() };
++    let t = AdaptiveTrochParams { max_engagement: 75.0, ..AdaptiveTrochParams::default() };
++    let err = match adaptive_trochoidal_with(&notch(), &p, &t) {
++        Ok(path) => panic!("notch 20x14 D6 (75 deg) posted: notes={:?}", path.notes),
++        Err(e) => e.to_string(),
++    };
++    assert!(err.contains("cleanup and lanes exceed the 75.0 deg engagement limit"), "{err}");
+ }
+ 
+ #[test]
+ fn cleanup_engagement_note_round_trips_for_2d_and_3d() {
+-    let note_2d = cleanup_engagement_note(102.5, Point3::new(1.25, -2.5, 0.0), 90.0);
++    let note_2d = cleanup_engagement_note(102.5, Point3::new(1.25, -2.5, -3.0), 90.0);
++    assert!(note_2d.contains("at (1.250, -2.500, -3.000)"), "{note_2d}");
+     assert!(note_2d.starts_with(CLEANUP_ENGAGEMENT_NOTE_PREFIX), "{note_2d}");
+     assert_eq!(cleanup_engagement_exceeded(std::slice::from_ref(&note_2d)), Some((102.5, 90.0)));
+ 
+diff --git a/docs/decisions/3849-trochoidal-cleanup-engagement.md b/docs/decisions/3849-trochoidal-cleanup-engagement.md
+new file mode 100644
+index 0000000000..5071c347ba
+--- /dev/null
++++ b/docs/decisions/3849-trochoidal-cleanup-engagement.md
+@@ -0,0 +1,37 @@
++## #3849 - 2D Adaptive (Trochoidal): the clean-up passes are checked against the engagement limit
++
++**Decided:** The clean-up chains of each level are measured against a
++post-lane stock model at every limit, the 90.0 deg default included. When
++they exceed the limit, the peel step steps down (1.0, 0.75, 0.5, 0.35,
++0.25 of the step). The result is one of three:
++
++- a step holds the limit: the path posts with the note "clean-up peel step
++  was reduced";
++- no step holds a CUSTOM limit: the whole-path measurement that `main`
++  already had refuses the path (`GenError::Invalid`, "cleanup and lanes
++  exceed the ... deg engagement limit"). This refusal stays as it was;
++- no step holds the 90.0 deg default: the path posts with an advisory
++  `Warning::EngagementExceeded` on the clean-up feed through the measured
++  peak. The warning shows on the operation and in the status line. It
++  does not hold the post.
++
++**Why:** `main` measured nothing at the default limit, so a clean-up
++overload at 90.0 deg posted silently (the 20 x 14 notch pocket with a
++6 mm tool: 118.5 deg, no note). A custom limit was already a refusal, and
++the Prime Directive prefers a refusal over a weaker diagnostic, so the
++refusal is kept. The default limit gets a warning and not a refusal: a
++refusal there would refuse paths that `main` posts today, and the risk is
++tool load, not a gouge.
++
++**Dropped:**
++
++- Advisory warning for a custom limit, in place of the refusal (the first
++  version of this PR). It removed a refusal that also covered lanes and
++  links, and no test showed that lanes and links hold the limit.
++- A whole-path refusal at the default limit. It also measures the lanes at
++  90.0 deg, which `main` never did, and it can refuse programs that post
++  today. That is a separate decision.
++
++**Cost to change later:** Small. The default-limit outcome is one branch
++in `plan_cleanup_checked`'s caller and one warning kind; a refusal there
++would change only `adaptive_troch.rs` and its pins.
+
+From f7d795b0c7a3d5e6cbb4256b73b0a1b1bcecc8ac Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Wed, 25 Nov 2026 23:31:40 -0800
+Subject: [PATCH 4/4] test(motion): run the #3849 clean-up checks in the
+ adaptive_troch_parallel binary
+
+The six clean-up engagement tests move from the new top-level binary
+crates/motion/tests/adaptive_troch_clean.rs into a module of the existing
+adaptive_troch_parallel binary (crates/motion/tests/adaptive_troch_parallel/clean.rs).
+That binary already maps adaptive_troch_clean in its Gate map and shares the
+same fixtures. No new test binary (New tests join a directory suite, #3187).
+
+Refs #3849
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/motion/tests/adaptive_troch_parallel.rs              | 4 ++++
+ .../clean.rs}                                               | 6 ++----
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+ rename crates/motion/tests/{adaptive_troch_clean.rs => adaptive_troch_parallel/clean.rs} (98%)
+
+diff --git a/crates/motion/tests/adaptive_troch_parallel.rs b/crates/motion/tests/adaptive_troch_parallel.rs
+index 0fb22801a0..0f40e7188c 100644
+--- a/crates/motion/tests/adaptive_troch_parallel.rs
++++ b/crates/motion/tests/adaptive_troch_parallel.rs
+@@ -4,6 +4,10 @@
+ #[path = "common/adaptive_troch.rs"]
+ mod fixtures;
+ 
++// #3849: the clean-up engagement checks join this binary (no new top-level test binary).
++#[path = "adaptive_troch_parallel/clean.rs"]
++mod clean;
++
+ use fixtures::*;
+ use camcraft_motion::machining2d::PocketParams;
+ 
+diff --git a/crates/motion/tests/adaptive_troch_clean.rs b/crates/motion/tests/adaptive_troch_parallel/clean.rs
+similarity index 98%
+rename from crates/motion/tests/adaptive_troch_clean.rs
+rename to crates/motion/tests/adaptive_troch_parallel/clean.rs
+index fccc303316..f857f62ef3 100644
+--- a/crates/motion/tests/adaptive_troch_clean.rs
++++ b/crates/motion/tests/adaptive_troch_parallel/clean.rs
+@@ -1,10 +1,9 @@
+ //! Issue #3849: 2D Adaptive (Trochoidal) clean-up passes are checked against
+ //! `max_engagement` (including the 90 deg default), stepped down when needed,
+ //! and surfaced with a named diagnostic when even reduced steps exceed it.
++//! A module of the `adaptive_troch_parallel` binary (no binary of its own, #3187).
+ 
+-#[path = "common/adaptive_troch.rs"]
+-mod fixtures;
+-
++use super::fixtures::*;
+ use camcraft_motion::cl::Toolpath;
+ use camcraft_motion::geo2d::Region;
+ use camcraft_motion::geometry::Point3;
+@@ -13,7 +12,6 @@ use camcraft_motion::machining2d::{
+     cleanup_engagement_exceeded, cleanup_engagement_note,
+ };
+ use camcraft_motion::quality::{QualitySpec, measure, stock_for};
+-use fixtures::*;
+ 
+ fn assert_cleanup_checked(name: &str, region: &Region, p: &PocketParams, max_engagement: f64) -> Toolpath {
+     let t = AdaptiveTrochParams { max_engagement, ..AdaptiveTrochParams::default() };
