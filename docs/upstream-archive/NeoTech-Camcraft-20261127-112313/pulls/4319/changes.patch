@@ -1,0 +1,408 @@
+From e086568649de35370209c8067ca2fdb8834979a6 Mon Sep 17 00:00:00 2001
+From: Scott Miller <152090551+seelesturm@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:13:45 -0600
+Subject: [PATCH] fix(ui): report failed window captures
+
+Deliver failed map, range and decoding results through the capture completion channel. Keep repainting until consumption and isolate obsolete callbacks after a timeout.
+
+Co-Authored-By: Coder <coder@users.noreply.github.com>
+
+Fixes #2745
+---
+ crates/ui/src/egui_app/report.rs              |   8 +
+ .../ui/src/egui_app/shell_window/capture.rs   |  70 ++++---
+ .../egui_app/shell_window/capture_tests.rs    | 185 ++++++++++++++++++
+ crates/ui/src/egui_app/shell_window/frame.rs  |   2 +-
+ docs/decisions/2745-report-capture-failure.md |  34 ++++
+ 5 files changed, 274 insertions(+), 25 deletions(-)
+ create mode 100644 crates/ui/src/egui_app/shell_window/capture_tests.rs
+ create mode 100644 docs/decisions/2745-report-capture-failure.md
+
+diff --git a/crates/ui/src/egui_app/report.rs b/crates/ui/src/egui_app/report.rs
+index 3f0adee33d..b3a8614be8 100644
+--- a/crates/ui/src/egui_app/report.rs
++++ b/crates/ui/src/egui_app/report.rs
+@@ -35,6 +35,14 @@ pub(crate) fn shot_token() -> &'static egui::UserData {
+     TOKEN.get_or_init(|| egui::UserData::new("camcraft-report-shot"))
+ }
+ 
++/// A failed native read-back answers only this door, even if it closed.
++/// The browser already has the complete text; never issue CopyImage here.
++pub(crate) fn capture_failed(state: &mut State, token: &egui::UserData) {
++    if token == shot_token() {
++        state.status = "Screenshot: picture was not copied - the text report is complete".to_owned();
++    }
++}
++
+ /// What the user files: a defect, or an enhancement. The two GitHub
+ /// labels are the repository's existing `bug` and `enhancement`.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+diff --git a/crates/ui/src/egui_app/shell_window/capture.rs b/crates/ui/src/egui_app/shell_window/capture.rs
+index 0993cf5a66..b09c4c33f2 100644
+--- a/crates/ui/src/egui_app/shell_window/capture.rs
++++ b/crates/ui/src/egui_app/shell_window/capture.rs
+@@ -39,10 +39,27 @@ const BYTES_PER_PIXEL: u32 = 4;
+ /// The channel message from the map callback (any thread) to the frame
+ /// loop: the picture, and the tokens that were waiting when it began.
+ struct ShotDone {
+-    image: Arc<ColorImage>,
++    image: Option<Arc<ColorImage>>,
+     tokens: Vec<UserData>,
++    in_flight: Arc<AtomicBool>,
+ }
+ 
++// The map callback and deterministic tests share this completion path.
++fn complete(
++    tx: &Sender<ShotDone>,
++    in_flight: &Arc<AtomicBool>,
++    tokens: Vec<UserData>,
++    image: Option<Arc<ColorImage>>,
++) {
++    // Send failures too. A receiver dropped during shutdown owns no picture.
++    let _ = tx.send(ShotDone { image, tokens, in_flight: Arc::clone(in_flight) });
++    in_flight.store(false, Ordering::Release);
++}
++
++#[cfg(test)]
++#[path = "capture_tests.rs"]
++mod tests;
++
+ /// Byte order of one pixel, as indices into the copied row. The surface
+ /// format decides it; the copied bytes of an sRGB format are already
+ /// sRGB-encoded, which is what egui's `Color32` stores, so there is no
+@@ -122,12 +139,11 @@ impl Shot {
+         // the callback has unmapped and dropped it).
+         let read_back = buffer.clone();
+         buffer.map_async(wgpu::MapMode::Read, 0..buffer.size(), move |result| {
+-            if let Err(err) = result {
+-                diag_warn!("report capture (#1696): read-back map failed: {err}");
+-                in_flight.store(false, Ordering::Release);
+-                return;
+-            }
+-            let done = (|| -> Option<ShotDone> {
++            let image = (|| -> Option<Arc<ColorImage>> {
++                if let Err(err) = result {
++                    diag_warn!("report capture (#1696): read-back map failed: {err}");
++                    return None;
++                }
+                 let mapped = match read_back.get_mapped_range(..) {
+                     Ok(view) => view,
+                     Err(err) => {
+@@ -160,17 +176,12 @@ impl Shot {
+                         ));
+                     }
+                 }
+-                Some(ShotDone {
+-                    image: Arc::new(ColorImage::new([width as usize, height as usize], pixels)),
+-                    tokens,
+-                })
++                Some(Arc::new(ColorImage::new([width as usize, height as usize], pixels)))
+             })();
+-            if let Some(done) = done {
+-                // A receiver outliving the shell means shutdown; the
+-                // picture then belongs to nobody - drop it quietly.
+-                let _ = tx.send(done);
++            if image.is_none() {
++                diag_warn!("report capture (#2745): picture was not read; the text report is complete");
+             }
+-            in_flight.store(false, Ordering::Release);
++            complete(&tx, &in_flight, tokens, image);
+         });
+     }
+ }
+@@ -217,7 +228,9 @@ impl Capture {
+     /// keeps redrawing so a completion is picked up without an input
+     /// event, and a wedged map still reaches its timeout.
+     pub(super) fn busy(&self) -> bool {
+-        self.in_flight.load(Ordering::Acquire) || !self.waiting.is_empty()
++        // Keep redrawing until the frame consumes the completion, even if
++        // the callback already cleared its flag during device.poll.
++        self.shot_since.is_some() || !self.waiting.is_empty()
+     }
+ 
+     /// Ready to start a capture this frame? Prunes timed-out waits and
+@@ -296,7 +309,9 @@ impl Capture {
+             mapped_at_creation: false,
+         });
+         let tokens = self.waiting.drain(..).map(|(token, _)| token).collect();
+-        self.in_flight.store(true, Ordering::Release);
++        // Each shot owns its flag. A callback after a timeout must not
++        // release a newer shot or deliver its obsolete result.
++        self.in_flight = Arc::new(AtomicBool::new(true));
+         self.shot_since = Some(Instant::now());
+         Some(Shot {
+             tex: self.tex.clone()?,
+@@ -315,16 +330,23 @@ impl Capture {
+     /// The token travels back untouched, so each door answers only its
+     /// own request; `report::window` is the only door on the native
+     /// shell's root viewport today (#1696).
+-    pub(super) fn drain_events(&mut self) -> Vec<egui::Event> {
++    pub(super) fn drain_events(&mut self, state: &mut State) -> Vec<egui::Event> {
+         let mut out = Vec::new();
+         while let Ok(done) = self.rx.try_recv() {
++            if self.shot_since.is_none() || !Arc::ptr_eq(&done.in_flight, &self.in_flight) {
++                continue; // A timed-out shot cannot answer a fresh request.
++            }
+             self.shot_since = None;
+             for token in done.tokens {
+-                out.push(egui::Event::Screenshot {
+-                    viewport_id: egui::ViewportId::ROOT,
+-                    user_data: token,
+-                    image: Arc::clone(&done.image),
+-                });
++                if let Some(image) = &done.image {
++                    out.push(egui::Event::Screenshot {
++                        viewport_id: egui::ViewportId::ROOT,
++                        user_data: token,
++                        image: Arc::clone(image),
++                    });
++                } else {
++                    super::super::report::capture_failed(state, &token);
++                }
+             }
+         }
+         out
+diff --git a/crates/ui/src/egui_app/shell_window/capture_tests.rs b/crates/ui/src/egui_app/shell_window/capture_tests.rs
+new file mode 100644
+index 0000000000..c876b094ff
+--- /dev/null
++++ b/crates/ui/src/egui_app/shell_window/capture_tests.rs
+@@ -0,0 +1,185 @@
++//! Report capture completion regressions (#2745).
++//! Provenance: our own callback/channel and status-strip tests; no device loss.
++use super::*;
++use crate::egui_app::{panes, report, theme};
++use egui_kittest::{kittest::Queryable, Harness};
++
++fn harness() -> Harness<'static, State> {
++    Harness::builder().with_size(egui::vec2(1200.0, 400.0)).build_ui_state(
++        |ui, state| {
++            report::window(ui.ctx(), state);
++            let pal = theme::current();
++            egui::Panel::bottom("status")
++                .frame(egui::Frame::NONE)
++                .exact_size(theme::status_h(&pal))
++                .show(ui, |ui| {
++                    panes::status(ui, state, &pal, None);
++                });
++        },
++        State::new(),
++    )
++}
++
++#[test]
++fn failed_readback_reaches_visible_status_without_copying_an_image() {
++    let mut h = harness();
++    h.state_mut().status = "copying the whole window".to_owned();
++    let mut capture = Capture::new();
++    capture.in_flight.store(true, Ordering::Release);
++    capture.shot_since = Some(Instant::now());
++    // None is the real callback's result for a map/range/decode failure.
++    complete(
++        &capture.tx,
++        &capture.in_flight,
++        vec![report::shot_token().clone()],
++        None,
++    );
++    assert!(capture.busy(), "a queued failure still needs a frame");
++    let events = capture.drain_events(h.state_mut());
++    h.input_mut().events.extend(events);
++    h.step();
++    assert_eq!(
++        h.state().status,
++        "Screenshot: picture was not copied - the text report is complete"
++    );
++    h.get_by_label("Screenshot: picture was not copied - the text report is complete");
++    assert!(!h
++        .output()
++        .platform_output
++        .commands
++        .iter()
++        .any(|c| matches!(c, egui::OutputCommand::CopyImage(_))));
++    assert!(!capture.busy());
++}
++
++#[test]
++fn cancelled_map_uses_the_real_callback_failure_path() {
++    let Some(gpu) = crate::headless_gpu::test_gpu("report capture cancellation").expect("GPU policy") else {
++        return;
++    };
++    let mut capture = Capture::new();
++    capture.want(report::shot_token().clone(), Instant::now());
++    let shot = capture
++        .begin(&gpu.device, [2, 2], wgpu::TextureFormat::Rgba8UnormSrgb)
++        .expect("shot");
++    let buffer = shot.buffer.clone();
++    shot.finish();
++    // wgpu's public cancellation API fails the pending map. This is not
++    // device loss and requires no permanent fault-injection option.
++    buffer.unmap();
++    capture.pump(&gpu.device);
++    let mut h = harness();
++    h.state_mut().status = "copying the whole window".to_owned();
++    let events = capture.drain_events(h.state_mut());
++    h.input_mut().events.extend(events);
++    h.step();
++    assert_eq!(
++        h.state().status,
++        "Screenshot: picture was not copied - the text report is complete"
++    );
++    assert!(!capture.busy());
++}
++
++#[test]
++fn foreign_failure_preserves_status_and_closed_report_still_gets_its_failure() {
++    let mut h = harness();
++    assert!(!h.state().report_open);
++    let mut capture = Capture::new();
++    for (token, expected) in [
++        (UserData::new("another door"), "keep me"),
++        (
++            report::shot_token().clone(),
++            "Screenshot: picture was not copied - the text report is complete",
++        ),
++    ] {
++        h.state_mut().status = "keep me".to_owned();
++        capture.shot_since = Some(Instant::now());
++        complete(&capture.tx, &capture.in_flight, vec![token], None);
++        let events = capture.drain_events(h.state_mut());
++        assert!(events.is_empty(), "failure never carries an image");
++        h.step();
++        assert_eq!(h.state().status, expected);
++        h.get_by_label(expected);
++        assert!(!capture.busy());
++    }
++}
++
++#[test]
++fn success_answers_all_tokens_and_a_waiting_request_recovers_after_failure() {
++    let Some(gpu) = crate::headless_gpu::test_gpu("report capture recovery").expect("GPU policy") else {
++        return;
++    };
++    let mut capture = Capture::new();
++    capture.want(report::shot_token().clone(), Instant::now());
++    let failed = capture
++        .begin(&gpu.device, [2, 2], wgpu::TextureFormat::Rgba8UnormSrgb)
++        .expect("shot");
++    let other = UserData::new("another door");
++    capture.want(other.clone(), Instant::now());
++    capture.want(report::shot_token().clone(), Instant::now());
++    complete(&failed.tx, &failed.in_flight, failed.tokens, None);
++    let mut h = harness();
++    assert!(capture.drain_events(h.state_mut()).is_empty());
++    assert!(capture.busy(), "later requests survive the failed shot");
++    assert!(capture.due(h.state_mut(), Instant::now()));
++    let shot = capture
++        .begin(&gpu.device, [2, 2], wgpu::TextureFormat::Rgba8UnormSrgb)
++        .expect("fresh shot");
++    shot.finish();
++    gpu.device
++        .poll(wgpu::PollType::wait_indefinitely())
++        .expect("map callback");
++    assert!(capture.busy(), "a completed image still needs a frame");
++    let events = capture.drain_events(h.state_mut());
++    assert_eq!(events.len(), 2);
++    assert!(matches!(&events[0], egui::Event::Screenshot {user_data, ..} if *user_data == other));
++    assert!(matches!(&events[1], egui::Event::Screenshot {user_data, ..} if user_data == report::shot_token()));
++    h.input_mut().events.extend(events);
++    h.step();
++    assert!(h
++        .output()
++        .platform_output
++        .commands
++        .iter()
++        .any(|c| matches!(c, egui::OutputCommand::CopyImage(_))));
++    assert_eq!(
++        h.state().status,
++        "Screenshot: CamCraft copied the whole window to the clipboard"
++    );
++    assert!(!capture.busy());
++}
++
++#[test]
++fn timeout_discards_late_replies_without_releasing_a_fresh_shot() {
++    let Some(gpu) = crate::headless_gpu::test_gpu("report capture timeout").expect("GPU policy") else {
++        return;
++    };
++    let now = Instant::now();
++    let mut capture = Capture::new();
++    let mut state = State::new();
++    capture.want(report::shot_token().clone(), now);
++    let old = capture
++        .begin(&gpu.device, [2, 2], wgpu::TextureFormat::Rgba8UnormSrgb)
++        .expect("old shot");
++    let later = capture.shot_since.expect("started") + CAPTURE_TIMEOUT + Duration::from_secs(1);
++    assert!(!capture.due(&mut state, later));
++    assert!(!capture.busy());
++    for image in [None, Some(Arc::new(ColorImage::filled([1, 1], Color32::RED)))] {
++        capture.want(report::shot_token().clone(), later);
++        let fresh = capture
++            .begin(&gpu.device, [2, 2], wgpu::TextureFormat::Rgba8UnormSrgb)
++            .expect("fresh shot");
++        state.status = "fresh request".to_owned();
++        complete(&old.tx, &old.in_flight, old.tokens.clone(), image);
++        assert!(capture.drain_events(&mut state).is_empty());
++        assert_eq!(state.status, "fresh request");
++        assert!(capture.in_flight.load(Ordering::Acquire));
++        assert!(capture.shot_since.is_some());
++        complete(&fresh.tx, &fresh.in_flight, fresh.tokens, None);
++        capture.drain_events(&mut state);
++        assert!(!capture.busy());
++    }
++    capture.want(report::shot_token().clone(), now);
++    assert!(!capture.due(&mut state, later));
++    assert!(!capture.busy(), "an unread waiting request also times out");
++}
+diff --git a/crates/ui/src/egui_app/shell_window/frame.rs b/crates/ui/src/egui_app/shell_window/frame.rs
+index 764bac695f..7dae8f47ee 100644
+--- a/crates/ui/src/egui_app/shell_window/frame.rs
++++ b/crates/ui/src/egui_app/shell_window/frame.rs
+@@ -109,7 +109,7 @@ impl Shell {
+         let mut raw_input = winit_state.take_egui_input(window);
+         // #1696: pictures the capture read-back finished arrive as egui's
+         // own Screenshot event, so the door that asked can match its token.
+-        raw_input.events.extend(capture.drain_events());
++        raw_input.events.extend(capture.drain_events(state));
+ 
+         // Size the 3D target from last frame's layout, like the imgui shell.
+         let want = view_pass::target_extent(*viewport_points, scale);
+diff --git a/docs/decisions/2745-report-capture-failure.md b/docs/decisions/2745-report-capture-failure.md
+new file mode 100644
+index 0000000000..73a7f1070e
+--- /dev/null
++++ b/docs/decisions/2745-report-capture-failure.md
+@@ -0,0 +1,34 @@
++## #2745 - Deliver a failed window read-back to the report status
++
++**Decided:** Send both a picture and a failed read-back through the existing
++capture completion channel. A failure retains its request tokens. The frame
++consumes it before drawing the status strip. Only the report token changes
++the report status. A failure sends no screenshot event or clipboard image.
++Map, mapped-range and pixel-decoding failures use this same completion path.
++
++Keep a capture busy until the frame consumes its completion, not only until
++the callback finishes. Give each shot its own completion flag. After a
++timeout, an old callback cannot clear a new shot or answer a new request.
++Requests that arrived during a shot remain queued for the next shot.
++
++**Why:** The old callback cleared its flag and dropped the tokens on failure.
++The timeout could no longer run, and the frame could stop repainting. The
++user saw a promise to copy a picture that could never arrive.
++
++**Considered and dropped:** Do not send an empty image as a failure. That
++would claim a successful copy and could replace the clipboard. Do not add a
++new screenshot service, dependency or persistent fault-injection option.
++Do not change the simulation preview read-back or machining policy.
++
++**Verification:** The callback/channel regression checks the rendered status
++and absence of a clipboard command. A second test cancels a real pending
++wgpu map with `Buffer::unmap`. This exercises the production map-error
++callback on Linux without losing a device. Tests also cover successful
++multi-token delivery, a foreign token, a closed dialog, timeouts, obsolete
++callbacks and a queued request after failure. A temporary rendering harness
++uses the real report button, capture callback and status renderer for the
++before/after evidence. It is not part of the source change.
++
++**Cost to change later:** A different screenshot consumer can interpret its
++own failed token at the existing frame-consumption seam. A change to the
++report message needs the corresponding visible-status assertion.

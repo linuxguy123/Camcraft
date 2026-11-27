@@ -1,0 +1,1225 @@
+From aae98799719ca27725202fd38f6fe3540d6d90fb Mon Sep 17 00:00:00 2001
+From: NeoTech <168627+NeoTech@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 02:01:51 +0000
+Subject: [PATCH] feat(motion): the converter from a kernel plan to a toolpath
+
+Add camcraft_motion::kernel_emit: emit_plan and emit_levels turn the
+kernel Plan of each level into a Toolpath in the plan's order. The
+converter makes no decision of its own: it refuses a step that it cannot
+emit by name, never drops a step and never adds a cut. Lateral rapids
+only at the clearance height; below the stock top only the moves of a
+proved step that starts where the tool stands. A lift is a retract to
+the clearance height with its reason in the notes in the links.rs text.
+Exact circles become G2/G3 arcs; leads and helices stay chords.
+
+The K4 motion pin now builds the whole plan (with the entry and exit
+stage) and converts it with the real converter; its counts stay. A new
+pin runs the camcraft-sim verifier on the converted disc and dog-bone
+plans. No old planner and no app code calls the converter yet.
+
+Refs #4269
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/motion/src/kernel_emit/arcs.rs         |  62 ++++
+ crates/motion/src/kernel_emit/mod.rs          | 213 +++++++++++++
+ crates/motion/src/kernel_emit/pen.rs          | 289 ++++++++++++++++++
+ crates/motion/src/kernel_emit/tests.rs        | 226 ++++++++++++++
+ crates/motion/src/lib.rs                      |   1 +
+ crates/motion/tests/kernel_laws.rs            |   5 +-
+ .../motion/tests/kernel_laws/k4_order_link.rs | 116 ++++---
+ .../motion/tests/kernel_laws/k6a_plan_emit.rs |  61 ++++
+ docs/decisions/4269-kernel-plan-converter.md  | 112 +++++++
+ 9 files changed, 1024 insertions(+), 61 deletions(-)
+ create mode 100644 crates/motion/src/kernel_emit/arcs.rs
+ create mode 100644 crates/motion/src/kernel_emit/mod.rs
+ create mode 100644 crates/motion/src/kernel_emit/pen.rs
+ create mode 100644 crates/motion/src/kernel_emit/tests.rs
+ create mode 100644 crates/motion/tests/kernel_laws/k6a_plan_emit.rs
+ create mode 100644 docs/decisions/4269-kernel-plan-converter.md
+
+diff --git a/crates/motion/src/kernel_emit/arcs.rs b/crates/motion/src/kernel_emit/arcs.rs
+new file mode 100644
+index 000000000..917e545d1
+--- /dev/null
++++ b/crates/motion/src/kernel_emit/arcs.rs
+@@ -0,0 +1,62 @@
++//! The arcs of a cut whose curve holds an exact circle: the plan's points
++//! must lie on the circle at one depth and turn one way round its centre;
++//! the arcs end on plan points, each a quarter turn or a little more, so a
++//! full ring is never one arc with the same start and end (the builder
++//! drops a zero-sweep arc).
++//! Provenance: circular interpolation G2/G3 of RS-274 / ISO 6983 (an arc is
++//! its end point, its centre and its sense); our own design record
++//! `docs/decisions/4269-kernel-plan-converter.md`.
++
++use super::pen::EMIT_TOL;
++use super::{ARC_NOT_MONOTONE, ARC_OFF_CIRCLE};
++use crate::geometry::Point3;
++use camcraft_pathkernel::guide::Circle;
++
++/// How far (mm) a point of a circle cut may be off the circle: the chord
++/// points of the guide stand on the circle, so this is a rounding margin.
++pub(super) const ARC_TOL: f64 = 1e-3;
++
++/// The arc ends after this much turn (radians): a quarter turn.
++const RUN: f64 = std::f64::consts::FRAC_PI_2;
++
++/// The arcs along `pts` (the first point is where the tool stands; a closed
++/// curve repeats its start at the end): each item is an arc end point and
++/// its sense (true = counter-clockwise, G3).
++pub(super) fn arc_runs(pts: &[Point3], c: Circle) -> Result<Vec<(Point3, bool)>, &'static str> {
++    let (o, r) = (c.center(), c.radius());
++    let Some(z) = pts.first().map(|p| p.z) else {
++        return Err(ARC_OFF_CIRCLE);
++    };
++    let off = |p: &Point3| ((p.x - o.x).hypot(p.y - o.y) - r).abs() > ARC_TOL || (p.z - z).abs() > EMIT_TOL;
++    if pts.iter().any(off) {
++        return Err(ARC_OFF_CIRCLE);
++    }
++    let mut sense: Option<bool> = None;
++    let mut turned = 0.0f64;
++    let mut pending: Option<(Point3, bool)> = None;
++    let mut out = Vec::new();
++    // A chord shorter than the tolerance (a repeated point) adds no turn:
++    // the arc runs on to the next point.
++    for w in pts.windows(2).filter(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y) > EMIT_TOL) {
++        let (a, b) = (w[0], w[1]);
++        let (ax, ay, bx, by) = (a.x - o.x, a.y - o.y, b.x - o.x, b.y - o.y);
++        let cross = ax * by - ay * bx;
++        let dot = ax * bx + ay * by;
++        let ccw = cross > 0.0;
++        if cross.abs() <= f64::EPSILON * r * r || sense.is_some_and(|s| s != ccw) {
++            return Err(ARC_NOT_MONOTONE);
++        }
++        sense = Some(ccw);
++        turned += cross.abs().atan2(dot);
++        pending = Some((b, ccw));
++        if turned >= RUN {
++            out.extend(pending.take());
++            turned = 0.0;
++        }
++    }
++    out.extend(pending);
++    if out.is_empty() {
++        return Err(ARC_NOT_MONOTONE);
++    }
++    Ok(out)
++}
+diff --git a/crates/motion/src/kernel_emit/mod.rs b/crates/motion/src/kernel_emit/mod.rs
+new file mode 100644
+index 000000000..7e4e069ac
+--- /dev/null
++++ b/crates/motion/src/kernel_emit/mod.rs
+@@ -0,0 +1,213 @@
++//! The converter from a path kernel plan to a toolpath (#4269, part of
++//! #4023): it emits the steps of each level's `Plan` in the plan's order -
++//! the entry, the cuts, the links, the lifts and the exit - and makes no
++//! decision of its own. A step that it cannot emit is refused by name; no
++//! step is dropped and no cut is added. No old planner calls it, so the
++//! output with the default planner switch does not change.
++//!
++//! The move rules (the safety floor of this code: it writes the moves that
++//! are posted):
++//! - A lateral rapid only at or above the clearance height. A rapid along
++//!   the tool axis goes only up (the retract of a lift or an exit).
++//! - Below the stock top only the moves of a step that the plan proved: a
++//!   cut, a stay-down link, the descent and lead of an entry, the lead-out
++//!   of an exit. Each step must start where the tool stands.
++//! - A lift is a retract to the clearance height. Its named reason goes to
++//!   the notes in the text form of the old links (`links.rs`).
++//! - A cut whose curve holds an exact circle becomes arcs (G2/G3); each other
++//!   cut, lead and descent is the plan's chords, as feeds.
++//!
++//! Provenance: our own design record `docs/decisions/4024-path-kernel-design.md`
++//! (K6, the converter in motion) and `docs/decisions/4269-kernel-plan-converter.md`;
++//! the G0/G1/G2/G3 vocabulary of RS-274 / ISO 6983. No vendor material consulted.
++
++mod arcs;
++mod pen;
++#[cfg(test)]
++mod tests;
++
++use std::ops::Range;
++
++use crate::cl::Toolpath;
++use camcraft_pathkernel::WorkPlane;
++use camcraft_pathkernel::plan::{Plan, Step};
++
++use pen::Pen;
++
++/// Refusal reason: heights that are not finite, or a clearance under the stock top.
++pub const BAD_HEIGHTS: &str = "the converter needs a finite stock top and a finite clearance height at or above it";
++/// Refusal reason: a feed rate that is not a positive finite number.
++pub const BAD_FEEDS: &str = "the converter needs a positive finite cut feed and plunge feed";
++/// Refusal reason: a work plane other than the setup's XY plane.
++pub const NOT_SETUP_XY: &str =
++    "the converter emits only plans in the setup's XY plane with the tool along +Z (a tilted or lathe plane is not supported yet)";
++/// Refusal reason: a cut with a tool axis other than the plane normal.
++pub const AXIS_NOT_NORMAL: &str = "the converter emits only cuts with the tool along the plane normal";
++/// Refusal reason: a step kind that this converter does not know.
++pub const UNKNOWN_STEP: &str = "the plan has a step kind that the converter cannot emit";
++/// Refusal reason: an entry while the tool is not at the clearance height.
++pub const ENTRY_NOT_CLEAR: &str = "an entry must start with the tool at the clearance height";
++/// Refusal reason: an entry with an approach point under the stock top.
++pub const APPROACH_IN_MATERIAL: &str = "the approach of an entry must stay at or above the stock top";
++/// Refusal reason: a cut, a link or an exit that does not start where the tool stands.
++pub const STEP_OFF_TOOL: &str = "a cut, a link or a lead-out must start where the tool stands: the move between them is not proved";
++/// Refusal reason: a cut, a link or an exit while the tool is not at depth.
++pub const STEP_NOT_DOWN: &str = "a cut, a link or an exit must follow an entry, a cut or a stay-down link";
++/// Refusal reason: a plan that does not end with the tool clear.
++pub const ENDS_DOWN: &str = "a plan must end with the tool at the clearance height";
++/// Refusal reason: a cut with a circle whose points are not on that circle at one depth.
++pub const ARC_OFF_CIRCLE: &str = "a cut with an exact circle must have its points on that circle, at one depth";
++/// Refusal reason: a cut with a circle whose points do not turn one way round it.
++pub const ARC_NOT_MONOTONE: &str = "a cut with an exact circle must turn one way round its centre";
++/// Refusal reason: a cut that gave no move.
++pub const CUT_DROPPED: &str = "a cut gave no move: the converter never drops a cut";
++/// Refusal reason: a point that is not a finite number after the mapping to XYZ.
++pub const NOT_FINITE: &str = "a point of the plan is not a finite number in XYZ";
++
++/// The heights that the converter reads, in setup Z: the clearance height
++/// (the plane of each lateral rapid and of each lift) and the stock top.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct EmitHeights {
++    clearance_z: f64,
++    top_z: f64,
++}
++
++impl EmitHeights {
++    pub fn new(clearance_z: f64, top_z: f64) -> Result<Self, EmitRefusal> {
++        if !(clearance_z.is_finite() && top_z.is_finite() && clearance_z >= top_z) {
++            return Err(EmitRefusal::new(BAD_HEIGHTS));
++        }
++        Ok(Self { clearance_z, top_z })
++    }
++    #[must_use]
++    pub fn clearance_z(&self) -> f64 {
++        self.clearance_z
++    }
++    #[must_use]
++    pub fn top_z(&self) -> f64 {
++        self.top_z
++    }
++}
++
++/// The feed rates (mm/min): the cut feed of the cuts, the links and the
++/// leads, and the plunge feed of each move down below the clearance height.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct EmitFeeds {
++    cut: f64,
++    plunge: f64,
++}
++
++impl EmitFeeds {
++    pub fn new(cut: f64, plunge: f64) -> Result<Self, EmitRefusal> {
++        let ok = |v: f64| v.is_finite() && v > 0.0;
++        if !(ok(cut) && ok(plunge)) {
++            return Err(EmitRefusal::new(BAD_FEEDS));
++        }
++        Ok(Self { cut, plunge })
++    }
++    #[must_use]
++    pub fn cut(&self) -> f64 {
++        self.cut
++    }
++    #[must_use]
++    pub fn plunge(&self) -> f64 {
++        self.plunge
++    }
++}
++
++/// One level: the plan that the caller made for it and the work plane of
++/// that level (its origin is on the level; a plan depth of 0 is the level).
++#[derive(Clone, Copy, Debug)]
++pub struct LevelPlan<'a> {
++    pub plan: &'a Plan,
++    pub plane: WorkPlane,
++}
++
++/// Why the converter refused, with the level and the step where it did.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct EmitRefusal {
++    reason: &'static str,
++    level: Option<usize>,
++    step: Option<usize>,
++}
++
++impl EmitRefusal {
++    fn new(reason: &'static str) -> Self {
++        Self { reason, level: None, step: None }
++    }
++    fn at(self, level: usize, step: Option<usize>) -> Self {
++        Self { level: Some(level), step, ..self }
++    }
++    /// The named reason (one of the constants of this module).
++    #[must_use]
++    pub fn reason(&self) -> &'static str {
++        self.reason
++    }
++    #[must_use]
++    pub fn level(&self) -> Option<usize> {
++        self.level
++    }
++    #[must_use]
++    pub fn step(&self) -> Option<usize> {
++        self.step
++    }
++}
++
++impl std::fmt::Display for EmitRefusal {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "kernel plan to toolpath: {}", self.reason)?;
++        if let Some(l) = self.level {
++            write!(f, " (level {}", l.saturating_add(1))?;
++            if let Some(s) = self.step {
++                write!(f, ", step {}", s.saturating_add(1))?;
++            }
++            write!(f, ")")?;
++        }
++        Ok(())
++    }
++}
++
++impl std::error::Error for EmitRefusal {}
++
++/// The toolpath of the plans, and what the converter emitted for them.
++#[derive(Clone, Debug, Default)]
++pub struct Emitted {
++    pub path: Toolpath,
++    /// The move range of each cut, in plan order: one range for each cut
++    /// step of the plans, never empty.
++    pub cut_moves: Vec<Range<usize>>,
++    /// The count of entries, stay-down links, lifts and exits emitted.
++    pub entries: usize,
++    pub stays: usize,
++    pub lifts: usize,
++    pub exits: usize,
++}
++
++/// The toolpath of one level's plan. See [`emit_levels`].
++pub fn emit_plan(plan: &Plan, plane: WorkPlane, h: EmitHeights, f: EmitFeeds) -> Result<Emitted, EmitRefusal> {
++    emit_levels(&[LevelPlan { plan, plane }], h, f)
++}
++
++/// The toolpath of the plans of each level, in the order given (the level
++/// order of the caller: the converter does not sort, merge or re-plan).
++/// Each plan starts with its own entry and ends with its own exit, so the
++/// move from one level to the next is the exit of the one and the entry of
++/// the next, through the clearance height.
++pub fn emit_levels(levels: &[LevelPlan<'_>], h: EmitHeights, f: EmitFeeds) -> Result<Emitted, EmitRefusal> {
++    let mut pen = Pen::new(h, f);
++    for (li, level) in levels.iter().enumerate() {
++        pen.set_plane(level.plane).map_err(|e| e.at(li, None))?;
++        for (si, step) in level.plan.steps().iter().enumerate() {
++            let done = match step {
++                Step::Entry(e) => pen.entry(e),
++                Step::Cut(c) => pen.cut(c),
++                Step::Link(hop) => pen.link(hop),
++                Step::Exit(x) => pen.exit(x),
++                _ => Err(EmitRefusal::new(UNKNOWN_STEP)),
++            };
++            done.map_err(|e| e.at(li, Some(si)))?;
++        }
++        pen.end_level().map_err(|e| e.at(li, None))?;
++    }
++    Ok(pen.finish())
++}
+diff --git a/crates/motion/src/kernel_emit/pen.rs b/crates/motion/src/kernel_emit/pen.rs
+new file mode 100644
+index 000000000..55bf29142
+--- /dev/null
++++ b/crates/motion/src/kernel_emit/pen.rs
+@@ -0,0 +1,289 @@
++//! The pen of the converter: the tool's place and state between two steps,
++//! and the one move rule for each step kind (see the module doc of
++//! [`super`]).
++//! Provenance: our own design record `docs/decisions/4269-kernel-plan-converter.md`;
++//! the retract-traverse-plunge order of general machining practice.
++
++use super::arcs::arc_runs;
++use super::{
++    APPROACH_IN_MATERIAL, AXIS_NOT_NORMAL, CUT_DROPPED, ENDS_DOWN, ENTRY_NOT_CLEAR, EmitFeeds, EmitHeights, EmitRefusal,
++    Emitted, NOT_FINITE, NOT_SETUP_XY, STEP_NOT_DOWN, STEP_OFF_TOOL,
++};
++use crate::cl::{MoveKind, PathBuilder};
++use crate::geo2d::Point2;
++use crate::geometry::Point3;
++use crate::links::{CLEARANCE_PLANE, LinkTally};
++use camcraft_pathkernel::entry::{Entry, Exit};
++use camcraft_pathkernel::link::Hop;
++use camcraft_pathkernel::plan::Cut;
++use camcraft_pathkernel::{PlanePoint, WorkPlane};
++
++/// The tolerance (mm) of "where the tool stands" and of the plane checks:
++/// ten times the kernel tolerance, for the rounding of the mapping to XYZ.
++pub(super) const EMIT_TOL: f64 = 1e-5;
++
++/// The word of the lift notes: "the keep-down in-plane link".
++const LINK_WORD: &str = "in-plane";
++
++/// Where the tool is between two steps.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum State {
++    /// At or above the clearance height (the start, after a lift or an exit).
++    Clear,
++    /// At depth, at the end of a proved step.
++    Down,
++}
++
++/// The setup-XY frame of a level: the Z of its origin.
++#[derive(Clone, Copy, Debug)]
++struct Frame {
++    z0: f64,
++}
++
++impl Frame {
++    fn of(plane: WorkPlane) -> Result<Self, EmitRefusal> {
++        let near = |a: [f64; 3], b: [f64; 3]| a.iter().zip(&b).all(|(p, q)| (p - q).abs() <= EMIT_TOL);
++        match plane {
++            WorkPlane::Planar(f) => {
++                let o = f.origin();
++                if near(f.normal(), [0.0, 0.0, 1.0]) && near(f.x_dir(), [1.0, 0.0, 0.0]) && near([o[0], o[1], 0.0], [0.0; 3]) {
++                    Ok(Self { z0: o[2] })
++                } else {
++                    Err(EmitRefusal::new(NOT_SETUP_XY))
++                }
++            }
++            _ => Err(EmitRefusal::new(NOT_SETUP_XY)),
++        }
++    }
++    /// The XYZ of a plane point: its place, and its depth along +Z above the origin.
++    fn xyz(self, p: &PlanePoint) -> Result<Point3, EmitRefusal> {
++        let q = Point3::new(p.at().x, p.at().y, self.z0 + p.depth());
++        if q.x.is_finite() && q.y.is_finite() && q.z.is_finite() { Ok(q) } else { Err(EmitRefusal::new(NOT_FINITE)) }
++    }
++}
++
++pub(super) struct Pen {
++    h: EmitHeights,
++    f: EmitFeeds,
++    frame: Option<Frame>,
++    b: Option<PathBuilder>,
++    state: State,
++    tally: LinkTally,
++    out: Emitted,
++}
++
++fn near3(a: Point3, b: Point3) -> bool {
++    (a.x - b.x).abs() <= EMIT_TOL && (a.y - b.y).abs() <= EMIT_TOL && (a.z - b.z).abs() <= EMIT_TOL
++}
++
++impl Pen {
++    pub(super) fn new(h: EmitHeights, f: EmitFeeds) -> Self {
++        Self { h, f, frame: None, b: None, state: State::Clear, tally: LinkTally::default(), out: Emitted::default() }
++    }
++
++    pub(super) fn set_plane(&mut self, plane: WorkPlane) -> Result<(), EmitRefusal> {
++        self.frame = Some(Frame::of(plane)?);
++        Ok(())
++    }
++
++    fn frame(&self) -> Result<Frame, EmitRefusal> {
++        self.frame.ok_or(EmitRefusal::new(NOT_SETUP_XY))
++    }
++
++    fn xyz(&self, p: &PlanePoint) -> Result<Point3, EmitRefusal> {
++        self.frame()?.xyz(p)
++    }
++
++    /// The builder, made at the clearance height over `over` at the first move.
++    fn builder(&mut self, over: Point3) -> &mut PathBuilder {
++        let z = self.h.clearance_z();
++        self.b.get_or_insert_with(|| PathBuilder::new(Point3::new(over.x, over.y, z)))
++    }
++
++    /// Where the tool stands (none before the first move).
++    fn at(&self) -> Option<Point3> {
++        self.b.as_ref().map(PathBuilder::at)
++    }
++
++    fn expect_down(&self, start: Point3) -> Result<(), EmitRefusal> {
++        if self.state != State::Down {
++            return Err(EmitRefusal::new(STEP_NOT_DOWN));
++        }
++        match self.at() {
++            Some(at) if near3(at, start) => Ok(()),
++            _ => Err(EmitRefusal::new(STEP_OFF_TOOL)),
++        }
++    }
++
++    /// A move of the air part of an entry: a rapid when both ends are at or
++    /// above the clearance height, else a plunge-feed move down or a feed.
++    fn air_move(&mut self, to: Point3) {
++        let clear = self.h.clearance_z() - EMIT_TOL;
++        let f = self.f;
++        let b = self.builder(to);
++        let from = b.at();
++        if from.z >= clear && to.z >= clear {
++            b.push(MoveKind::Rapid, to, None);
++        } else if to.z < from.z {
++            b.push(MoveKind::Plunge, to, Some(f.plunge()));
++        } else {
++            b.push(MoveKind::Feed, to, Some(f.cut()));
++        }
++    }
++
++    fn feed(&mut self, kind: MoveKind, to: Point3) {
++        let rate = if kind == MoveKind::Plunge { self.f.plunge() } else { self.f.cut() };
++        self.builder(to).push(kind, to, Some(rate));
++    }
++
++    /// Straight up along the tool axis to `z` (at least the clearance height).
++    fn retract(&mut self, z: f64) {
++        let z = z.max(self.h.clearance_z());
++        if let Some(b) = self.b.as_mut() {
++            let at = b.at();
++            if at.z < z {
++                b.push(MoveKind::Rapid, Point3::new(at.x, at.y, z), None);
++            }
++        }
++        self.state = State::Clear;
++    }
++
++    /// An entry: a rapid at the clearance height over the first point, the
++    /// move down to it, the approach (at or above the stock top), the
++    /// proved descent at the plunge feed, and the lead at the cut feed.
++    pub(super) fn entry(&mut self, e: &Entry) -> Result<(), EmitRefusal> {
++        if self.state != State::Clear {
++            return Err(EmitRefusal::new(ENTRY_NOT_CLEAR));
++        }
++        let approach = e.approach().iter().map(|p| self.xyz(p)).collect::<Result<Vec<_>, _>>()?;
++        if approach.iter().any(|p| p.z < self.h.top_z() - EMIT_TOL) {
++            return Err(EmitRefusal::new(APPROACH_IN_MATERIAL));
++        }
++        let descent = e.descent().iter().map(|p| self.xyz(p)).collect::<Result<Vec<_>, _>>()?;
++        let lead = e.lead().map_or(Ok(Vec::new()), |l| l.pts().iter().map(|p| self.xyz(p)).collect::<Result<Vec<_>, _>>())?;
++        let Some(&first) = approach.first().or(descent.first()) else {
++            return Err(EmitRefusal::new(STEP_OFF_TOOL));
++        };
++        let clear = self.h.clearance_z();
++        let at_z = self.at().map_or(clear, |a| a.z).max(clear);
++        self.builder(first).push(MoveKind::Rapid, Point3::new(first.x, first.y, at_z), None);
++        for p in &approach {
++            self.air_move(*p);
++        }
++        for p in &descent {
++            self.feed(MoveKind::Plunge, *p);
++        }
++        // The lead starts where the descent ends (`Entry::led` checks it).
++        for p in lead.iter().skip(1) {
++            self.feed(MoveKind::Feed, *p);
++        }
++        self.state = State::Down;
++        self.out.entries = self.out.entries.saturating_add(1);
++        Ok(())
++    }
++
++    /// A cut: from where the tool stands, along the curve (closed curves
++    /// back to their start), as arcs where the curve holds an exact circle.
++    pub(super) fn cut(&mut self, c: &Cut) -> Result<(), EmitRefusal> {
++        if c.axis().is_some_and(|a| !near3(Point3::new(a[0], a[1], a[2]), Point3::new(0.0, 0.0, 1.0))) {
++            return Err(EmitRefusal::new(AXIS_NOT_NORMAL));
++        }
++        let curve = c.curve();
++        let mut pts = curve.pts().iter().map(|p| self.xyz(p)).collect::<Result<Vec<_>, _>>()?;
++        let Some(&start) = pts.first() else {
++            return Err(EmitRefusal::new(CUT_DROPPED));
++        };
++        self.expect_down(start)?;
++        if curve.closed() {
++            pts.push(start);
++        }
++        let begin = self.b.as_ref().map_or(0, PathBuilder::moves_len);
++        let rate = self.f.cut();
++        match curve.arc() {
++            Some(circle) => {
++                let runs = arc_runs(&pts, circle).map_err(EmitRefusal::new)?;
++                let b = self.builder(start);
++                for (to, ccw) in runs {
++                    b.push_arc(MoveKind::Feed, to, Some(rate), circle.center(), ccw);
++                }
++            }
++            None => {
++                for p in pts.iter().skip(1) {
++                    self.feed(MoveKind::Feed, *p);
++                }
++            }
++        }
++        let end = self.b.as_ref().map_or(0, PathBuilder::moves_len);
++        if end <= begin {
++            return Err(EmitRefusal::new(CUT_DROPPED));
++        }
++        self.out.cut_moves.push(begin..end);
++        Ok(())
++    }
++
++    /// A link: a stay-down hop is fed along its proved points at the depth
++    /// where the tool stands; a lift is a retract to the clearance height,
++    /// counted by its named reason for the notes.
++    pub(super) fn link(&mut self, hop: &Hop) -> Result<(), EmitRefusal> {
++        match hop {
++            Hop::Stay(path) => {
++                let pts = path.points();
++                let at = self.at().ok_or(EmitRefusal::new(STEP_NOT_DOWN))?;
++                let to3 = |q: Point2| Point3::new(q.x, q.y, at.z);
++                let Some(&first) = pts.first() else {
++                    return Err(EmitRefusal::new(STEP_OFF_TOOL));
++                };
++                self.expect_down(to3(first))?;
++                for q in pts.iter().skip(1) {
++                    self.feed(MoveKind::Feed, to3(*q));
++                }
++                self.out.stays = self.out.stays.saturating_add(1);
++            }
++            Hop::Lift(reason) => {
++                let at = self.at().ok_or(EmitRefusal::new(STEP_NOT_DOWN))?;
++                if self.state != State::Down {
++                    return Err(EmitRefusal::new(STEP_NOT_DOWN));
++                }
++                self.tally.lift_to(reason.get(), CLEARANCE_PLANE, Point2::new(at.x, at.y), at.z);
++                self.retract(self.h.clearance_z());
++                self.out.lifts = self.out.lifts.saturating_add(1);
++            }
++        }
++        Ok(())
++    }
++
++    /// An exit: the proved lead-out at the cut feed, then the retract to the
++    /// exit's height or the clearance height, whichever is higher.
++    pub(super) fn exit(&mut self, x: &Exit) -> Result<(), EmitRefusal> {
++        let at = self.at().ok_or(EmitRefusal::new(STEP_NOT_DOWN))?;
++        if let Some(lead) = x.lead_out() {
++            let pts = lead.iter().map(|p| self.xyz(p)).collect::<Result<Vec<_>, _>>()?;
++            self.expect_down(pts.first().copied().unwrap_or(at))?;
++            for p in pts.iter().skip(1) {
++                self.feed(MoveKind::Feed, *p);
++            }
++        } else if self.state != State::Down {
++            return Err(EmitRefusal::new(STEP_NOT_DOWN));
++        }
++        let z = self.frame()?.z0 + x.retract();
++        if !z.is_finite() {
++            return Err(EmitRefusal::new(NOT_FINITE));
++        }
++        self.retract(z);
++        self.out.exits = self.out.exits.saturating_add(1);
++        Ok(())
++    }
++
++    pub(super) fn end_level(&mut self) -> Result<(), EmitRefusal> {
++        if self.state == State::Clear { Ok(()) } else { Err(EmitRefusal::new(ENDS_DOWN)) }
++    }
++
++    /// The toolpath, with one note for each lift reason.
++    pub(super) fn finish(mut self) -> Emitted {
++        if let Some(mut b) = self.b.take() {
++            self.tally.say(&mut b, LINK_WORD);
++            self.out.path = b.finish();
++        }
++        self.out
++    }
++}
+diff --git a/crates/motion/src/kernel_emit/tests.rs b/crates/motion/src/kernel_emit/tests.rs
+new file mode 100644
+index 000000000..7cd51bf10
+--- /dev/null
++++ b/crates/motion/src/kernel_emit/tests.rs
+@@ -0,0 +1,226 @@
++//! Pins of the converter (#4269) on hand-made plans: each step kind gives
++//! its moves, a lift gives a retract and a note with its reason, a step
++//! that cannot be emitted is refused by name, and no cut is dropped.
++
++use super::*;
++use crate::cl::{Move, MoveKind};
++use crate::geo2d::{Loop, Point2, Region};
++use crate::geometry::Point3;
++use camcraft_pathkernel::entry::{Area, Entry, EntryChoice, EntryKind, Exit, Proof};
++use camcraft_pathkernel::guide::{Circle, Curve, Family};
++use camcraft_pathkernel::link::{CUTS_PART, Hop};
++use camcraft_pathkernel::plan::Cut;
++use camcraft_pathkernel::{PlanePoint, ToolShape};
++
++const LEVEL: f64 = -2.0;
++const CLEAR: f64 = 10.0;
++
++fn pp(x: f64, y: f64, d: f64) -> PlanePoint {
++    PlanePoint::new(Point2::new(x, y), d).unwrap()
++}
++
++fn air() -> Area {
++    let sq = vec![Point2::new(-50.0, -50.0), Point2::new(50.0, -50.0), Point2::new(50.0, 50.0), Point2::new(-50.0, 50.0)];
++    Area::new(Region::new(vec![Loop::new(sq).unwrap()]).unwrap()).unwrap()
++}
++
++/// An air entry at `(x, y)`: the approach 3 above the level (1 above the
++/// stock top at Z 0), straight down to the level.
++fn entry_at(x: f64, y: f64, approach_depth: f64) -> Step {
++    let choice = EntryChoice::new(EntryKind::Air, 1.0, vec![]).unwrap();
++    let tool = ToolShape::disc(4.0, 0.0, true, 30.0).unwrap();
++    let e = Entry::new(EntryKind::Air, vec![pp(x, y, approach_depth)], vec![pp(x, y, 0.0)], Proof::InAir(air()), &choice, tool);
++    Step::Entry(e.unwrap())
++}
++
++fn line(a: (f64, f64), b: (f64, f64)) -> Step {
++    let c = Curve::new(vec![pp(a.0, a.1, 0.0), pp(b.0, b.1, 0.0)], None, false, 0, Family::Row).unwrap();
++    Step::Cut(Cut::new(c, None).unwrap())
++}
++
++fn ring(r: f64, n: u32, circle: bool) -> Step {
++    let pts = (0..n)
++        .map(|k| {
++            let a = f64::from(k) * std::f64::consts::TAU / f64::from(n);
++            pp(r * a.cos(), r * a.sin(), 0.0)
++        })
++        .collect();
++    let arc = circle.then(|| Circle::new(Point2::new(0.0, 0.0), r).unwrap());
++    Step::Cut(Cut::new(Curve::new(pts, arc, true, 0, Family::Ring).unwrap(), None).unwrap())
++}
++
++fn exit() -> Step {
++    Step::Exit(Exit::new(None, 5.0).unwrap())
++}
++
++fn run(steps: Vec<Step>) -> Result<Emitted, EmitRefusal> {
++    let plan = Plan::new(steps).unwrap();
++    emit_plan(&plan, WorkPlane::setup_xy(LEVEL).unwrap(), EmitHeights::new(CLEAR, 0.0).unwrap(), EmitFeeds::new(1000.0, 300.0).unwrap())
++}
++
++/// The safety rules of the module doc, on each move of `path`.
++fn assert_move_rules(moves: &[Move]) {
++    for (i, m) in moves.iter().enumerate() {
++        if m.kind != MoveKind::Rapid {
++            continue;
++        }
++        let lateral = (m.to.x - m.from.x).hypot(m.to.y - m.from.y) > 1e-9;
++        if lateral {
++            assert!(m.from.z >= CLEAR - 1e-9 && m.to.z >= CLEAR - 1e-9, "move {i}: a lateral rapid under the clearance height: {m:?}");
++        } else {
++            assert!(m.to.z >= m.from.z, "move {i}: a rapid goes only up along the axis: {m:?}");
++        }
++    }
++    for w in moves.windows(2) {
++        assert_eq!(w[0].to, w[1].from, "the moves chain");
++    }
++}
++
++#[test]
++fn each_step_kind_gives_its_moves() {
++    let steps = vec![
++        entry_at(0.0, 0.0, 3.0),
++        line((0.0, 0.0), (10.0, 0.0)),
++        Step::Link(Hop::stay(vec![Point2::new(10.0, 0.0), Point2::new(10.0, 5.0)]).unwrap()),
++        line((10.0, 5.0), (0.0, 5.0)),
++        Step::Link(Hop::lift(CUTS_PART).unwrap()),
++        entry_at(0.0, 10.0, 3.0),
++        line((0.0, 10.0), (10.0, 10.0)),
++        exit(),
++    ];
++    let out = run(steps).unwrap();
++    let m = &out.path.moves;
++    assert_move_rules(m);
++    let kinds: Vec<MoveKind> = m.iter().map(|m| m.kind).collect();
++    use MoveKind::{Feed, Plunge, Rapid};
++    // Down to the approach and the level, the cut, the stay link, the cut,
++    // the lift, the rapid over, down again, the cut, the exit's retract.
++    assert_eq!(kinds, vec![Plunge, Plunge, Feed, Feed, Feed, Rapid, Rapid, Plunge, Plunge, Feed, Rapid]);
++    assert_eq!(m[0].to, Point3::new(0.0, 0.0, 1.0), "the approach 3 above the level");
++    assert_eq!(m[1].to.z, LEVEL, "the descent to the level");
++    assert_eq!(m[3].to, Point3::new(10.0, 5.0, LEVEL), "the stay-down link stays at depth");
++    assert_eq!(m[5].to, Point3::new(0.0, 5.0, CLEAR), "the lift is a retract to the clearance height");
++    assert_eq!(m[10].to, Point3::new(10.0, 10.0, CLEAR), "the exit retracts to the clearance height at least");
++    assert_eq!((out.entries, out.stays, out.lifts, out.exits), (2, 1, 1, 1));
++    assert_eq!(out.cut_moves, vec![2..3, 4..5, 9..10]);
++    assert_eq!(m[2].feed, Some(1000.0));
++    assert_eq!(m[1].feed, Some(300.0));
++}
++
++#[test]
++fn a_lift_writes_its_reason_to_the_notes() {
++    let steps = vec![
++        entry_at(0.0, 0.0, 3.0),
++        line((0.0, 0.0), (10.0, 0.0)),
++        Step::Link(Hop::lift(CUTS_PART).unwrap()),
++        entry_at(0.0, 5.0, 3.0),
++        line((0.0, 5.0), (10.0, 5.0)),
++        Step::Link(Hop::lift(CUTS_PART).unwrap()),
++        entry_at(0.0, 10.0, 3.0),
++        line((0.0, 10.0), (10.0, 10.0)),
++        exit(),
++    ];
++    let out = run(steps).unwrap();
++    assert_eq!(out.lifts, 2);
++    assert_eq!(out.path.notes.len(), 1, "one note for each reason: {:?}", out.path.notes);
++    let note = &out.path.notes[0];
++    assert!(note.starts_with("link: the tool lifted to the clearance height 2 time(s) instead of the keep-down in-plane link - "), "{note}");
++    assert!(note.contains(CUTS_PART), "{note}");
++}
++
++#[test]
++fn an_exact_circle_becomes_arcs() {
++    let out = run(vec![entry_at(5.0, 0.0, 3.0), ring(5.0, 64, true), exit()]).unwrap();
++    let span = out.cut_moves[0].clone();
++    let arcs = &out.path.moves[span];
++    assert_eq!(arcs.len(), 4, "a full ring is four quarter arcs");
++    assert!(arcs.iter().all(|m| m.arc.is_some_and(|a| a.ccw) && m.kind == MoveKind::Feed));
++    assert!(arcs.last().is_some_and(|m| (m.to.x - 5.0).abs() < 1e-9 && m.to.y.abs() < 1e-9), "the ring closes on its start");
++    // The same ring without the circle stays chords.
++    let out = run(vec![entry_at(5.0, 0.0, 3.0), ring(5.0, 64, false), exit()]).unwrap();
++    let chords = &out.path.moves[out.cut_moves[0].clone()];
++    assert_eq!(chords.len(), 64);
++    assert!(chords.iter().all(|m| m.arc.is_none()));
++}
++
++#[test]
++fn levels_are_emitted_in_the_given_order() {
++    // The caller plans each level: the approach of the lower level is 2
++    // deeper in plan units, so that it stays 1 above the stock top.
++    let upper = Plan::new(vec![entry_at(0.0, 0.0, 3.0), line((0.0, 0.0), (10.0, 0.0)), exit()]).unwrap();
++    let lower = Plan::new(vec![entry_at(0.0, 0.0, 5.0), line((0.0, 0.0), (10.0, 0.0)), exit()]).unwrap();
++    let levels = [
++        LevelPlan { plan: &upper, plane: WorkPlane::setup_xy(-2.0).unwrap() },
++        LevelPlan { plan: &lower, plane: WorkPlane::setup_xy(-4.0).unwrap() },
++    ];
++    let out = emit_levels(&levels, EmitHeights::new(CLEAR, 0.0).unwrap(), EmitFeeds::new(1000.0, 300.0).unwrap()).unwrap();
++    assert_move_rules(&out.path.moves);
++    let zs: Vec<f64> = out.cut_moves.iter().map(|r| out.path.moves[r.start].to.z).collect();
++    assert_eq!(zs, vec![-2.0, -4.0]);
++    assert_eq!((out.entries, out.exits), (2, 2));
++}
++
++#[test]
++fn nothing_is_dropped() {
++    let steps = vec![
++        entry_at(5.0, 0.0, 3.0),
++        ring(5.0, 64, true),
++        Step::Link(Hop::stay(vec![Point2::new(5.0, 0.0), Point2::new(8.0, 0.0)]).unwrap()),
++        ring(8.0, 96, false),
++        Step::Link(Hop::lift(CUTS_PART).unwrap()),
++        entry_at(20.0, 0.0, 3.0),
++        line((20.0, 0.0), (20.0, 0.5)),
++        exit(),
++    ];
++    let cuts = steps.iter().filter(|s| matches!(s, Step::Cut(_))).count();
++    let out = run(steps).unwrap();
++    assert_eq!(out.cut_moves.len(), cuts, "one move group for each cut");
++    assert!(out.cut_moves.iter().all(|r| !r.is_empty()));
++    let cut_moves: usize = out.cut_moves.iter().map(|r| r.len()).sum();
++    assert_eq!(cut_moves, 4 + 96 + 1);
++}
++
++#[test]
++fn a_step_that_cannot_be_emitted_is_refused_by_name() {
++    let reason = |r: Result<Emitted, EmitRefusal>| r.map(|_| ()).unwrap_err().reason();
++    // A cut that does not start where the entry ended.
++    assert_eq!(reason(run(vec![entry_at(0.0, 0.0, 3.0), line((1.0, 0.0), (10.0, 0.0)), exit()])), STEP_OFF_TOOL);
++    // A stay link that does not start at the end of the cut.
++    let off = Hop::stay(vec![Point2::new(9.0, 0.0), Point2::new(10.0, 5.0)]).unwrap();
++    let steps = vec![entry_at(0.0, 0.0, 3.0), line((0.0, 0.0), (10.0, 0.0)), Step::Link(off), line((10.0, 5.0), (0.0, 5.0)), exit()];
++    assert_eq!(reason(run(steps)), STEP_OFF_TOOL);
++    // An approach under the stock top (Z 0 is 2 above the level).
++    assert_eq!(reason(run(vec![entry_at(0.0, 0.0, 1.0), line((0.0, 0.0), (10.0, 0.0)), exit()])), APPROACH_IN_MATERIAL);
++    // A circle cut whose points are not on its circle.
++    let bad = Curve::new(vec![pp(5.0, 0.0, 0.0), pp(0.0, 5.0, 0.0), pp(-5.0, 0.0, 0.0)], Some(Circle::new(Point2::new(0.0, 0.0), 6.0).unwrap()), true, 0, Family::Ring);
++    let steps = vec![entry_at(5.0, 0.0, 3.0), Step::Cut(Cut::new(bad.unwrap(), None).unwrap()), exit()];
++    assert_eq!(reason(run(steps)), ARC_OFF_CIRCLE);
++    // A circle cut that turns back.
++    let zig = Curve::new(vec![pp(5.0, 0.0, 0.0), pp(0.0, 5.0, 0.0), pp(5.0, 0.0, 0.0)], Some(Circle::new(Point2::new(0.0, 0.0), 5.0).unwrap()), false, 0, Family::Ring);
++    let steps = vec![entry_at(5.0, 0.0, 3.0), Step::Cut(Cut::new(zig.unwrap(), None).unwrap()), exit()];
++    assert_eq!(reason(run(steps)), ARC_NOT_MONOTONE);
++    // A cut with a tilted tool axis.
++    let c = Curve::new(vec![pp(0.0, 0.0, 0.0), pp(10.0, 0.0, 0.0)], None, false, 0, Family::Row).unwrap();
++    let tilted = Cut::new(c, Some([0.0, 0.6, 0.8])).unwrap();
++    assert_eq!(reason(run(vec![entry_at(0.0, 0.0, 3.0), Step::Cut(tilted), exit()])), AXIS_NOT_NORMAL);
++    // A plane that is not the setup's XY plane.
++    let plan = Plan::new(vec![entry_at(0.0, 0.0, 3.0), line((0.0, 0.0), (10.0, 0.0)), exit()]).unwrap();
++    let side = WorkPlane::planar([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]).unwrap();
++    let r = emit_plan(&plan, side, EmitHeights::new(CLEAR, 0.0).unwrap(), EmitFeeds::new(1000.0, 300.0).unwrap());
++    assert_eq!(reason(r), NOT_SETUP_XY);
++    // The refusal names its level and step.
++    let e = run(vec![entry_at(0.0, 0.0, 3.0), line((1.0, 0.0), (10.0, 0.0)), exit()]).map(|_| ()).unwrap_err();
++    assert_eq!((e.level(), e.step()), (Some(0), Some(1)));
++    assert!(e.to_string().contains("level 1, step 2"), "{e}");
++    // Bad heights and feeds.
++    assert_eq!(EmitHeights::new(-1.0, 0.0).unwrap_err().reason(), BAD_HEIGHTS);
++    assert_eq!(EmitHeights::new(f64::NAN, 0.0).unwrap_err().reason(), BAD_HEIGHTS);
++    assert_eq!(EmitFeeds::new(0.0, 300.0).unwrap_err().reason(), BAD_FEEDS);
++    assert_eq!(EmitFeeds::new(1000.0, f64::INFINITY).unwrap_err().reason(), BAD_FEEDS);
++}
++
++#[test]
++fn an_empty_plan_gives_an_empty_path() {
++    let out = run(vec![]).unwrap();
++    assert!(out.path.moves.is_empty() && out.cut_moves.is_empty());
++}
+diff --git a/crates/motion/src/lib.rs b/crates/motion/src/lib.rs
+index bff5afcf8..4de50f971 100644
+--- a/crates/motion/src/lib.rs
++++ b/crates/motion/src/lib.rs
+@@ -30,6 +30,7 @@ pub mod break_through;
+ pub mod entry;
+ pub mod entry_arc;
+ pub mod links;
++pub mod kernel_emit;
+ // #1558: a zig-zag ramp flown as the ring's own helical arcs.
+ pub mod ring_zig;
+ #[cfg(test)]
+diff --git a/crates/motion/tests/kernel_laws.rs b/crates/motion/tests/kernel_laws.rs
+index 4cdfb0a4f..dce8add5e 100644
+--- a/crates/motion/tests/kernel_laws.rs
++++ b/crates/motion/tests/kernel_laws.rs
+@@ -8,7 +8,8 @@
+ //! Gate map: covers the test helpers `common/law_measure` and the old
+ //! planners of camcraft_motion::machining2d and machining3d (read only),
+ //! and the order and link stages of the kernel (camcraft_pathkernel::order,
+-//! camcraft_pathkernel::link; #4177) on the same fixtures.
++//! camcraft_pathkernel::link; #4177) on the same fixtures, and the converter
++//! from a kernel plan to a toolpath (camcraft_motion::kernel_emit; #4269).
+ //! Provenance: our own design record (#4024, "the laws as checks" and the
+ //! switch-over proof); no vendor material consulted.
+ 
+@@ -27,3 +28,5 @@ mod laws_holes;
+ mod laws_slots;
+ #[path = "kernel_laws/k4_order_link.rs"]
+ mod k4_order_link;
++#[path = "kernel_laws/k6a_plan_emit.rs"]
++mod k6a_plan_emit;
+diff --git a/crates/motion/tests/kernel_laws/k4_order_link.rs b/crates/motion/tests/kernel_laws/k4_order_link.rs
+index 6595b9f36..46c3938f9 100644
+--- a/crates/motion/tests/kernel_laws/k4_order_link.rs
++++ b/crates/motion/tests/kernel_laws/k4_order_link.rs
+@@ -1,93 +1,89 @@
+ //! #4177 (K4 of the path kernel): the kernel's ring guide, order stage and
+ //! link stage round the disc of #3934 and the dog bone of #3741, Inside and
+ //! Outside, read with the same law measures as the old planners (#4154).
+-//! The test turns the kernel plan into a toolpath only as far as the
+-//! measures need: a rapid and a plunge for each entry, a feed along each
+-//! cut and each stay-down link, a rapid up for each lift, and one link
+-//! note for each lift reason (the note text of `links.rs`).
++//! The kernel plan of each case (guide, order, link, and the entry and
++//! exit stage) is made into a toolpath by the real converter of motion
++//! (`camcraft_motion::kernel_emit`, #4269), which writes one link note for
++//! each lift reason (the note text of `links.rs`).
+ //! Pins: no crossing feed, each lift named, and the lift count.
+ 
+ use super::common::law_measure::{Readings, measure};
+ use super::fixture::{R, STEP, TOP, Z, parts, planned_deg, spec_round, stock};
+-use camcraft_motion::cl::{Move, MoveKind, Toolpath};
++use camcraft_motion::cl::Toolpath;
+ use camcraft_motion::geo2d::{Point2, Region};
+-use camcraft_motion::geometry::Point3;
++use camcraft_motion::kernel_emit::{EmitFeeds, EmitHeights, Emitted, emit_plan};
++use camcraft_pathkernel::entry::{ArcChoice, EntryChoice, EntryKind, EntryPlanner, EntryStage, Heights};
+ use camcraft_pathkernel::guide::{GuideChoice, GuidePlanner, RingPlanner, RingRef, RingsChoice};
+ use camcraft_pathkernel::link::{Hop, Level, LinkPolicy, LinkProof, LinkStage, LinkTally};
+ use camcraft_pathkernel::order::{Direction, OrderChoice, OrderPlanner, OrderStage, StartSide};
+-use camcraft_pathkernel::plan::Cut;
++use camcraft_pathkernel::plan::{Cut, Plan, Step};
+ use camcraft_pathkernel::{Bounds, MaterialSide, Selection, ToolShape, WorkPlane, region};
+ 
+-/// The retract plane of the converted path.
+-const RETRACT: f64 = 2.0;
++/// The clearance height of the converted path (setup Z).
++pub const CLEARANCE: f64 = 10.0;
+ 
+-struct Pen {
+-    path: Toolpath,
+-    at: Point3,
+-}
+-
+-impl Pen {
+-    fn go(&mut self, kind: MoveKind, x: f64, y: f64, z: f64) {
+-        let to = Point3::new(x, y, z);
+-        let feed = (kind != MoveKind::Rapid).then_some(1000.0);
+-        self.path.moves.push(Move::new(kind, self.at, to, feed));
+-        self.at = to;
+-    }
+-    fn feed(&mut self, q: Point2) {
+-        if (q.x - self.at.x).hypot(q.y - self.at.y) > 1e-9 {
+-            self.go(MoveKind::Feed, q.x, q.y, Z);
+-        }
+-    }
+-    fn enter(&mut self, q: Point2) {
+-        self.go(MoveKind::Rapid, self.at.x, self.at.y, RETRACT);
+-        self.go(MoveKind::Rapid, q.x, q.y, RETRACT);
+-        self.go(MoveKind::Plunge, q.x, q.y, Z);
+-    }
+-}
+-
+-/// The kernel plan of the material round `part` from `side`, as a
+-/// toolpath, with its link tally.
+-fn kernel_path(part: &Region, side: StartSide) -> (Toolpath, LinkTally) {
++/// The kernel plan of the material round `part` from `side` at the one
++/// level Z, with its link tally: the stages in the order of the law kit
++/// (`crates/pathkernel/tests/laws/kit.rs`), a helix asked for each entry.
++pub fn kernel_plan(part: &Region, side: StartSide) -> (Plan, LinkTally) {
+     let sel = Selection::face(part.loops()[0].points().to_vec(), vec![]).unwrap();
+     let bounds = Bounds::new(Some(stock()), Region::empty(), TOP, Z).unwrap();
+     let tool = ToolShape::disc(R, 0.0, true, 30.0).unwrap();
+-    let r = region(&sel, MaterialSide::Outside, &bounds, WorkPlane::setup_xy(0.0).unwrap(), tool, 0.0).unwrap();
++    let r = region(&sel, MaterialSide::Outside, &bounds, WorkPlane::setup_xy(Z).unwrap(), tool, 0.0).unwrap();
+     let g = GuideChoice::Rings(RingsChoice::new(RingRef::Part, 0.0, STEP, None, None).unwrap());
+     let set = RingPlanner.guide(&r, &g, 1e-3).unwrap().out().unwrap().clone();
+     let oc = OrderChoice { start: side, direction: Direction::Climb };
+     let ordered = OrderStage.order(set, &r, &oc, None).unwrap().out().unwrap().clone();
+     let cuts: Vec<Cut> = ordered.curves().iter().map(|c| Cut::new(c.clone(), None).unwrap()).collect();
+-    let mut pen = Pen { path: Toolpath::default(), at: Point3::new(0.0, 0.0, 10.0) };
++    // The heights of the entry stage are along the plane normal above the level.
++    let stage = EntryStage::new(Heights::new(TOP - Z, 1.0, CLEARANCE - Z).unwrap(), ArcChoice::new(R, 90.0).unwrap(), 0.01).unwrap();
++    let choice = EntryChoice::new(EntryKind::Helix, 1.0, vec![]).unwrap();
++    let cleared = Region::empty();
+     let mut tally = LinkTally::default();
+     let mut paths: Vec<Vec<Point2>> = Vec::new();
++    let mut steps = Vec::new();
+     for (i, cut) in cuts.iter().enumerate() {
+-        let pts: Vec<Point2> = cut.curve().pts().iter().map(|q| q.at()).collect();
+-        let first = pts[0];
+-        match i.checked_sub(1) {
+-            None => pen.enter(first),
+-            Some(j) => match LinkStage.link(&cuts[j], cut, &r, Level::new(&cuts[..i], &cuts[i..]).with_links(&paths), LinkPolicy::StayWhereProved, &mut tally) {
+-                Hop::Stay(path) => {
+-                    for q in path.points() {
+-                        pen.feed(q);
+-                    }
+-                    pen.feed(first);
++        let lifted = match i.checked_sub(1) {
++            None => true,
++            Some(j) => {
++                let level = Level::new(&cuts[..i], &cuts[i..]).with_links(&paths);
++                let hop = LinkStage.link(&cuts[j], cut, &r, level, LinkPolicy::StayWhereProved, &mut tally);
++                if let Hop::Stay(path) = &hop {
+                     paths.push(path.points());
+                 }
+-                Hop::Lift(_) => pen.enter(first),
+-            },
+-        }
+-        for q in &pts[1..] {
+-            pen.feed(*q);
+-        }
+-        if cut.curve().closed() {
+-            pen.feed(first);
++                let lift = matches!(hop, Hop::Lift(_));
++                steps.push(Step::Link(hop));
++                lift
++            }
++        };
++        if lifted {
++            let e = stage.entry(cut, &r, &cleared, &choice).unwrap();
++            steps.push(Step::Entry(e.out().unwrap().clone()));
+         }
++        steps.push(Step::Cut(cut.clone()));
+     }
+-    pen.go(MoveKind::Rapid, pen.at.x, pen.at.y, RETRACT);
+-    for (why, n) in tally.by_reason() {
+-        pen.path.notes.push(format!("link: the tool lifted to the retract plane {n} time(s) instead of the keep-down link - {why}"));
++    if let Some(last) = cuts.last() {
++        steps.push(Step::Exit(stage.exit(last, &r, &cleared).unwrap()));
+     }
+-    (pen.path, tally)
++    (Plan::new(steps).unwrap(), tally)
++}
++
++/// The plan made into a toolpath by the converter.
++pub fn convert(plan: &Plan) -> Emitted {
++    let h = EmitHeights::new(CLEARANCE, TOP).unwrap();
++    let f = EmitFeeds::new(1000.0, 300.0).unwrap();
++    emit_plan(plan, WorkPlane::setup_xy(Z).unwrap(), h, f).unwrap()
++}
++
++/// The kernel plan of the material round `part` from `side`, as a
++/// toolpath, with its link tally.
++fn kernel_path(part: &Region, side: StartSide) -> (Toolpath, LinkTally) {
++    let (plan, tally) = kernel_plan(part, side);
++    let out = convert(&plan);
++    let cuts = plan.steps().iter().filter(|s| matches!(s, Step::Cut(_))).count();
++    assert_eq!(out.cut_moves.len(), cuts, "the converter emits each cut");
++    assert_eq!(out.lifts, tally.lifts() as usize, "the converter emits each lift");
++    (out.path, tally)
+ }
+ 
+ /// The lift count of the kernel for each part and side: (part, side, lifts).
+diff --git a/crates/motion/tests/kernel_laws/k6a_plan_emit.rs b/crates/motion/tests/kernel_laws/k6a_plan_emit.rs
+new file mode 100644
+index 000000000..8623d657e
+--- /dev/null
++++ b/crates/motion/tests/kernel_laws/k6a_plan_emit.rs
+@@ -0,0 +1,61 @@
++//! #4269 (K6a of the path kernel): the verifier of `camcraft-sim` and the
++//! entry measure on the kernel plans of the disc and the dog bone, made
++//! into toolpaths by the real converter (`camcraft_motion::kernel_emit`).
++//! Pins: no rapid in stock or in the part, no plunge into stock, no gouge
++//! of the part, and each descent below the stock top is the descent of a
++//! plan entry (no plunge without an entry), started in air or going into
++//! material only by the helix or ramp that the entry stage proved.
++
++use super::common::law_measure::{EntryKind, EntryStart, measure};
++use super::fixture::{R, STEP, TOP, parts, planned_deg, spec_round, stock};
++use super::k4_order_link::{CLEARANCE, convert, kernel_plan};
++use camcraft_motion::verify::{Mode, ToolGeom, VerifyContext, Warning, verify};
++use camcraft_pathkernel::order::StartSide;
++use camcraft_pathkernel::plan::Step;
++
++#[test]
++fn the_verifier_finds_no_rapid_into_stock_and_no_plunge_without_an_entry() {
++    let tool = ToolGeom { radius: R, nose_radius: 0.0, flute_len: 30.0, shank_radius: R, shank_len: 10.0, holder_radius: 15.0, holder_len: 30.0 };
++    let st = stock();
++    for (pname, part) in parts() {
++        for (sname, side) in [("Inside", StartSide::Inside), ("Outside", StartSide::Outside)] {
++            let (plan, _) = kernel_plan(&part, side);
++            let path = convert(&plan).path;
++            // The Outside start enters in the air round the stock, with its arc
++            // lead up to 1.5 tool radii out: the verifier's area is the stock
++            // grown by four tool radii, less the part, so a gouge is a gouge
++            // of the part (with the band of `fixture::band`, 2 radii, the air
++            // leads read as gouges 17 mm or more from the part).
++            let area = st.offset(4.0 * R).unwrap().difference(&part).unwrap();
++            let cx = VerifyContext {
++                region: &area,
++                stock: Some(&st),
++                tool: &tool,
++                mode: Mode::Area,
++                stock_top_z: TOP,
++                clearance_z: CLEARANCE,
++                gouge_tol: 0.01,
++                z_tol: 0.05,
++                ..VerifyContext::default()
++            };
++            let warns = verify(&path, &cx);
++            let gouges = warns.iter().filter(|w| matches!(w, Warning::Gouge { .. })).count();
++            let other: Vec<&Warning> = warns.iter().filter(|w| !matches!(w, Warning::Gouge { .. })).collect();
++            eprintln!("{pname} {sname}: {} moves, verifier: {gouges} gouge(s), other {other:?}", path.moves.len());
++            let bad: Vec<&Warning> = warns
++                .iter()
++                .filter(|w| matches!(w, Warning::RapidInStock { .. } | Warning::RapidInPart { .. } | Warning::PlungeIntoStock { .. }))
++                .collect();
++            assert!(bad.is_empty(), "{pname} {sname}: the verifier finds a rapid in stock or a plunge into stock: {bad:?}");
++            assert_eq!(gouges, 0, "{pname} {sname}: the verifier finds no gouge of the part");
++            let r = measure(&path, &spec_round(&part, planned_deg(STEP, R))).unwrap();
++            let planned = plan.steps().iter().filter(|s| matches!(s, Step::Entry(_))).count();
++            eprintln!("  entries {:?}", r.entries);
++            assert_eq!(r.entries.len(), planned, "{pname} {sname}: each descent is a plan entry");
++            for e in &r.entries {
++                let proved = e.start != EntryStart::Solid || matches!(e.kind, EntryKind::Helix | EntryKind::Ramp);
++                assert!(proved, "{pname} {sname}: a plunge into solid stock without a proved entry: {e:?}");
++            }
++        }
++    }
++}
+diff --git a/docs/decisions/4269-kernel-plan-converter.md b/docs/decisions/4269-kernel-plan-converter.md
+new file mode 100644
+index 000000000..82cfa3500
+--- /dev/null
++++ b/docs/decisions/4269-kernel-plan-converter.md
+@@ -0,0 +1,112 @@
++## #4269 - Path kernel K6a: the converter from a kernel plan to a toolpath
++
++The converter is in `crates/motion/src/kernel_emit/` (`mod.rs`, `pen.rs`,
++`arcs.rs`). Motion calls the kernel; the kernel does not change. No old
++planner and no app code calls the converter yet, so the output with the
++default planner switch does not change. The first recipe (#3752) calls it.
++
++**What was decided**
++
++1. **The public surface.** `emit_plan(plan, plane, heights, feeds)` and
++   `emit_levels(&[LevelPlan { plan, plane }], heights, feeds)` return
++   `Result<Emitted, EmitRefusal>`. `EmitHeights::new(clearance_z, top_z)`
++   and `EmitFeeds::new(cut, plunge)` are checked values. `Emitted` holds
++   the `Toolpath`, the move range of each cut, and the counts of entries,
++   stay-down links, lifts and exits. `EmitRefusal` has a named reason (a
++   constant of the module), the level and the step.
++2. **No decision of its own.** The converter emits the steps in the
++   plan's order. It never drops a step and never adds a cut. Each step must
++   start where the tool stands (within 1e-5 mm): a cut after its entry or
++   its stay-down link, a stay-down link and a lead-out at the end of the
++   cut. Else it refuses with `STEP_OFF_TOOL`. The plan does not check this
++   continuity, so the converter does: a move between two steps would be a
++   move that no stage proved.
++3. **The heights.** One rapid plane: the clearance height. A lateral rapid
++   is only at or above it. A rapid along the tool axis goes only up (the
++   retract of a lift or an exit). The move down from the clearance height
++   to the first approach point is a plunge-feed move, not a rapid: the
++   rule "no rapid under the clearance height" holds without exceptions.
++   The approach points must be at or above the stock top
++   (`APPROACH_IN_MATERIAL`). A lift is a vertical rapid up to the
++   clearance height. An exit retracts to its own height or to the
++   clearance height, whichever is higher.
++   Dropped: a rapid down to a retract plane above the stock (the old
++   planners do this). The kernel plan has no retract plane for a lift,
++   and a second rapid plane would need its own proof that it is above all
++   stock. A later PR can add it if the time in air is too long.
++4. **The lift note.** Each lift is counted by its reason in the motion
++   `LinkTally`. At the end, one note for each reason goes to the path in
++   the text form of `links.rs`: `link: the tool lifted to the clearance
++   height N time(s) instead of the keep-down in-plane link - <reason>; ...`.
++   The status line and the #4154 measures (`named_lifts`) read it.
++5. **Arcs.** A cut whose curve holds an exact circle becomes G2/G3 arcs.
++   The points must be on the circle (1e-3 mm) at one depth and turn one
++   way (`ARC_OFF_CIRCLE`, `ARC_NOT_MONOTONE`). Each arc ends on a plan
++   point after a quarter turn or a little more, so a full ring is four
++   arcs and never one arc with the same start and end. Each other cut is
++   the plan's chords, as feeds.
++   **Arc leads, helices and ramps are chords.** The entry stage keeps the
++   arc of a lead and the helix of a descent as chord points within its
++   chord tolerance (#4178 point 5). The plan has no exact circle for them,
++   so the converter emits feeds along the chords. The law measure then
++   reads a chorded helix as a ramp (an XY travel without an arc). G2/G3
++   leads and helices need the entry stage to record the circle first.
++6. **The moves of each step.** The approach is fed in air (plunge feed
++   down, cut feed else, a rapid only at or above the clearance height).
++   Each descent move is a plunge-feed move. The lead, the cut, the
++   stay-down link and the lead-out are cut-feed moves. A stay-down link is
++   at the depth where the tool stands: the next cut must start there.
++7. **The work plane.** The converter maps a plan point through the level's
++   `WorkPlane`: Z is the plane origin plus the depth. It refuses each plane
++   that is not the setup's XY plane (normal +Z, X axis +X, origin on the
++   Z axis) with `NOT_SETUP_XY`, and each cut with a tool axis other than
++   +Z with `AXIS_NOT_NORMAL`. The types do not assume XY: a lathe or 3+2
++   plane is a new arm of the mapping.
++8. **One plan for each level.** The caller plans each level: it gives one
++   `Plan` and one plane (its origin on the level) for each Z level, in the
++   present level order of `levels.rs`. When the stock state differs
++   between levels (an upper level cleared the stock that a lower level
++   enters through), the caller's entry stage reads that state through its
++   `cleared` area and gives a different entry in that level's plan. The
++   converter does not re-plan, merge or sort levels. Each plan ends with
++   its exit and the next starts with its entry, so the move between two
++   levels is an exit, a rapid at the clearance height and an entry.
++9. **Notes of the stages.** The plan holds the entries, not the verdict
++   of the entry stage. The caller writes the fallbacks and notes of the
++   stage verdicts; the converter writes only the lift notes.
++10. **A step kind that is not known** (`Step` is `#[non_exhaustive]`) is
++    refused with `UNKNOWN_STEP`. No such kind exists yet, so no test can
++    make one.
++
++**The pins.** Unit tests in `kernel_emit/tests.rs` on hand-made plans.
++The K4 pin of motion (`kernel_laws`) now builds the whole plan (guide,
++order, link, and the entry and exit stage with a helix asked) and converts
++it with the real converter: the counts stay (disc and dog bone Inside 0
++lifts; Outside 13 and 15, each named; 0 crossings). The new pin
++`k6a_plan_emit` runs the verifier of `camcraft-sim` and the entry measure
++on the same converted plans.
++
++**Readings** (tool radius 4, the 80 x 50 stock, one level at Z -2,
++clearance Z 10, a helix asked):
++
++| Fixture | Moves | Lifts (named) | Entries | Verifier |
++|---|---|---|---|---|
++| disc, Inside | 7355 | 0 | 1 into solid (read as a ramp: the helix is chords) | nothing |
++| disc, Outside | 6402 | 13 (13) | 14 in air | nothing |
++| dog bone, Inside | 5368 | 0 | 1 into solid (ramp) | nothing |
++| dog bone, Outside | 4784 | 15 (15) | 16 in air | nothing |
++
++The verifier area is the stock grown by four tool radii, less the part.
++With the band of `fixture::band` (two radii) the verifier gave 72 and 84
++`Gouge` warnings on Outside. Each one is on an air entry or its arc lead
++outside the band, 17 mm or more from the part: the band was too small for
++the air round the stock, and no warning is near the part. The law measure
++also reads 44 (disc) and 52 (dog bone) Outside feeds whose centre leaves
++the reach of `fixture::centre_reach` (the stock grown by one radius):
++these are the same arc leads in the air. The K4 pin does not assert the
++reach. The entry stage plans them in the kernel's air zone, so this is a
++reading of the entry stage, not of the converter.
++
++**Cost to change later.** A retract plane under the clearance height, or
++exact arcs for leads and helices, are local changes in `pen.rs` and need
++no change of the public surface.
