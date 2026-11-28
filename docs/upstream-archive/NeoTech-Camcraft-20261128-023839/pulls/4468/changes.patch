@@ -1,0 +1,2324 @@
+From d5fe0af0158cbcac7708f653fe44b7df8c967162 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 23:29:45 +0100
+Subject: [PATCH 1/6] feat(gcode): the Klartext reader reads RND, CHF and polar
+ LP / CP
+
+Third slice of the HEIDENHAIN Klartext reader:
+- RND (rounding arc) and CHF (chamfer) between two straight feed lines
+  (L or LP) in the working plane, by one-block look-ahead: the line
+  before waits, the line after sets the cut-back points. The F of the
+  transition acts only on it.
+- LP with PR/PA and IPR/IPA about the pole CC.
+- CP with PA or IPA and DR, with Z/IZ as a helix, split into pieces of
+  at most 90 degrees.
+Transitions next to arcs, FMAX lines, Z changes or block-end M
+functions, a CP IPA/DR sign mismatch and polar angles at the pole are
+refused by name and line. RL/RR, APPR/DEP, CTP, LBL and inch programs
+stay refused.
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/src/klartext/corner.rs       | 289 ++++++++++++++++++++++
+ crates/gcode/src/klartext/exec.rs         |  26 +-
+ crates/gcode/src/klartext/mod.rs          |   6 +-
+ crates/gcode/src/klartext/path.rs         |  30 ++-
+ crates/gcode/src/klartext/polar.rs        | 174 +++++++++++++
+ crates/gcode/src/klartext/words.rs        |  61 ++++-
+ crates/gcode/tests/klartext/contours.rs   | 142 +++++++++++
+ crates/gcode/tests/klartext/degenerate.rs |  55 +++-
+ crates/gcode/tests/klartext/main.rs       |   2 +
+ crates/gcode/tests/klartext/polar.rs      | 114 +++++++++
+ crates/gcode/tests/klartext/refusals.rs   |   6 +-
+ docs/decisions/2227-klartext-reader.md    |  64 +++++
+ 12 files changed, 945 insertions(+), 24 deletions(-)
+ create mode 100644 crates/gcode/src/klartext/corner.rs
+ create mode 100644 crates/gcode/src/klartext/polar.rs
+ create mode 100644 crates/gcode/tests/klartext/contours.rs
+ create mode 100644 crates/gcode/tests/klartext/polar.rs
+
+diff --git a/crates/gcode/src/klartext/corner.rs b/crates/gcode/src/klartext/corner.rs
+new file mode 100644
+index 000000000..96718d9f6
+--- /dev/null
++++ b/crates/gcode/src/klartext/corner.rs
+@@ -0,0 +1,289 @@
++//! Klartext transition elements `RND` (rounding arc) and `CHF` (chamfer) between two straight lines in the working plane: the lines are cut back and the arc or chamfer joins them.
++//! Provenance: HEIDENHAIN iTNC 530 conversational user's manual 533 190-22 (path functions RND and CHF: the corner point is not machined, the rounding arc is tangent to both elements, the chamfer side length is cut from each line, the F word acts only in the RND/CHF block), as summarized in docs/research/heidenhain/differences.md; tangent-length formula t = R tan(phi/2) from plane geometry.
++
++use camcraft_cl::cl::{ArcPlane, MoveKind};
++use camcraft_geometry::geo2d::Point2;
++use camcraft_geometry::geometry::Point3;
++
++use super::exec::Machine;
++use super::source::Block;
++use super::words::{Words, value};
++use crate::domain::{check_feed, check_len, check_point};
++use crate::types::GcodeError;
++
++/// A straight feed line in the working plane whose end is the corner of the
++/// next `RND` / `CHF` block. It is not in the toolpath until that block and
++/// the line after it set the cut-back point.
++#[derive(Clone, Debug, PartialEq)]
++pub struct PendingLine {
++    /// Physical line of the block that programmed the line.
++    pub line: usize,
++    /// Start of the line, after a cut-back by an earlier `RND` / `CHF`.
++    pub start: Point3,
++    /// Programmed end point: the corner.
++    pub corner: Point3,
++    /// Unit XY direction of the programmed line.
++    pub dir: Point2,
++    pub feed: f64,
++}
++
++/// The transition element of an `RND` / `CHF` block.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum CornerKind {
++    /// `RND R..`: rounding arc of this radius.
++    Round(f64),
++    /// `CHF ..`: chamfer with this side length on each line.
++    Chamfer(f64),
++}
++
++/// An `RND` / `CHF` block that waits for the line after it.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Corner {
++    pub kind: CornerKind,
++    /// Feed of the transition element: the `F` of the block, else the modal feed.
++    pub feed: f64,
++    pub block: Block,
++}
++
++impl CornerKind {
++    fn name(self) -> &'static str {
++        match self {
++            CornerKind::Round(_) => "RND",
++            CornerKind::Chamfer(_) => "CHF",
++        }
++    }
++}
++
++impl Machine<'_> {
++    fn next_is_corner(&self) -> Option<&'static str> {
++        match self.next_word.as_deref() {
++            Some("RND") => Some("RND"),
++            Some("CHF") => Some("CHF"),
++            _ => None,
++        }
++    }
++
++    /// The name of the `RND` / `CHF` that touches the current straight-line block.
++    fn corner_name(&self) -> Option<&'static str> {
++        self.corner
++            .as_ref()
++            .map(|c| c.kind.name())
++            .or_else(|| self.next_is_corner())
++    }
++
++    /// `RND R.. [F..]` and `CHF <length> [F..]`.
++    pub fn corner_block(&mut self, b: &Block, toks: &[String]) -> Result<(), GcodeError> {
++        let name = if b.words.first().map(String::as_str) == Some("RND") {
++            "RND"
++        } else {
++            "CHF"
++        };
++        let (mut size, mut feed) = (None, None);
++        for (i, t) in toks.iter().enumerate() {
++            if let Some(v) = t.strip_prefix('F') {
++                if v == "MAX" {
++                    return Err(b.unsupported(name, "FMAX on a transition element is not read"));
++                }
++                if feed.replace(check_feed(b.line, value(b, "F", v, &self.q)?)?).is_some() {
++                    return Err(b.syntax("F appears twice"));
++                }
++                continue;
++            }
++            let v = match (name, t.strip_prefix('R')) {
++                ("RND", Some(v)) => v,
++                ("CHF", None) if i == 0 => t.as_str(),
++                _ => return Err(b.unknown(t)),
++            };
++            if size.replace(value(b, name, v, &self.q)?).is_some() {
++                return Err(b.syntax(&format!("{name} has two sizes")));
++            }
++        }
++        let size = size.ok_or_else(|| b.syntax(&format!("{name} needs its size")))?;
++        let size = check_len(b.line, name, size)?;
++        if size <= 1e-6 {
++            return Err(b.syntax(&format!("{name} size ({size}) must be greater than 0")));
++        }
++        if self.corner.is_some() || self.pending.is_none() {
++            return Err(b.unsupported(
++                name,
++                "a transition element needs a straight line (L or LP) in the working plane before it; next to an arc, a cycle or at the contour start it is not read in this reader version",
++            ));
++        }
++        if !matches!(self.next_word.as_deref(), Some("L" | "LP")) {
++            return Err(b.unsupported(
++                name,
++                "a transition element needs a straight line (L or LP) in the working plane after it; next to an arc or another block it is not read in this reader version",
++            ));
++        }
++        let feed = match feed.or(self.modal.feed_rate_mm_min) {
++            Some(f) => f,
++            None => return Err(b.invalid_modal(&format!("{name} needs a feed rate F"))),
++        };
++        let kind = if name == "RND" {
++            CornerKind::Round(size)
++        } else {
++            CornerKind::Chamfer(size)
++        };
++        self.corner = Some(Corner {
++            kind,
++            feed,
++            block: b.clone(),
++        });
++        Ok(())
++    }
++
++    /// Word checks for a straight-line block next to an `RND` / `CHF`: the line
++    /// must move, the line after a transition takes no M function, and the line
++    /// before it takes only M functions that act at the block start.
++    pub fn corner_words_check(
++        &self,
++        b: &Block,
++        w: &Words,
++        moves: bool,
++    ) -> Result<(), GcodeError> {
++        let Some(name) = self.corner_name() else {
++            return Ok(());
++        };
++        if !moves {
++            return Err(b.unsupported(name, "the straight line next to it has no end point"));
++        }
++        if self.corner.is_some() && (!w.m.is_empty() || w.mb.is_some()) {
++            return Err(b.unsupported(
++                name,
++                "an M function in the line after a transition element is not read",
++            ));
++        }
++        if self.next_is_corner().is_some()
++            && (w.mb.is_some() || w.m.iter().any(|n| !matches!(n, 3 | 4 | 8 | 13 | 14)))
++        {
++            return Err(b.unsupported(
++                name,
++                "the line before a transition element takes only M3, M4, M8, M13 or M14 (an M function at the block end is not read there)",
++            ));
++        }
++        Ok(())
++    }
++
++    /// A straight line of an `L` / `LP` block, with the `RND` / `CHF` before and
++    /// after it: the line before a transition waits; the line after it sets the
++    /// cut-back points, and the toolpath gets the shortened line, the
++    /// transition element and the start of this line.
++    pub fn line_to(
++        &mut self,
++        b: &Block,
++        kind: MoveKind,
++        to: Point3,
++        feed: Option<f64>,
++    ) -> Result<(), GcodeError> {
++        let Some(name) = self.corner_name() else {
++            self.push_line(b, kind, to, feed);
++            return Ok(());
++        };
++        let from = self.pos;
++        let (dx, dy) = (to.x - from.x, to.y - from.y);
++        let len = dx.hypot(dy);
++        let feed = match (kind, feed) {
++            (MoveKind::Feed, Some(f)) => f,
++            _ => return Err(b.unsupported(name, "the straight line next to it must be a feed move, not FMAX")),
++        };
++        if (to.z - from.z).abs() > 1e-9 {
++            return Err(b.unsupported(name, "the straight line next to it must stay in the working plane (no Z change)"));
++        }
++        if len <= 1e-6 {
++            return Err(b.unsupported(name, "the straight line next to it has no length in the working plane"));
++        }
++        let mut start = from;
++        if let Some(c) = self.corner.take() {
++            let p = self.pending.take().ok_or_else(|| {
++                c.block
++                    .unsupported(c.kind.name(), "no straight line waits before this block")
++            })?;
++            let v = Point2::new(dx / len, dy / len);
++            let (t1, t2) = corner_points(&c, &p, v, len, b.line)?;
++            check_point(c.block.line, "transition start", t1)?;
++            check_point(c.block.line, "transition end", t2)?;
++            self.current
++                .push_move(p.line, MoveKind::Feed, t1, Some(p.feed));
++            match c.kind {
++                CornerKind::Round(r) => {
++                    let (center, ccw) = round_center(p.dir, v, t1, r);
++                    self.current
++                        .push_arc(c.block.line, t2, c.feed, center, ccw, ArcPlane::Xy);
++                }
++                CornerKind::Chamfer(_) => {
++                    self.current
++                        .push_move(c.block.line, MoveKind::Feed, t2, Some(c.feed));
++                }
++            }
++            start = t2;
++        }
++        self.tangent = Some(Point2::new(dx / len, dy / len));
++        if self.next_is_corner().is_some() {
++            self.pending = Some(PendingLine {
++                line: b.line,
++                start,
++                corner: to,
++                dir: Point2::new(dx / len, dy / len),
++                feed,
++            });
++        } else {
++            self.current.push_move(b.line, MoveKind::Feed, to, Some(feed));
++        }
++        self.pos = to;
++        Ok(())
++    }
++}
++
++/// The cut-back points on the line before (`t1`) and after (`t2`) the corner;
++/// `v` and `len_out` are the unit direction and the length of the line after,
++/// which starts on physical line `after`.
++fn corner_points(
++    c: &Corner,
++    p: &PendingLine,
++    v: Point2,
++    len_out: f64,
++    after: usize,
++) -> Result<(Point3, Point3), GcodeError> {
++    let name = c.kind.name();
++    let u = p.dir;
++    // The line before can be cut back already by an earlier transition.
++    let len_in = (p.corner.x - p.start.x).hypot(p.corner.y - p.start.y);
++    let cross = u.x * v.y - u.y * v.x;
++    let dot = u.x * v.x + u.y * v.y;
++    if cross.abs() <= 1e-9 {
++        return Err(c.block.unsupported(
++            name,
++            "the lines before and after it are in line (no corner to round or chamfer)",
++        ));
++    }
++    let dist = match c.kind {
++        CornerKind::Round(r) => r * (cross.abs().atan2(dot) / 2.0).tan(),
++        CornerKind::Chamfer(l) => l,
++    };
++    let room = len_in.min(len_out);
++    if !dist.is_finite() || dist > room + 1e-9 {
++        return Err(c.block.unsupported(
++            name,
++            &format!(
++                "it needs {dist:.4} mm of each line, but the line before has {len_in:.4} mm and the line after (line {after}) has {len_out:.4} mm"
++            ),
++        ));
++    }
++    let z = p.corner.z;
++    let t1 = Point3::new(p.corner.x - u.x * dist, p.corner.y - u.y * dist, z);
++    let t2 = Point3::new(p.corner.x + v.x * dist, p.corner.y + v.y * dist, z);
++    Ok((t1, t2))
++}
++
++/// Centre and direction of the rounding arc of radius `r` that starts at `t1`
++/// on the line before the corner (direction `u`; the line after has `v`): on
++/// the inner side of the turn.
++fn round_center(u: Point2, v: Point2, t1: Point3, r: f64) -> (Point2, bool) {
++    let ccw = u.x * v.y - u.y * v.x > 0.0;
++    let n = if ccw {
++        Point2::new(-u.y, u.x)
++    } else {
++        Point2::new(u.y, -u.x)
++    };
++    (Point2::new(t1.x + n.x * r, t1.y + n.y * r), ccw)
++}
+diff --git a/crates/gcode/src/klartext/exec.rs b/crates/gcode/src/klartext/exec.rs
+index 8f4843b6c..18a030944 100644
+--- a/crates/gcode/src/klartext/exec.rs
++++ b/crates/gcode/src/klartext/exec.rs
+@@ -6,6 +6,7 @@ use camcraft_geometry::geometry::Point3;
+ use camcraft_geometry::geometry::units::Unit;
+ 
+ use super::KlartextOptions;
++use super::corner::{Corner, PendingLine};
+ use super::cycles::DrillDef;
+ use super::old_cycles::OldCycle;
+ use super::source::Block;
+@@ -24,6 +25,12 @@ pub struct Machine<'a> {
+     pub cc: Option<Point2>,
+     /// Unit XY direction at the end of the last move, for `CT`.
+     pub tangent: Option<Point2>,
++    /// A straight line that waits for the `RND` / `CHF` block after it.
++    pub pending: Option<PendingLine>,
++    /// An `RND` / `CHF` block that waits for the straight line after it.
++    pub corner: Option<Corner>,
++    /// The first word of the next block (look-ahead for `RND` / `CHF`).
++    pub next_word: Option<String>,
+     pub cycle: Option<DrillDef>,
+     /// A sub-block cycle (`CYCL DEF 9.0`, `32.1`) that waits for its next block.
+     pub old: Option<OldCycle>,
+@@ -52,6 +59,9 @@ impl<'a> Machine<'a> {
+             pos,
+             cc: None,
+             tangent: None,
++            pending: None,
++            corner: None,
++            next_word: None,
+             cycle: None,
+             old: None,
+             q: QTable::new(),
+@@ -68,7 +78,10 @@ impl<'a> Machine<'a> {
+         }
+     }
+ 
+-    pub fn step(&mut self, b: &Block) -> Result<(), GcodeError> {
++    /// Execute one block; `next` is the block after it (look-ahead for the
++    /// rounding and chamfer blocks, which change the element before them).
++    pub fn step(&mut self, b: &Block, next: Option<&Block>) -> Result<(), GcodeError> {
++        self.next_word = next.and_then(|n| n.words.first().cloned());
+         let w: Vec<&str> = b.words.iter().map(String::as_str).collect();
+         if self.pgm_ended {
+             return Err(b.syntax("block after END PGM"));
+@@ -127,6 +140,9 @@ impl<'a> Machine<'a> {
+             "C" => self.arc_block(b, rest),
+             "CR" => self.radius_arc_block(b, rest),
+             "CT" => self.tangent_arc_block(b, rest),
++            "LP" => self.polar_line_block(b, rest),
++            "CP" => self.polar_arc_block(b, rest),
++            "RND" | "CHF" => self.corner_block(b, rest),
+             "BLK" => self.blk_form(b, rest),
+             "TOOL" => self.tool_block(b, rest),
+             "CYCL" => self.cycle_block(b, rest),
+@@ -142,11 +158,11 @@ impl<'a> Machine<'a> {
+                 self.pre_m(b, &words.m)?;
+                 self.post_m(b, &words.m, words.mb)
+             }
+-            "RND" | "CHF" => Err(b.unsupported(
+-                w[0],
+-                "rounding and chamfer blocks change the neighbour elements; this reader version refuses them",
++            "CTP" => Err(b.unsupported(
++                "CTP",
++                "the tangential polar arc is not read in this reader version",
+             )),
+-            "LP" | "CP" | "CTP" | "PA" => Err(b.unsupported(w[0], "polar coordinates are not read")),
++            "PA" => Err(b.unsupported("PA", "polar coordinates are read only in LP and CP")),
+             "APPR" | "DEP" => Err(b.unsupported(w[0], "approach and departure functions are not read")),
+             "LBL" | "CALL" => Err(b.unsupported(
+                 w[0],
+diff --git a/crates/gcode/src/klartext/mod.rs b/crates/gcode/src/klartext/mod.rs
+index b64f80c96..d864c6ccf 100644
+--- a/crates/gcode/src/klartext/mod.rs
++++ b/crates/gcode/src/klartext/mod.rs
+@@ -2,10 +2,12 @@
+ //! Provenance: HEIDENHAIN iTNC 530 conversational user's manual 533 190-22 and the TNC cycle manuals, as summarized in docs/research/heidenhain/; CamCraft's own Klartext post output (assets/posts/heidenhain-klartext.cps). Decisions: docs/decisions/2227-klartext-reader.md.
+ 
+ mod blocks;
++mod corner;
+ mod cycles;
+ mod exec;
+ mod old_cycles;
+ mod path;
++mod polar;
+ mod source;
+ mod taps;
+ mod words;
+@@ -58,8 +60,8 @@ pub fn parse_klartext_with(
+     check_options(options)?;
+     let (blocks, lines) = source::split_blocks(program)?;
+     let mut m = exec::Machine::new(options);
+-    for b in &blocks {
+-        m.step(b)?;
++    for (i, b) in blocks.iter().enumerate() {
++        m.step(b, blocks.get(i + 1))?;
+     }
+     m.finish(lines)
+ }
+diff --git a/crates/gcode/src/klartext/path.rs b/crates/gcode/src/klartext/path.rs
+index dad973d44..0a747ec13 100644
+--- a/crates/gcode/src/klartext/path.rs
++++ b/crates/gcode/src/klartext/path.rs
+@@ -16,18 +16,13 @@ impl Machine<'_> {
+     pub fn line_block(&mut self, b: &Block, toks: &[String]) -> Result<(), GcodeError> {
+         let w = decode(b, toks, &self.q)?;
+         reject_arc_words(b, &w, "L")?;
++        self.corner_words_check(b, &w, w.has_coords())?;
+         self.pre_m(b, &w.m)?;
+         let rate = self.feed_words(b, &w)?;
+         if w.has_coords() {
+             let to = self.target(b, &w)?;
+-            let (kind, feed) = match w.feed {
+-                Some(Feed::Max) => (MoveKind::Rapid, None),
+-                _ => (
+-                    MoveKind::Feed,
+-                    Some(rate.ok_or_else(|| b.invalid_modal("L needs a feed rate F or FMAX"))?),
+-                ),
+-            };
+-            self.push_line(b, kind, to, feed);
++            let (kind, feed) = line_feed(b, &w, rate, "L")?;
++            self.line_to(b, kind, to, feed)?;
+         }
+         self.post_m(b, &w.m, w.mb)
+     }
+@@ -196,7 +191,7 @@ impl Machine<'_> {
+     }
+ 
+     /// Apply an `F` word to the modal feed and return the active feed rate.
+-    fn feed_words(&mut self, b: &Block, w: &Words) -> Result<Option<f64>, GcodeError> {
++    pub fn feed_words(&mut self, b: &Block, w: &Words) -> Result<Option<f64>, GcodeError> {
+         if let Some(Feed::Rate(f)) = w.feed {
+             self.modal.feed_rate_mm_min = Some(check_feed(b.line, f)?);
+         }
+@@ -264,6 +259,23 @@ impl Machine<'_> {
+     }
+ }
+ 
++/// Move kind and feed of a straight-line block: `FMAX` is a rapid for this
++/// block only, else the modal feed rate.
++pub fn line_feed(
++    b: &Block,
++    w: &Words,
++    rate: Option<f64>,
++    what: &str,
++) -> Result<(MoveKind, Option<f64>), GcodeError> {
++    Ok(match w.feed {
++        Some(Feed::Max) => (MoveKind::Rapid, None),
++        _ => (
++            MoveKind::Feed,
++            Some(rate.ok_or_else(|| b.invalid_modal(&format!("{what} needs a feed rate F or FMAX")))?),
++        ),
++    })
++}
++
+ fn reject_arc_words(b: &Block, w: &Words, what: &str) -> Result<(), GcodeError> {
+     if w.ccw.is_some() || w.radius.is_some() {
+         return Err(b.syntax(&format!("{what} takes no DR and no R radius")));
+diff --git a/crates/gcode/src/klartext/polar.rs b/crates/gcode/src/klartext/polar.rs
+new file mode 100644
+index 000000000..7f6d670c4
+--- /dev/null
++++ b/crates/gcode/src/klartext/polar.rs
+@@ -0,0 +1,174 @@
++//! Klartext polar path blocks about the pole `CC`: `LP PR.. PA..` straight lines and `CP PA../IPA.. DR±` arcs, with `Z`/`IZ` in `CP` as a helix.
++//! Provenance: HEIDENHAIN iTNC 530 conversational user's manual 533 190-22 (polar coordinates: pole CC, polar radius PR, polar angle PA from the +X axis, counter-clockwise positive; LP and CP; helix as CP with IPA and IZ, the signs of IPA and DR agree), as summarized in docs/research/heidenhain/differences.md.
++
++use camcraft_cl::cl::ArcPlane;
++use camcraft_geometry::geo2d::Point2;
++use camcraft_geometry::geometry::Point3;
++
++use super::exec::Machine;
++use super::path::line_feed;
++use super::source::Block;
++use super::words::{Feed, Words, decode_polar};
++use crate::domain::{check_len, check_point};
++use crate::types::GcodeError;
++
++/// Largest polar angle input of the control, in degrees.
++const MAX_ANGLE: f64 = 99_999.9999;
++/// Largest sweep of one arc move of a `CP` block, in degrees.
++const PIECE_DEG: f64 = 90.0;
++
++impl Machine<'_> {
++    fn pole(&self, b: &Block, what: &str) -> Result<Point2, GcodeError> {
++        self.cc
++            .ok_or_else(|| b.invalid_modal(&format!("{what} needs a pole: a CC block before it")))
++    }
++
++    /// Polar radius and angle (degrees) of the tool position about the pole.
++    fn polar_pos(&self, pole: Point2) -> (f64, f64) {
++        let (dx, dy) = (self.pos.x - pole.x, self.pos.y - pole.y);
++        (dx.hypot(dy), dy.atan2(dx).to_degrees())
++    }
++
++    /// The tool-axis end of a polar block: `Z`, `IZ`, or the current Z.
++    fn polar_z(&self, b: &Block, w: &Words) -> Result<f64, GcodeError> {
++        let z = match (w.abs[2], w.inc[2]) {
++            (Some(z), _) => z,
++            (None, Some(d)) => self.pos.z + d,
++            (None, None) => self.pos.z,
++        };
++        check_len(b.line, "Z", z)
++    }
++
++    /// `LP PR.. PA.. [Z..] [R0] F../FMAX`: a straight line to polar coordinates.
++    /// A polar coordinate that is not written keeps its value of the tool position.
++    pub fn polar_line_block(&mut self, b: &Block, toks: &[String]) -> Result<(), GcodeError> {
++        let w = decode_polar(b, toks, &self.q)?;
++        if w.ccw.is_some() || w.radius.is_some() {
++            return Err(b.syntax("LP takes no DR and no R radius"));
++        }
++        let pole = self.pole(b, "LP")?;
++        let moves = w.pr.or(w.ipr).or(w.pa).or(w.ipa).is_some() || w.has_coords();
++        self.corner_words_check(b, &w, moves)?;
++        self.pre_m(b, &w.m)?;
++        let rate = self.feed_words(b, &w)?;
++        if moves {
++            let (r0, a0) = self.polar_pos(pole);
++            let r = match (w.pr, w.ipr) {
++                (Some(r), _) => r,
++                (None, Some(d)) => r0 + d,
++                (None, None) => r0,
++            };
++            if r < 0.0 {
++                return Err(b.invalid_modal(&format!("LP polar radius ({r}) is negative")));
++            }
++            let angle_from_pos = w.pa.is_none();
++            if angle_from_pos && r0 <= 1e-9 && r > 1e-9 {
++                return Err(b.invalid_modal(
++                    "LP needs PA: the tool is at the pole, so its polar angle is not defined",
++                ));
++            }
++            let a = match (w.pa, w.ipa) {
++                (Some(a), _) => a,
++                (None, Some(d)) => a0 + d,
++                (None, None) => a0,
++            };
++            if a.abs() > 2.0 * MAX_ANGLE {
++                return Err(b.invalid_modal(&format!("LP polar angle ({a}) is out of range")));
++            }
++            let (s, c) = a.to_radians().sin_cos();
++            let to = check_point(
++                b.line,
++                "end point",
++                Point3::new(pole.x + r * c, pole.y + r * s, self.polar_z(b, &w)?),
++            )?;
++            let (kind, feed) = line_feed(b, &w, rate, "LP")?;
++            self.line_to(b, kind, to, feed)?;
++        }
++        self.post_m(b, &w.m, w.mb)
++    }
++
++    /// `CP PA.. DR±` or `CP IPA.. DR±` (with `Z`/`IZ`: a helix): an arc about the
++    /// pole at the radius of the tool position.
++    pub fn polar_arc_block(&mut self, b: &Block, toks: &[String]) -> Result<(), GcodeError> {
++        let w = decode_polar(b, toks, &self.q)?;
++        if w.pr.is_some() || w.ipr.is_some() || w.radius.is_some() {
++            return Err(b.syntax("CP takes no PR and no R; the radius is the distance to the pole"));
++        }
++        if w.mb.is_some() {
++            return Err(b.syntax("MB on an arc block"));
++        }
++        if w.feed == Some(Feed::Max) {
++            return Err(b.invalid_arc("FMAX on an arc is not read; give a feed rate F"));
++        }
++        let ccw = w.ccw.ok_or_else(|| b.invalid_arc("CP needs DR+ or DR-"))?;
++        let pole = self.pole(b, "CP")?;
++        let (r, a0) = self.polar_pos(pole);
++        if r <= 1e-6 {
++            return Err(b.invalid_arc("CP starts at the pole; the arc has no radius"));
++        }
++        let sweep = cp_sweep(b, &w, a0, ccw)?;
++        self.pre_m(b, &w.m)?;
++        let feed = self
++            .feed_words(b, &w)?
++            .ok_or_else(|| b.invalid_modal("an arc needs a feed rate F"))?;
++        let z0 = self.pos.z;
++        let z1 = self.polar_z(b, &w)?;
++        // At most 1112 pieces: the sweep is bounded by MAX_ANGLE.
++        let n = (sweep.abs() / PIECE_DEG).ceil().max(1.0) as usize;
++        let mut to = self.pos;
++        for k in 1..=n {
++            let f = k as f64 / n as f64;
++            let (s, c) = (a0 + sweep * f).to_radians().sin_cos();
++            to = check_point(
++                b.line,
++                "arc point",
++                Point3::new(pole.x + r * c, pole.y + r * s, z0 + (z1 - z0) * f),
++            )?;
++            self.current.push_arc(b.line, to, feed, pole, ccw, ArcPlane::Xy);
++        }
++        let (rx, ry) = ((to.x - pole.x) / r, (to.y - pole.y) / r);
++        self.tangent = Some(if ccw {
++            Point2::new(-ry, rx)
++        } else {
++            Point2::new(ry, -rx)
++        });
++        self.pos = to;
++        self.post_m(b, &w.m, None)
++    }
++}
++
++/// Signed sweep of a `CP` block in degrees (positive counter-clockwise).
++fn cp_sweep(b: &Block, w: &Words, a0: f64, ccw: bool) -> Result<f64, GcodeError> {
++    match (w.pa, w.ipa) {
++        (_, Some(d)) => {
++            if !(d.abs() > 1e-9 && d.abs() <= MAX_ANGLE) {
++                return Err(b.invalid_arc(&format!(
++                    "CP IPA ({d}) must be non-zero and at most {MAX_ANGLE} degrees"
++                )));
++            }
++            if (d > 0.0) != ccw {
++                return Err(b.invalid_arc(
++                    "CP IPA and DR have different signs; the direction of the arc is not clear",
++                ));
++            }
++            Ok(d)
++        }
++        (Some(a), None) => {
++            if a.abs() > MAX_ANGLE {
++                return Err(b.invalid_arc(&format!("CP PA ({a}) is out of range")));
++            }
++            let d = if ccw {
++                (a - a0).rem_euclid(360.0)
++            } else {
++                -(a0 - a).rem_euclid(360.0)
++            };
++            if d.abs() <= 1e-9 || (360.0 - d.abs()) <= 1e-9 {
++                return Err(b.invalid_arc(
++                    "CP PA is the start angle; write IPA+360 or IPA-360 for a full circle",
++                ));
++            }
++            Ok(d)
++        }
++        (None, None) => Err(b.invalid_arc("CP needs the end angle PA or IPA")),
++    }
++}
+diff --git a/crates/gcode/src/klartext/words.rs b/crates/gcode/src/klartext/words.rs
+index b5c55ad4e..1332b100b 100644
+--- a/crates/gcode/src/klartext/words.rs
++++ b/crates/gcode/src/klartext/words.rs
+@@ -1,4 +1,4 @@
+-//! Word decoding for Klartext path blocks (`L`, `CC`, `C`, `CR`, `CT`): coordinates, radius compensation, feed, direction, radius and M functions.
++//! Word decoding for Klartext path blocks (`L`, `CC`, `C`, `CR`, `CT`, polar `LP` / `CP`): coordinates, polar coordinates, radius compensation, feed, direction, radius and M functions.
+ //! Provenance: HEIDENHAIN iTNC 530 conversational user's manual 533 190-22 (path function words), as summarized in docs/research/heidenhain/differences.md, and the blocks of assets/posts/heidenhain-klartext.cps.
+ 
+ use std::collections::HashMap;
+@@ -40,6 +40,12 @@ pub struct Words {
+     pub radius: Option<f64>,
+     pub m: Vec<u32>,
+     pub mb: Option<Mb>,
++    /// Polar radius `PR` (absolute) and `IPR` (incremental); only in polar mode.
++    pub pr: Option<f64>,
++    pub ipr: Option<f64>,
++    /// Polar angle `PA` (absolute) and `IPA` (incremental), in degrees; only in polar mode.
++    pub pa: Option<f64>,
++    pub ipa: Option<f64>,
+ }
+ 
+ impl Words {
+@@ -68,8 +74,18 @@ pub fn value(b: &Block, what: &str, tok: &str, q: &QTable) -> Result<f64, GcodeE
+ 
+ const AXES: [&str; 3] = ["X", "Y", "Z"];
+ 
+-/// Decode the words after the block keyword.
++/// Decode the words after the block keyword of a Cartesian block.
+ pub fn decode(b: &Block, toks: &[String], q: &QTable) -> Result<Words, GcodeError> {
++    decode_mode(b, toks, q, false)
++}
++
++/// Decode the words of a polar block (`LP`, `CP`): `PR`/`IPR` and `PA`/`IPA`
++/// are read, the working-plane axes `X`/`Y` are refused.
++pub fn decode_polar(b: &Block, toks: &[String], q: &QTable) -> Result<Words, GcodeError> {
++    decode_mode(b, toks, q, true)
++}
++
++fn decode_mode(b: &Block, toks: &[String], q: &QTable, polar: bool) -> Result<Words, GcodeError> {
+     let mut w = Words::default();
+     let mut i = 0;
+     while i < toks.len() {
+@@ -87,11 +103,50 @@ pub fn decode(b: &Block, toks: &[String], q: &QTable) -> Result<Words, GcodeErro
+             set_mb(b, &mut w, arg, q)?;
+             continue;
+         }
++        if polar && polar_one(b, &mut w, t, q)? {
++            continue;
++        }
+         decode_one(b, &mut w, t, q)?;
+     }
+     Ok(w)
+ }
+ 
++/// A polar word of an `LP` / `CP` block. Returns false for a word that is not polar.
++fn polar_one(b: &Block, w: &mut Words, t: &str, q: &QTable) -> Result<bool, GcodeError> {
++    for (name, slot_inc) in [("IPR", true), ("IPA", true), ("PR", false), ("PA", false)] {
++        let Some(rest) = t.strip_prefix(name) else {
++            continue;
++        };
++        let v = value(b, name, rest, q)?;
++        let slot = match (name.ends_with('R'), slot_inc) {
++            (true, true) => &mut w.ipr,
++            (true, false) => &mut w.pr,
++            (false, true) => &mut w.ipa,
++            (false, false) => &mut w.pa,
++        };
++        let other = match (name.ends_with('R'), slot_inc) {
++            (true, true) => w.pr,
++            (true, false) => w.ipr,
++            (false, true) => w.pa,
++            (false, false) => w.ipa,
++        };
++        if other.is_some() {
++            return Err(b.syntax(&format!("{name} and its absolute/incremental pair in one block")));
++        }
++        set(b, slot, v, name)?;
++        return Ok(true);
++    }
++    let axis = t.strip_prefix('I').unwrap_or(t);
++    if let Some(rest) = axis.strip_prefix(['X', 'Y'])
++        && (literal(rest).is_some() || q_ref(rest).is_some())
++    {
++        return Err(b.syntax(&format!(
++            "{t} in a polar block; LP and CP take PR/PA, and only Z of the Cartesian axes"
++        )));
++    }
++    Ok(false)
++}
++
+ fn set_mb(b: &Block, w: &mut Words, arg: &str, q: &QTable) -> Result<(), GcodeError> {
+     if w.mb.is_some() {
+         return Err(b.syntax("MB appears twice"));
+@@ -109,7 +164,7 @@ fn decode_one(b: &Block, w: &mut Words, t: &str, q: &QTable) -> Result<(), Gcode
+         "R0" => return once(b, &mut w.r0, t),
+         "RL" | "RR" => return Err(b.unsupported(
+             t,
+-            "radius compensation RL/RR is not read; this reader needs the tool-centre path (R0)",
++            "radius compensation RL/RR is not read: the compensated path needs the tool radius of the tool table and the control's corner rules; this reader reads the tool-centre path (R0)",
+         )),
+         "FMAX" => return set(b, &mut w.feed, Feed::Max, "F"),
+         "FAUTO" | "FU" | "FZ" | "FT" => {
+diff --git a/crates/gcode/tests/klartext/contours.rs b/crates/gcode/tests/klartext/contours.rs
+new file mode 100644
+index 000000000..406082b05
+--- /dev/null
++++ b/crates/gcode/tests/klartext/contours.rs
+@@ -0,0 +1,142 @@
++//! Transition elements: RND rounding arcs and CHF chamfers between straight lines give the published corner geometry (cut-back points, arc centre, tangency), or a refusal that names the block.
++
++use camcraft_cl::cl::{Move, MoveKind};
++use camcraft_gcode::GcodeError;
++
++use super::{assert_to, moves, near, ok, pgm, refusal};
++
++/// Assert an arc move about (cx, cy) in the given direction.
++fn assert_arc(m: &Move, cx: f64, cy: f64, ccw: bool) {
++    let a = m.arc.expect("an arc move");
++    assert!(
++        near(a.center.x, cx) && near(a.center.y, cy) && a.ccw == ccw,
++        "arc {a:?}, expected centre ({cx}, {cy}) ccw={ccw}"
++    );
++}
++
++#[test]
++fn klartext_rnd_rounds_a_right_angle_with_its_own_feed() {
++    let p = ok(&pgm(&[
++        "L X+0 Y+0 Z-1 R0 F100",
++        "L X+20 Y+0",
++        "RND R5 F50",
++        "L X+20 Y+20",
++    ]));
++    let m = moves(&p);
++    assert_eq!(m.len(), 4, "line, cut-back line, rounding arc, line");
++    // The corner (20, 0) is not machined: the line stops R tan(45 deg) = 5 before it.
++    assert_to(m[1], 15.0, 0.0, -1.0);
++    assert_to(m[2], 20.0, 5.0, -1.0);
++    assert_arc(m[2], 15.0, 5.0, true);
++    assert_to(m[3], 20.0, 20.0, -1.0);
++    // F50 acts only on the rounding arc; the modal F100 stays.
++    let feeds: Vec<_> = m.iter().map(|m| m.feed).collect();
++    assert_eq!(feeds, vec![Some(100.0), Some(100.0), Some(50.0), Some(100.0)]);
++    // Each move maps to the block that programmed it.
++    let lines: Vec<_> = (0..4).map(|i| p.line_for_move(0, i)).collect();
++    assert_eq!(lines, vec![Some(2), Some(3), Some(4), Some(5)]);
++}
++
++#[test]
++fn klartext_chf_and_rnd_chain_on_right_turns() {
++    let p = ok(&pgm(&[
++        "L X+0 Y+0 Z-1 R0 F200",
++        "L X+30 Y+0",
++        "CHF 3",
++        "L X+30 Y-10",
++        "RND R2",
++        "L X+0 Y-10",
++    ]));
++    let m = moves(&p);
++    assert_eq!(m.len(), 6);
++    // CHF 3 cuts 3 mm from each line; the chamfer is a feed line at the modal F.
++    assert_to(m[1], 27.0, 0.0, -1.0);
++    assert_to(m[2], 30.0, -3.0, -1.0);
++    assert!(m[2].arc.is_none() && m[2].kind == MoveKind::Feed);
++    assert_eq!(m[2].feed, Some(200.0));
++    // The middle line starts at the chamfer end and stops 2 mm before (30, -10).
++    assert_to(m[3], 30.0, -8.0, -1.0);
++    assert_to(m[4], 28.0, -10.0, -1.0);
++    assert_arc(m[4], 28.0, -8.0, false);
++    assert_to(m[5], 0.0, -10.0, -1.0);
++}
++
++#[test]
++fn klartext_rnd_on_an_obtuse_corner_is_tangent_to_both_lines() {
++    let p = ok(&pgm(&[
++        "L X+0 Y+0 Z-1 R0 F100",
++        "L X+10 Y+0",
++        "RND R4",
++        "L X+20 Y+10",
++    ]));
++    let m = moves(&p);
++    // A 45 deg turn: the tangent length is R tan(22.5 deg).
++    let t = 4.0 * (22.5_f64).to_radians().tan();
++    let s = std::f64::consts::FRAC_1_SQRT_2;
++    assert_to(m[1], 10.0 - t, 0.0, -1.0);
++    assert_to(m[2], 10.0 + t * s, t * s, -1.0);
++    let a = m[2].arc.expect("arc");
++    assert!(a.ccw);
++    for p in [m[1].to, m[2].to] {
++        assert!(near((p.x - a.center.x).hypot(p.y - a.center.y), 4.0), "radius at {p:?}");
++    }
++    // Tangency: the radius at each end is normal to its line.
++    assert!(near(m[1].to.x - a.center.x, 0.0));
++    let (rx, ry) = (m[2].to.x - a.center.x, m[2].to.y - a.center.y);
++    assert!(near(rx * s + ry * s, 0.0), "radius is normal to the line after");
++}
++
++#[test]
++fn klartext_rnd_between_l_and_lp_lines() {
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+0 Y+0 Z-1 R0 F100",
++        "L X+10",
++        "RND R2",
++        "LP PR+10 PA+90",
++    ]));
++    let m = moves(&p);
++    // A 135 deg turn: t = 2 tan(67.5 deg).
++    let t = 2.0 * (67.5_f64).to_radians().tan();
++    let s = std::f64::consts::FRAC_1_SQRT_2;
++    assert_to(m[1], 10.0 - t, 0.0, -1.0);
++    assert_to(m[2], 10.0 - t * s, t * s, -1.0);
++    assert_arc(m[2], 10.0 - t, 2.0, true);
++    assert_to(m[3], 0.0, 10.0, -1.0);
++}
++
++#[test]
++fn klartext_transition_elements_refuse_what_is_not_exact() {
++    let base = "L X+0 Y+0 Z-1 R0 F100";
++    // (body, line of the refused block, code)
++    let cases: [(&[&str], usize, &str); 11] = [
++        // After an arc, before an arc, at the program end.
++        (&[base, "CC X+0 Y+5", "C X+5 Y+5 DR-", "RND R2", "L X+5 Y+20"], 5, "RND"),
++        (&[base, "L X+10", "RND R2", "CR X+20 Y+10 R+10 DR+"], 4, "RND"),
++        (&[base, "L X+10", "CHF 2"], 4, "CHF"),
++        // Too large for the line, on a straight run, two in a row.
++        (&[base, "L X+5", "RND R10", "L X+5 Y+20"], 4, "RND"),
++        (&[base, "L X+10", "CHF 2", "L X+20"], 4, "CHF"),
++        (&[base, "L X+10", "RND R2", "RND R3", "L Y+10"], 4, "RND"),
++        // The middle line is 5 mm, but the two roundings need 3 mm each.
++        (&[base, "L X+10", "RND R3", "L Y+5", "RND R3", "L X+0"], 6, "RND"),
++        // A Z change, FMAX, an M function at the block end before, an M function after.
++        (&[base, "L X+10", "RND R2", "L Y+10 Z-2"], 5, "RND"),
++        (&[base, "L X+10 FMAX", "RND R2", "L Y+10"], 3, "RND"),
++        (&[base, "L X+10 M5", "RND R2", "L Y+10"], 3, "RND"),
++        (&[base, "L X+10", "CHF 2", "L Y+10 M9"], 5, "CHF"),
++    ];
++    for (body, line, code) in cases {
++        let e = refusal(&pgm(body));
++        match &e {
++            GcodeError::UnsupportedCode { code: c, .. } => assert_eq!(c, code, "{body:?}: {e}"),
++            other => panic!("{body:?}: expected an unsupported-code refusal, got {other}"),
++        }
++        assert_eq!(e.line(), line, "{body:?}: {e}");
++        assert!(e.to_string().contains(&format!("block {}:", line - 1)), "{e}");
++    }
++    for bad in ["RND R0", "RND R-2", "RND", "CHF", "CHF 2 3", "RND R2 X+1"] {
++        let e = refusal(&pgm(&[base, "L X+10", bad, "L Y+10"]));
++        assert_eq!(e.line(), 4, "{bad}: {e}");
++    }
++}
+diff --git a/crates/gcode/tests/klartext/degenerate.rs b/crates/gcode/tests/klartext/degenerate.rs
+index 29cab0e68..ee76482cd 100644
+--- a/crates/gcode/tests/klartext/degenerate.rs
++++ b/crates/gcode/tests/klartext/degenerate.rs
+@@ -9,10 +9,42 @@ const GOLDEN: &str =
+ /// The cycle golden: cycles 200, 206, 207, the cycle 9 dwell and continuation lines.
+ const CYCLES: &str =
+     include_str!("../../../post/tests/recorded/golden/heidenhain-klartext/picomax_cycles.nc");
++/// A hand-written contour with every contour element of the third slice:
++/// RND and CHF between L and LP lines, LP, CP arcs and a CP helix.
++const CONTOUR: &str = "0 BEGIN PGM CONTOUR MM
++1 BLK FORM 0.1 Z X-50 Y-50 Z-20
++2 BLK FORM 0.2 X+50 Y+50 Z+0
++3 TOOL CALL 1 Z S4000
++4 CC X+0 Y+0
++5 L X+30 Y+0 Z+5 R0 FMAX M3
++6 L Z-2 F300
++7 L X+30 Y+30
++8 RND R5 F150
++9 L X-30 Y+30
++10 CHF 4
++11 L X-30 Y-30
++12 RND R3
++13 LP PR+30 PA-45
++14 CP IPA+45 DR+
++15 CP PA+90 DR+ F200
++16 CT X-20 Y+20
++17 L X+0 Y+0
++18 CC X+0 Y+0
++19 L X+10 Y+0 Z-2 R0 F300
++20 CP IPA+360 IZ-1 DR+
++21 LP PR+5 PA+180
++22 L Z+50 FMAX M5
++23 M30
++24 END PGM CONTOUR MM
++";
+ 
+ #[test]
+ fn klartext_every_truncation_of_the_golden_is_refused_without_a_panic() {
+-    for (name, golden) in [("picomax", GOLDEN), ("picomax_cycles", CYCLES)] {
++    for (name, golden) in [
++        ("picomax", GOLDEN),
++        ("picomax_cycles", CYCLES),
++        ("contour", CONTOUR),
++    ] {
+         let n = in_time(30, name, move || {
+             let o = opts();
+             let mut refused = 0usize;
+@@ -109,12 +141,31 @@ fn klartext_seeded_mutations_of_the_cycle_golden_never_panic() {
+     mutate("picomax_cycles", CYCLES, 0x2227_4b4c_4152_0002);
+ }
+ 
++#[test]
++fn klartext_contour_with_every_slice_3_element_parses() {
++    let p = in_time(5, "contour", || parse_klartext_with(CONTOUR, &opts()));
++    let p = p.unwrap_or_else(|e| panic!("the contour program parses: {e}"));
++    let arcs = p
++        .sections
++        .iter()
++        .flat_map(|s| s.toolpath.moves.iter())
++        .filter(|m| m.arc.is_some())
++        .count();
++    // RND 8, RND 12, CP 14, CP 15, CT 16, and the helix of CP 20 in four quarters.
++    assert_eq!(arcs, 9, "arc moves");
++}
++
++#[test]
++fn klartext_seeded_mutations_of_the_contour_never_panic() {
++    mutate("contour", CONTOUR, 0x2227_4b4c_4152_0003);
++}
++
+ /// 3000 seeded mutations (replace, delete a run, insert) of `golden`: each
+ /// gives a result or a refusal, never a panic or a hang.
+ fn mutate(name: &'static str, golden: &'static str, seed: u64) {
+     in_time(90, name, move || {
+         let o = opts();
+-        let alphabet: &[u8] = b"0123456789+-.~;\"QXYZFMRCLDBTSHAPE: =\n \t";
++        let alphabet: &[u8] = b"0123456789+-.~;\"QXYZFMRCLDBTSHAPEIN: =\n \t";
+         let mut seed = seed;
+         let mut next = move || {
+             seed = seed
+diff --git a/crates/gcode/tests/klartext/main.rs b/crates/gcode/tests/klartext/main.rs
+index 98c77e483..fb1c13077 100644
+--- a/crates/gcode/tests/klartext/main.rs
++++ b/crates/gcode/tests/klartext/main.rs
+@@ -2,9 +2,11 @@
+ //! Provenance: HEIDENHAIN iTNC 530 conversational manual 533 190-22 and the TNC cycle manuals (behaviour only, via docs/research/heidenhain/), and CamCraft's recorded Klartext post golden.
+ //! Gate map: covers camcraft_gcode::{klartext, types, section, arc, cycle_expand, domain, error}.
+ 
++mod contours;
+ mod cycles;
+ mod degenerate;
+ mod paths;
++mod polar;
+ mod refusals;
+ mod round_trip;
+ mod round_trip_cycles;
+diff --git a/crates/gcode/tests/klartext/polar.rs b/crates/gcode/tests/klartext/polar.rs
+new file mode 100644
+index 000000000..d3f4addcc
+--- /dev/null
++++ b/crates/gcode/tests/klartext/polar.rs
+@@ -0,0 +1,114 @@
++//! Polar blocks about the pole CC: LP lines with absolute and incremental polar coordinates, CP arcs (PA and IPA, both directions), the CP helix, and their refusals.
++
++use camcraft_cl::cl::MoveKind;
++use camcraft_gcode::GcodeError;
++
++use super::{assert_to, moves, near, ok, pgm, refusal};
++
++const H: f64 = 8.660_254_037_844_386; // 10 sin(60 deg)
++
++#[test]
++fn klartext_lp_reaches_polar_points_about_the_pole() {
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+10 Y+0 Z-1 R0 F100",
++        "LP PR+10 PA+60",
++        "LP IPA+60",
++        "LP PR+5",
++        "LP IPR+1 IPA+60",
++        "LP PA-90 Z+2 FMAX",
++    ]));
++    let m = moves(&p);
++    assert_to(m[1], 5.0, H, -1.0);
++    assert_to(m[2], -5.0, H, -1.0);
++    // PR alone keeps the polar angle of the tool position (120 deg).
++    assert_to(m[3], -2.5, H / 2.0, -1.0);
++    // IPR and IPA add to the polar coordinates of the tool position.
++    assert_to(m[4], -6.0, 0.0, -1.0);
++    // PA alone keeps the polar radius (6); FMAX is a rapid.
++    assert_to(m[5], 0.0, -6.0, 2.0);
++    assert_eq!((m[5].kind, m[5].feed), (MoveKind::Rapid, None));
++    assert!(m[1..5].iter().all(|m| m.arc.is_none() && m.feed == Some(100.0)));
++}
++
++#[test]
++fn klartext_cp_arcs_about_the_pole_in_both_directions() {
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+10 Y+0 Z-1 R0 F100",
++        "CP PA+90 DR+",
++        "CP IPA-180 DR-",
++        "CP PA+0 DR+ F300",
++        "CT X+0 Y+10",
++    ]));
++    let m = moves(&p);
++    assert_eq!(m.len(), 6, "line, quarter, half in two pieces, quarter, CT");
++    assert_to(m[1], 0.0, 10.0, -1.0);
++    assert_to(m[2], 10.0, 0.0, -1.0);
++    assert_to(m[3], 0.0, -10.0, -1.0);
++    assert_to(m[4], 10.0, 0.0, -1.0);
++    for (mv, ccw) in [(m[1], true), (m[2], false), (m[3], false), (m[4], true)] {
++        let a = mv.arc.expect("arc");
++        assert!(near(a.center.x, 0.0) && near(a.center.y, 0.0) && a.ccw == ccw, "{a:?}");
++    }
++    assert_eq!(m[4].feed, Some(300.0));
++    // CT continues the tangent at the end of the CP arc: same circle.
++    let a = m[5].arc.expect("CT arc");
++    assert!(a.ccw && near(a.center.x, 0.0) && near(a.center.y, 0.0), "{a:?}");
++    assert_eq!(p.line_for_move(0, 3), Some(5), "both pieces map to the CP block");
++}
++
++#[test]
++fn klartext_cp_with_iz_is_a_helix_split_into_quarter_turns() {
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+10 Y+0 Z-1 R0 F100",
++        "CP IPA+720 IZ-4 DR+",
++    ]));
++    let m = moves(&p);
++    assert_eq!(m.len(), 9, "two turns are eight quarter arcs");
++    assert_to(m[1], 0.0, 10.0, -1.5);
++    assert_to(m[2], -10.0, 0.0, -2.0);
++    assert_to(m[8], 10.0, 0.0, -5.0);
++    assert!(m[1..].iter().all(|m| m.arc.is_some_and(|a| a.ccw)));
++}
++
++#[test]
++fn klartext_polar_blocks_refuse_what_is_not_exact() {
++    let base = "L X+10 Y+0 Z-1 R0 F100";
++    let kind = |body: &[&str]| refusal(&pgm(body));
++    let e = kind(&[base, "LP PR+5 PA+0"]);
++    assert!(matches!(e, GcodeError::InvalidModal { line: 3, .. }), "no pole: {e}");
++    let e = kind(&["CC X+0 Y+0", base, "LP X+5 PA+0"]);
++    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "X in LP: {e}");
++    let e = kind(&["CC X+0 Y+0", base, "LP PR+5 IPR+1"]);
++    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "PR and IPR: {e}");
++    let e = kind(&["CC X+0 Y+0", base, "LP PR-5 PA+0"]);
++    assert!(matches!(e, GcodeError::InvalidModal { line: 4, .. }), "negative PR: {e}");
++    let e = kind(&["CC X+10 Y+0", base, "LP PR+5"]);
++    assert!(matches!(e, GcodeError::InvalidModal { line: 4, .. }), "angle at the pole: {e}");
++    for cp in [
++        "CP IPA+90 DR-",
++        "CP IPA-90 DR+",
++        "CP PA+0 DR+",
++        "CP IPA+200000 DR+",
++        "CP IPA+0 DR+",
++        "CP PA+90",
++        "CP DR+",
++        "CP PA+90 DR+ FMAX",
++    ] {
++        let e = kind(&["CC X+0 Y+0", base, cp]);
++        assert!(matches!(e, GcodeError::InvalidArc { line: 4, .. }), "{cp}: {e}");
++    }
++    let e = kind(&["CC X+10 Y+0", base, "CP IPA+90 DR+"]);
++    assert!(matches!(e, GcodeError::InvalidArc { line: 4, .. }), "CP at the pole: {e}");
++    let e = kind(&["CC X+0 Y+0", base, "CP PR+5 PA+90 DR+"]);
++    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "PR in CP: {e}");
++    for (line, code) in [("LP PR+5 PA+0 RL", "RL"), ("CP IPA+90 DR+ RR", "RR")] {
++        let e = kind(&["CC X+0 Y+0", base, line]);
++        assert!(
++            matches!(&e, GcodeError::UnsupportedCode { code: c, line: 4, .. } if c == code),
++            "{line}: {e}"
++        );
++    }
++}
+diff --git a/crates/gcode/tests/klartext/refusals.rs b/crates/gcode/tests/klartext/refusals.rs
+index 29aebb6e6..840617a55 100644
+--- a/crates/gcode/tests/klartext/refusals.rs
++++ b/crates/gcode/tests/klartext/refusals.rs
+@@ -1,4 +1,4 @@
+-//! Refusals: each Klartext function outside the first slice is refused by name, with its line and block number; the program frame is checked.
++//! Refusals: each Klartext function that this reader does not read is refused by name, with its line and block number; the program frame is checked.
+ 
+ use camcraft_gcode::{GcodeError, KlartextOptions};
+ 
+@@ -9,8 +9,8 @@ fn klartext_functions_outside_the_slice_are_refused_by_name_and_block() {
+     let cases: [(&str, &str); 17] = [
+         ("RND R5", "RND"),
+         ("CHF 2", "CHF"),
+-        ("LP PR+10 PA+0 R0 F100", "LP"),
+-        ("CP IPA+90 DR+", "CP"),
++        ("CTP X+10 Y+0", "CTP"),
++        ("LP PR+10 PA+0 RL F100", "RL"),
+         ("L X+5 RL F100", "RL"),
+         ("L X+5 RR F100", "RR"),
+         ("LBL 1", "LBL"),
+diff --git a/docs/decisions/2227-klartext-reader.md b/docs/decisions/2227-klartext-reader.md
+index cc482cbdf..6e7eb579a 100644
+--- a/docs/decisions/2227-klartext-reader.md
++++ b/docs/decisions/2227-klartext-reader.md
+@@ -141,3 +141,67 @@ inside a cycle, with no test of the consumer side); a default S for 207.
+ **Cost to change later.** A left-hand thread needs a spindle-direction
+ override in the cycle record. A stored tolerance is one new field in
+ `ParsedSection`.
++
++## #2227 - Klartext reader, third slice: RND, CHF, polar LP / CP
++
++**What was decided.** The reader reads the contour elements of a
++hand-written program that its motion model can show exactly:
++
++- `RND R<r> [F<f>]` (rounding arc) and `CHF <l> [F<f>]` (chamfer) between
++  two straight feed lines (`L` or `LP`) in the working plane.
++- `LP PR.. PA.. [Z..] [R0] F../FMAX` with `IPR` / `IPA`: a straight line to
++  polar coordinates about the pole `CC`.
++- `CP PA.. DR±` and `CP IPA.. DR±`, with `Z` / `IZ` as a helix: an arc about
++  the pole at the radius of the tool position.
++
++`RL` / `RR`, `APPR` / `DEP`, `CTP`, `LBL` / `CALL LBL` and inch programs stay
++refused by name and line.
++
++**Why, item by item.**
++- *Look-ahead, not a rewrite of moves.* A transition changes the element
++  before it. The reader looks one block ahead: a line that an `RND` / `CHF`
++  follows waits, and the line after the transition sets the cut-back points.
++  The toolpath then gets the shortened line, the transition and the next
++  line. No move that is already in the toolpath changes.
++- *Geometry.* The corner point is not machined. A rounding arc of radius R
++  on a turn of angle phi starts and ends R tan(phi/2) from the corner, on
++  each line, with its centre on the inner side; it is tangent to both lines.
++  A chamfer cuts the side length from each line (the cut-off triangle has two
++  legs of that length). A transition that needs more of a line than the line
++  has after an earlier cut-back is refused, as are two lines in line (no
++  corner).
++- *The F of RND / CHF acts only on the transition.* Without F, the
++  transition uses the modal feed. The modal feed does not change.
++- *Only line-line transitions.* A transition next to an arc needs the fillet
++  between a line and a circle or two circles. It is refused by name; it is a
++  follow-up. A transition next to an `FMAX` line, a line with a Z change, a
++  line with an M function that acts at the block end (before) or with any M
++  function (after) is refused too: the order of these effects around the
++  transition is not settled in our sources.
++- *Polar reference.* A polar coordinate that is not written, and the
++  reference of `IPR` / `IPA`, come from the tool position about the current
++  pole. An angle from a position differs from the last programmed angle only
++  by whole turns, which do not change an `LP` end point or a `CP` sweep. At
++  the pole the angle is not defined, so `LP` without `PA` and `CP` from the
++  pole are refused.
++- *CP direction.* `CP IPA` needs the sign of `IPA` and `DR` to agree, as in
++  the manual's helix table; a mismatch is refused, not guessed. `CP PA` with
++  the start angle is refused (write `IPA+360` for a full circle). `|IPA|` is
++  limited to the control input range 99999.9999 degrees.
++- *CP pieces.* The toolpath arc model holds less than one turn per move, so
++  each `CP` is split into equal pieces of at most 90 degrees on the same
++  circle, with Z linear over the sweep (a helix). The motion is the same.
++- *`RL` / `RR` stay refused.* The compensated path needs the tool radius of
++  the tool table, which is not in the program, and the control's corner
++  rules. `R0` is read. `APPR` / `DEP` always come with `RL` / `RR`, so they
++  do not fit the tool-centre model and stay refused.
++
++**Dropped.** Reading a transition next to an arc as a transition next to its
++chord (wrong path); taking `CP IPA` as `|IPA|` in the direction of `DR`
++(guessed sweep); a tool-radius option to compute `RL` / `RR` (needs the
++control's corner and approach rules, a separate design).
++
++**Cost to change later.** A transition next to an arc is one new geometry
++function in `klartext/corner.rs` (offset-curve intersection) and the
++look-ahead accepts `C` / `CR` / `CT` / `CP`. `CTP` is one function in
++`klartext/polar.rs`.
+
+From 28957402d773240201241c85084f546521733497 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 23:30:50 +0100
+Subject: [PATCH 2/6] style(gcode): format the third Klartext slice; fix a
+ borrow in polar word decoding
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/src/klartext/corner.rs       | 32 ++++++++----
+ crates/gcode/src/klartext/path.rs         | 12 +++--
+ crates/gcode/src/klartext/polar.rs        |  3 +-
+ crates/gcode/src/klartext/words.rs        | 21 ++++----
+ crates/gcode/tests/klartext/contours.rs   | 38 +++++++++++---
+ crates/gcode/tests/klartext/degenerate.rs |  5 +-
+ crates/gcode/tests/klartext/polar.rs      | 62 ++++++++++++++++++-----
+ 7 files changed, 128 insertions(+), 45 deletions(-)
+
+diff --git a/crates/gcode/src/klartext/corner.rs b/crates/gcode/src/klartext/corner.rs
+index 96718d9f6..05850fe97 100644
+--- a/crates/gcode/src/klartext/corner.rs
++++ b/crates/gcode/src/klartext/corner.rs
+@@ -84,7 +84,10 @@ impl Machine<'_> {
+                 if v == "MAX" {
+                     return Err(b.unsupported(name, "FMAX on a transition element is not read"));
+                 }
+-                if feed.replace(check_feed(b.line, value(b, "F", v, &self.q)?)?).is_some() {
++                if feed
++                    .replace(check_feed(b.line, value(b, "F", v, &self.q)?)?)
++                    .is_some()
++                {
+                     return Err(b.syntax("F appears twice"));
+                 }
+                 continue;
+@@ -135,12 +138,7 @@ impl Machine<'_> {
+     /// Word checks for a straight-line block next to an `RND` / `CHF`: the line
+     /// must move, the line after a transition takes no M function, and the line
+     /// before it takes only M functions that act at the block start.
+-    pub fn corner_words_check(
+-        &self,
+-        b: &Block,
+-        w: &Words,
+-        moves: bool,
+-    ) -> Result<(), GcodeError> {
++    pub fn corner_words_check(&self, b: &Block, w: &Words, moves: bool) -> Result<(), GcodeError> {
+         let Some(name) = self.corner_name() else {
+             return Ok(());
+         };
+@@ -184,13 +182,24 @@ impl Machine<'_> {
+         let len = dx.hypot(dy);
+         let feed = match (kind, feed) {
+             (MoveKind::Feed, Some(f)) => f,
+-            _ => return Err(b.unsupported(name, "the straight line next to it must be a feed move, not FMAX")),
++            _ => {
++                return Err(b.unsupported(
++                    name,
++                    "the straight line next to it must be a feed move, not FMAX",
++                ));
++            }
+         };
+         if (to.z - from.z).abs() > 1e-9 {
+-            return Err(b.unsupported(name, "the straight line next to it must stay in the working plane (no Z change)"));
++            return Err(b.unsupported(
++                name,
++                "the straight line next to it must stay in the working plane (no Z change)",
++            ));
+         }
+         if len <= 1e-6 {
+-            return Err(b.unsupported(name, "the straight line next to it has no length in the working plane"));
++            return Err(b.unsupported(
++                name,
++                "the straight line next to it has no length in the working plane",
++            ));
+         }
+         let mut start = from;
+         if let Some(c) = self.corner.take() {
+@@ -227,7 +236,8 @@ impl Machine<'_> {
+                 feed,
+             });
+         } else {
+-            self.current.push_move(b.line, MoveKind::Feed, to, Some(feed));
++            self.current
++                .push_move(b.line, MoveKind::Feed, to, Some(feed));
+         }
+         self.pos = to;
+         Ok(())
+diff --git a/crates/gcode/src/klartext/path.rs b/crates/gcode/src/klartext/path.rs
+index 0a747ec13..ae748fdde 100644
+--- a/crates/gcode/src/klartext/path.rs
++++ b/crates/gcode/src/klartext/path.rs
+@@ -269,10 +269,14 @@ pub fn line_feed(
+ ) -> Result<(MoveKind, Option<f64>), GcodeError> {
+     Ok(match w.feed {
+         Some(Feed::Max) => (MoveKind::Rapid, None),
+-        _ => (
+-            MoveKind::Feed,
+-            Some(rate.ok_or_else(|| b.invalid_modal(&format!("{what} needs a feed rate F or FMAX")))?),
+-        ),
++        _ => {
++            (
++                MoveKind::Feed,
++                Some(rate.ok_or_else(|| {
++                    b.invalid_modal(&format!("{what} needs a feed rate F or FMAX"))
++                })?),
++            )
++        }
+     })
+ }
+ 
+diff --git a/crates/gcode/src/klartext/polar.rs b/crates/gcode/src/klartext/polar.rs
+index 7f6d670c4..3b1c6c57c 100644
+--- a/crates/gcode/src/klartext/polar.rs
++++ b/crates/gcode/src/klartext/polar.rs
+@@ -124,7 +124,8 @@ impl Machine<'_> {
+                 "arc point",
+                 Point3::new(pole.x + r * c, pole.y + r * s, z0 + (z1 - z0) * f),
+             )?;
+-            self.current.push_arc(b.line, to, feed, pole, ccw, ArcPlane::Xy);
++            self.current
++                .push_arc(b.line, to, feed, pole, ccw, ArcPlane::Xy);
+         }
+         let (rx, ry) = ((to.x - pole.x) / r, (to.y - pole.y) / r);
+         self.tangent = Some(if ccw {
+diff --git a/crates/gcode/src/klartext/words.rs b/crates/gcode/src/klartext/words.rs
+index 1332b100b..ac47239b9 100644
+--- a/crates/gcode/src/klartext/words.rs
++++ b/crates/gcode/src/klartext/words.rs
+@@ -118,21 +118,24 @@ fn polar_one(b: &Block, w: &mut Words, t: &str, q: &QTable) -> Result<bool, Gcod
+             continue;
+         };
+         let v = value(b, name, rest, q)?;
+-        let slot = match (name.ends_with('R'), slot_inc) {
+-            (true, true) => &mut w.ipr,
+-            (true, false) => &mut w.pr,
+-            (false, true) => &mut w.ipa,
+-            (false, false) => &mut w.pa,
+-        };
+-        let other = match (name.ends_with('R'), slot_inc) {
++        let radius = name.ends_with('R');
++        let pair = match (radius, slot_inc) {
+             (true, true) => w.pr,
+             (true, false) => w.ipr,
+             (false, true) => w.pa,
+             (false, false) => w.ipa,
+         };
+-        if other.is_some() {
+-            return Err(b.syntax(&format!("{name} and its absolute/incremental pair in one block")));
++        if pair.is_some() {
++            return Err(b.syntax(&format!(
++                "{name} and its absolute/incremental pair in one block"
++            )));
+         }
++        let slot = match (radius, slot_inc) {
++            (true, true) => &mut w.ipr,
++            (true, false) => &mut w.pr,
++            (false, true) => &mut w.ipa,
++            (false, false) => &mut w.pa,
++        };
+         set(b, slot, v, name)?;
+         return Ok(true);
+     }
+diff --git a/crates/gcode/tests/klartext/contours.rs b/crates/gcode/tests/klartext/contours.rs
+index 406082b05..0d87fd74e 100644
+--- a/crates/gcode/tests/klartext/contours.rs
++++ b/crates/gcode/tests/klartext/contours.rs
+@@ -31,7 +31,10 @@ fn klartext_rnd_rounds_a_right_angle_with_its_own_feed() {
+     assert_to(m[3], 20.0, 20.0, -1.0);
+     // F50 acts only on the rounding arc; the modal F100 stays.
+     let feeds: Vec<_> = m.iter().map(|m| m.feed).collect();
+-    assert_eq!(feeds, vec![Some(100.0), Some(100.0), Some(50.0), Some(100.0)]);
++    assert_eq!(
++        feeds,
++        vec![Some(100.0), Some(100.0), Some(50.0), Some(100.0)]
++    );
+     // Each move maps to the block that programmed it.
+     let lines: Vec<_> = (0..4).map(|i| p.line_for_move(0, i)).collect();
+     assert_eq!(lines, vec![Some(2), Some(3), Some(4), Some(5)]);
+@@ -78,12 +81,18 @@ fn klartext_rnd_on_an_obtuse_corner_is_tangent_to_both_lines() {
+     let a = m[2].arc.expect("arc");
+     assert!(a.ccw);
+     for p in [m[1].to, m[2].to] {
+-        assert!(near((p.x - a.center.x).hypot(p.y - a.center.y), 4.0), "radius at {p:?}");
++        assert!(
++            near((p.x - a.center.x).hypot(p.y - a.center.y), 4.0),
++            "radius at {p:?}"
++        );
+     }
+     // Tangency: the radius at each end is normal to its line.
+     assert!(near(m[1].to.x - a.center.x, 0.0));
+     let (rx, ry) = (m[2].to.x - a.center.x, m[2].to.y - a.center.y);
+-    assert!(near(rx * s + ry * s, 0.0), "radius is normal to the line after");
++    assert!(
++        near(rx * s + ry * s, 0.0),
++        "radius is normal to the line after"
++    );
+ }
+ 
+ #[test]
+@@ -111,15 +120,27 @@ fn klartext_transition_elements_refuse_what_is_not_exact() {
+     // (body, line of the refused block, code)
+     let cases: [(&[&str], usize, &str); 11] = [
+         // After an arc, before an arc, at the program end.
+-        (&[base, "CC X+0 Y+5", "C X+5 Y+5 DR-", "RND R2", "L X+5 Y+20"], 5, "RND"),
+-        (&[base, "L X+10", "RND R2", "CR X+20 Y+10 R+10 DR+"], 4, "RND"),
++        (
++            &[base, "CC X+0 Y+5", "C X+5 Y+5 DR-", "RND R2", "L X+5 Y+20"],
++            5,
++            "RND",
++        ),
++        (
++            &[base, "L X+10", "RND R2", "CR X+20 Y+10 R+10 DR+"],
++            4,
++            "RND",
++        ),
+         (&[base, "L X+10", "CHF 2"], 4, "CHF"),
+         // Too large for the line, on a straight run, two in a row.
+         (&[base, "L X+5", "RND R10", "L X+5 Y+20"], 4, "RND"),
+         (&[base, "L X+10", "CHF 2", "L X+20"], 4, "CHF"),
+         (&[base, "L X+10", "RND R2", "RND R3", "L Y+10"], 4, "RND"),
+         // The middle line is 5 mm, but the two roundings need 3 mm each.
+-        (&[base, "L X+10", "RND R3", "L Y+5", "RND R3", "L X+0"], 6, "RND"),
++        (
++            &[base, "L X+10", "RND R3", "L Y+5", "RND R3", "L X+0"],
++            6,
++            "RND",
++        ),
+         // A Z change, FMAX, an M function at the block end before, an M function after.
+         (&[base, "L X+10", "RND R2", "L Y+10 Z-2"], 5, "RND"),
+         (&[base, "L X+10 FMAX", "RND R2", "L Y+10"], 3, "RND"),
+@@ -133,7 +154,10 @@ fn klartext_transition_elements_refuse_what_is_not_exact() {
+             other => panic!("{body:?}: expected an unsupported-code refusal, got {other}"),
+         }
+         assert_eq!(e.line(), line, "{body:?}: {e}");
+-        assert!(e.to_string().contains(&format!("block {}:", line - 1)), "{e}");
++        assert!(
++            e.to_string().contains(&format!("block {}:", line - 1)),
++            "{e}"
++        );
+     }
+     for bad in ["RND R0", "RND R-2", "RND", "CHF", "CHF 2 3", "RND R2 X+1"] {
+         let e = refusal(&pgm(&[base, "L X+10", bad, "L Y+10"]));
+diff --git a/crates/gcode/tests/klartext/degenerate.rs b/crates/gcode/tests/klartext/degenerate.rs
+index ee76482cd..86690f5cd 100644
+--- a/crates/gcode/tests/klartext/degenerate.rs
++++ b/crates/gcode/tests/klartext/degenerate.rs
+@@ -56,7 +56,10 @@ fn klartext_every_truncation_of_the_golden_is_refused_without_a_panic() {
+             }
+             (refused, end)
+         });
+-        assert_eq!(n.0, n.1, "{name}: a program cut before END PGM must be refused");
++        assert_eq!(
++            n.0, n.1,
++            "{name}: a program cut before END PGM must be refused"
++        );
+     }
+ }
+ 
+diff --git a/crates/gcode/tests/klartext/polar.rs b/crates/gcode/tests/klartext/polar.rs
+index d3f4addcc..7022d1771 100644
+--- a/crates/gcode/tests/klartext/polar.rs
++++ b/crates/gcode/tests/klartext/polar.rs
+@@ -28,7 +28,11 @@ fn klartext_lp_reaches_polar_points_about_the_pole() {
+     // PA alone keeps the polar radius (6); FMAX is a rapid.
+     assert_to(m[5], 0.0, -6.0, 2.0);
+     assert_eq!((m[5].kind, m[5].feed), (MoveKind::Rapid, None));
+-    assert!(m[1..5].iter().all(|m| m.arc.is_none() && m.feed == Some(100.0)));
++    assert!(
++        m[1..5]
++            .iter()
++            .all(|m| m.arc.is_none() && m.feed == Some(100.0))
++    );
+ }
+ 
+ #[test]
+@@ -49,13 +53,23 @@ fn klartext_cp_arcs_about_the_pole_in_both_directions() {
+     assert_to(m[4], 10.0, 0.0, -1.0);
+     for (mv, ccw) in [(m[1], true), (m[2], false), (m[3], false), (m[4], true)] {
+         let a = mv.arc.expect("arc");
+-        assert!(near(a.center.x, 0.0) && near(a.center.y, 0.0) && a.ccw == ccw, "{a:?}");
++        assert!(
++            near(a.center.x, 0.0) && near(a.center.y, 0.0) && a.ccw == ccw,
++            "{a:?}"
++        );
+     }
+     assert_eq!(m[4].feed, Some(300.0));
+     // CT continues the tangent at the end of the CP arc: same circle.
+     let a = m[5].arc.expect("CT arc");
+-    assert!(a.ccw && near(a.center.x, 0.0) && near(a.center.y, 0.0), "{a:?}");
+-    assert_eq!(p.line_for_move(0, 3), Some(5), "both pieces map to the CP block");
++    assert!(
++        a.ccw && near(a.center.x, 0.0) && near(a.center.y, 0.0),
++        "{a:?}"
++    );
++    assert_eq!(
++        p.line_for_move(0, 3),
++        Some(5),
++        "both pieces map to the CP block"
++    );
+ }
+ 
+ #[test]
+@@ -78,15 +92,30 @@ fn klartext_polar_blocks_refuse_what_is_not_exact() {
+     let base = "L X+10 Y+0 Z-1 R0 F100";
+     let kind = |body: &[&str]| refusal(&pgm(body));
+     let e = kind(&[base, "LP PR+5 PA+0"]);
+-    assert!(matches!(e, GcodeError::InvalidModal { line: 3, .. }), "no pole: {e}");
++    assert!(
++        matches!(e, GcodeError::InvalidModal { line: 3, .. }),
++        "no pole: {e}"
++    );
+     let e = kind(&["CC X+0 Y+0", base, "LP X+5 PA+0"]);
+-    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "X in LP: {e}");
++    assert!(
++        matches!(e, GcodeError::Syntax { line: 4, .. }),
++        "X in LP: {e}"
++    );
+     let e = kind(&["CC X+0 Y+0", base, "LP PR+5 IPR+1"]);
+-    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "PR and IPR: {e}");
++    assert!(
++        matches!(e, GcodeError::Syntax { line: 4, .. }),
++        "PR and IPR: {e}"
++    );
+     let e = kind(&["CC X+0 Y+0", base, "LP PR-5 PA+0"]);
+-    assert!(matches!(e, GcodeError::InvalidModal { line: 4, .. }), "negative PR: {e}");
++    assert!(
++        matches!(e, GcodeError::InvalidModal { line: 4, .. }),
++        "negative PR: {e}"
++    );
+     let e = kind(&["CC X+10 Y+0", base, "LP PR+5"]);
+-    assert!(matches!(e, GcodeError::InvalidModal { line: 4, .. }), "angle at the pole: {e}");
++    assert!(
++        matches!(e, GcodeError::InvalidModal { line: 4, .. }),
++        "angle at the pole: {e}"
++    );
+     for cp in [
+         "CP IPA+90 DR-",
+         "CP IPA-90 DR+",
+@@ -98,12 +127,21 @@ fn klartext_polar_blocks_refuse_what_is_not_exact() {
+         "CP PA+90 DR+ FMAX",
+     ] {
+         let e = kind(&["CC X+0 Y+0", base, cp]);
+-        assert!(matches!(e, GcodeError::InvalidArc { line: 4, .. }), "{cp}: {e}");
++        assert!(
++            matches!(e, GcodeError::InvalidArc { line: 4, .. }),
++            "{cp}: {e}"
++        );
+     }
+     let e = kind(&["CC X+10 Y+0", base, "CP IPA+90 DR+"]);
+-    assert!(matches!(e, GcodeError::InvalidArc { line: 4, .. }), "CP at the pole: {e}");
++    assert!(
++        matches!(e, GcodeError::InvalidArc { line: 4, .. }),
++        "CP at the pole: {e}"
++    );
+     let e = kind(&["CC X+0 Y+0", base, "CP PR+5 PA+90 DR+"]);
+-    assert!(matches!(e, GcodeError::Syntax { line: 4, .. }), "PR in CP: {e}");
++    assert!(
++        matches!(e, GcodeError::Syntax { line: 4, .. }),
++        "PR in CP: {e}"
++    );
+     for (line, code) in [("LP PR+5 PA+0 RL", "RL"), ("CP IPA+90 DR+ RR", "RR")] {
+         let e = kind(&["CC X+0 Y+0", base, line]);
+         assert!(
+
+From 007ec28b4ec7f28e552294373548f80ae69da28f Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 23:31:40 +0100
+Subject: [PATCH 3/6] fix(gcode): a line that waits for RND/CHF keeps the
+ section start
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/src/klartext/exec.rs       |  7 ++++++
+ crates/gcode/tests/klartext/contours.rs | 33 +++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/crates/gcode/src/klartext/exec.rs b/crates/gcode/src/klartext/exec.rs
+index 18a030944..1083512b7 100644
+--- a/crates/gcode/src/klartext/exec.rs
++++ b/crates/gcode/src/klartext/exec.rs
+@@ -262,6 +262,13 @@ impl<'a> Machine<'a> {
+ 
+     /// Start a new section when the tool, offset, spindle or coolant changed after a move.
+     pub fn sync_section(&mut self) {
++        // A line that waits for its RND / CHF is not in the builder yet: the
++        // builder start must stay at that line's start. No modal state can
++        // change while it waits (the transition and the line after it take
++        // no M function).
++        if self.pending.is_some() {
++            return;
++        }
+         if !self.current.has_moves() {
+             self.current = SectionBuilder::new(self.current.index, self.pos, &self.modal);
+             self.section_tool_name = self.tool_name.clone();
+diff --git a/crates/gcode/tests/klartext/contours.rs b/crates/gcode/tests/klartext/contours.rs
+index 0d87fd74e..78db84d4a 100644
+--- a/crates/gcode/tests/klartext/contours.rs
++++ b/crates/gcode/tests/klartext/contours.rs
+@@ -164,3 +164,36 @@ fn klartext_transition_elements_refuse_what_is_not_exact() {
+         assert_eq!(e.line(), 4, "{bad}: {e}");
+     }
+ }
++
++#[test]
++fn klartext_rnd_on_the_first_move_of_a_section_starts_at_the_line_start() {
++    // The first move of the program waits for its RND.
++    let p = ok(&pgm(&["L X+20 Y+0 F100", "RND R5", "L X+20 Y+20"]));
++    let m = moves(&p);
++    assert_eq!(m.len(), 3);
++    assert!(
++        near(m[0].from.x, 0.0) && near(m[0].from.y, 0.0),
++        "{:?}",
++        m[0].from
++    );
++    assert_to(m[0], 15.0, 0.0, 0.0);
++    assert_arc(m[1], 15.0, 5.0, true);
++    assert_to(m[2], 20.0, 20.0, 0.0);
++    // The first move after a tool change waits for its RND.
++    let p = ok(&pgm(&[
++        "L X+0 Y+0 Z-1 R0 F100",
++        "TOOL CALL 2 Z S1000",
++        "L X+20 Y+0",
++        "RND R5",
++        "L X+20 Y+20",
++    ]));
++    assert_eq!(p.sections.len(), 2);
++    let s = &p.sections[1].toolpath.moves;
++    assert!(
++        near(s[0].from.x, 0.0) && near(s[0].from.y, 0.0),
++        "{:?}",
++        s[0].from
++    );
++    assert_to(&s[0], 15.0, 0.0, -1.0);
++    assert_arc(&s[1], 15.0, 5.0, true);
++}
+
+From 9e59d4d3cdcdbd35b9b2e421291199ca4358e961 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Fri, 27 Nov 2026 23:41:24 +0100
+Subject: [PATCH 4/6] style(gcode): group the digits of the polar angle limit
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/src/klartext/polar.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/gcode/src/klartext/polar.rs b/crates/gcode/src/klartext/polar.rs
+index 3b1c6c57c..49e3427b6 100644
+--- a/crates/gcode/src/klartext/polar.rs
++++ b/crates/gcode/src/klartext/polar.rs
+@@ -13,7 +13,7 @@ use crate::domain::{check_len, check_point};
+ use crate::types::GcodeError;
+ 
+ /// Largest polar angle input of the control, in degrees.
+-const MAX_ANGLE: f64 = 99_999.9999;
++const MAX_ANGLE: f64 = 99_999.999_9;
+ /// Largest sweep of one arc move of a `CP` block, in degrees.
+ const PIECE_DEG: f64 = 90.0;
+ 
+
+From 55386f6bd408d62051526460a039b4c2bbfc5e61 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Sat, 28 Nov 2026 01:36:51 +0100
+Subject: [PATCH 5/6] fix(gcode): Klartext LP refuses an unknown last polar
+ coordinate; no zero-length transition line
+
+- LP: a polar coordinate that is not written, and the base of IPR / IPA,
+  is the last programmed PR / PA about the current pole. The reader keeps
+  it only while it knows it exactly (an LP or CP about the same pole, no
+  X/Y move by another block, no moved CC). Else the LP is refused by name
+  and line ("LP without PR: the last polar radius about this pole is not
+  known"). Same rule for PA.
+- RND / CHF that takes exactly the whole line writes no zero-length feed
+  move for that line.
+- New tests: polar reference refusals and keeps, LP angle out of range,
+  whole-line transitions, RND after M3/M8, CHF with an LP line, FMAX on a
+  transition.
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/src/klartext/corner.rs     |  17 ++-
+ crates/gcode/src/klartext/exec.rs       |  12 +-
+ crates/gcode/src/klartext/polar.rs      | 140 +++++++++++++++++-------
+ crates/gcode/tests/klartext/contours.rs |  88 +++++++++++++++
+ crates/gcode/tests/klartext/polar.rs    | 111 ++++++++++++++++++-
+ docs/decisions/2227-klartext-reader.md  |  29 +++--
+ 6 files changed, 341 insertions(+), 56 deletions(-)
+
+diff --git a/crates/gcode/src/klartext/corner.rs b/crates/gcode/src/klartext/corner.rs
+index 05850fe97..86c42be8f 100644
+--- a/crates/gcode/src/klartext/corner.rs
++++ b/crates/gcode/src/klartext/corner.rs
+@@ -211,8 +211,11 @@ impl Machine<'_> {
+             let (t1, t2) = corner_points(&c, &p, v, len, b.line)?;
+             check_point(c.block.line, "transition start", t1)?;
+             check_point(c.block.line, "transition end", t2)?;
+-            self.current
+-                .push_move(p.line, MoveKind::Feed, t1, Some(p.feed));
++            // A transition that takes the whole line before leaves no line.
++            if !same_xy(p.start, t1) {
++                self.current
++                    .push_move(p.line, MoveKind::Feed, t1, Some(p.feed));
++            }
+             match c.kind {
+                 CornerKind::Round(r) => {
+                     let (center, ccw) = round_center(p.dir, v, t1, r);
+@@ -235,7 +238,8 @@ impl Machine<'_> {
+                 dir: Point2::new(dx / len, dy / len),
+                 feed,
+             });
+-        } else {
++        } else if !same_xy(start, to) {
++            // A transition that takes the whole line after leaves no line.
+             self.current
+                 .push_move(b.line, MoveKind::Feed, to, Some(feed));
+         }
+@@ -285,6 +289,13 @@ fn corner_points(
+     Ok((t1, t2))
+ }
+ 
++/// Two points of the working plane at the same place (within 1e-6 mm, the
++/// length below which a line has no length in the working plane). The
++/// lines next to a transition have no Z change, so X/Y decide.
++fn same_xy(a: Point3, b: Point3) -> bool {
++    (a.x - b.x).hypot(a.y - b.y) <= 1e-6
++}
++
+ /// Centre and direction of the rounding arc of radius `r` that starts at `t1`
+ /// on the line before the corner (direction `u`; the line after has `v`): on
+ /// the inner side of the turn.
+diff --git a/crates/gcode/src/klartext/exec.rs b/crates/gcode/src/klartext/exec.rs
+index 1083512b7..dccbaa29b 100644
+--- a/crates/gcode/src/klartext/exec.rs
++++ b/crates/gcode/src/klartext/exec.rs
+@@ -9,6 +9,7 @@ use super::KlartextOptions;
+ use super::corner::{Corner, PendingLine};
+ use super::cycles::DrillDef;
+ use super::old_cycles::OldCycle;
++use super::polar::PolarRef;
+ use super::source::Block;
+ use super::words::QTable;
+ use crate::section::SectionBuilder;
+@@ -23,6 +24,8 @@ pub struct Machine<'a> {
+     pub pos: Point3,
+     /// Circle centre of the last `CC` block (modal).
+     pub cc: Option<Point2>,
++    /// Polar coordinates last programmed about `cc`, where known.
++    pub polar: PolarRef,
+     /// Unit XY direction at the end of the last move, for `CT`.
+     pub tangent: Option<Point2>,
+     /// A straight line that waits for the `RND` / `CHF` block after it.
+@@ -58,6 +61,7 @@ impl<'a> Machine<'a> {
+             modal,
+             pos,
+             cc: None,
++            polar: PolarRef::default(),
+             tangent: None,
+             pending: None,
+             corner: None,
+@@ -99,7 +103,13 @@ impl<'a> Machine<'a> {
+         if self.ended.is_some() {
+             return Err(b.syntax("executable block after program end (M2/M30)"));
+         }
+-        self.dispatch(b, &w)
++        let (x, y, cc) = (self.pos.x, self.pos.y, self.cc);
++        self.dispatch(b, &w)?;
++        let moved = self.pos.x != x || self.pos.y != y || self.cc != cc;
++        if moved && !matches!(w[0], "LP" | "CP") {
++            self.polar = PolarRef::default();
++        }
++        Ok(())
+     }
+ 
+     fn begin(&mut self, b: &Block, w: &[&str]) -> Result<(), GcodeError> {
+diff --git a/crates/gcode/src/klartext/polar.rs b/crates/gcode/src/klartext/polar.rs
+index 49e3427b6..555019aa0 100644
+--- a/crates/gcode/src/klartext/polar.rs
++++ b/crates/gcode/src/klartext/polar.rs
+@@ -23,10 +23,24 @@ impl Machine<'_> {
+             .ok_or_else(|| b.invalid_modal(&format!("{what} needs a pole: a CC block before it")))
+     }
+ 
+-    /// Polar radius and angle (degrees) of the tool position about the pole.
+-    fn polar_pos(&self, pole: Point2) -> (f64, f64) {
+-        let (dx, dy) = (self.pos.x - pole.x, self.pos.y - pole.y);
+-        (dx.hypot(dy), dy.atan2(dx).to_degrees())
++    /// Polar angle (degrees) of the tool position about the pole.
++    fn polar_angle(&self, pole: Point2) -> f64 {
++        (self.pos.y - pole.y)
++            .atan2(self.pos.x - pole.x)
++            .to_degrees()
++    }
++
++    /// Polar radius of the tool position about the pole.
++    fn polar_radius(&self, pole: Point2) -> f64 {
++        (self.pos.x - pole.x).hypot(self.pos.y - pole.y)
++    }
++
++    /// Forget the last programmed polar coordinates when the tool left the end
++    /// point `end` of the polar block (a cycle call by `M99` can move it).
++    fn keep_polar_if_at(&mut self, end: Point3) {
++        if self.pos.x != end.x || self.pos.y != end.y {
++            self.polar = PolarRef::default();
++        }
+     }
+ 
+     /// The tool-axis end of a polar block: `Z`, `IZ`, or the current Z.
+@@ -40,7 +54,9 @@ impl Machine<'_> {
+     }
+ 
+     /// `LP PR.. PA.. [Z..] [R0] F../FMAX`: a straight line to polar coordinates.
+-    /// A polar coordinate that is not written keeps its value of the tool position.
++    /// A polar coordinate that is not written, and the base of `IPR` / `IPA`,
++    /// is the last programmed value about this pole ([`PolarRef`]); when the
++    /// reader does not know that value, the block is refused.
+     pub fn polar_line_block(&mut self, b: &Block, toks: &[String]) -> Result<(), GcodeError> {
+         let w = decode_polar(b, toks, &self.q)?;
+         if w.ccw.is_some() || w.radius.is_some() {
+@@ -51,40 +67,37 @@ impl Machine<'_> {
+         self.corner_words_check(b, &w, moves)?;
+         self.pre_m(b, &w.m)?;
+         let rate = self.feed_words(b, &w)?;
+-        if moves {
+-            let (r0, a0) = self.polar_pos(pole);
+-            let r = match (w.pr, w.ipr) {
+-                (Some(r), _) => r,
+-                (None, Some(d)) => r0 + d,
+-                (None, None) => r0,
+-            };
+-            if r < 0.0 {
+-                return Err(b.invalid_modal(&format!("LP polar radius ({r}) is negative")));
+-            }
+-            let angle_from_pos = w.pa.is_none();
+-            if angle_from_pos && r0 <= 1e-9 && r > 1e-9 {
+-                return Err(b.invalid_modal(
+-                    "LP needs PA: the tool is at the pole, so its polar angle is not defined",
+-                ));
+-            }
+-            let a = match (w.pa, w.ipa) {
+-                (Some(a), _) => a,
+-                (None, Some(d)) => a0 + d,
+-                (None, None) => a0,
+-            };
+-            if a.abs() > 2.0 * MAX_ANGLE {
+-                return Err(b.invalid_modal(&format!("LP polar angle ({a}) is out of range")));
+-            }
+-            let (s, c) = a.to_radians().sin_cos();
+-            let to = check_point(
+-                b.line,
+-                "end point",
+-                Point3::new(pole.x + r * c, pole.y + r * s, self.polar_z(b, &w)?),
+-            )?;
+-            let (kind, feed) = line_feed(b, &w, rate, "LP")?;
+-            self.line_to(b, kind, to, feed)?;
++        if !moves {
++            return self.post_m(b, &w.m, w.mb);
++        }
++        let last = self.polar;
++        let r = polar_value(b, w.pr, w.ipr, last.pr, "PR", "radius")?;
++        if r < 0.0 {
++            return Err(b.invalid_modal(&format!("LP polar radius ({r}) is negative")));
+         }
+-        self.post_m(b, &w.m, w.mb)
++        // At the pole (PR 0) the angle does not change the end point.
++        let a = match polar_value(b, w.pa, w.ipa, last.pa, "PA", "angle") {
++            Ok(a) => Some(a),
++            Err(_) if r <= 1e-9 => None,
++            Err(e) => return Err(e),
++        };
++        if let Some(a) = a
++            && a.abs() > 2.0 * MAX_ANGLE
++        {
++            return Err(b.invalid_modal(&format!("LP polar angle ({a}) is out of range")));
++        }
++        let (s, c) = a.unwrap_or(0.0).to_radians().sin_cos();
++        let to = check_point(
++            b.line,
++            "end point",
++            Point3::new(pole.x + r * c, pole.y + r * s, self.polar_z(b, &w)?),
++        )?;
++        let (kind, feed) = line_feed(b, &w, rate, "LP")?;
++        self.line_to(b, kind, to, feed)?;
++        self.polar = PolarRef { pr: Some(r), pa: a };
++        self.post_m(b, &w.m, w.mb)?;
++        self.keep_polar_if_at(to);
++        Ok(())
+     }
+ 
+     /// `CP PA.. DR±` or `CP IPA.. DR±` (with `Z`/`IZ`: a helix): an arc about the
+@@ -102,7 +115,7 @@ impl Machine<'_> {
+         }
+         let ccw = w.ccw.ok_or_else(|| b.invalid_arc("CP needs DR+ or DR-"))?;
+         let pole = self.pole(b, "CP")?;
+-        let (r, a0) = self.polar_pos(pole);
++        let (r, a0) = (self.polar_radius(pole), self.polar_angle(pole));
+         if r <= 1e-6 {
+             return Err(b.invalid_arc("CP starts at the pole; the arc has no radius"));
+         }
+@@ -134,7 +147,54 @@ impl Machine<'_> {
+             Point2::new(ry, -rx)
+         });
+         self.pos = to;
+-        self.post_m(b, &w.m, None)
++        // CP takes its radius from the tool position, so the last programmed
++        // PR stays as it was. The end angle is known when the block writes PA,
++        // or when the start angle was known (IPA adds to it).
++        let pa = match w.pa {
++            Some(a) if w.ipa.is_none() => Some(a),
++            _ => self.polar.pa.map(|_| a0 + sweep),
++        };
++        self.polar.pa = pa;
++        self.post_m(b, &w.m, None)?;
++        self.keep_polar_if_at(to);
++        Ok(())
++    }
++}
++
++/// The polar coordinates last programmed about the current pole, as far as the
++/// reader knows them exactly. A `CC` block that moves the pole, and each move
++/// that is not `LP` / `CP` and changes the X/Y position, forget them: the
++/// control's last programmed value can then differ from the tool position
++/// (docs/decisions/2227-klartext-reader.md, "Polar reference").
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct PolarRef {
++    /// Last programmed polar radius `PR`.
++    pub pr: Option<f64>,
++    /// Last programmed polar angle `PA`, in degrees.
++    pub pa: Option<f64>,
++}
++
++/// One polar coordinate of an `LP` block: the absolute word, the incremental
++/// word added to the last programmed value, or the last programmed value.
++fn polar_value(
++    b: &Block,
++    abs: Option<f64>,
++    inc: Option<f64>,
++    last: Option<f64>,
++    word: &str,
++    what: &str,
++) -> Result<f64, GcodeError> {
++    let unknown = |how: &str| {
++        b.invalid_modal(&format!(
++            "LP {how}: the last polar {what} about this pole is not known (write {word})"
++        ))
++    };
++    match (abs, inc, last) {
++        (Some(v), _, _) => Ok(v),
++        (None, Some(d), Some(l)) => Ok(l + d),
++        (None, Some(_), None) => Err(unknown(&format!("I{word}"))),
++        (None, None, Some(l)) => Ok(l),
++        (None, None, None) => Err(unknown(&format!("without {word}"))),
+     }
+ }
+ 
+diff --git a/crates/gcode/tests/klartext/contours.rs b/crates/gcode/tests/klartext/contours.rs
+index 78db84d4a..283254c6b 100644
+--- a/crates/gcode/tests/klartext/contours.rs
++++ b/crates/gcode/tests/klartext/contours.rs
+@@ -197,3 +197,91 @@ fn klartext_rnd_on_the_first_move_of_a_section_starts_at_the_line_start() {
+     assert_to(&s[0], 15.0, 0.0, -1.0);
+     assert_arc(&s[1], 15.0, 5.0, true);
+ }
++
++/// Assert that no move of the program has zero length.
++fn assert_no_zero_move(p: &camcraft_gcode::ParsedProgram) {
++    for m in moves(p) {
++        let len = (m.to.x - m.from.x)
++            .hypot(m.to.y - m.from.y)
++            .hypot(m.to.z - m.from.z);
++        assert!(len > 1e-6, "zero-length move {m:?}");
++    }
++}
++
++#[test]
++fn klartext_transition_that_takes_the_whole_line_leaves_no_zero_length_move() {
++    let base = "L X+0 Y+0 Z-1 R0 F100";
++    // CHF 10 takes all of the 10 mm line before it.
++    let p = ok(&pgm(&[base, "L X+10", "CHF 10", "L X+10 Y+20"]));
++    assert_no_zero_move(&p);
++    let m = moves(&p);
++    assert_eq!(m.len(), 3, "line, chamfer, line: {m:?}");
++    assert_to(m[1], 10.0, 10.0, -1.0);
++    assert_eq!(p.line_for_move(0, 1), Some(4), "the chamfer maps to CHF");
++    // CHF 5 takes all of the 5 mm line after it.
++    let p = ok(&pgm(&[base, "L X+10", "CHF 5", "L X+10 Y+5"]));
++    assert_no_zero_move(&p);
++    let m = moves(&p);
++    assert_eq!(m.len(), 3, "line, line, chamfer: {m:?}");
++    assert_to(m[1], 5.0, 0.0, -1.0);
++    assert_to(m[2], 10.0, 5.0, -1.0);
++    // RND R10 on a right angle takes all of both 10 mm lines.
++    let p = ok(&pgm(&[base, "L X+10", "RND R10", "L X+10 Y+10"]));
++    assert_no_zero_move(&p);
++    let m = moves(&p);
++    assert_eq!(m.len(), 2, "line, rounding arc: {m:?}");
++    assert_to(m[1], 10.0, 10.0, -1.0);
++    assert_arc(m[1], 0.0, 10.0, true);
++}
++
++#[test]
++fn klartext_rnd_after_a_line_with_m3_or_m8() {
++    for m_word in ["M3", "M8"] {
++        let line = format!("L X+10 {m_word}");
++        let p = ok(&pgm(&[
++            "L X+0 Y+0 Z-1 R0 F100",
++            &line,
++            "RND R2",
++            "L X+10 Y+10",
++        ]));
++        let m = moves(&p);
++        assert_eq!(m.len(), 4, "{m_word}: {m:?}");
++        assert_to(m[1], 8.0, 0.0, -1.0);
++        assert_arc(m[2], 8.0, 2.0, true);
++        assert_to(m[3], 10.0, 10.0, -1.0);
++    }
++}
++
++#[test]
++fn klartext_chf_between_an_l_and_an_lp_line() {
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+0 Y+0 Z-1 R0 F100",
++        "L X+10",
++        "CHF 2",
++        "LP PR+10 PA+90",
++    ]));
++    let m = moves(&p);
++    let s = std::f64::consts::SQRT_2;
++    assert_eq!(m.len(), 4);
++    assert_to(m[1], 8.0, 0.0, -1.0);
++    assert_to(m[2], 10.0 - s, s, -1.0);
++    assert!(m[2].arc.is_none() && m[2].kind == MoveKind::Feed);
++    assert_to(m[3], 0.0, 10.0, -1.0);
++}
++
++#[test]
++fn klartext_transition_with_fmax_is_refused() {
++    for bad in ["RND R2 FMAX", "CHF 2 FMAX"] {
++        let e = refusal(&pgm(&[
++            "L X+0 Y+0 Z-1 R0 F100",
++            "L X+10",
++            bad,
++            "L X+10 Y+10",
++        ]));
++        assert!(
++            matches!(&e, GcodeError::UnsupportedCode { line: 4, .. }),
++            "{bad}: {e}"
++        );
++    }
++}
+diff --git a/crates/gcode/tests/klartext/polar.rs b/crates/gcode/tests/klartext/polar.rs
+index 7022d1771..d2bfb59d9 100644
+--- a/crates/gcode/tests/klartext/polar.rs
++++ b/crates/gcode/tests/klartext/polar.rs
+@@ -21,11 +21,11 @@ fn klartext_lp_reaches_polar_points_about_the_pole() {
+     let m = moves(&p);
+     assert_to(m[1], 5.0, H, -1.0);
+     assert_to(m[2], -5.0, H, -1.0);
+-    // PR alone keeps the polar angle of the tool position (120 deg).
++    // PR alone keeps the last programmed polar angle (120 deg).
+     assert_to(m[3], -2.5, H / 2.0, -1.0);
+-    // IPR and IPA add to the polar coordinates of the tool position.
++    // IPR and IPA add to the last programmed polar coordinates.
+     assert_to(m[4], -6.0, 0.0, -1.0);
+-    // PA alone keeps the polar radius (6); FMAX is a rapid.
++    // PA alone keeps the last programmed polar radius (6); FMAX is a rapid.
+     assert_to(m[5], 0.0, -6.0, 2.0);
+     assert_eq!((m[5].kind, m[5].feed), (MoveKind::Rapid, None));
+     assert!(
+@@ -114,7 +114,7 @@ fn klartext_polar_blocks_refuse_what_is_not_exact() {
+     let e = kind(&["CC X+10 Y+0", base, "LP PR+5"]);
+     assert!(
+         matches!(e, GcodeError::InvalidModal { line: 4, .. }),
+-        "angle at the pole: {e}"
++        "PR without PA after a Cartesian move: {e}"
+     );
+     for cp in [
+         "CP IPA+90 DR-",
+@@ -150,3 +150,106 @@ fn klartext_polar_blocks_refuse_what_is_not_exact() {
+         );
+     }
+ }
++
++/// The refusal text of a program that must be refused as `InvalidModal` on `line`.
++fn modal_refusal(body: &[&str], line: usize) -> String {
++    let e = refusal(&pgm(body));
++    assert!(
++        matches!(e, GcodeError::InvalidModal { line: l, .. } if l == line),
++        "{body:?}: {e}"
++    );
++    e.to_string()
++}
++
++#[test]
++fn klartext_lp_refuses_a_polar_coordinate_that_it_does_not_know() {
++    let start = ["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "LP PR+10 PA+0"];
++    // A Cartesian move or a moved pole: the last programmed PR / PA is not known.
++    for (tail, what) in [
++        (&["L X+0 Y+10", "LP PR+5"][..], "angle"),
++        (&["L X+0 Y+10", "LP PA+0"][..], "radius"),
++        (&["L X+0 Y+10", "LP IPR+1 PA+0"][..], "radius"),
++        (&["L X+0 Y+10", "LP PR+5 IPA+10"][..], "angle"),
++        (&["CC X+5 Y+0", "LP PA+90"][..], "radius"),
++        (&["C X+0 Y+10 DR+", "LP PR+5"][..], "angle"),
++    ] {
++        let body: Vec<&str> = start.iter().chain(tail).copied().collect();
++        let e = modal_refusal(&body, 6);
++        assert!(
++            e.contains(&format!(
++                "the last polar {what} about this pole is not known"
++            )),
++            "{body:?}: {e}"
++        );
++    }
++    // The first LP after the CC block knows no polar coordinate.
++    let e = modal_refusal(&["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "LP PR+10"], 4);
++    assert!(e.contains("LP without PA"), "{e}");
++    let e = modal_refusal(&["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "LP IPA+90"], 4);
++    assert!(e.contains("LP without PR"), "{e}");
++}
++
++#[test]
++fn klartext_lp_keeps_the_last_polar_coordinates_where_they_are_known() {
++    // A Z-only move, the same pole again and an M block keep PR and PA.
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+10 Y+0 Z-1 R0 F100",
++        "LP PR+10 PA+0",
++        "L Z-2",
++        "CC X+0 Y+0",
++        "M8",
++        "LP PA+90",
++    ]));
++    assert_to(moves(&p)[3], 0.0, 10.0, -2.0);
++    // CP keeps PR; CP PA sets PA, and CP IPA adds to a known PA.
++    let p = ok(&pgm(&[
++        "CC X+0 Y+0",
++        "L X+10 Y+0 Z-1 R0 F100",
++        "LP PR+10 PA+0",
++        "CP PA+90 DR+",
++        "CP IPA+90 DR+",
++        "LP IPA+90",
++        "LP PR+5",
++    ]));
++    let m = moves(&p);
++    assert_to(m[4], 0.0, -10.0, -1.0);
++    assert_to(m[5], 0.0, -5.0, -1.0);
++    // After a Cartesian move, CP PA sets the angle, but the radius stays unknown.
++    let after_l = ["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "CP PA+90 DR+"];
++    let body: Vec<&str> = after_l.iter().copied().chain(["LP PR+5"]).collect();
++    assert_to(moves(&ok(&pgm(&body)))[2], 0.0, 5.0, -1.0);
++    let body: Vec<&str> = after_l.iter().copied().chain(["LP PA+180"]).collect();
++    assert!(modal_refusal(&body, 5).contains("LP without PR"));
++    // CP IPA from an unknown start angle leaves the angle unknown.
++    let e = modal_refusal(
++        &[
++            "CC X+0 Y+0",
++            "L X+10 Y+0 Z-1 R0 F100",
++            "CP IPA+90 DR+",
++            "LP PR+5",
++        ],
++        5,
++    );
++    assert!(e.contains("LP without PA"), "{e}");
++    // PR 0 is the pole: no angle is needed, and none is known after it.
++    let p = ok(&pgm(&["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "LP PR+0"]));
++    assert_to(moves(&p)[1], 0.0, 0.0, -1.0);
++    let body = ["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "LP PR+0", "LP PR+5"];
++    assert!(modal_refusal(&body, 5).contains("LP without PA"));
++}
++
++#[test]
++fn klartext_lp_angle_out_of_range_is_refused() {
++    let e = modal_refusal(
++        &[
++            "CC X+0 Y+0",
++            "L X+10 Y+0 Z-1 R0 F100",
++            "LP PR+10 PA+99999",
++            "LP IPA+99999",
++            "LP IPA+99999",
++        ],
++        6,
++    );
++    assert!(e.contains("out of range"), "{e}");
++}
+diff --git a/docs/decisions/2227-klartext-reader.md b/docs/decisions/2227-klartext-reader.md
+index 6e7eb579a..be0bd710c 100644
+--- a/docs/decisions/2227-klartext-reader.md
++++ b/docs/decisions/2227-klartext-reader.md
+@@ -169,7 +169,8 @@ refused by name and line.
+   A chamfer cuts the side length from each line (the cut-off triangle has two
+   legs of that length). A transition that needs more of a line than the line
+   has after an earlier cut-back is refused, as are two lines in line (no
+-  corner).
++  corner). A transition that takes exactly the whole line leaves no line:
++  the reader writes no zero-length feed move for it.
+ - *The F of RND / CHF acts only on the transition.* Without F, the
+   transition uses the modal feed. The modal feed does not change.
+ - *Only line-line transitions.* A transition next to an arc needs the fillet
+@@ -178,12 +179,22 @@ refused by name and line.
+   line with an M function that acts at the block end (before) or with any M
+   function (after) is refused too: the order of these effects around the
+   transition is not settled in our sources.
+-- *Polar reference.* A polar coordinate that is not written, and the
+-  reference of `IPR` / `IPA`, come from the tool position about the current
+-  pole. An angle from a position differs from the last programmed angle only
+-  by whole turns, which do not change an `LP` end point or a `CP` sweep. At
+-  the pole the angle is not defined, so `LP` without `PA` and `CP` from the
+-  pole are refused.
++- *Polar reference.* A polar coordinate that `LP` does not write, and the
++  base of `IPR` / `IPA`, is the last programmed value about the current
++  pole. Our sources do not say what the control keeps as that value after a
++  Cartesian move (`L`, `C`, `CR`, `CT`) or after a `CC` block that moves the
++  pole: it can be the old programmed value, which is not the polar radius or
++  angle of the tool position. The sources say no more for the angle than for
++  the radius, so one rule covers the two. The reader keeps the last `PR` and
++  `PA` only while it knows them exactly: from an `LP` (or a `CP` that writes
++  `PA`, or a `CP IPA` from a known angle) about the same pole, with no X/Y
++  move by another block and no move of the pole in between. A Z-only move,
++  an M block or a `CC` at the same point keeps them. `CP` takes its radius
++  from the tool position, so it keeps the last `PR` as it was. When the
++  reader does not know the value, it refuses the `LP` by name and line
++  ("LP without PR: the last polar radius about this pole is not known").
++  `LP PR+0` needs no angle: its end is the pole. `CP` itself is not
++  affected: the manual starts the arc at the tool position.
+ - *CP direction.* `CP IPA` needs the sign of `IPA` and `DR` to agree, as in
+   the manual's helix table; a mismatch is refused, not guessed. `CP PA` with
+   the start angle is refused (write `IPA+360` for a full circle). `|IPA|` is
+@@ -198,7 +209,9 @@ refused by name and line.
+ 
+ **Dropped.** Reading a transition next to an arc as a transition next to its
+ chord (wrong path); taking `CP IPA` as `|IPA|` in the direction of `DR`
+-(guessed sweep); a tool-radius option to compute `RL` / `RR` (needs the
++(guessed sweep); the polar radius and angle of the tool position as the
++value of a polar coordinate that is not written (wrong after a Cartesian
++move or a moved pole, if the control keeps the programmed value); a tool-radius option to compute `RL` / `RR` (needs the
+ control's corner and approach rules, a separate design).
+ 
+ **Cost to change later.** A transition next to an arc is one new geometry
+
+From 755d7dce2e8fd6f7ed0c38a966e20250b5327c33 Mon Sep 17 00:00:00 2001
+From: Quintin Smits <qd.smits@gmail.com>
+Date: Sat, 28 Nov 2026 01:37:54 +0100
+Subject: [PATCH 6/6] test(gcode): polar reference test reads the last moves (a
+ zero-length LP adds no move)
+
+Refs #2227
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gcode/tests/klartext/polar.rs | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/crates/gcode/tests/klartext/polar.rs b/crates/gcode/tests/klartext/polar.rs
+index d2bfb59d9..3d5d20f7a 100644
+--- a/crates/gcode/tests/klartext/polar.rs
++++ b/crates/gcode/tests/klartext/polar.rs
+@@ -201,7 +201,9 @@ fn klartext_lp_keeps_the_last_polar_coordinates_where_they_are_known() {
+         "M8",
+         "LP PA+90",
+     ]));
+-    assert_to(moves(&p)[3], 0.0, 10.0, -2.0);
++    // (The first LP ends where the tool is: it adds no move.)
++    let m = moves(&p);
++    assert_to(m[m.len() - 1], 0.0, 10.0, -2.0);
+     // CP keeps PR; CP PA sets PA, and CP IPA adds to a known PA.
+     let p = ok(&pgm(&[
+         "CC X+0 Y+0",
+@@ -213,8 +215,9 @@ fn klartext_lp_keeps_the_last_polar_coordinates_where_they_are_known() {
+         "LP PR+5",
+     ]));
+     let m = moves(&p);
+-    assert_to(m[4], 0.0, -10.0, -1.0);
+-    assert_to(m[5], 0.0, -5.0, -1.0);
++    let n = m.len();
++    assert_to(m[n - 2], 0.0, -10.0, -1.0);
++    assert_to(m[n - 1], 0.0, -5.0, -1.0);
+     // After a Cartesian move, CP PA sets the angle, but the radius stays unknown.
+     let after_l = ["CC X+0 Y+0", "L X+10 Y+0 Z-1 R0 F100", "CP PA+90 DR+"];
+     let body: Vec<&str> = after_l.iter().copied().chain(["LP PR+5"]).collect();

@@ -1,0 +1,1878 @@
+From f1d91efa46ce1c226cd636d879bf2517a9ef4d80 Mon Sep 17 00:00:00 2001
+From: mkinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 23:39:35 +0100
+Subject: [PATCH 1/2] feat(sim): simulate and verify external NC programs
+ against the setup
+
+Add camcraft_app::nc_sim. It takes a program that camcraft-gcode parsed
+and simulates it against the setup:
+- maps each T number to cutter geometry (an explicit map, the document's
+  tool numbers, or a .camtools row) and refuses unmapped numbers by name;
+- maps program coordinates to world millimetres (origin + sign * program,
+  with the WCS flip and the machine's inverted axes; arcs reverse sense
+  when one in-plane axis is negated);
+- cuts the setup stock with the dexel engine and measures the deviation
+  from the target model; refuses a setup with no stock by name;
+- runs verify::solid_hits, bands_vs_fixtures_held and
+  rapids_vs_fixtures_held, and the machine travel, feed, spindle and tool
+  size limits, each finding on its 1-based NC line;
+- builds a PlaySeed (PlaySeed::of_planned) so the playback can run it.
+
+camcraft-app now depends on camcraft-gcode; the decision record is
+docs/decisions/2218-nc-sim-runner.md.
+
+Fixes #2218
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                    |   1 +
+ Cargo.toml                                    |   1 +
+ crates/app/Cargo.toml                         |   3 +
+ crates/app/src/lib.rs                         |   2 +
+ crates/app/src/nc_sim/checks.rs               | 130 ++++++
+ crates/app/src/nc_sim/frame.rs                | 119 ++++++
+ crates/app/src/nc_sim/mod.rs                  | 380 ++++++++++++++++++
+ crates/app/src/nc_sim/tools.rs                | 172 ++++++++
+ crates/app/src/stock_play.rs                  |   2 +
+ crates/app/src/stock_play_nc.rs               |  26 ++
+ crates/app/tests/stock_sim_document.rs        |   6 +-
+ .../tests/stock_sim_document/nc_program.rs    | 245 +++++++++++
+ docs/decisions/2218-nc-sim-runner.md          |  64 +++
+ 13 files changed, 1150 insertions(+), 1 deletion(-)
+ create mode 100644 crates/app/src/nc_sim/checks.rs
+ create mode 100644 crates/app/src/nc_sim/frame.rs
+ create mode 100644 crates/app/src/nc_sim/mod.rs
+ create mode 100644 crates/app/src/nc_sim/tools.rs
+ create mode 100644 crates/app/src/stock_play_nc.rs
+ create mode 100644 crates/app/tests/stock_sim_document/nc_program.rs
+ create mode 100644 docs/decisions/2218-nc-sim-runner.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index b59b3bf4c0..49c308ec30 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -758,6 +758,7 @@ version = "0.27.0"
+ dependencies = [
+  "boa_engine",
+  "camcraft-cl",
++ "camcraft-gcode",
+  "camcraft-geometry",
+  "camcraft-motion",
+  "camcraft-post",
+diff --git a/Cargo.toml b/Cargo.toml
+index dfc8e546b3..e53223b49d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,6 +12,7 @@ rust-version = "1.90"
+ camcraft-app = { path = "crates/app" }
+ camcraft-geometry = { path = "crates/geometry" }
+ camcraft-cl = { path = "crates/cl" }
++camcraft-gcode = { path = "crates/gcode" }
+ camcraft-tools = { path = "crates/tools" }
+ camcraft-post = { path = "crates/post" }
+ camcraft-sim = { path = "crates/sim" }
+diff --git a/crates/app/Cargo.toml b/crates/app/Cargo.toml
+index adacec0db4..13a6fca2a9 100644
+--- a/crates/app/Cargo.toml
++++ b/crates/app/Cargo.toml
+@@ -9,6 +9,9 @@ rust-version.workspace = true
+ flecs_ecs = { workspace = true }
+ camcraft-geometry = { workspace = true }
+ camcraft-cl = { workspace = true }
++# #2218: external NC programs are parsed by camcraft-gcode and simulated here
++# (docs/decisions/2218-nc-sim-runner.md).
++camcraft-gcode = { workspace = true }
+ camcraft-tools = { workspace = true }
+ camcraft-post = { workspace = true }
+ camcraft-sim = { workspace = true }
+diff --git a/crates/app/src/lib.rs b/crates/app/src/lib.rs
+index 83975ec171..333b78863c 100644
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -78,6 +78,8 @@ mod posting_family;
+ /// Which spindle a lathe post turns for a section, and the door that
+ /// keeps a milling operation off the work spindle (#1190).
+ pub mod lathe_voice;
++// #2218: simulate and verify an external NC program (camcraft-gcode).
++pub mod nc_sim;
+ // #155: standalone Pause / Home entries in the operation list.
+ pub mod program_entry;
+ // #3012: pattern folders - linear and grid copies of member operations.
+diff --git a/crates/app/src/nc_sim/checks.rs b/crates/app/src/nc_sim/checks.rs
+new file mode 100644
+index 0000000000..8a97e7c110
+--- /dev/null
++++ b/crates/app/src/nc_sim/checks.rs
+@@ -0,0 +1,130 @@
++//! The region-free verify laws and the machine limits over an external NC
++//! program's world moves (#2218), each finding mapped to its 1-based NC
++//! line. Provenance: CamCraft's own verify laws (`sim::verify::laws`,
++//! `solid`) and machine check (`post::machine::check`); RS-274 line numbers.
++
++use crate::cl::Toolpath;
++use crate::geometry::Triangle;
++use crate::machine::{Machine, MachineCheck, SourceLocation};
++use crate::verify::{self, Cutter, SolidLaw, Warning};
++use camcraft_sim::fixture::FixtureBox;
++use camcraft_tools::holder_profile::HolderStack;
++
++use super::tools::NcTool;
++use super::{NcFinding, NcFindingKind};
++
++/// Sample spacing of the solid law along a vertical-plane arc, mm (the
++/// value the operation solid laws use).
++const SOLID_STEP: f64 = 0.25;
++
++/// One section, resolved: its world path, its tool, its frame and its NC lines.
++pub(super) struct Resolved<'a> {
++    pub index: usize,
++    pub path: Toolpath,
++    pub tool: &'a NcTool,
++    pub lines: &'a [usize],
++    pub rpm: Option<f64>,
++    pub origin: [f64; 3],
++    pub flip: [bool; 3],
++}
++
++/// The move index a warning points at, and its kind. Exhaustive on
++/// purpose: a new warning kind fails to compile here until it says what it is.
++fn kind_at(w: &Warning) -> (NcFindingKind, usize) {
++    use NcFindingKind as K;
++    match w {
++        Warning::Crossing { moves } => (K::Path, moves[0]),
++        Warning::Gouge { at } | Warning::StockChamferGouge { at } | Warning::StockDeburrGouge { at } => (K::Gouge, *at),
++        Warning::RapidInPart { at } => (K::RapidInPart, *at),
++        Warning::ShankHit { at, .. } | Warning::HolderHit { at, .. } | Warning::SweepHit { at, .. } => (K::Body, *at),
++        Warning::FixtureHit { at, .. } | Warning::FirstTraverseUnderTable { at, .. } => (K::Fixture, *at),
++        Warning::RapidInStock { at }
++        | Warning::FirstTraverseLow { at, .. }
++        | Warning::AvoidHit { at, .. }
++        | Warning::NonFinite { at }
++        | Warning::Envelope { at, .. }
++        | Warning::RestUnjudged { at, .. }
++        | Warning::Scallop { at, .. }
++        | Warning::ProbeSearch { at, .. }
++        | Warning::SinkerFinishOrder { at, .. }
++        | Warning::DrillUndersize { at, .. }
++        | Warning::UndercutLift { at }
++        | Warning::StrategyFallback { at, .. }
++        | Warning::FluteShort { at, .. }
++        | Warning::PlungeTooDeep { at, .. }
++        | Warning::EntryNotRecommended { at, .. }
++        | Warning::EntryStandIn { at, .. }
++        | Warning::PlungeIntoStock { at }
++        | Warning::EngagementExceeded { at, .. } => (K::Path, *at),
++    }
++}
++
++fn line_of(s: &Resolved<'_>, at: usize) -> usize {
++    // The lines are checked 1-to-1 with the moves before any law runs, so
++    // a missing entry cannot happen; 0 is the "no line" fallback.
++    s.lines.get(at).copied().unwrap_or(0)
++}
++
++/// The solid law against the target and the two fixture laws, per section.
++pub(super) fn verify_sections(
++    sections: &[Resolved<'_>],
++    target: &[Triangle],
++    fixtures: &[FixtureBox],
++    spindle: Option<(f64, f64)>,
++    tol: f64,
++) -> Vec<NcFinding> {
++    let mut out = Vec::new();
++    for s in sections {
++        let geom = s.tool.tool.geom();
++        let mut warns = Vec::new();
++        if !target.is_empty() {
++            let cutter = Cutter::judged(&geom, Some(Cutter::of(&s.tool.tool)));
++            let law = SolidLaw { step: SOLID_STEP, allow: tol, hole_walls: false };
++            warns.extend(verify::solid_hits(&s.path, target, &cutter, &law));
++        }
++        if !fixtures.is_empty() {
++            let holder = HolderStack::cylinder(&geom);
++            warns.extend(verify::bands_vs_fixtures_held(&s.path, &geom, &holder, fixtures, spindle, tol));
++            warns.extend(verify::rapids_vs_fixtures_held(&s.path, &geom, &holder, fixtures, spindle));
++        }
++        for w in warns {
++            let (kind, at) = kind_at(&w);
++            out.push(NcFinding { line: line_of(s, at), section: s.index, kind, message: w.to_string() });
++        }
++    }
++    out.sort_by_key(|f| (f.line, f.section));
++    out
++}
++
++/// The machine's limits: the tool count, each tool's size and spindle
++/// speed, and each move's feed and travel, named by NC line.
++pub(super) fn machine_findings(machine: &Machine, sections: &[Resolved<'_>]) -> (Vec<NcFinding>, Vec<String>) {
++    let mut program = MachineCheck::default();
++    let mut names: Vec<&str> = sections.iter().map(|s| s.tool.name.as_str()).collect();
++    names.dedup();
++    program.check_tool_count(machine, &names);
++    let mut out = Vec::new();
++    for s in sections {
++        let first = s.lines.first().copied().unwrap_or(0);
++        let t = &s.tool.tool;
++        let mut c = MachineCheck::default();
++        c.check_tool_size(machine, Some(SourceLocation::NcLine(first)), &s.tool.name, t.flute_len + t.shank_len + t.holder_len, t.diameter);
++        if let Some(rpm) = s.rpm {
++            c.check_spindle(machine, Some(SourceLocation::NcLine(first)), &s.tool.name, rpm);
++        }
++        push(&mut out, s.index, first, c);
++        for (i, mv) in s.path.moves.iter().enumerate() {
++            let line = line_of(s, i);
++            let mut c = MachineCheck::default();
++            c.check_path(machine, Some(SourceLocation::NcLine(line)), &Toolpath::new(vec![*mv]), s.origin, s.flip, true);
++            push(&mut out, s.index, line, c);
++        }
++    }
++    let mut notes = program.problems;
++    notes.extend(program.notes);
++    (out, notes)
++}
++
++fn push(out: &mut Vec<NcFinding>, section: usize, line: usize, c: MachineCheck) {
++    out.extend(c.problems.into_iter().map(|message| NcFinding { line, section, kind: NcFindingKind::Machine, message }));
++}
+diff --git a/crates/app/src/nc_sim/frame.rs b/crates/app/src/nc_sim/frame.rs
+new file mode 100644
+index 0000000000..e816c068f8
+--- /dev/null
++++ b/crates/app/src/nc_sim/frame.rs
+@@ -0,0 +1,119 @@
++//! NC program coordinates to world millimetres (#2218): `world = origin +
++//! sign * program_mm`, the inverse of the post's origin shift
++//! (`posting::wcs_context`), its WCS flip and the machine's inverted axes
++//! (`post::invert`). Provenance: plane geometry and the RS-274 rule that
++//! G2/G3 read from the plane normal's positive end.
++
++use flecs_ecs::prelude::World;
++
++use crate::cl::{ArcPlane, Move};
++use crate::geo2d::Point2;
++use crate::geometry::Point3;
++use crate::machine::Machine;
++
++use super::NcSimOptions;
++
++/// The map of one work offset's program frame onto the world frame.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct NcFrame {
++    /// The work offset origin, world millimetres.
++    pub origin: [f64; 3],
++    /// The setup's WCS flip, as `true` per negated axis.
++    pub flip: [bool; 3],
++    /// Program to world sign per axis: the flip times the machine's axis direction.
++    pub sign: [f64; 3],
++}
++
++fn offset_word(index: usize) -> String {
++    format!("G{}", 54 + index)
++}
++
++/// The frame of work offset `index` (0 for `G54` .. 5 for `G59`).
++///
++/// The origin is the caller's override for that offset, else the setup's
++/// own WCS when the setup states that offset. Any other offset is refused
++/// by name, never read as the setup's origin. A setup WCS that is turned
++/// is refused too: this map holds a translation and a sign only.
++///
++/// # Errors
++/// Returns the refusal text.
++pub fn frame_for(world: &World, opts: &NcSimOptions, machine: Option<&Machine>, index: usize) -> Result<NcFrame, String> {
++    let setup = opts.setup.as_deref();
++    let origin = match opts.wcs_origins.get(index).copied().flatten() {
++        Some(o) => o,
++        None => {
++            let slot = crate::setup::wcs_slot(world, setup);
++            if slot != index {
++                return Err(format!(
++                    "the program uses {}, the setup states {} - give an origin for {} to simulate it",
++                    offset_word(index),
++                    crate::setup::wcs_name(world, setup),
++                    offset_word(index)
++                ));
++            }
++            if let Some(loc) = crate::setup::wcs_entity(world, setup).and_then(|e| crate::model::transform_of(world, &e))
++                && !crate::setup_align::is_identity_rot(loc.rot)
++            {
++                return Err(format!(
++                    "the setup's WCS ({}) is turned - the NC simulation maps a square WCS only",
++                    crate::setup::wcs_name(world, setup)
++                ));
++            }
++            crate::posting::wcs_context(world, setup).1
++        }
++    };
++    if !origin.iter().all(|v| v.is_finite()) {
++        return Err(format!("the origin of {} is not finite: {origin:?}", offset_word(index)));
++    }
++    let flip = crate::setup_wcs_flip::of_setup(world, setup);
++    let mut sign = [1.0; 3];
++    for (k, s) in sign.iter_mut().enumerate() {
++        let dir = machine.and_then(|m| m.axis(k)).map_or(1.0, |a| a.direction.sign());
++        *s = dir * if flip[k] { -1.0 } else { 1.0 };
++    }
++    Ok(NcFrame { origin, flip, sign })
++}
++
++impl NcFrame {
++    fn point(&self, p: Point3) -> Point3 {
++        Point3::new(
++            self.origin[0] + self.sign[0] * p.x,
++            self.origin[1] + self.sign[1] * p.y,
++            self.origin[2] + self.sign[2] * p.z,
++        )
++    }
++
++    /// One program move in world millimetres. An arc's center maps with
++    /// its plane's two axes, and its sense reverses when exactly one of
++    /// them is negated.
++    ///
++    /// # Errors
++    /// Refuses a posed or rotary move and a move that is not finite.
++    pub fn move_to_world(&self, m: &Move) -> Result<Move, String> {
++        if m.axis.is_some() || m.rotary.is_some() {
++            return Err("a posed or rotary move - the NC simulation is 3-axis".into());
++        }
++        if !m.is_finite() {
++            return Err("a move with a coordinate or feed that is not finite".into());
++        }
++        let mut out = *m;
++        out.from = self.point(m.from);
++        out.to = self.point(m.to);
++        if let Some(mut a) = m.arc {
++            let (u, v) = match a.plane {
++                ArcPlane::Xy => (0, 1),
++                ArcPlane::Xz => (0, 2),
++                ArcPlane::Yz => (1, 2),
++            };
++            a.center = Point2::new(
++                self.origin[u] + self.sign[u] * a.center.x,
++                self.origin[v] + self.sign[v] * a.center.y,
++            );
++            if self.sign[u] * self.sign[v] < 0.0 {
++                a.ccw = !a.ccw;
++            }
++            out.arc = Some(a);
++        }
++        Ok(out)
++    }
++}
+diff --git a/crates/app/src/nc_sim/mod.rs b/crates/app/src/nc_sim/mod.rs
+new file mode 100644
+index 0000000000..da1a3499b0
+--- /dev/null
++++ b/crates/app/src/nc_sim/mod.rs
+@@ -0,0 +1,380 @@
++//! External NC program simulation (#2218): a parsed RS-274 / ISO 6983
++//! program (`camcraft-gcode`) cut from the setup's stock, judged against
++//! the target model, the fixtures and the mounted machine, with each
++//! finding on its 1-based NC line. Provenance: RS-274/NGC (NISTIR 6556) and
++//! ISO 6983 program semantics; CamCraft's own stock-sim, verify and machine laws.
++//!
++//! The runner reads the document and changes nothing, so it is no undoable
++//! command. Each refusal names its reason: a `T` number with no cutter
++//! geometry, a setup with no stock, a work offset with no origin, a turned
++//! WCS, a machine that is not a mill, a posed move.
++
++mod checks;
++mod frame;
++mod tools;
++
++pub use frame::{frame_for, NcFrame};
++pub use tools::{map_tools, NcTool, NcToolMap, NcToolSource};
++
++use flecs_ecs::prelude::World;
++
++use camcraft_gcode::{GcodeError, ParseOptions, ParsedProgram, ParsedSection};
++use camcraft_sim::fixture::FixtureBox;
++
++use crate::cl::Move;
++use crate::geometry::Triangle;
++use crate::machine::Machine;
++use crate::stock_sim::{Deviation, Planned, SimOp, DEV_TOL};
++use crate::tool_library::LibraryTool;
++
++/// The caller's inputs. Each `None` or empty field reads the document:
++/// the active setup, its mounted machine, its fixtures and its parts.
++#[derive(Clone, Debug, Default)]
++pub struct NcSimOptions {
++    /// The setup whose stock, WCS, fixtures and machine are read (`None`: the active one).
++    pub setup: Option<String>,
++    /// Explicit `T` number to tool name: a library row's name, else a document tool's.
++    pub tool_map: Vec<(u32, String)>,
++    /// Rows of a `.camtools` library (`tool_library::parse_tool_library`).
++    pub library: Vec<LibraryTool>,
++    /// World-millimetre origins of `G54`..`G59`, overriding the setup's WCS.
++    pub wcs_origins: [Option<[f64; 3]>; 6],
++    /// The target model's world facets (`Some(empty)`: no target).
++    pub target: Option<Vec<Triangle>>,
++    /// The fixture boxes (`Some(empty)`: no fixtures).
++    pub fixtures: Option<Vec<FixtureBox>>,
++    /// The machine, overriding the setup's mounted `.mch`.
++    pub machine: Option<Machine>,
++    /// The gouge and deviation tolerance, mm (default `DEV_TOL`).
++    pub tol: Option<f64>,
++}
++
++/// Why an NC program was not simulated.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum NcSimError {
++    /// The program text did not parse.
++    Parse(String),
++    /// A section cuts before any tool call, at this NC line.
++    NoTool { line: usize },
++    /// These `T` numbers have no cutter geometry, with one reason each.
++    UnmappedTools { numbers: Vec<u32>, reasons: Vec<String> },
++    /// Any other refusal, by name.
++    Refused(String),
++}
++
++impl core::fmt::Display for NcSimError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            NcSimError::Parse(e) => write!(f, "the NC program does not parse: {e}"),
++            NcSimError::NoTool { line } => write!(f, "line {line}: the program moves before any tool call (T word)"),
++            NcSimError::UnmappedTools { numbers, reasons } => {
++                let list: Vec<String> = numbers.iter().map(|n| format!("T{n}")).collect();
++                write!(f, "unmapped tools {} - {}", list.join(", "), reasons.join("; "))
++            }
++            NcSimError::Refused(why) => f.write_str(why),
++        }
++    }
++}
++
++impl std::error::Error for NcSimError {}
++
++/// The law a finding comes from.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NcFindingKind {
++    /// A cutting move in the target model.
++    Gouge,
++    /// A rapid move in the target model.
++    RapidInPart,
++    /// The shank or holder in the target model.
++    Body,
++    /// The tool, holder or spindle in a fixture or the table.
++    Fixture,
++    /// A machine limit: travel, feed, spindle speed, tool size.
++    Machine,
++    /// Any other path law.
++    Path,
++}
++
++/// One finding, on its 1-based NC line.
++#[derive(Clone, Debug, PartialEq)]
++pub struct NcFinding {
++    pub line: usize,
++    pub section: usize,
++    pub kind: NcFindingKind,
++    pub message: String,
++}
++
++/// One simulated section.
++#[derive(Clone, Debug, PartialEq)]
++pub struct NcSection {
++    pub index: usize,
++    pub tool_number: u32,
++    pub tool: String,
++    pub moves: usize,
++    pub first_line: usize,
++}
++
++/// The simulation result.
++#[derive(Clone, Debug)]
++pub struct NcSimReport {
++    pub sections: Vec<NcSection>,
++    /// The cut stock against the target model; `None` with no target.
++    pub deviation: Option<Deviation>,
++    pub tol: f64,
++    /// Line-numbered findings, in line order.
++    pub findings: Vec<NcFinding>,
++    /// Program-wide machine findings (the tool changer's capacity).
++    pub program_problems: Vec<String>,
++    /// What was not judged, and why. Notes never block.
++    pub notes: Vec<String>,
++}
++
++impl NcSimReport {
++    /// No finding, and no gouge past the tolerance.
++    #[must_use]
++    pub fn is_clean(&self) -> bool {
++        self.findings.is_empty()
++            && self.program_problems.is_empty()
++            && self.deviation.as_ref().is_none_or(|d| d.max_gouge <= self.tol)
++    }
++}
++
++/// One section in world millimetres, with its tool.
++struct Section<'a> {
++    src: &'a ParsedSection,
++    tool: &'a NcTool,
++    frame: NcFrame,
++    moves: Vec<Move>,
++}
++
++fn first_line(s: &ParsedSection) -> usize {
++    s.move_lines.first().copied().unwrap_or(0)
++}
++
++fn machine_of(world: &World, opts: &NcSimOptions) -> Result<Option<Machine>, NcSimError> {
++    let m = opts.machine.clone().or_else(|| crate::machine::of_setup(world, opts.setup.as_deref()).1);
++    if let Some(m) = &m {
++        let kind = crate::machine::kind(Some(m));
++        if !matches!(kind, crate::machine::Kind::Mill | crate::machine::Kind::MillTurn) {
++            return Err(NcSimError::Refused(format!(
++                "the machine '{}' is a {kind:?} - the NC simulation judges milling programs only",
++                m.model
++            )));
++        }
++    }
++    Ok(m)
++}
++
++/// Map the program's `T` numbers to cutter geometry (no refusal for an
++/// unmapped number: the map lists them).
++///
++/// # Errors
++/// Returns a section that moves before any tool call, or the document's
++/// tool-number refusal.
++pub fn unmapped_tools(world: &World, program: &ParsedProgram, opts: &NcSimOptions) -> Result<NcToolMap, NcSimError> {
++    let mut numbers = Vec::new();
++    for s in program.sections.iter().filter(|s| !s.toolpath.moves.is_empty()) {
++        let n = s.tool_number.ok_or(NcSimError::NoTool { line: first_line(s) })?;
++        numbers.push(n);
++    }
++    map_tools(world, &numbers, opts).map_err(NcSimError::Refused)
++}
++
++fn sections<'a>(
++    world: &World,
++    program: &'a ParsedProgram,
++    opts: &NcSimOptions,
++    map: &'a NcToolMap,
++    machine: Option<&Machine>,
++) -> Result<Vec<Section<'a>>, NcSimError> {
++    let mut out = Vec::new();
++    for src in program.sections.iter().filter(|s| !s.toolpath.moves.is_empty()) {
++        let line = first_line(src);
++        if src.move_lines.len() != src.toolpath.moves.len() {
++            return Err(NcSimError::Refused(format!("line {line}: the section's line map does not match its moves")));
++        }
++        let n = src.tool_number.ok_or(NcSimError::NoTool { line })?;
++        let tool = map.get(n).ok_or_else(|| NcSimError::UnmappedTools { numbers: vec![n], reasons: Vec::new() })?;
++        let frame = frame_for(world, opts, machine, src.work_offset.index())
++            .map_err(|e| NcSimError::Refused(format!("line {line}: {e}")))?;
++        let mut moves = src
++            .toolpath
++            .moves
++            .iter()
++            .zip(&src.move_lines)
++            .map(|(m, l)| frame.move_to_world(m).map_err(|e| NcSimError::Refused(format!("line {l}: {e}"))))
++            .collect::<Result<Vec<_>, _>>()?;
++        // The program's first move starts from the parser's assumed
++        // position (`Dialect::initial_position`), not from a place the
++        // machine stood: the tool appears at its first commanded point.
++        if out.is_empty()
++            && let Some(m) = moves.first_mut()
++            && m.arc.is_none()
++        {
++            m.from = m.to;
++        }
++        out.push(Section { src, tool, frame, moves });
++    }
++    if out.is_empty() {
++        return Err(NcSimError::Refused("the NC program has no moves to simulate".into()));
++    }
++    Ok(out)
++}
++
++fn planned(sections: &[Section<'_>], setup: Option<&str>) -> Result<Vec<Planned>, NcSimError> {
++    sections
++        .iter()
++        .map(|s| {
++            let tools::Atom { radius, ball, cone, corner, drill } = tools::atom(s.tool).map_err(NcSimError::Refused)?;
++            Ok(Planned {
++                name: format!("T{} (line {})", s.tool.number, first_line(s.src)),
++                moves: s.moves.clone(),
++                radius,
++                ball,
++                cone,
++                corner,
++                setup: setup.map(str::to_owned),
++                rotary: None,
++                lathe: None,
++                breaks: Vec::new(),
++                walled: false,
++                auto_edges: false,
++                mark: None,
++                electrode: None,
++                drill,
++                undercut: None,
++                corner_reliefs: Vec::new(),
++            })
++        })
++        .collect()
++}
++
++struct Prepared<'a> {
++    sections: Vec<Section<'a>>,
++    planned: Vec<Planned>,
++    machine: Option<Machine>,
++}
++
++fn prepare<'a>(world: &World, program: &'a ParsedProgram, opts: &NcSimOptions, map: &'a NcToolMap) -> Result<Prepared<'a>, NcSimError> {
++    if !map.unmapped.is_empty() {
++        return Err(NcSimError::UnmappedTools { numbers: map.unmapped.clone(), reasons: map.reasons.clone() });
++    }
++    let machine = machine_of(world, opts)?;
++    let sections = sections(world, program, opts, map, machine.as_ref())?;
++    let planned = planned(&sections, opts.setup.as_deref())?;
++    Ok(Prepared { sections, planned, machine })
++}
++
++fn tol_of(opts: &NcSimOptions) -> Result<f64, NcSimError> {
++    let tol = opts.tol.unwrap_or(DEV_TOL);
++    if tol.is_finite() && tol > 0.0 {
++        Ok(tol)
++    } else {
++        Err(NcSimError::Refused(format!("the simulation tolerance must be a positive number, not {tol}")))
++    }
++}
++
++fn target_of(world: &World, opts: &NcSimOptions) -> Vec<Triangle> {
++    opts.target.clone().unwrap_or_else(|| crate::setup_align::parts_facets_in(world, opts.setup.as_deref()))
++}
++
++/// Parse `text` and simulate it ([`simulate_nc`]).
++///
++/// # Errors
++/// Returns the parser's line-numbered error, or a refusal of [`simulate_nc`].
++pub fn simulate_nc_text(world: &World, text: &str, parse: &ParseOptions, opts: &NcSimOptions) -> Result<NcSimReport, NcSimError> {
++    let program = camcraft_gcode::parse_with(text, parse).map_err(|e: GcodeError| NcSimError::Parse(e.to_string()))?;
++    simulate_nc(world, &program, opts)
++}
++
++/// Cut the program from the setup's stock, measure the deviation from the
++/// target model, and judge the solid law, the fixture laws and the
++/// machine limits on every move.
++///
++/// # Errors
++/// Refuses unmapped tools, a setup with no stock, and the frame refusals
++/// ([`frame_for`]), each by name. A refusal changes nothing.
++pub fn simulate_nc(world: &World, program: &ParsedProgram, opts: &NcSimOptions) -> Result<NcSimReport, NcSimError> {
++    let tol = tol_of(opts)?;
++    let map = unmapped_tools(world, program, opts)?;
++    let prep = prepare(world, program, opts, &map)?;
++    let setup = opts.setup.as_deref();
++    let refused = |e: String| NcSimError::Refused(e);
++
++    let min_r = prep.planned.iter().map(|p| p.radius).fold(f64::INFINITY, f64::min);
++    let mut dex = crate::stock_sim::stock_grid(world, setup, min_r).map_err(refused)?;
++    let ops: Vec<SimOp<'_>> = prep
++        .planned
++        .iter()
++        .map(|p| SimOp { moves: &p.moves, radius: p.radius, ball: p.ball, cone: p.cone, corner: p.corner })
++        .collect();
++    crate::stock_sim::simulate(&mut dex, &ops).map_err(|e| refused(e.to_string()))?;
++
++    let mut notes = vec![format!(
++        "line {}: the first move starts at its own end point - the position before the program is not known",
++        prep.sections.first().map_or(0, |s| first_line(s.src))
++    )];
++    let target = target_of(world, opts);
++    let deviation = if target.is_empty() {
++        notes.push("no target model - the deviation and the solid law are not judged".to_string());
++        None
++    } else {
++        Some(crate::stock_sim::deviate(&dex, &target, tol).map_err(|e| refused(e.to_string()))?)
++    };
++    let fixtures = opts.fixtures.clone().unwrap_or_else(|| crate::fixture::boxes_for(world, setup));
++    let spindle = prep.machine.as_ref().and_then(|m| m.spindle_d.zip(m.spindle_len)).map(|(d, l)| (d * 0.5, l));
++
++    let resolved: Vec<checks::Resolved<'_>> = prep
++        .sections
++        .iter()
++        .map(|s| checks::Resolved {
++            index: s.src.index,
++            path: crate::cl::Toolpath::new(s.moves.clone()),
++            tool: s.tool,
++            lines: &s.src.move_lines,
++            rpm: s.src.spindle_rpm,
++            origin: s.frame.origin,
++            flip: s.frame.flip,
++        })
++        .collect();
++    let mut findings = checks::verify_sections(&resolved, &target, &fixtures, spindle, tol);
++    let mut program_problems = Vec::new();
++    match &prep.machine {
++        Some(m) => {
++            let (more, problems) = checks::machine_findings(m, &resolved);
++            findings.extend(more);
++            program_problems = problems;
++        }
++        None => notes.push("no machine mounted - travel, feed and spindle limits are not judged".to_string()),
++    }
++    findings.sort_by_key(|f| (f.line, f.section));
++
++    let sections = prep
++        .sections
++        .iter()
++        .map(|s| NcSection {
++            index: s.src.index,
++            tool_number: s.tool.number,
++            tool: s.tool.name.clone(),
++            moves: s.moves.len(),
++            first_line: first_line(s.src),
++        })
++        .collect();
++    Ok(NcSimReport { sections, deviation, tol, findings, program_problems, notes })
++}
++
++/// The playback seed of the program's sections at a display budget of
++/// `texels` cells: the setup's stock, the sections in world millimetres
++/// (one timeline entry each, named `T<n> (line <first line>)`), and the
++/// target model when there is one.
++///
++/// # Errors
++/// The refusals of [`simulate_nc`], and the field view's own refusals.
++pub fn play_seed(world: &World, program: &ParsedProgram, opts: &NcSimOptions, texels: f64) -> Result<crate::stock_play::PlaySeed, NcSimError> {
++    let tol = tol_of(opts)?;
++    let map = unmapped_tools(world, program, opts)?;
++    let prep = prepare(world, program, opts, &map)?;
++    let target = target_of(world, opts);
++    let part = (!target.is_empty()).then_some(target);
++    crate::stock_play::PlaySeed::of_planned(world, prep.planned, opts.setup.clone(), part, tol, texels).map_err(NcSimError::Refused)
++}
+diff --git a/crates/app/src/nc_sim/tools.rs b/crates/app/src/nc_sim/tools.rs
+new file mode 100644
+index 0000000000..bb34e62a3a
+--- /dev/null
++++ b/crates/app/src/nc_sim/tools.rs
+@@ -0,0 +1,172 @@
++//! The external NC program's `T` numbers mapped to cutter geometry (#2218):
++//! an explicit `T -> tool` map, the document's tool numbers, or a `.camtools`
++//! library row. Provenance: RS-274/NGC (NISTIR 6556) tool-select semantics;
++//! the atoms follow CamCraft's own stock-sim law (`stock_sim::plan_ops`).
++
++use flecs_ecs::prelude::World;
++
++use crate::model;
++use crate::tool_library::LibraryTool;
++use crate::tools::{Tool, ToolKind};
++
++use super::NcSimOptions;
++
++/// Where a mapped tool's geometry came from.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NcToolSource {
++    /// The caller's explicit `T -> tool` map.
++    Explicit,
++    /// A document tool that carries this number.
++    Document,
++    /// A `.camtools` library row that states this number.
++    Library,
++}
++
++/// One `T` number with the cutter that the simulation sweeps for it.
++#[derive(Clone, Debug)]
++pub struct NcTool {
++    pub number: u32,
++    pub name: String,
++    pub tool: Tool,
++    pub source: NcToolSource,
++}
++
++/// The result of the tool map: the mapped tools, the `T` numbers with no
++/// cutter geometry, and one reason for each unmapped number.
++#[derive(Clone, Debug, Default)]
++pub struct NcToolMap {
++    pub tools: Vec<NcTool>,
++    pub unmapped: Vec<u32>,
++    pub reasons: Vec<String>,
++}
++
++impl NcToolMap {
++    #[must_use]
++    pub fn get(&self, number: u32) -> Option<&NcTool> {
++        self.tools.iter().find(|t| t.number == number)
++    }
++}
++
++/// The milling kinds a 3-axis stock atom sweeps. Every other kind (a lathe
++/// insert, a probe, a torch, a wire, an electrode, an undercut head) has no
++/// atom on this path and is refused by name.
++const SWEPT: &[ToolKind] = &[
++    ToolKind::EndMill,
++    ToolKind::BallNose,
++    ToolKind::BullNose,
++    ToolKind::Drill,
++    ToolKind::Tap,
++    ToolKind::Bore,
++    ToolKind::Taper,
++    ToolKind::ThreadMill,
++    ToolKind::ThreadMillSingle,
++];
++
++fn document_tool(world: &World, name: &str) -> Option<Tool> {
++    let e = model::find_by_name(world, name)?;
++    if !model::is_tool(world, &e) {
++        return None;
++    }
++    model::tool_of(world, &e)
++}
++
++fn library_named<'a>(library: &'a [LibraryTool], name: &str) -> Option<&'a LibraryTool> {
++    library.iter().find(|r| r.name == name)
++}
++
++fn resolve(world: &World, number: u32, opts: &NcSimOptions, numbered: &[(String, u32)]) -> Result<NcTool, String> {
++    if let Some((_, name)) = opts.tool_map.iter().find(|(t, _)| *t == number) {
++        let tool = library_named(&opts.library, name)
++            .map(|r| r.tool.clone())
++            .or_else(|| document_tool(world, name))
++            .ok_or_else(|| format!("T{number}: the tool map names '{name}', which is no document tool and no library row"))?;
++        return Ok(NcTool { number, name: name.clone(), tool, source: NcToolSource::Explicit });
++    }
++    if let Some((name, _)) = numbered.iter().find(|(_, n)| *n == number) {
++        let tool = document_tool(world, name).ok_or_else(|| format!("T{number}: document tool '{name}' has no definition"))?;
++        return Ok(NcTool { number, name: name.clone(), tool, source: NcToolSource::Document });
++    }
++    if let Some(row) = opts.library.iter().find(|r| r.number == Some(number)) {
++        return Ok(NcTool { number, name: row.name.clone(), tool: row.tool.clone(), source: NcToolSource::Library });
++    }
++    Err(format!("T{number}: no document tool, library row or map entry carries this number"))
++}
++
++/// Why `tool` cannot be swept as a 3-axis cutter, or `None`.
++fn geometry_problem(t: &NcTool) -> Option<String> {
++    if !SWEPT.contains(&t.tool.kind) {
++        return Some(format!(
++            "T{}: '{}' is a {} - the NC simulation sweeps only milling cutters",
++            t.number, t.name, t.tool.kind
++        ));
++    }
++    if !t.tool.is_sane() {
++        return Some(format!("T{}: '{}' has no sane cutter geometry", t.number, t.name));
++    }
++    None
++}
++
++/// Map each distinct `T` number of the program to cutter geometry.
++///
++/// # Errors
++/// Returns the document's tool-number refusal (`tool_numbers::numbers`).
++pub fn map_tools(world: &World, numbers: &[u32], opts: &NcSimOptions) -> Result<NcToolMap, String> {
++    let numbered = crate::tool_numbers::numbers(world)?;
++    let mut out = NcToolMap::default();
++    for &n in numbers {
++        if out.get(n).is_some() || out.unmapped.contains(&n) {
++            continue;
++        }
++        match resolve(world, n, opts, &numbered) {
++            Ok(t) => match geometry_problem(&t) {
++                None => out.tools.push(t),
++                Some(why) => {
++                    out.unmapped.push(n);
++                    out.reasons.push(why);
++                }
++            },
++            Err(why) => {
++                out.unmapped.push(n);
++                out.reasons.push(why);
++            }
++        }
++    }
++    Ok(out)
++}
++
++/// The stock atom of a mapped cutter, by the same kind law as
++/// `stock_sim::plan_ops`.
++pub(super) struct Atom {
++    pub radius: f64,
++    pub ball: bool,
++    /// The cone's cotangent of its half-angle (chamfer mill, pointed drill).
++    pub cone: Option<f64>,
++    /// The bull nose's corner radius.
++    pub corner: Option<f64>,
++    /// A twist drill's point.
++    pub drill: bool,
++}
++
++/// The [`Atom`] of a mapped cutter.
++///
++/// # Errors
++/// Refuses a cone or corner that states no sane geometry, by tool name.
++pub(super) fn atom(t: &NcTool) -> Result<Atom, String> {
++    let tool = &t.tool;
++    let cone_of = |what: &str| -> Result<f64, String> {
++        let tan_half = (tool.tip_angle.to_radians() * 0.5).tan();
++        if tan_half.is_finite() && tan_half > 0.0 && tool.tip_angle > 0.0 && tool.tip_angle < 180.0 {
++            Ok(1.0 / tan_half)
++        } else {
++            Err(format!("T{}: {what} '{}' carries no sane cone (tip angle {})", t.number, t.name, tool.tip_angle))
++        }
++    };
++    let (cone, drill) = match tool.kind {
++        ToolKind::Taper => (Some(cone_of("chamfer mill")?), false),
++        ToolKind::Drill if (tool.tip_angle - 180.0).abs() > 1e-9 => (Some(cone_of("drill")?), true),
++        _ => (None, false),
++    };
++    let corner = crate::stock_sim::bull_corner(tool).map_err(|e| format!("T{}: {e}", t.number))?;
++    let radius = crate::operation::tool_law::cutting_radius(tool).map_err(|e| format!("T{}: {e}", t.number))?;
++    Ok(Atom { radius, ball: tool.kind == ToolKind::BallNose, cone, corner, drill })
++}
+diff --git a/crates/app/src/stock_play.rs b/crates/app/src/stock_play.rs
+index 293d64a71a..d0cc3edfc7 100644
+--- a/crates/app/src/stock_play.rs
++++ b/crates/app/src/stock_play.rs
+@@ -403,6 +403,8 @@ pub use head::{progress, settle_frac, Progress};
+ 
+ #[path = "stock_play_cut.rs"]
+ mod cut;
++#[path = "stock_play_nc.rs"] // #2218: a seed over an external NC program's plan
++mod nc;
+ 
+ #[path = "stock_play_precalc.rs"]
+ mod precalc;
+diff --git a/crates/app/src/stock_play_nc.rs b/crates/app/src/stock_play_nc.rs
+new file mode 100644
+index 0000000000..e738725d6c
+--- /dev/null
++++ b/crates/app/src/stock_play_nc.rs
+@@ -0,0 +1,26 @@
++//! A playback seed from a plan the caller resolved (#2218: an external NC
++//! program's sections, `nc_sim::play_seed`). Provenance: the same display
++//! inputs as `PlaySeed::gather` (`stock_view::display_inputs_of`).
++
++use crate::geometry::Triangle;
++use crate::stock_sim::Planned;
++use crate::stock_view::display_inputs_of;
++
++use super::PlaySeed;
++
++impl PlaySeed {
++    /// A seed over `planned`, drawn on `setup`'s stock at `texels` cells,
++    /// judged against `part` at `tol` when a part is given. The whole plan
++    /// plays: nothing waits for generation.
++    pub(crate) fn of_planned(
++        world: &flecs_ecs::prelude::World,
++        planned: Vec<Planned>,
++        setup: Option<String>,
++        part: Option<Vec<Triangle>>,
++        tol: f64,
++        texels: f64,
++    ) -> Result<Self, String> {
++        let (stock_facets, planned, cell) = display_inputs_of(world, texels, planned, setup)?;
++        Ok(PlaySeed { stock_facets, planned, cell, part, tol: Ok(tol), rest: Vec::new() })
++    }
++}
+diff --git a/crates/app/tests/stock_sim_document.rs b/crates/app/tests/stock_sim_document.rs
+index 38001d08d8..713bc342d5 100644
+--- a/crates/app/tests/stock_sim_document.rs
++++ b/crates/app/tests/stock_sim_document.rs
+@@ -12,7 +12,7 @@
+ //! that is clean, 20 an undercut (gouge), 16 a standing layer (rest),
+ //! each 2 mm exactly, located.
+ //!
+-//! Gate map (M4.4): covers app::commands, app::geometry, motion::machining2d, app::model, app::operation, app::posting, app::schema, geometry::geometry::stock, app::stock_sim, sim::stock_sim, tools::tools, app::world.
++//! Gate map (M4.4): covers app::commands, app::geometry, motion::machining2d, app::model, app::operation, app::posting, app::schema, geometry::geometry::stock, app::stock_sim, sim::stock_sim, tools::tools, app::world, app::nc_sim, app::stock_play (PlaySeed::of_planned).
+ 
+ use flecs_ecs::prelude::World;
+ 
+@@ -30,6 +30,10 @@ use camcraft_app::stock_sim::{DEV_TOL, simulate_document};
+ use camcraft_app::tools::catalog;
+ use camcraft_app::world::new_world;
+ 
++// #2218: external NC programs simulated against the setup.
++#[path = "stock_sim_document/nc_program.rs"]
++mod nc_program;
++
+ fn catalog_tool(name: &str) -> camcraft_app::tools::Tool {
+     catalog()
+         .into_iter()
+diff --git a/crates/app/tests/stock_sim_document/nc_program.rs b/crates/app/tests/stock_sim_document/nc_program.rs
+new file mode 100644
+index 0000000000..64aabfe711
+--- /dev/null
++++ b/crates/app/tests/stock_sim_document/nc_program.rs
+@@ -0,0 +1,245 @@
++//! #2218: an external NC program (parsed by camcraft-gcode) simulated
++//! against the setup's stock, the target model, fixtures and a `.mch`
++//! machine, with each finding on its 1-based NC line; unmapped tools and
++//! a missing stock refused by name; a playback seed that plays.
++//!
++//! Fixture: the suite's 60x60x20 box stock at the origin (XY -30..30,
++//! Z 0..20), a model top at Z 18, a 4 mm end mill as T1, and the WCS on
++//! the world origin unless a test moves it.
++
++use flecs_ecs::prelude::World;
++
++use camcraft_app::cl::{ArcPlane, Move, MoveKind};
++use camcraft_app::commands::{AddTool, History, ImportModel, SetStock, SetWcsOrigin};
++use camcraft_app::geo2d::Point2;
++use camcraft_app::geometry::{IDENTITY_Q, Point3, cube};
++use camcraft_app::machine::{AxisDirection, AxisLimits, Machine};
++use camcraft_app::nc_sim::{
++    frame_for, play_seed, simulate_nc, simulate_nc_text, unmapped_tools, NcFindingKind, NcSimError, NcSimOptions,
++    NcToolSource,
++};
++use camcraft_app::schema::Location;
++use camcraft_app::stock::StockShape;
++use camcraft_app::stock_play::FieldPlay;
++use camcraft_app::tool_library::LibraryTool;
++use camcraft_app::tools::catalog;
++use camcraft_app::world::new_world;
++use camcraft_gcode::{parse_with, ParseOptions};
++use camcraft_sim::fixture::FixtureBox;
++
++const TOOL: &str = "EM-0400-2FL";
++
++fn tool(name: &str) -> camcraft_app::tools::Tool {
++    catalog().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t).expect("catalog entry")
++}
++
++fn world_with(stock: bool, wcs: Point3) -> World {
++    let world = new_world();
++    let mut h = History::default();
++    if stock {
++        let loc = Location { pos: Point3::new(0.0, 0.0, 0.0), rot: IDENTITY_Q };
++        h.execute(&world, SetStock::new(&world, StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 }, loc).expect("stock"));
++    }
++    h.execute(&world, AddTool::new(&world, TOOL, tool(TOOL)).expect("tool"));
++    assert_eq!(camcraft_app::tool_numbers::number_of(&world, TOOL), Some(1), "the first tool is T1");
++    let part = cube(Point3::new(-30.0, -30.0, 0.0), Point3::new(30.0, 30.0, 18.0));
++    h.execute(&world, ImportModel::from_mesh("part", part));
++    h.execute(&world, SetWcsOrigin::new(&world, Location { pos: wcs, rot: IDENTITY_Q }).expect("wcs"));
++    world
++}
++
++fn world() -> World {
++    world_with(true, Point3::new(0.0, 0.0, 0.0))
++}
++
++/// A face program at `z` in rows 3 mm apart; `gouge` puts one feed row 1 mm
++/// lower. Returns the text and the 1-based line of the lowered row.
++fn face(tool: u32, z: f64, shift: [f64; 3], gouge: bool) -> (String, usize) {
++    let mut l = vec![
++        "%".to_string(),
++        "O0100 (FACE)".into(),
++        "G21 G17 G90 G94 G54".into(),
++        format!("T{tool} M6"),
++        "S8000 M3".into(),
++        format!("G0 X{:.3} Y{:.3} Z{:.3}", -34.0 + shift[0], -30.0 + shift[1], 25.0 + shift[2]),
++    ];
++    let mut low = 0;
++    for (k, y) in (0..=20).map(|k| (k, -30.0 + 3.0 * f64::from(k))) {
++        let x = if k % 2 == 0 { 34.0 } else { -34.0 };
++        let zz = if gouge && k == 10 { z - 1.0 } else { z };
++        l.push(format!("G1 Y{:.3} Z{:.3} F600", y + shift[1], zz + shift[2]));
++        l.push(format!("G1 X{:.3}", x + shift[0]));
++        if gouge && k == 10 {
++            low = l.len();
++        }
++    }
++    l.push(format!("G0 Z{:.3}", 25.0 + shift[2]));
++    l.extend(["M5".into(), "M30".into(), "%".into()]);
++    (l.join("\n"), low)
++}
++
++fn run(world: &World, text: &str, opts: &NcSimOptions) -> Result<camcraft_app::nc_sim::NcSimReport, NcSimError> {
++    simulate_nc_text(world, text, &ParseOptions::default(), opts)
++}
++
++#[test]
++fn nc_face_pass_cuts_the_stock_to_the_model_without_findings() {
++    let world = world();
++    let (text, _) = face(1, 18.0, [0.0; 3], false);
++    let r = run(&world, &text, &NcSimOptions::default()).expect("simulates");
++    assert_eq!(r.sections.len(), 1);
++    assert_eq!((r.sections[0].tool_number, r.sections[0].tool.as_str()), (1, TOOL));
++    let dev = r.deviation.as_ref().expect("the part is the target");
++    assert!(dev.max_gouge <= r.tol, "no gouge: {}", dev.max_gouge);
++    assert!(dev.max_rest <= r.tol + 1e-9 || dev.rest_cells > 0, "the deviation is measured");
++    assert!(r.findings.is_empty(), "{:?}", r.findings);
++    assert!(r.notes.iter().any(|n| n.contains("no machine")), "the unjudged machine is said: {:?}", r.notes);
++}
++
++#[test]
++fn nc_gouge_is_found_on_its_nc_line() {
++    let world = world();
++    let (text, low) = face(1, 18.0, [0.0; 3], true);
++    let r = run(&world, &text, &NcSimOptions::default()).expect("simulates");
++    assert!(r.deviation.as_ref().is_some_and(|d| d.max_gouge > 0.9), "the cut stock shows the 1 mm gouge");
++    let gouges: Vec<usize> = r.findings.iter().filter(|f| f.kind == NcFindingKind::Gouge).map(|f| f.line).collect();
++    assert!(gouges.contains(&low), "the gouge names line {low}: {:?}", r.findings);
++    assert!(!r.is_clean());
++}
++
++#[test]
++fn nc_program_reads_the_setup_wcs_origin() {
++    // The WCS at the stock's top corner: program X0 Y0 Z0 is world (-30, -30, 20).
++    let world = world_with(true, Point3::new(-30.0, -30.0, 20.0));
++    let (text, _) = face(1, 18.0, [30.0, 30.0, -20.0], false);
++    let r = run(&world, &text, &NcSimOptions::default()).expect("simulates");
++    assert!(r.deviation.as_ref().is_some_and(|d| d.max_gouge <= r.tol), "same cut as the world-frame program");
++    assert!(r.findings.is_empty(), "{:?}", r.findings);
++}
++
++#[test]
++fn nc_unmapped_tool_is_refused_by_number() {
++    let world = world();
++    let (text, _) = face(7, 18.0, [0.0; 3], false);
++    let err = run(&world, &text, &NcSimOptions::default()).expect_err("T7 has no geometry");
++    match &err {
++        NcSimError::UnmappedTools { numbers, reasons } => {
++            assert_eq!(numbers, &vec![7]);
++            assert!(reasons.iter().any(|r| r.starts_with("T7:")), "each unmapped number says why: {reasons:?}");
++        }
++        other => panic!("wrong refusal: {other}"),
++    }
++    assert!(err.to_string().contains("T7"), "{err}");
++    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let map = unmapped_tools(&world, &parsed, &NcSimOptions::default()).expect("maps");
++    assert_eq!(map.unmapped, vec![7]);
++}
++
++#[test]
++fn nc_tools_come_from_the_map_and_the_library() {
++    let world = world();
++    let mut row = LibraryTool::bare("LIB-4", tool(TOOL));
++    row.number = Some(9);
++    let opts = NcSimOptions {
++        tool_map: vec![(7, "LIB-4".into())],
++        library: vec![row],
++        ..Default::default()
++    };
++    let (text, _) = face(7, 18.0, [0.0; 3], false);
++    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let map = unmapped_tools(&world, &parsed, &opts).expect("maps");
++    assert_eq!(map.get(7).map(|t| t.source), Some(NcToolSource::Explicit));
++    assert!(simulate_nc(&world, &parsed, &opts).is_ok_and(|r| r.sections[0].tool == "LIB-4"));
++    let (text, _) = face(9, 18.0, [0.0; 3], false);
++    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let map = unmapped_tools(&world, &parsed, &opts).expect("maps");
++    assert_eq!(map.get(9).map(|t| t.source), Some(NcToolSource::Library));
++    let probe = LibraryTool::bare("PROBE", tool("PRB-0400"));
++    let opts = NcSimOptions { tool_map: vec![(9, "PROBE".into())], library: vec![probe], ..Default::default() };
++    let err = simulate_nc(&world, &parsed, &opts).expect_err("a probe is no cutter");
++    assert!(matches!(err, NcSimError::UnmappedTools { .. }), "{err}");
++}
++
++#[test]
++fn nc_missing_stock_is_refused_by_name() {
++    let world = world_with(false, Point3::new(0.0, 0.0, 0.0));
++    let (text, _) = face(1, 18.0, [0.0; 3], false);
++    let err = run(&world, &text, &NcSimOptions::default()).expect_err("no stock");
++    assert!(err.to_string().contains("no stock"), "{err}");
++}
++
++#[test]
++fn nc_fixture_strike_is_on_its_nc_line() {
++    let world = world();
++    let text = "G21 G90 G54\nT1 M6\nS8000 M3\nG0 X45 Y0 Z40\nG0 Z10\nG0 Z40\nM30";
++    let clamp = FixtureBox { min: Point3::new(40.0, -5.0, 0.0), max: Point3::new(50.0, 5.0, 25.0) };
++    let opts = NcSimOptions { fixtures: Some(vec![clamp]), ..Default::default() };
++    let r = run(&world, text, &opts).expect("simulates");
++    let lines: Vec<usize> = r.findings.iter().filter(|f| f.kind == NcFindingKind::Fixture).map(|f| f.line).collect();
++    assert!(lines.contains(&5), "the rapid down to Z10 on line 5 strikes the clamp: {:?}", r.findings);
++    assert!(!lines.contains(&4), "line 4 stays above the clamp: {:?}", r.findings);
++}
++
++fn small_mill() -> Machine {
++    let axis = |name: &str, travel| AxisLimits {
++        name: name.into(),
++        feed: Some(500.0),
++        rapid: Some(10000.0),
++        travel: Some(travel),
++        ..Default::default()
++    };
++    Machine {
++        model: "NC test mill".into(),
++        spindle_min: Some(100.0),
++        spindle_max: Some(6000.0),
++        axes: vec![axis("X", (-20.0, 20.0)), axis("Y", (-100.0, 100.0)), axis("Z", (-100.0, 100.0))],
++        ..Default::default()
++    }
++}
++
++#[test]
++fn nc_machine_travel_feed_and_spindle_findings_have_lines() {
++    let world = world();
++    let (text, _) = face(1, 18.0, [0.0; 3], false);
++    let opts = NcSimOptions { machine: Some(small_mill()), ..Default::default() };
++    let r = run(&world, &text, &opts).expect("simulates");
++    let machine: Vec<_> = r.findings.iter().filter(|f| f.kind == NcFindingKind::Machine).collect();
++    // Line 4 is `T1 M6`; the section's first move is line 6.
++    assert!(machine.iter().any(|f| f.line == 6 && f.message.contains("8000 rpm")), "{machine:?}");
++    assert!(machine.iter().any(|f| f.line == 6 && f.message.contains("stroke")), "X-34 is past -20: {machine:?}");
++    assert!(machine.iter().any(|f| f.line == 7 && f.message.contains("600 mm/min")), "{machine:?}");
++    assert!(machine.iter().all(|f| f.message.starts_with(&format!("line {}:", f.line))), "{machine:?}");
++}
++
++#[test]
++fn nc_work_offsets_map_by_origin_and_sign() {
++    let world = world();
++    let text = "G21 G90 G55\nT1 M6\nG0 X0 Y0 Z30\nM30";
++    let err = run(&world, text, &NcSimOptions::default()).expect_err("G55 has no origin");
++    assert!(err.to_string().contains("G55"), "{err}");
++
++    let mut opts = NcSimOptions::default();
++    opts.wcs_origins[1] = Some([10.0, 0.0, 0.0]);
++    let mut m = small_mill();
++    m.axes[0].direction = AxisDirection::Inverted;
++    let f = frame_for(&world, &opts, Some(&m), 1).expect("G55 frame");
++    assert_eq!(f.sign, [-1.0, 1.0, 1.0]);
++    let arc = Move::new(MoveKind::Feed, Point3::new(5.0, 0.0, 1.0), Point3::new(0.0, 5.0, 1.0), Some(300.0))
++        .with_arc_in(Point2::new(0.0, 0.0), true, ArcPlane::Xy);
++    let w = f.move_to_world(&arc).expect("maps");
++    assert_eq!((w.from.x, w.to.x, w.to.y), (5.0, 10.0, 5.0));
++    let a = w.arc.expect("still an arc");
++    assert_eq!((a.center.x, a.center.y, a.ccw), (10.0, 0.0, false), "one negated axis reverses G3 to G2");
++}
++
++#[test]
++fn nc_play_seed_builds_a_playback_that_plays_to_the_end() {
++    let world = world();
++    let (text, _) = face(1, 18.0, [0.0; 3], false);
++    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let seed = play_seed(&world, &parsed, &NcSimOptions::default(), 20_000.0).expect("seed");
++    let total = seed.index().total();
++    assert_eq!(total, parsed.sections.iter().map(|s| s.toolpath.moves.len()).sum::<usize>());
++    let mut play = FieldPlay::from_seed(seed).expect("plays");
++    assert!(play.seek(total).is_ok(), "the playback seeks to its last move");
++}
+diff --git a/docs/decisions/2218-nc-sim-runner.md b/docs/decisions/2218-nc-sim-runner.md
+new file mode 100644
+index 0000000000..d97092e723
+--- /dev/null
++++ b/docs/decisions/2218-nc-sim-runner.md
+@@ -0,0 +1,64 @@
++## #2218 - Simulate and verify an external NC program
++
++**What was decided.** `camcraft_app::nc_sim` simulates a program that
++`camcraft-gcode` parsed. It cuts the setup's stock with the column engine,
++measures the deviation from the target model, runs the solid law and the
++two fixture laws, and runs the machine limits on each move. Each finding
++has its 1-based NC line. `nc_sim::play_seed` builds a `PlaySeed` for the
++playback. The runner reads the document and changes nothing, so it is no
++undoable command. The MCP tool is a follow-up issue.
++
++**The crate edge `camcraft-app` -> `camcraft-gcode`.**
++- Imported items: `parse_with`, `ParseOptions`, `ParsedProgram`,
++  `ParsedSection` (with its `WorkOffset`, `move_lines` and `tool_number`),
++  `GcodeError`.
++- The caller cannot pass the value in: the runner must read the parsed
++  sections, their tool numbers, work offsets and line maps. A closure or a
++  recorded file would copy the parser's types into `app`.
++- What rebuilds: a change in `crates/gcode` rebuilds `camcraft-app` and the
++  crates above it (`camcraft-ui`, the binaries). `camcraft-gcode` depends
++  only on `camcraft-cl` and `camcraft-geometry`, which `app` already uses.
++- The workspace entry comes back. #3955 removed it until a crate used it.
++
++**Choices taken unattended.**
++- Tool map order: the explicit `T -> tool` map (a library row by name, else
++  a document tool by name), then the document's tool numbers, then a
++  `.camtools` row that states the number. Each `T` number with no cutter
++  geometry is listed with its reason. The simulation is refused when the
++  list is not empty. Only milling kinds are cutters here. A probe, a lathe
++  insert, a torch, a wire, an electrode or an undercut head is refused by
++  name.
++- Frame: `world = origin + sign * program_mm`. The sign is the setup's WCS
++  flip times the machine's axis direction. This is the same law that
++  `post::machine::check_path` uses to read program travel. An arc center
++  maps with its plane's two axes. The arc sense reverses when exactly one
++  of them is negated (`post::invert`).
++- Work offsets: the caller can give an origin for each of `G54`..`G59`.
++  Without one, only the setup's own offset is read, from its WCS. Any other
++  offset is refused by name, never read as the setup's origin. A turned
++  setup WCS is refused: the map holds a translation and a sign only.
++- The first move: the parser starts from `Dialect::initial_position`, not
++  from a place the machine stood. The program's first straight move is
++  collapsed to its end point. A note says so. Without this, the approach
++  from (0, 0, 0) gave false gouges and false fixture strikes.
++- Gouge lines: the deviation of the dexel grid has no move index. The
++  line-numbered gouges come from `verify::solid_hits` against the same
++  target, at the simulation tolerance (default `DEV_TOL`).
++- Machine findings: `MachineCheck::check_path` runs once for each move with
++  `SourceLocation::NcLine`, so each finding starts with `line N:`. The tool
++  size and the spindle speed are judged on the section's first move line.
++  The changer capacity is a program-wide finding.
++- Fixtures: the setup's fixture boxes (`fixture::boxes_for`), or the
++  caller's boxes. The holder is the tool's holder cylinder.
++
++**Dropped.**
++- Using the field engine (`Held`) for the verdict: the column engine is the
++  program verdict's engine, and a 3-axis program has no posed move.
++- Reusing `posting::program_ops` or `stock_sim::plan_ops`: they read
++  operations from the world. The runner builds the same `Planned` values
++  from the parsed sections.
++- Transforming the canned cycle records: the parser expands cycles to
++  moves, and the runner keeps only the moves.
++
++**Cost to change later.** The runner is one module with one entry point.
++An MCP tool or a UI dialog calls `simulate_nc_text` or `simulate_nc`.
+
+From 7b01e1ebebe7194501a4b501cafcaf14d5b9693d Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 15:50:31 -0800
+Subject: [PATCH 2/2] fix(sim): guard NC approaches, taper tips and mesh
+ fidelity
+
+Preserve known initial motion and refuse unknown starts. Reject unread taper tips from every tool source and share strict mesh-fidelity preparation between simulation and playback.
+
+Fixes #2218
+---
+ crates/app/src/nc_sim/fidelity.rs             |  74 +++++++
+ crates/app/src/nc_sim/mod.rs                  |  45 ++--
+ crates/app/src/nc_sim/tools.rs                |   6 +
+ .../tests/stock_sim_document/nc_program.rs    |  28 ++-
+ .../app/tests/stock_sim_document/nc_safety.rs | 193 ++++++++++++++++++
+ docs/decisions/2218-nc-sim-runner.md          |  32 +++
+ 6 files changed, 351 insertions(+), 27 deletions(-)
+ create mode 100644 crates/app/src/nc_sim/fidelity.rs
+ create mode 100644 crates/app/tests/stock_sim_document/nc_safety.rs
+
+diff --git a/crates/app/src/nc_sim/fidelity.rs b/crates/app/src/nc_sim/fidelity.rs
+new file mode 100644
+index 0000000000..84d408afa0
+--- /dev/null
++++ b/crates/app/src/nc_sim/fidelity.rs
+@@ -0,0 +1,74 @@
++//! NC verdict preparation from the selected document meshes. Provenance:
++//! CamCraft's model-fidelity law (#864, #1056): no verdict from unknown
++//! facets, and a strict tolerance budget for reduced-fidelity surfaces.
++
++use flecs_ecs::prelude::World;
++
++use super::NcSimOptions;
++use crate::{model, model_fidelity as fidelity};
++
++/// Guard the same inputs for both simulation and playback. Caller-supplied
++/// target facets and fixture boxes replace the corresponding document inputs;
++/// the setup's stock always comes from the document.
++pub(super) fn prepare(world: &World, opts: &NcSimOptions, requested: f64) -> Result<f64, String> {
++    let setup = opts.setup.as_deref();
++    let stock = crate::setup::stock_entity_name(world, setup);
++    if let Some(entity) = model::find_by_name(world, &stock)
++        && fidelity::chord_of(world, &entity).is_none()
++        && !fidelity::stock_fidelity_known(world, setup)
++    {
++        return Err(format!(
++            "stock '{stock}' has unknown mesh fidelity - re-import its source and recreate the stock"
++        ));
++    }
++    let mut judged = vec![stock];
++    if opts.target.is_none() {
++        let skip = crate::stock_source::stock_only_model(world);
++        judged.extend(
++            model::model_entities(world)
++                .into_iter()
++                .filter(|(_, e)| crate::stock_source::judged(world, e, skip))
++                .filter(|(_, e)| {
++                    crate::setup_align::facets_in(world, e, setup).is_some_and(|f| !f.is_empty())
++                })
++                .map(|(n, _)| n),
++        );
++    }
++    let mut worst = 0.0_f64;
++    let mut coarsest = String::new();
++    for name in judged {
++        if let Some(chord) = fidelity::chord_behind(world, &name) {
++            if fidelity::is_unknown(chord) {
++                return Err(format!(
++                    "model or stock '{name}' was {}",
++                    crate::mesh_open::unknown_note(world, &name)
++                ));
++            }
++            let excess = fidelity::excess(chord);
++            if excess > worst {
++                worst = excess;
++                coarsest = name;
++            }
++        }
++    }
++    // Known coarse fixtures are already grown by their chord in steel_box.
++    // The unknown sentinel deliberately cannot grow a box: refuse it here.
++    if opts.fixtures.is_none() {
++        for (name, entity) in crate::fixture::tagged(world, setup) {
++            if fidelity::chord_of(world, &entity).is_some_and(fidelity::is_unknown) {
++                return Err(format!(
++                    "fixture '{name}' was {}",
++                    crate::mesh_open::unknown_note(world, &name)
++                ));
++            }
++        }
++    }
++    if worst == 0.0 {
++        return Ok(requested);
++    }
++    // This runner checks shanks and holders as well as cutting edges, so
++    // use the strict law, without the cutting-only file-tolerance widening.
++    // An explicit tolerance cannot buy back a depleted fidelity budget.
++    crate::verify::excess_floor(requested.min(crate::stock_sim::DEV_TOL), worst)
++        .ok_or_else(|| format!("model or stock '{coarsest}' was {}", fidelity::TOO_COARSE))
++}
+diff --git a/crates/app/src/nc_sim/mod.rs b/crates/app/src/nc_sim/mod.rs
+index da1a3499b0..ccbb0f3b9a 100644
+--- a/crates/app/src/nc_sim/mod.rs
++++ b/crates/app/src/nc_sim/mod.rs
+@@ -11,6 +11,7 @@
+ 
+ mod checks;
+ mod frame;
++mod fidelity;
+ mod tools;
+ 
+ pub use frame::{frame_for, NcFrame};
+@@ -27,12 +28,17 @@ use crate::machine::Machine;
+ use crate::stock_sim::{Deviation, Planned, SimOp, DEV_TOL};
+ use crate::tool_library::LibraryTool;
+ 
+-/// The caller's inputs. Each `None` or empty field reads the document:
+-/// the active setup, its mounted machine, its fixtures and its parts.
++/// The caller's inputs. Optional document overrides read the active setup,
++/// its mounted machine, fixtures and parts when absent. The initial tool
++/// position must be explicitly confirmed before any approach is judged.
+ #[derive(Clone, Debug, Default)]
+ pub struct NcSimOptions {
+     /// The setup whose stock, WCS, fixtures and machine are read (`None`: the active one).
+     pub setup: Option<String>,
++    /// The caller confirms the parser's initial position is the actual tool
++    /// position in the initial work frame. Required for every motion kind;
++    /// an assumed parser default cannot establish a safe approach.
++    pub initial_position_known: bool,
+     /// Explicit `T` number to tool name: a library row's name, else a document tool's.
+     pub tool_map: Vec<(u32, String)>,
+     /// Rows of a `.camtools` library (`tool_library::parse_tool_library`).
+@@ -46,6 +52,7 @@ pub struct NcSimOptions {
+     /// The machine, overriding the setup's mounted `.mch`.
+     pub machine: Option<Machine>,
+     /// The gouge and deviation tolerance, mm (default `DEV_TOL`).
++    /// Reduced mesh fidelity tightens it; an override cannot bypass that guard.
+     pub tol: Option<f64>,
+ }
+ 
+@@ -197,22 +204,13 @@ fn sections<'a>(
+         let tool = map.get(n).ok_or_else(|| NcSimError::UnmappedTools { numbers: vec![n], reasons: Vec::new() })?;
+         let frame = frame_for(world, opts, machine, src.work_offset.index())
+             .map_err(|e| NcSimError::Refused(format!("line {line}: {e}")))?;
+-        let mut moves = src
++        let moves = src
+             .toolpath
+             .moves
+             .iter()
+             .zip(&src.move_lines)
+             .map(|(m, l)| frame.move_to_world(m).map_err(|e| NcSimError::Refused(format!("line {l}: {e}"))))
+             .collect::<Result<Vec<_>, _>>()?;
+-        // The program's first move starts from the parser's assumed
+-        // position (`Dialect::initial_position`), not from a place the
+-        // machine stood: the tool appears at its first commanded point.
+-        if out.is_empty()
+-            && let Some(m) = moves.first_mut()
+-            && m.arc.is_none()
+-        {
+-            m.from = m.to;
+-        }
+         out.push(Section { src, tool, frame, moves });
+     }
+     if out.is_empty() {
+@@ -253,16 +251,23 @@ struct Prepared<'a> {
+     sections: Vec<Section<'a>>,
+     planned: Vec<Planned>,
+     machine: Option<Machine>,
++    tol: f64,
+ }
+ 
+ fn prepare<'a>(world: &World, program: &'a ParsedProgram, opts: &NcSimOptions, map: &'a NcToolMap) -> Result<Prepared<'a>, NcSimError> {
+     if !map.unmapped.is_empty() {
+         return Err(NcSimError::UnmappedTools { numbers: map.unmapped.clone(), reasons: map.reasons.clone() });
+     }
++    if !opts.initial_position_known {
++        return Err(NcSimError::Refused(
++            "the initial tool position is unknown - supply the actual parser start and confirm initial_position_known before judging the approach".into(),
++        ));
++    }
++    let tol = fidelity::prepare(world, opts, tol_of(opts)?).map_err(NcSimError::Refused)?;
+     let machine = machine_of(world, opts)?;
+     let sections = sections(world, program, opts, map, machine.as_ref())?;
+     let planned = planned(&sections, opts.setup.as_deref())?;
+-    Ok(Prepared { sections, planned, machine })
++    Ok(Prepared { sections, planned, machine, tol })
+ }
+ 
+ fn tol_of(opts: &NcSimOptions) -> Result<f64, NcSimError> {
+@@ -292,12 +297,13 @@ pub fn simulate_nc_text(world: &World, text: &str, parse: &ParseOptions, opts: &
+ /// machine limits on every move.
+ ///
+ /// # Errors
+-/// Refuses unmapped tools, a setup with no stock, and the frame refusals
+-/// ([`frame_for`]), each by name. A refusal changes nothing.
++/// Refuses an unknown initial position, unsupported tools, missing stock,
++/// unknown or excessive mesh error, and frame refusals ([`frame_for`]),
++/// each by name. A refusal changes nothing.
+ pub fn simulate_nc(world: &World, program: &ParsedProgram, opts: &NcSimOptions) -> Result<NcSimReport, NcSimError> {
+-    let tol = tol_of(opts)?;
+     let map = unmapped_tools(world, program, opts)?;
+     let prep = prepare(world, program, opts, &map)?;
++    let tol = prep.tol;
+     let setup = opts.setup.as_deref();
+     let refused = |e: String| NcSimError::Refused(e);
+ 
+@@ -310,10 +316,7 @@ pub fn simulate_nc(world: &World, program: &ParsedProgram, opts: &NcSimOptions)
+         .collect();
+     crate::stock_sim::simulate(&mut dex, &ops).map_err(|e| refused(e.to_string()))?;
+ 
+-    let mut notes = vec![format!(
+-        "line {}: the first move starts at its own end point - the position before the program is not known",
+-        prep.sections.first().map_or(0, |s| first_line(s.src))
+-    )];
++    let mut notes = Vec::new();
+     let target = target_of(world, opts);
+     let deviation = if target.is_empty() {
+         notes.push("no target model - the deviation and the solid law are not judged".to_string());
+@@ -371,9 +374,9 @@ pub fn simulate_nc(world: &World, program: &ParsedProgram, opts: &NcSimOptions)
+ /// # Errors
+ /// The refusals of [`simulate_nc`], and the field view's own refusals.
+ pub fn play_seed(world: &World, program: &ParsedProgram, opts: &NcSimOptions, texels: f64) -> Result<crate::stock_play::PlaySeed, NcSimError> {
+-    let tol = tol_of(opts)?;
+     let map = unmapped_tools(world, program, opts)?;
+     let prep = prepare(world, program, opts, &map)?;
++    let tol = prep.tol;
+     let target = target_of(world, opts);
+     let part = (!target.is_empty()).then_some(target);
+     crate::stock_play::PlaySeed::of_planned(world, prep.planned, opts.setup.clone(), part, tol, texels).map_err(NcSimError::Refused)
+diff --git a/crates/app/src/nc_sim/tools.rs b/crates/app/src/nc_sim/tools.rs
+index bb34e62a3a..b2f847ae85 100644
+--- a/crates/app/src/nc_sim/tools.rs
++++ b/crates/app/src/nc_sim/tools.rs
+@@ -100,6 +100,12 @@ fn geometry_problem(t: &NcTool) -> Option<String> {
+             t.number, t.name, t.tool.kind
+         ));
+     }
++    if camcraft_tools::taper::is_unread_tip(&t.tool) {
++        return Some(format!(
++            "T{}: '{}' has a {} taper tip - the NC simulation cannot verify this tip geometry",
++            t.number, t.name, t.tool.tip_form
++        ));
++    }
+     if !t.tool.is_sane() {
+         return Some(format!("T{}: '{}' has no sane cutter geometry", t.number, t.name));
+     }
+diff --git a/crates/app/tests/stock_sim_document/nc_program.rs b/crates/app/tests/stock_sim_document/nc_program.rs
+index 64aabfe711..8ce8ce0045 100644
+--- a/crates/app/tests/stock_sim_document/nc_program.rs
++++ b/crates/app/tests/stock_sim_document/nc_program.rs
+@@ -27,6 +27,9 @@ use camcraft_app::world::new_world;
+ use camcraft_gcode::{parse_with, ParseOptions};
+ use camcraft_sim::fixture::FixtureBox;
+ 
++#[path = "nc_safety.rs"]
++mod safety;
++
+ const TOOL: &str = "EM-0400-2FL";
+ 
+ fn tool(name: &str) -> camcraft_app::tools::Tool {
+@@ -78,8 +81,20 @@ fn face(tool: u32, z: f64, shift: [f64; 3], gouge: bool) -> (String, usize) {
+     (l.join("\n"), low)
+ }
+ 
++fn known_parse() -> ParseOptions {
++    let mut parse = ParseOptions::default();
++    // The fixture starts above all steel, outside the part's left edge.
++    parse.dialect.initial_position = Point3::new(-34.0, -30.0, 40.0);
++    parse
++}
++
++fn known_opts() -> NcSimOptions {
++    NcSimOptions { initial_position_known: true, ..Default::default() }
++}
++
+ fn run(world: &World, text: &str, opts: &NcSimOptions) -> Result<camcraft_app::nc_sim::NcSimReport, NcSimError> {
+-    simulate_nc_text(world, text, &ParseOptions::default(), opts)
++    let opts = NcSimOptions { initial_position_known: true, ..opts.clone() };
++    simulate_nc_text(world, text, &known_parse(), &opts)
+ }
+ 
+ #[test]
+@@ -130,7 +145,7 @@ fn nc_unmapped_tool_is_refused_by_number() {
+         other => panic!("wrong refusal: {other}"),
+     }
+     assert!(err.to_string().contains("T7"), "{err}");
+-    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let parsed = parse_with(&text, &known_parse()).expect("parses");
+     let map = unmapped_tools(&world, &parsed, &NcSimOptions::default()).expect("maps");
+     assert_eq!(map.unmapped, vec![7]);
+ }
+@@ -141,17 +156,18 @@ fn nc_tools_come_from_the_map_and_the_library() {
+     let mut row = LibraryTool::bare("LIB-4", tool(TOOL));
+     row.number = Some(9);
+     let opts = NcSimOptions {
++        initial_position_known: true,
+         tool_map: vec![(7, "LIB-4".into())],
+         library: vec![row],
+         ..Default::default()
+     };
+     let (text, _) = face(7, 18.0, [0.0; 3], false);
+-    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let parsed = parse_with(&text, &known_parse()).expect("parses");
+     let map = unmapped_tools(&world, &parsed, &opts).expect("maps");
+     assert_eq!(map.get(7).map(|t| t.source), Some(NcToolSource::Explicit));
+     assert!(simulate_nc(&world, &parsed, &opts).is_ok_and(|r| r.sections[0].tool == "LIB-4"));
+     let (text, _) = face(9, 18.0, [0.0; 3], false);
+-    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
++    let parsed = parse_with(&text, &known_parse()).expect("parses");
+     let map = unmapped_tools(&world, &parsed, &opts).expect("maps");
+     assert_eq!(map.get(9).map(|t| t.source), Some(NcToolSource::Library));
+     let probe = LibraryTool::bare("PROBE", tool("PRB-0400"));
+@@ -236,8 +252,8 @@ fn nc_work_offsets_map_by_origin_and_sign() {
+ fn nc_play_seed_builds_a_playback_that_plays_to_the_end() {
+     let world = world();
+     let (text, _) = face(1, 18.0, [0.0; 3], false);
+-    let parsed = parse_with(&text, &ParseOptions::default()).expect("parses");
+-    let seed = play_seed(&world, &parsed, &NcSimOptions::default(), 20_000.0).expect("seed");
++    let parsed = parse_with(&text, &known_parse()).expect("parses");
++    let seed = play_seed(&world, &parsed, &known_opts(), 20_000.0).expect("seed");
+     let total = seed.index().total();
+     assert_eq!(total, parsed.sections.iter().map(|s| s.toolpath.moves.len()).sum::<usize>());
+     let mut play = FieldPlay::from_seed(seed).expect("plays");
+diff --git a/crates/app/tests/stock_sim_document/nc_safety.rs b/crates/app/tests/stock_sim_document/nc_safety.rs
+new file mode 100644
+index 0000000000..c35a9f0b6a
+--- /dev/null
++++ b/crates/app/tests/stock_sim_document/nc_safety.rs
+@@ -0,0 +1,193 @@
++//! Review pins (#4470): the first motion, unsupported taper tips, and
++//! document mesh fidelity must never disappear from an NC verdict.
++
++use super::*;
++use camcraft_app::commands::TagFixture;
++use camcraft_app::{model, model_fidelity};
++use camcraft_app::stock_sim::DEV_TOL;
++use camcraft_tools::taper::TaperTip;
++
++fn parsed_from(text: &str, start: Point3) -> camcraft_gcode::ParsedProgram {
++    let mut parse = ParseOptions::default();
++    parse.dialect.initial_position = start;
++    parse_with(text, &parse).expect("parses from the stated position")
++}
++
++#[test]
++fn nc_first_rapid_crossing_fixture_is_checked_with_clear_endpoints() {
++    let world = world();
++    let parsed = parsed_from("G21 G90 G54\nT1 M6\nG0 X10 Y0 Z10\nM30", Point3::new(-10.0, 0.0, 10.0));
++    let clamp = FixtureBox { min: Point3::new(-1.0, -3.0, 0.0), max: Point3::new(1.0, 3.0, 15.0) };
++    let opts = NcSimOptions { target: Some(Vec::new()), fixtures: Some(vec![clamp]), ..known_opts() };
++    let report = simulate_nc(&world, &parsed, &opts).expect("known approach is judged");
++    assert!(report.findings.iter().any(|f| f.line == 3 && f.kind == NcFindingKind::Fixture), "{:?}", report.findings);
++    assert!(!report.is_clean());
++}
++
++#[test]
++fn nc_first_feed_crossing_target_is_checked_with_clear_endpoints() {
++    let world = world();
++    let parsed = parsed_from("G21 G90 G54\nT1 M6\nG1 X10 Y0 Z10 F300\nM30", Point3::new(-10.0, 0.0, 10.0));
++    let target = cube(Point3::new(-1.0, -3.0, 0.0), Point3::new(1.0, 3.0, 15.0));
++    let opts = NcSimOptions { target: Some(target.facets.to_vec()), fixtures: Some(Vec::new()), ..known_opts() };
++    let report = simulate_nc(&world, &parsed, &opts).expect("known approach is judged");
++    assert!(report.findings.iter().any(|f| f.line == 3 && f.kind == NcFindingKind::Gouge), "{:?}", report.findings);
++    assert!(!report.is_clean());
++}
++
++#[test]
++fn nc_unknown_start_refuses_straights_and_arcs_in_simulation_and_playback() {
++    let world = world();
++    for first in ["G0 X10 Y0 Z10", "G1 X10 Y0 Z10 F300", "G3 X10 Y0 Z10 I10 J0 F300"] {
++        let text = format!("G21 G17 G90 G54\nT1 M6\n{first}\nM30");
++        let parsed = parsed_from(&text, Point3::new(-10.0, 0.0, 10.0));
++        let opts = NcSimOptions::default();
++        let err = simulate_nc(&world, &parsed, &opts).expect_err("unknown initial position is refused");
++        assert!(err.to_string().contains("initial tool position"), "{err}");
++        let err = match play_seed(&world, &parsed, &opts, 2_000.0) {
++            Err(err) => err,
++            Ok(_) => panic!("unknown initial position must not play"),
++        };
++        assert!(err.to_string().contains("initial tool position"), "{err}");
++    }
++}
++
++#[test]
++fn nc_flat_and_ball_taper_tips_are_refused_from_every_tool_source() {
++    for form in [TaperTip::Flat, TaperTip::Ball] {
++        for source in [NcToolSource::Explicit, NcToolSource::Document, NcToolSource::Library] {
++            let world = world();
++            let mut cutter = tool("CM-0600-90");
++            cutter.tip_form = form;
++            cutter.tip_diameter = if form == TaperTip::Flat { 2.0 } else { 0.0 };
++            cutter.corner_r = if form == TaperTip::Ball { 1.0 } else { 0.0 };
++            assert!(cutter.is_sane(), "the {form} tool must be valid geometry");
++            let mut opts = known_opts();
++            let number = match source {
++                NcToolSource::Document => {
++                    History::default().execute(&world, AddTool::new(&world, "taper", cutter).expect("sane taper"));
++                    camcraft_app::tool_numbers::number_of(&world, "taper").expect("numbered document tool")
++                }
++                NcToolSource::Explicit | NcToolSource::Library => {
++                    let mut row = LibraryTool::bare("taper", cutter);
++                    if source == NcToolSource::Explicit {
++                        opts.tool_map.push((9, "taper".into()));
++                    } else {
++                        row.number = Some(9);
++                    }
++                    opts.library.push(row);
++                    9
++                }
++            };
++            let text = format!("G21 G90 G54\nT{number} M6\nG0 X0 Y0 Z40\nM30");
++            let parsed = parse_with(&text, &known_parse()).expect("parses");
++            let map = unmapped_tools(&world, &parsed, &opts).expect("tool map");
++            assert_eq!(map.unmapped, vec![number], "{form} from {source:?}");
++            assert!(map.reasons.iter().any(|why| why.contains(&form.to_string()) && why.contains(&format!("T{number}"))), "{:?}", map.reasons);
++            assert!(matches!(simulate_nc(&world, &parsed, &opts), Err(NcSimError::UnmappedTools { .. })));
++            assert!(matches!(play_seed(&world, &parsed, &opts, 2_000.0), Err(NcSimError::UnmappedTools { .. })));
++        }
++    }
++}
++
++fn set_fidelity(world: &World, name: &str, chord: f64) {
++    let entity = model::find_by_name(world, name).expect("named mesh");
++    model_fidelity::set(world, &entity, Some(chord));
++}
++
++fn stock_from_model(world: &World, chord: f64) {
++    let mut history = History::default();
++    history.execute(world, ImportModel::from_mesh("blank", cube(Point3::new(-30.0, -30.0, 0.0), Point3::new(30.0, 30.0, 20.0))));
++    set_fidelity(world, "blank", chord);
++    history.execute(world, SetStock::new(world, StockShape::FromModel { source: "blank".into() }, Location::default()).expect("model stock"));
++}
++
++fn air_program() -> camcraft_gcode::ParsedProgram {
++    parse_with("G21 G90 G54\nT1 M6\nG0 X0 Y0 Z40\nM30", &known_parse()).expect("air program")
++}
++
++fn assert_fidelity_refusal(world: &World, opts: &NcSimOptions, name: &str) {
++    let parsed = air_program();
++    let err = simulate_nc(world, &parsed, opts).expect_err("untrusted facets cannot give a verdict");
++    assert!(err.to_string().contains(name), "{err}");
++    let err = match play_seed(world, &parsed, opts, 2_000.0) {
++        Err(err) => err,
++        Ok(_) => panic!("untrusted facets cannot give playback verdicts"),
++    };
++    assert!(err.to_string().contains(name), "{err}");
++}
++
++#[test]
++fn nc_reduced_target_tightens_simulation_and_playback_even_with_explicit_tolerance() {
++    let world = world();
++    let excess = DEV_TOL * 0.25;
++    let chord = camcraft_app::geometry::import::step::CHORD_CAP + excess;
++    set_fidelity(&world, "part", chord);
++    for tol in [None, Some(DEV_TOL), Some(10.0)] {
++        let opts = NcSimOptions { tol, ..known_opts() };
++        let report = simulate_nc(&world, &air_program(), &opts).expect("reduced target is still verifiable");
++        assert!((report.tol - (DEV_TOL - excess)).abs() < 1e-12, "{}", report.tol);
++        let seed = play_seed(&world, &air_program(), &opts, 2_000.0).expect("seed");
++        let play = FieldPlay::from_seed(seed).expect("playback");
++        assert!((play.view().tol - report.tol).abs() < 1e-12);
++    }
++}
++
++#[test]
++fn nc_reduced_stock_tightens_simulation_and_playback_without_document_target() {
++    let world = world();
++    let excess = DEV_TOL * 0.25;
++    stock_from_model(&world, camcraft_app::geometry::import::step::CHORD_CAP + excess);
++    // An external target does not erase fidelity of the stock itself.
++    let opts = NcSimOptions { target: Some(Vec::new()), tol: Some(10.0), ..known_opts() };
++    let report = simulate_nc(&world, &air_program(), &opts).expect("reduced stock is verifiable");
++    assert!((report.tol - (DEV_TOL - excess)).abs() < 1e-12, "{}", report.tol);
++    let seed = play_seed(&world, &air_program(), &opts, 2_000.0).expect("seed");
++    assert!((FieldPlay::from_seed(seed).expect("playback").view().tol - report.tol).abs() < 1e-12);
++}
++
++#[test]
++fn nc_unknown_target_and_fixture_refuse_simulation_and_playback_with_explicit_tolerance() {
++    for fixture in [false, true] {
++        let world = world();
++        let name = if fixture { "clamp" } else { "part" };
++        if fixture {
++            let mut history = History::default();
++            history.execute(&world, ImportModel::from_mesh(name, cube(Point3::new(40.0, -5.0, 0.0), Point3::new(50.0, 5.0, 20.0))));
++            history.execute(&world, TagFixture::new(&world, name, None).expect("fixture"));
++        }
++        set_fidelity(&world, name, model_fidelity::UNKNOWN_MM);
++        for tol in [None, Some(10.0)] {
++            assert_fidelity_refusal(&world, &NcSimOptions { tol, ..known_opts() }, name);
++        }
++    }
++}
++
++#[test]
++fn nc_unknown_stock_refuses_even_when_target_and_fixtures_are_overridden() {
++    let world = world();
++    stock_from_model(&world, model_fidelity::UNKNOWN_MM);
++    let opts = NcSimOptions { target: Some(Vec::new()), fixtures: Some(Vec::new()), tol: Some(10.0), ..known_opts() };
++    assert_fidelity_refusal(&world, &opts, "stock");
++}
++
++#[test]
++fn nc_unverifiable_reduced_target_cannot_be_bypassed_by_a_large_tolerance() {
++    let world = world();
++    set_fidelity(&world, "part", camcraft_app::geometry::import::step::CHORD_CAP + DEV_TOL * 2.0);
++    assert_fidelity_refusal(&world, &NcSimOptions { tol: Some(10.0), ..known_opts() }, "part");
++}
++
++#[test]
++fn nc_legacy_stock_with_a_missing_source_refuses_simulation_and_playback() {
++    let world = world();
++    stock_from_model(&world, camcraft_app::geometry::import::step::CHORD_CAP + DEV_TOL * 0.25);
++    // Legacy copies have no own record. Once their source is gone there
++    // is no evidence that their retained facets have any known fidelity.
++    let stock = camcraft_app::setup::stock_entity_name(&world, None);
++    let entity = model::find_by_name(&world, &stock).expect("stock copy");
++    model_fidelity::set(&world, &entity, None);
++    History::default().execute(&world, camcraft_app::commands::DeleteEntity::new(&world, "blank").expect("delete source"));
++    let opts = NcSimOptions { target: Some(Vec::new()), fixtures: Some(Vec::new()), tol: Some(10.0), ..known_opts() };
++    assert_fidelity_refusal(&world, &opts, "stock");
++}
+diff --git a/docs/decisions/2218-nc-sim-runner.md b/docs/decisions/2218-nc-sim-runner.md
+index d97092e723..f728c94442 100644
+--- a/docs/decisions/2218-nc-sim-runner.md
++++ b/docs/decisions/2218-nc-sim-runner.md
+@@ -62,3 +62,35 @@ undoable command. The MCP tool is a follow-up issue.
+ 
+ **Cost to change later.** The runner is one module with one entry point.
+ An MCP tool or a UI dialog calls `simulate_nc_text` or `simulate_nc`.
++
++**Review-fix decisions (PR #4470).** These supersede the first-move
++choice above.
++- Require `NcSimOptions::initial_position_known` before simulation or
++  playback. The caller confirms that the parser's initial position is
++  the actual tool position. Preserve the complete first move for straight
++  paths and arcs alike. Collapsing it can hide a collision between clear
++  endpoints; a note cannot make that verdict safe. Inferring knowledge
++  from a nonzero parser start was dropped because zero can be a real
++  start, and any configured value can still be an assumption.
++- Reject `taper::is_unread_tip` after tool resolution, for explicit,
++  document and library mappings. Flat and ball taper tips must not be
++  judged as sharp cones. Implementing their sweep and collision geometry
++  was dropped from this review fix: those shapes need their own verified
++  laws before this door can accept them.
++- Use one fidelity preparation guard for simulation and playback. Check
++  the selected stock, the document target and the selected fixtures;
++  explicit target facets or fixture boxes replace their respective
++  document inputs. Unknown fidelity refuses both entry points. Known
++  coarse fixture boxes retain their existing chord growth. For reduced
++  stock or target fidelity, subtract the maximum excess from the lesser
++  of the requested tolerance and `DEV_TOL`, refusing when no positive
++  budget remains. This uses the strict law because the checks include
++  shanks and holders. Cutting-only tolerance widening and allowing an
++  explicit tolerance to restore an exhausted fidelity budget were
++  dropped: neither supplies an honest body-collision verdict. Playback
++  receives the same adjusted tolerance rather than an unguarded value.
++
++**Cost to change these choices later.** Callers must explicitly confirm
++the parser start. Accepting other taper tips requires verified stock and
++collision shapes. Relaxing the fidelity guard requires laws that preserve
++the same surface and body bounds in both simulation and playback.
