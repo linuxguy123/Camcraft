@@ -1,0 +1,1217 @@
+From 829a7f8fae8cf0df5f49558832c8f5bad3c5dba9 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 14:43:49 -0800
+Subject: [PATCH 1/4] feat(2d): face to size from numbers on a stock-only setup
+
+A new undoable FaceToSize command holds an optional SetStock (a box
+with its top at the top Z) and a normal Face on the stock, from the top
+Z down to the final Z in passes of the depth per pass. One undo takes
+back the two. Z values are program Z (the active setup's WCS, else the
+world origin). The command refuses by name: a final Z not below the top
+Z, a depth per pass or stepover not above 0, a missing tool or one
+narrower than the stepover, no stock and no size, a top Z under the
+stock top, a final Z at or under the stock bottom.
+
+The MCP tool face_to_size and a "Face to size" group on the Stock page
+call the same command. The generated MCP reference and the MCP guide
+name the tool.
+
+Fixes #3196
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/commands/face_to_size.rs       | 245 ++++++++++++++++++
+ crates/app/src/commands/mod.rs                |   3 +
+ crates/app/src/mcp/face_to_size_tools.rs      |  98 +++++++
+ crates/app/src/mcp/mod.rs                     |   2 +
+ crates/app/src/mcp/tools.rs                   |   1 +
+ crates/app/tests/mcp_face_to_size.rs          | 191 ++++++++++++++
+ crates/ui/src/egui_app/mod.rs                 |   2 +
+ crates/ui/src/egui_app/stock_face_to_size.rs  | 144 ++++++++++
+ crates/ui/src/egui_app/stock_page.rs          |   2 +
+ crates/ui/src/egui_app/tests.rs               |   1 +
+ .../src/egui_app/tests/stock_face_to_size.rs  |  93 +++++++
+ crates/ui/src/state.rs                        |   5 +
+ crates/ui/src/state_face_to_size.rs           |  26 ++
+ docs/agents/mcp-tools.md                      |   3 +-
+ docs/decisions/3196-face-to-size.md           |  49 ++++
+ site/content/guide/automate/mcp.md            |   2 +-
+ 16 files changed, 865 insertions(+), 2 deletions(-)
+ create mode 100644 crates/app/src/commands/face_to_size.rs
+ create mode 100644 crates/app/src/mcp/face_to_size_tools.rs
+ create mode 100644 crates/app/tests/mcp_face_to_size.rs
+ create mode 100644 crates/ui/src/egui_app/stock_face_to_size.rs
+ create mode 100644 crates/ui/src/egui_app/tests/stock_face_to_size.rs
+ create mode 100644 crates/ui/src/state_face_to_size.rs
+ create mode 100644 docs/decisions/3196-face-to-size.md
+
+diff --git a/crates/app/src/commands/face_to_size.rs b/crates/app/src/commands/face_to_size.rs
+new file mode 100644
+index 0000000000..a87eb0e900
+--- /dev/null
++++ b/crates/app/src/commands/face_to_size.rs
+@@ -0,0 +1,245 @@
++//! `FaceToSize` (#3196): face a block to height from numbers, as ONE
++//! undoable step - an optional `SetStock` (a box of the stated size,
++//! its top at the stated top Z) and a normal `CreateOperation` of a
++//! Face on the setup's stock, from the top Z down to the final Z in
++//! passes of the stated depth. The Z values are program Z: measured
++//! from the active setup's placed WCS, else from the world origin.
++//! Every number is checked at construction; a refusal names it and
++//! leaves the world as it was.
++//!
++//! Provenance: our own design over plain facing practice (top Z, final
++//! Z, depth per pass, stepover); the `SetSheetJob` composite shape; no
++//! vendor material consulted.
++
++use flecs_ecs::prelude::World;
++
++use crate::commands::{BatchCommand, Command, CommandError, CreateOperation, SetStock};
++use crate::model;
++use crate::operation::{Height, OpParams, SrcRef};
++use crate::schema::Location;
++use crate::stock::StockShape;
++
++/// How far the clearance plane stands over the top Z, mm (the seed's).
++const CLEARANCE_MM: f64 = 25.0;
++/// The slack a top Z may sit under the stock top (a float round-off).
++const TOP_SLACK_MM: f64 = 1e-6;
++/// The name a face to size takes when the caller gives none.
++pub const DEFAULT_NAME: &str = "Face to size";
++
++/// What a face to size asks for, in plain machining terms (mm, mm/min).
++#[derive(Clone, Debug, PartialEq)]
++pub struct FaceToSizeSpec {
++    /// The operation's name; `None` takes the first free [`DEFAULT_NAME`].
++    pub name: Option<String>,
++    /// The facing tool, by its document name.
++    pub tool: String,
++    /// A box stock `[length X, width Y, height Z]` with its top at
++    /// `top_z`; `None` faces the setup's stock as it stands.
++    pub stock: Option<[f64; 3]>,
++    /// The Z of the first pass's top, program Z.
++    pub top_z: f64,
++    /// The finished Z, program Z.
++    pub final_z: f64,
++    /// Depth per pass.
++    pub stepdown: f64,
++    /// Radial stepover between rows.
++    pub stepover: f64,
++    /// Climb (true) or conventional cut.
++    pub climb: bool,
++    /// Cutting feed.
++    pub feed: f64,
++    /// Plunge feed.
++    pub plunge_feed: f64,
++}
++
++/// The stock and the Face as one undo step.
++pub struct FaceToSize {
++    operation: String,
++    stock_set: bool,
++    batch: BatchCommand,
++}
++
++impl std::fmt::Debug for FaceToSize {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("FaceToSize").field("operation", &self.operation).field("stock_set", &self.stock_set).finish_non_exhaustive()
++    }
++}
++
++fn invalid(why: impl Into<String>) -> CommandError {
++    CommandError::Invalid(why.into())
++}
++
++/// The numbers alone, before the world is read.
++fn check_numbers(s: &FaceToSizeSpec) -> Result<(), CommandError> {
++    let named = [
++        ("top Z", s.top_z),
++        ("final Z", s.final_z),
++        ("depth per pass", s.stepdown),
++        ("stepover", s.stepover),
++        ("feed", s.feed),
++        ("plunge feed", s.plunge_feed),
++    ];
++    if let Some((what, v)) = named.iter().find(|(_, v)| !v.is_finite()) {
++        return Err(invalid(format!("the {what} {v} is not a number")));
++    }
++    if s.final_z >= s.top_z {
++        return Err(invalid(format!("the final Z {} must be below the top Z {}", s.final_z, s.top_z)));
++    }
++    if s.stepdown <= 0.0 {
++        return Err(invalid(format!("the depth per pass {} must be more than 0", s.stepdown)));
++    }
++    if s.stepover <= 0.0 {
++        return Err(invalid(format!("the stepover {} must be more than 0", s.stepover)));
++    }
++    if s.feed <= 0.0 || s.plunge_feed <= 0.0 {
++        return Err(invalid(format!("the feed {} and the plunge feed {} must be more than 0", s.feed, s.plunge_feed)));
++    }
++    if s.tool.trim().is_empty() {
++        return Err(CommandError::Needs("face to size needs a tool - add a facing tool first".into()));
++    }
++    Ok(())
++}
++
++/// The tool must be a document tool at least as wide as the stepover:
++/// a wider stepover leaves ribs standing between the rows.
++fn check_tool(world: &World, s: &FaceToSizeSpec) -> Result<(), CommandError> {
++    let entity = model::find_by_name(world, &s.tool).ok_or_else(|| CommandError::NotFound(s.tool.clone()))?;
++    let tool = model::tool_of(world, &entity).ok_or_else(|| invalid(format!("'{}' is not a tool", s.tool)))?;
++    if s.stepover > tool.diameter {
++        return Err(invalid(format!(
++            "the stepover {} is wider than the tool '{}' ({} mm): ribs would stand between the rows",
++            s.stepover, s.tool, tool.diameter
++        )));
++    }
++    Ok(())
++}
++
++/// The first free name: the caller's, or `Face to size`, `Face to size 2`...
++fn op_name(world: &World, asked: Option<&str>) -> String {
++    if let Some(n) = asked {
++        return n.to_owned();
++    }
++    (1..)
++        .map(|i| if i == 1 { DEFAULT_NAME.to_owned() } else { format!("{DEFAULT_NAME} {i}") })
++        .find(|n| model::find_by_name(world, n).is_none())
++        .unwrap_or_else(|| DEFAULT_NAME.to_owned())
++}
++
++/// The world Z of program Z0 for the active setup: its placed WCS, else 0.
++fn program_zero(world: &World, setup: Option<&str>) -> [f64; 3] {
++    crate::setup::wcs_entity(world, setup)
++        .and_then(|e| model::transform_of(world, &e))
++        .map_or([0.0; 3], |l| [l.pos.x, l.pos.y, l.pos.z])
++}
++
++/// The Face that steps from `top` down to `bottom` (world Z).
++fn face_params(s: &FaceToSizeSpec, top: f64, bottom: f64) -> OpParams {
++    OpParams::Face {
++        holes: Default::default(),
++        tilt: None,
++        stepover: s.stepover,
++        clearance_z: Height::fixed(top + CLEARANCE_MM),
++        cut_z: Height::fixed(bottom),
++        top_z: Some(Height::fixed(top)),
++        stepdown: Some(s.stepdown),
++        feed: s.feed,
++        plunge_feed: s.plunge_feed,
++        climb: s.climb,
++        blend_turns: false,
++        blend_radius: None,
++        picks: Default::default(),
++    }
++}
++
++/// The stock the face cuts must hold the final Z, and its top must not
++/// stand over the top Z: the first pass would cut more than one depth.
++fn check_against_stock(stock_top: f64, stock_bottom: f64, top: f64, bottom: f64, s: &FaceToSizeSpec) -> Result<(), CommandError> {
++    if top < stock_top - TOP_SLACK_MM {
++        return Err(invalid(format!(
++            "the top Z {} is below the stock top (Z{:.3} here): the first pass would cut more than the depth per pass",
++            s.top_z,
++            stock_top - (top - s.top_z)
++        )));
++    }
++    if bottom <= stock_bottom {
++        return Err(invalid(format!(
++            "the final Z {} is at or below the stock bottom (Z{:.3} here): the face would cut through the block",
++            s.final_z,
++            stock_bottom - (bottom - s.final_z)
++        )));
++    }
++    Ok(())
++}
++
++impl FaceToSize {
++    /// Validate `spec` against the world and build the step. Refuses by
++    /// name: a final Z not below the top Z, a depth per pass or stepover
++    /// not above 0, a missing tool or one narrower than the stepover, no
++    /// stock (and no size), a top Z under the stock top, or a final Z at
++    /// or under the stock bottom.
++    pub fn new(world: &World, spec: &FaceToSizeSpec) -> Result<Self, CommandError> {
++        check_numbers(spec)?;
++        check_tool(world, spec)?;
++        let setup = crate::setup::active(world);
++        let zero = program_zero(world, setup.as_deref());
++        let (top, bottom) = (zero[2] + spec.top_z, zero[2] + spec.final_z);
++        let name = op_name(world, spec.name.as_deref());
++        let params = face_params(spec, top, bottom);
++        let stock = match spec.stock {
++            Some([dx, dy, dz]) => {
++                check_against_stock(top, top - dz, top, bottom, spec)?;
++                // Kept where the stock sat in XY; at the WCS when none.
++                let (cx, cy) = model::stock_world_aabb_for(world, setup.as_deref())
++                    .map_or((zero[0], zero[1]), |b| ((b.min.x + b.max.x) / 2.0, (b.min.y + b.max.y) / 2.0));
++                let at = Location { pos: crate::geometry::Point3 { x: cx, y: cy, z: top - dz }, ..Location::default() };
++                Some(SetStock::new(world, StockShape::Box { dx, dy, dz }, at)?)
++            }
++            None => {
++                let b = model::stock_world_aabb_for(world, setup.as_deref()).ok_or_else(|| {
++                    CommandError::Needs("face to size needs stock - give the stock size, or set up the stock first".into())
++                })?;
++                check_against_stock(b.max.z, b.min.z, top, bottom, spec)?;
++                None
++            }
++        };
++        // The Face is checked against the stock it will cut: the new stock
++        // stands in the world while the op is built, then is taken back.
++        if let Some(s) = &stock {
++            s.apply(world);
++        }
++        let op = CreateOperation::new(world, &name, &spec.tool, SrcRef::Stock, params);
++        if let Some(s) = &stock {
++            s.invert(world);
++        }
++        let op = op?;
++        let stock_set = stock.is_some();
++        let mut steps: Vec<Box<dyn Command>> = Vec::with_capacity(2);
++        if let Some(s) = stock {
++            steps.push(Box::new(s));
++        }
++        steps.push(Box::new(op));
++        Ok(Self { operation: name, stock_set, batch: BatchCommand::new("Face to size", steps) })
++    }
++
++    /// The operation this step creates.
++    #[must_use]
++    pub fn operation(&self) -> &str {
++        &self.operation
++    }
++
++    /// Whether this step sets the stock (else it faces the stock as it stands).
++    #[must_use]
++    pub fn stock_set(&self) -> bool {
++        self.stock_set
++    }
++}
++
++impl Command for FaceToSize {
++    fn apply(&self, world: &World) {
++        self.batch.apply(world);
++    }
++
++    fn invert(&self, world: &World) {
++        self.batch.invert(world);
++    }
++}
+diff --git a/crates/app/src/commands/mod.rs b/crates/app/src/commands/mod.rs
+index 6d7415eec0..5f201c6c83 100644
+--- a/crates/app/src/commands/mod.rs
++++ b/crates/app/src/commands/mod.rs
+@@ -65,6 +65,8 @@ pub mod setup_post_options;
+ pub mod setup_nose;
+ pub mod setup_workholding;
+ pub mod sheet_job;
++// #3196: face a block to height from numbers, one undo step.
++pub mod face_to_size;
+ // #316: a setup placed relative to another (flip / turn presets).
+ pub mod setup_relative;
+ // #320: a setup's stock source.
+@@ -160,6 +162,7 @@ pub use setup_post_options::SetSetupPostOptions;
+ pub use setup_nose::SetSetupNoseToAxis;
+ pub use setup_workholding::SetSetupWorkholdingRpm;
+ pub use sheet_job::SetSheetJob;
++pub use face_to_size::{FaceToSize, FaceToSizeSpec};
+ pub use setup_relative::SetSetupRelative;
+ pub use setup_stock::SetSetupStockSource;
+ pub use set_units::SetUnits;
+diff --git a/crates/app/src/mcp/face_to_size_tools.rs b/crates/app/src/mcp/face_to_size_tools.rs
+new file mode 100644
+index 0000000000..c1f68207be
+--- /dev/null
++++ b/crates/app/src/mcp/face_to_size_tools.rs
+@@ -0,0 +1,98 @@
++//! The MCP face-to-size tool (#3196): face a block to height from
++//! numbers in one call - one `FaceToSize` run through the session
++//! History, so one `undo` takes back the stock it set and the Face.
++//! Every refusal is the command's own text, returned as a tool error.
++//!
++//! Provenance: our own tool surface over this repo's facing command.
++
++use super::setup_tools::{cmd_err, obj};
++use super::tools::Tool;
++use crate::commands::{FaceToSize, FaceToSizeSpec};
++use crate::script::Env;
++
++use serde_json::{json, Map, Value};
++
++/// The feeds a face takes when the caller states none (the seed's).
++const FEED: f64 = 1200.0;
++const PLUNGE_FEED: f64 = 300.0;
++
++pub(super) const TOOLS: &[Tool] = &[Tool {
++    name: "face_to_size",
++    description: "Face a block to height from numbers, as one undo step: optionally set the active setup's stock to a box (stock {dx, dy, dz}, its top at top_z), then add a Face on the stock that steps from top_z down to final_z in passes of stepdown, rows stepover apart. Z values are program Z (from the setup's WCS, else the world origin), sizes in mm, feeds in mm/min. Refused by name: final_z not below top_z, stepdown or stepover not above 0, a missing tool or one narrower than the stepover, no stock and no size, top_z under the stock top, final_z at or under the stock bottom. Not generated until generate runs.",
++    schema: s_face_to_size,
++    run: face_to_size,
++}];
++
++fn num(a: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
++    match a.get(key) {
++        None | Some(Value::Null) => Ok(None),
++        Some(Value::Number(n)) => n.as_f64().map(Some).ok_or_else(|| format!("\"{key}\" {n} is not a number")),
++        Some(other) => Err(format!("\"{key}\" must be a number, got {other}")),
++    }
++}
++
++fn need(a: &Map<String, Value>, key: &str) -> Result<f64, String> {
++    num(a, key)?.ok_or_else(|| format!("\"{key}\" is required"))
++}
++
++fn stock(a: &Map<String, Value>) -> Result<Option<[f64; 3]>, String> {
++    match a.get("stock") {
++        None | Some(Value::Null) => Ok(None),
++        Some(Value::Object(s)) => Ok(Some([need(s, "dx")?, need(s, "dy")?, need(s, "dz")?])),
++        Some(other) => Err(format!("\"stock\" must be {{\"dx\", \"dy\", \"dz\"}} in mm, got {other}")),
++    }
++}
++
++fn word(a: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
++    match a.get(key) {
++        None | Some(Value::Null) => Ok(None),
++        Some(Value::String(s)) => Ok(Some(s.clone())),
++        Some(other) => Err(format!("\"{key}\" must be a string, got {other}")),
++    }
++}
++
++fn face_to_size(env: &mut Env, a: &Map<String, Value>) -> Result<Value, String> {
++    let climb = match a.get("climb") {
++        None | Some(Value::Null) => true,
++        Some(Value::Bool(b)) => *b,
++        Some(other) => return Err(format!("\"climb\" must be true or false, got {other}")),
++    };
++    let spec = FaceToSizeSpec {
++        name: word(a, "name")?,
++        tool: word(a, "tool")?.unwrap_or_default(),
++        stock: stock(a)?,
++        top_z: need(a, "top_z")?,
++        final_z: need(a, "final_z")?,
++        stepdown: need(a, "stepdown")?,
++        stepover: need(a, "stepover")?,
++        climb,
++        feed: num(a, "feed")?.unwrap_or(FEED),
++        plunge_feed: num(a, "plunge_feed")?.unwrap_or(PLUNGE_FEED),
++    };
++    let cmd = FaceToSize::new(&env.world, &spec).map_err(cmd_err)?;
++    let (operation, stock_set) = (cmd.operation().to_owned(), cmd.stock_set());
++    env.history.execute(&env.world, cmd);
++    Ok(json!({ "operation": operation, "stock_set": stock_set }))
++}
++
++fn s_face_to_size() -> Value {
++    obj(
++        json!({
++            "tool": { "type": "string", "description": "The facing tool, by its document name (add_tool first)." },
++            "stock": {
++                "type": ["object", "null"],
++                "description": "A box stock to set, mm: length X, width Y, height Z; its top is at top_z. Omit to face the setup's stock as it stands.",
++                "properties": { "dx": { "type": "number" }, "dy": { "type": "number" }, "dz": { "type": "number" } }
++            },
++            "top_z": { "type": "number", "description": "The Z of the first pass's top, program Z, mm." },
++            "final_z": { "type": "number", "description": "The finished Z, program Z, mm; below top_z." },
++            "stepdown": { "type": "number", "description": "Depth per pass, mm." },
++            "stepover": { "type": "number", "description": "Radial stepover between rows, mm; not wider than the tool." },
++            "climb": { "type": "boolean", "description": "Climb cut (default true); false cuts conventional." },
++            "feed": { "type": "number", "description": "Cutting feed, mm/min (default 1200)." },
++            "plunge_feed": { "type": "number", "description": "Plunge feed, mm/min (default 300)." },
++            "name": { "type": "string", "description": "The operation's name (default: Face to size, then Face to size 2, ...)." }
++        }),
++        &["tool", "top_z", "final_z", "stepdown", "stepover"],
++    )
++}
+diff --git a/crates/app/src/mcp/mod.rs b/crates/app/src/mcp/mod.rs
+index c71106befb..178d4922ca 100644
+--- a/crates/app/src/mcp/mod.rs
++++ b/crates/app/src/mcp/mod.rs
+@@ -105,6 +105,8 @@ mod thread_infeed_tools;
+ mod workholding_tools;
+ // #3070: the guided sheet job.
+ mod sheet_job_tools;
++// #3196: face a block to height from numbers.
++mod face_to_size_tools;
+ // #3073: saved cut recipes.
+ mod recipe_tools;
+ // #3647: tool components, assemblies and the component library.
+diff --git a/crates/app/src/mcp/tools.rs b/crates/app/src/mcp/tools.rs
+index 78870453f9..8817189d2a 100644
+--- a/crates/app/src/mcp/tools.rs
++++ b/crates/app/src/mcp/tools.rs
+@@ -88,6 +88,7 @@ pub(super) fn all() -> impl Iterator<Item = &'static Tool> {
+         .chain(super::thread_infeed_tools::TOOLS)
+         .chain(super::workholding_tools::TOOLS)
+         .chain(super::sheet_job_tools::TOOLS)
++        .chain(super::face_to_size_tools::TOOLS)
+         .chain(super::order_tools::TOOLS)
+         .chain(super::pattern_tools::TOOLS)
+         .chain(super::sinker_tools::TOOLS)
+diff --git a/crates/app/tests/mcp_face_to_size.rs b/crates/app/tests/mcp_face_to_size.rs
+new file mode 100644
+index 0000000000..c2008d26af
+--- /dev/null
++++ b/crates/app/tests/mcp_face_to_size.rs
+@@ -0,0 +1,191 @@
++//! Face to size from numbers (#3196), driven in-process over the MCP
++//! server's JSON-RPC handler: on an empty project one `face_to_size`
++//! makes the stock box and a Face on the stock; the op generates,
++//! verifies and posts with its Z words at the stated depths; one undo
++//! takes both back. Bad numbers are refused by name and change nothing.
++//!
++//! Provenance: our own fixture over plain facing practice (top Z, final
++//! Z, depth per pass); no vendor material consulted.
++//!
++//! Gate map: covers app::commands::face_to_size, app::mcp::face_to_size_tools.
++
++use camcraft_app::mcp::Server;
++
++use serde_json::{json, Value};
++use std::path::PathBuf;
++
++const CUTTER: &str = "EM-1000-4FL";
++
++struct Client {
++    server: Server,
++    next: i64,
++}
++
++impl Client {
++    fn new() -> Self {
++        let mut c = Self { server: Server::new(), next: 1 };
++        c.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
++        c
++    }
++
++    fn request(&mut self, method: &str, params: Value) -> Value {
++        let id = self.next;
++        self.next += 1;
++        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
++        self.server.handle(&msg).expect("a request gets a response")
++    }
++
++    fn call(&mut self, name: &str, args: Value) -> (bool, Value) {
++        let reply = self.request("tools/call", json!({ "name": name, "arguments": args }));
++        let result = &reply["result"];
++        assert!(result.is_object(), "tools/call answers with a result: {reply}");
++        let is_err = result["isError"] == json!(true);
++        let body = if is_err { result["content"][0]["text"].clone() } else { result["structuredContent"].clone() };
++        (is_err, body)
++    }
++
++    fn ok(&mut self, name: &str, args: Value) -> Value {
++        let (err, body) = self.call(name, args);
++        assert!(!err, "{name} refused: {body}");
++        body
++    }
++
++    fn refused(&mut self, name: &str, args: Value) -> String {
++        let (err, body) = self.call(name, args);
++        assert!(err, "{name} should have refused, got {body}");
++        body.as_str().unwrap_or_default().to_owned()
++    }
++
++    fn ops(&mut self) -> Vec<Value> {
++        self.ok("get_job", json!({}))["operations"].as_array().cloned().unwrap_or_default()
++    }
++
++    fn has_stock(&mut self) -> bool {
++        !self.ok("get_job", json!({}))["setups"][0]["stock"].is_null()
++    }
++}
++
++fn tmp_dir(tag: &str) -> PathBuf {
++    let mut p = std::env::temp_dir();
++    p.push(format!("camcraft-mcp-face-to-size-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&p);
++    std::fs::create_dir_all(&p).expect("temp dir");
++    p
++}
++
++/// A block 80 x 60 x 20 with its top at Z0, faced to Z-1.5 in 0.5 mm passes.
++fn job() -> Value {
++    json!({
++        "stock": { "dx": 80.0, "dy": 60.0, "dz": 20.0 },
++        "top_z": 0.0, "final_z": -1.5, "stepdown": 0.5, "stepover": 6.0,
++        "tool": CUTTER, "feed": 900.0, "plunge_feed": 250.0,
++    })
++}
++
++/// The cutting Z levels of a posted program: each distinct Z word below
++/// the top of the stock.
++fn cut_levels(nc: &str) -> Vec<f64> {
++    let mut zs: Vec<f64> = nc
++        .split_whitespace()
++        .filter_map(|w| w.strip_prefix('Z').and_then(|v| v.parse::<f64>().ok()))
++        .filter(|z| *z < -1e-6)
++        .collect();
++    zs.sort_by(|a, b| b.total_cmp(a));
++    zs.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
++    zs
++}
++
++#[test]
++fn face_to_size_on_an_empty_project_makes_stock_and_a_face_and_posts_the_stated_depths() {
++    let dir = tmp_dir("post");
++    let mut c = Client::new();
++    c.ok("add_tool", json!({ "catalog": CUTTER }));
++    assert!(!c.has_stock(), "an empty project has no stock");
++    let made = c.ok("face_to_size", job());
++    let op = made["operation"].as_str().unwrap_or_default().to_owned();
++    assert!(!op.is_empty(), "{made}");
++    let ops = c.ops();
++    assert_eq!(ops.len(), 1, "{ops:?}");
++    assert_eq!(ops[0]["kind"], json!("Face"), "{ops:?}");
++    assert_eq!(ops[0]["source"], json!("stock"), "{ops:?}");
++    assert!(c.has_stock(), "the stock is made");
++
++    let generated = c.ok("generate", json!({}));
++    assert_eq!(generated["generated"][0]["status"], json!("ok"), "{generated}");
++    let ver = c.ok("verify", json!({}));
++    assert_eq!(ver["ok"], json!(true), "{ver}");
++    let out = dir.join("face.nc");
++    let posted = c.ok("post", json!({ "output": out.display().to_string(), "post": "Fanuc" }));
++    assert!(posted["lines"].as_u64().is_some_and(|n| n > 0), "{posted}");
++    let nc = std::fs::read_to_string(&out).expect("posted file");
++    assert_eq!(cut_levels(&nc), vec![-0.5, -1.0, -1.5], "three passes to the final Z:\n{nc}");
++
++    // One undo takes back the generate; the next takes the op AND the stock.
++    c.ok("undo", json!({}));
++    assert_eq!(c.ops().len(), 1, "the first undo is the generate");
++    c.ok("undo", json!({}));
++    assert!(c.ops().is_empty(), "one undo removes the face");
++    assert!(!c.has_stock(), "the same undo removes the stock it made");
++    c.ok("redo", json!({}));
++    assert_eq!(c.ops().len(), 1, "redo brings the face back");
++    assert!(c.has_stock(), "and its stock");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn face_to_size_keeps_the_existing_stock_when_no_size_is_given() {
++    let mut c = Client::new();
++    c.ok("add_tool", json!({ "catalog": CUTTER }));
++    c.ok("set_stock", json!({ "box": { "dx": 50.0, "dy": 40.0, "dz": 10.0 } }));
++    // The stock stands on Z0, so its top is Z10.
++    let made = c.ok("face_to_size", json!({
++        "top_z": 10.0, "final_z": 9.0, "stepdown": 0.5, "stepover": 6.0, "tool": CUTTER,
++    }));
++    assert_eq!(made["stock_set"], json!(false), "{made}");
++    let generated = c.ok("generate", json!({}));
++    assert_eq!(generated["generated"][0]["status"], json!("ok"), "{generated}");
++    c.ok("undo", json!({}));
++    c.ok("undo", json!({}));
++    assert!(c.ops().is_empty());
++    assert!(c.has_stock(), "the undo keeps the stock it did not make");
++}
++
++#[test]
++fn face_to_size_refuses_bad_numbers_by_name_and_changes_nothing() {
++    let mut c = Client::new();
++    c.ok("add_tool", json!({ "catalog": CUTTER }));
++    let with = |k: &str, v: Value| {
++        let mut j = job();
++        j[k] = v;
++        j
++    };
++    let cases = [
++        (with("final_z", json!(0.0)), "below the top Z"),
++        (with("final_z", json!(2.0)), "below the top Z"),
++        (with("stepdown", json!(0.0)), "depth per pass"),
++        (with("stepdown", json!(-1.0)), "depth per pass"),
++        (with("stepover", json!(0.0)), "stepover"),
++        (with("stepover", json!(12.0)), "wider than the tool"),
++        (with("tool", json!("")), "tool"),
++        (with("tool", json!("NO-SUCH-TOOL")), "NO-SUCH-TOOL"),
++        (with("final_z", json!(-20.0)), "stock bottom"),
++    ];
++    for (args, words) in cases {
++        let why = c.refused("face_to_size", args.clone());
++        assert!(why.contains(words), "{args}: '{why}' should name '{words}'");
++        assert!(c.ops().is_empty(), "{args}: no op enters");
++        assert!(!c.has_stock(), "{args}: no stock enters");
++    }
++    // Without a size, the project's stock is needed.
++    let mut no_size = job();
++    no_size.as_object_mut().map(|o| o.remove("stock"));
++    let why = c.refused("face_to_size", no_size);
++    assert!(why.contains("stock"), "{why}");
++    // A top Z below the stock top would cut more than one pass deep.
++    c.ok("set_stock", json!({ "box": { "dx": 50.0, "dy": 40.0, "dz": 10.0 } }));
++    let why = c.refused("face_to_size", json!({
++        "top_z": 8.0, "final_z": 7.0, "stepdown": 0.5, "stepover": 6.0, "tool": CUTTER,
++    }));
++    assert!(why.contains("below the stock top"), "{why}");
++    assert!(c.ops().is_empty());
++}
+diff --git a/crates/ui/src/egui_app/mod.rs b/crates/ui/src/egui_app/mod.rs
+index 448f7c714c..94fe1c30e7 100644
+--- a/crates/ui/src/egui_app/mod.rs
++++ b/crates/ui/src/egui_app/mod.rs
+@@ -125,6 +125,8 @@ mod vouch_row;
+ // #1094: the stock page's raw-stock-only checkbox.
+ mod raw_stock_row;
+ mod stock_material_row;
++// #3196: face a block to height from numbers.
++mod stock_face_to_size;
+ // #371: the tool editor's Body section and its picking preview.
+ mod tool_body_assembly_page;
+ mod tool_body_lathe_page;
+diff --git a/crates/ui/src/egui_app/stock_face_to_size.rs b/crates/ui/src/egui_app/stock_face_to_size.rs
+new file mode 100644
+index 0000000000..d738487982
+--- /dev/null
++++ b/crates/ui/src/egui_app/stock_face_to_size.rs
+@@ -0,0 +1,144 @@
++//! The Stock page's "Face to size" group (#3196): face a block to height
++//! from numbers - the facing tool, an optional box stock size (its top at
++//! the top Z), the top Z and the final Z (program Z), the depth per pass,
++//! the stepover, the cut direction and the feeds. The button queues
++//! `CommandKind::FaceToSize`, which lands ONE undoable `FaceToSize` (the
++//! stock and a Face on it). Nothing here writes the world.
++//! Provenance: our own page law over plain facing practice (issue #3196);
++//! no vendor material consulted.
++
++use egui::{RichText, Ui};
++
++use camcraft_app::commands::FaceToSizeSpec;
++use camcraft_app::model;
++
++use crate::state::{CommandKind, State};
++
++use super::fields::{combo_owned, num_feed_named, num_named};
++use super::layout::prop_grid;
++
++/// The group title, pinned by the page tests.
++pub(crate) const GROUP: &str = "Face to size";
++/// The button, pinned by the page tests.
++pub(crate) const APPLY: &str = "Add face to size";
++/// The tick that sets the stock to the stated box.
++pub(crate) const SET_STOCK: &str = "Set the stock to this box";
++
++/// The document's tools, by name.
++fn tool_names(state: &State) -> Vec<String> {
++    model::named_entities(&state.world)
++        .into_iter()
++        .filter(|(_, e)| model::is_tool(&state.world, e))
++        .map(|(n, _)| n)
++        .collect()
++}
++
++/// The program Z of the active setup's WCS origin (0 when none is placed).
++fn program_zero_z(state: &State) -> f64 {
++    let setup = camcraft_app::setup::active(&state.world);
++    camcraft_app::setup::wcs_entity(&state.world, setup.as_deref())
++        .and_then(|e| model::transform_of(&state.world, &e))
++        .map_or(0.0, |l| l.pos.z)
++}
++
++/// What a fresh group offers: the setup's stock as it stands (faced 1 mm
++/// from its top), else a 100 x 100 x 25 block with its top at Z0.
++fn first_draft(state: &State, tools: &[String]) -> FaceToSizeSpec {
++    let setup = camcraft_app::setup::active(&state.world);
++    let held = model::stock_world_aabb_for(&state.world, setup.as_deref());
++    let top_z = held.map_or(0.0, |b| b.max.z - program_zero_z(state));
++    let stock = match held {
++        Some(b) => [b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z],
++        None => [100.0, 100.0, 25.0],
++    };
++    let tool = tools.first().cloned().unwrap_or_default();
++    // 70 % of the first tool's diameter: rows that overlap, no ribs.
++    let stepover = model::find_by_name(&state.world, &tool)
++        .and_then(|e| model::tool_of(&state.world, &e))
++        .map_or(3.0, |t| (t.diameter * 0.7 * 100.0).round() / 100.0);
++    FaceToSizeSpec {
++        name: None,
++        tool,
++        stock: held.is_none().then_some(stock),
++        top_z,
++        final_z: top_z - 1.0,
++        stepdown: 0.5,
++        stepover,
++        climb: true,
++        feed: 1200.0,
++        plunge_feed: 300.0,
++    }
++}
++
++/// The draft's box when the stock is not set (kept for the tick).
++#[derive(Clone)]
++struct Draft {
++    spec: FaceToSizeSpec,
++    size: [f64; 3],
++}
++
++pub(super) fn group_body(ui: &mut Ui, state: &mut State) {
++    let u = state.units();
++    let tools = tool_names(state);
++    let id = ui.id().with("stock_face_to_size_draft");
++    let mut d: Draft = ui.data_mut(|m| {
++        m.get_temp_mut_or_insert_with(id, || {
++            let spec = first_draft(state, &tools);
++            let size = spec.stock.unwrap_or([100.0, 100.0, 25.0]);
++            Draft { spec, size }
++        })
++        .clone()
++    });
++    if tools.is_empty() {
++        ui.label(RichText::new("Add a facing tool on the Tools page first.").weak());
++        return;
++    }
++    let mut set_stock = d.spec.stock.is_some();
++    prop_grid(ui, "stock_face_to_size_grid", |ui| {
++        ui.label("Tool");
++        let mut idx = tools.iter().position(|t| *t == d.spec.tool).unwrap_or(0);
++        combo_owned(ui, "face_to_size_tool", &mut idx, &tools);
++        d.spec.tool = tools.get(idx).cloned().unwrap_or_default();
++        ui.end_row();
++        ui.label("");
++        ui.checkbox(&mut set_stock, SET_STOCK);
++        ui.end_row();
++        if set_stock {
++            for (label, v) in ["Block length (X)", "Block width (Y)", "Block height (Z)"].into_iter().zip(d.size.iter_mut()) {
++                ui.label(label);
++                num_named(ui, u, v, label);
++                ui.end_row();
++            }
++        }
++        for (label, v) in [
++            ("Top Z", &mut d.spec.top_z),
++            ("Final Z", &mut d.spec.final_z),
++            ("Depth per pass", &mut d.spec.stepdown),
++            ("Stepover", &mut d.spec.stepover),
++        ] {
++            ui.label(label);
++            num_named(ui, u, v, label);
++            ui.end_row();
++        }
++        ui.label("");
++        ui.checkbox(&mut d.spec.climb, "Climb cut");
++        ui.end_row();
++        ui.label("Feed");
++        num_feed_named(ui, u, &mut d.spec.feed, "Feed");
++        ui.end_row();
++        ui.label("Plunge feed");
++        num_feed_named(ui, u, &mut d.spec.plunge_feed, "Plunge feed");
++        ui.end_row();
++    });
++    d.spec.stock = set_stock.then_some(d.size);
++    let passes = ((d.spec.top_z - d.spec.final_z) / d.spec.stepdown).ceil();
++    if passes.is_finite() && passes >= 1.0 {
++        ui.label(RichText::new(format!("{passes:.0} pass(es) from the top Z down to the final Z; Z values are program Z")).small().weak());
++    }
++    let hover = "Adds a Face on the stock (and sets the stock when ticked), as one undo step. \
++                 Generate, verify and post it as any other operation.";
++    if ui.button(APPLY).on_hover_text(hover).clicked() {
++        state.pending.push_back(CommandKind::FaceToSize(d.spec.clone()));
++    }
++    ui.data_mut(|m| m.insert_temp(id, d));
++}
+diff --git a/crates/ui/src/egui_app/stock_page.rs b/crates/ui/src/egui_app/stock_page.rs
+index 1c2a16f127..73af3fde5e 100644
+--- a/crates/ui/src/egui_app/stock_page.rs
++++ b/crates/ui/src/egui_app/stock_page.rs
+@@ -34,6 +34,8 @@ pub(super) fn stock_page(ui: &mut Ui, state: &mut State) {
+         group(ui, "Fit to models", None, |ui| fit_fields(ui, state, u));
+     }
+     actions(ui, state);
++    // #3196: face this block to height from numbers, one undo step.
++    group(ui, super::stock_face_to_size::GROUP, None, |ui| super::stock_face_to_size::group_body(ui, state));
+     // #1863: DXF profiles placed on this stock's top, under the stock's
+     // own actions (those act on the stock, not on its profiles).
+     group(ui, "DXF profiles", None, |ui| super::stock_profiles::profiles_group(ui, state));
+diff --git a/crates/ui/src/egui_app/tests.rs b/crates/ui/src/egui_app/tests.rs
+index 252d67c2da..b5324b2421 100644
+--- a/crates/ui/src/egui_app/tests.rs
++++ b/crates/ui/src/egui_app/tests.rs
+@@ -92,6 +92,7 @@ mod stock_size;
+ mod dxf_profile;
+ mod stock_axis;
+ mod stock_material;
++mod stock_face_to_size;
+ mod setup_settings_page;
+ mod machine_page;
+ mod setup_user_machines;
+diff --git a/crates/ui/src/egui_app/tests/stock_face_to_size.rs b/crates/ui/src/egui_app/tests/stock_face_to_size.rs
+new file mode 100644
+index 0000000000..46e77ed4e0
+--- /dev/null
++++ b/crates/ui/src/egui_app/tests/stock_face_to_size.rs
+@@ -0,0 +1,93 @@
++//! #3196: the Stock page's "Face to size" group adds a Face on the stock
++//! from numbers through one undoable `FaceToSize`; with "Set the stock to
++//! this box" ticked the same undo step takes the box back too.
++//! Provenance: our own page law.
++
++use super::*;
++
++use crate::egui_app::stock_face_to_size::{APPLY, GROUP, SET_STOCK};
++use camcraft_app::commands::FaceToSizeSpec;
++use camcraft_app::operation::SrcRef;
++
++fn stock_page() -> Harness<'static, ShellUi> {
++    let mut harness = shell_harness();
++    harness.state_mut().state.ui_target = UiTarget::Stock;
++    harness.run();
++    harness
++}
++
++fn face_src(st: &State, name: &str) -> Option<SrcRef> {
++    let e = camcraft_app::model::find_by_name(&st.world, name)?;
++    camcraft_app::model::operation_of(&st.world, &e).map(|o| o.src)
++}
++
++#[test]
++fn the_stock_page_adds_a_face_to_size_as_one_undo_step() {
++    let mut h = stock_page();
++    for label in [GROUP, APPLY, SET_STOCK, "Top Z", "Final Z", "Depth per pass", "Stepover", "Climb cut"] {
++        assert!(h.query_all_by_label(label).next().is_some(), "the group shows {label}");
++    }
++    let before = h.state().state.history.done_len();
++    h.get_by_label(APPLY).scroll_to_me();
++    h.run();
++    h.get_by_label(APPLY).click();
++    h.run_steps(3);
++    let st = &mut h.state_mut().state;
++    assert_eq!(face_src(st, "Face to size"), Some(SrcRef::Stock), "a Face on the stock: {}", st.status);
++    assert_eq!(st.history.done_len(), before + 1, "one history step");
++    assert!(st.history.undo(&st.world), "one undo step");
++    assert_eq!(face_src(st, "Face to size"), None, "the undo takes the Face back");
++}
++
++#[test]
++fn face_to_size_with_a_ticked_box_sets_the_stock_in_the_same_undo_step() {
++    let mut h = stock_page();
++    let st = &mut h.state_mut().state;
++    let held = camcraft_app::model::stock_world_aabb(&st.world);
++    let tool = camcraft_app::model::named_entities(&st.world)
++        .into_iter()
++        .find(|(_, e)| camcraft_app::model::is_tool(&st.world, e))
++        .map(|(n, _)| n)
++        .expect("the seed has a tool");
++    st.pending.push_back(CommandKind::FaceToSize(FaceToSizeSpec {
++        name: Some("FTS".into()),
++        tool,
++        stock: Some([90.0, 70.0, 30.0]),
++        top_z: 40.0,
++        final_z: 39.0,
++        stepdown: 0.5,
++        stepover: 1.0,
++        climb: true,
++        feed: 1000.0,
++        plunge_feed: 200.0,
++    }));
++    st.drain_actions();
++    let b = camcraft_app::model::stock_world_aabb(&st.world).expect("stock");
++    assert!((b.max.z - 40.0).abs() < 1e-9 && (b.max.x - b.min.x - 90.0).abs() < 1e-9, "the box, top at Z40: {b:?} {}", st.status);
++    assert_eq!(face_src(st, "FTS"), Some(SrcRef::Stock));
++    assert!(st.history.undo(&st.world));
++    assert_eq!(face_src(st, "FTS"), None);
++    assert_eq!(camcraft_app::model::stock_world_aabb(&st.world), held, "the same undo puts the old stock back");
++}
++
++#[test]
++fn a_refused_face_to_size_names_the_number_and_adds_nothing() {
++    let mut h = stock_page();
++    let st = &mut h.state_mut().state;
++    let before = st.history.done_len();
++    st.pending.push_back(CommandKind::FaceToSize(FaceToSizeSpec {
++        name: None,
++        tool: String::new(),
++        stock: Some([90.0, 70.0, 30.0]),
++        top_z: 0.0,
++        final_z: 0.0,
++        stepdown: 0.5,
++        stepover: 1.0,
++        climb: true,
++        feed: 1000.0,
++        plunge_feed: 200.0,
++    }));
++    st.drain_actions();
++    assert!(st.status.contains("below the top Z"), "{}", st.status);
++    assert_eq!(st.history.done_len(), before, "nothing entered the history");
++}
+diff --git a/crates/ui/src/state.rs b/crates/ui/src/state.rs
+index d510edd66b..54e97e09aa 100644
+--- a/crates/ui/src/state.rs
++++ b/crates/ui/src/state.rs
+@@ -98,6 +98,8 @@ pub use pockets::PocketScan;
+ mod setup_post_options;
+ #[path = "state_setup_workholding.rs"]
+ mod setup_workholding;
++#[path = "state_face_to_size.rs"]
++mod face_to_size;
+ #[path = "state_sheet_job.rs"]
+ mod sheet_job;
+ #[path = "state_fixture.rs"]
+@@ -326,6 +328,8 @@ pub enum CommandKind {
+     SetSetupWorkholdingRpm { setup: String, max_rpm: Option<f64> },
+     /// #3070: set up (`Some`) or clear the setup's sheet job (`SetSheetJob`).
+     SetSheetJob { setup: String, job: Option<camcraft_app::sheet_job::SheetJob> },
++    /// #3196: face a block to height from numbers (`FaceToSize`), one undo step.
++    FaceToSize(camcraft_app::commands::FaceToSizeSpec),
+     /// The post's user options (issue #34): the undoable
+     /// `SetPostOptions` with the picked value.
+     SetPostOptions(camcraft_app::schema::PostOptions),
+@@ -3699,6 +3703,7 @@ impl State {
+             CommandKind::SetupNoseToAxis { setup, value } => self.set_setup_nose(&setup, value),
+             CommandKind::SetSetupWorkholdingRpm { setup, max_rpm } => self.set_workholding_rpm(&setup, max_rpm),
+             CommandKind::SetSheetJob { setup, job } => self.set_sheet_job(&setup, job),
++            CommandKind::FaceToSize(spec) => self.face_to_size(&spec),
+             CommandKind::EditMachineDialog => {
+                 let (path, m) = machine::of(&self.world);
+                 match m {
+diff --git a/crates/ui/src/state_face_to_size.rs b/crates/ui/src/state_face_to_size.rs
+new file mode 100644
+index 0000000000..69491c9be7
+--- /dev/null
++++ b/crates/ui/src/state_face_to_size.rs
+@@ -0,0 +1,26 @@
++//! Face to size from the Stock page (#3196): the group queues
++//! `CommandKind::FaceToSize`, and the drain lands it here as one undoable
++//! `FaceToSize` (the stock and a Face on it); a refusal is the command's
++//! own text on the setup's error line. The new Face is selected.
++//! Provenance: our own page law (issue #3196); no vendor material consulted.
++
++use camcraft_app::commands::{FaceToSize, FaceToSizeSpec};
++
++use super::{CommandKind, ErrorScope, State, UiTarget};
++
++impl State {
++    /// Add the face to size that `spec` states.
++    pub(super) fn face_to_size(&mut self, spec: &FaceToSizeSpec) {
++        match FaceToSize::new(&self.world, spec) {
++            Ok(cmd) => {
++                let name = cmd.operation().to_owned();
++                self.history.execute(&self.world, cmd);
++                self.doc_version += 1;
++                self.pending.push_back(CommandKind::Select(Some(name.clone())));
++                self.ui_target = UiTarget::Operation(name.clone());
++                self.status = format!("{name}: faces Z{} down to Z{} in {} mm passes", spec.top_z, spec.final_z, spec.stepdown);
++            }
++            Err(why) => self.refuse(ErrorScope::Setup, format!("face to size not added: {why}")),
++        }
++    }
++}
+diff --git a/docs/agents/mcp-tools.md b/docs/agents/mcp-tools.md
+index 7c356a4af9..be27803676 100644
+--- a/docs/agents/mcp-tools.md
++++ b/docs/agents/mcp-tools.md
+@@ -1,7 +1,7 @@
+ <!-- Generated from crates/app/src/mcp/tools.rs. Do not edit by hand. Write it again with: cargo run -p camcraft-app --bin camcraft-cli -- mcp reference > docs/agents/mcp-tools.md -->
+ # CamCraft MCP tool reference
+ 
+-The server lists 137 tools. The live `tools/list` reply is the authority; this file is generated from the same table. An argument with `?` is optional.
++The server lists 138 tools. The live `tools/list` reply is the authority; this file is generated from the same table. An argument with `?` is optional.
+ 
+ | Tool | Arguments | What it does |
+ |---|---|---|
+@@ -108,6 +108,7 @@ The server lists 137 tools. The live `tools/list` reply is the authority; this f
+ | `set_thread_infeed` | `infeed_plan`, `name` | Patch a Threading operation's infeed plan through EditOperationParams. Unspecified fields keep their values. One undo step. Refuses unknown fields and invalid plans by name. |
+ | `set_workholding_max_rpm` | `max_rpm`, `setup?` | State the rated maximum rpm of a lathe setup's chuck or collet (null clears it). Constant surface speed clamps to the lowest of the machine's, the tool's and this limit (Fanuc G50 S, Tormach G96 D); a constant-rpm turning operation over it is refused by name at the post. One undo step. |
+ | `set_sheet_job` | `allowance?`, `clamp_clearance?`, `clear?`, `length?`, `thickness?`, `width?`, `xy_zero?`, `z_zero?` | Set up the active setup as a flat-sheet router job, as one undo step: the stock becomes a box of the sheet's length (X), width (Y) and thickness; the WCS moves to Z zero at the sheet top or the spoilboard and XY zero on the stated corner (front_left by default). The through-cut allowance (how far a cut may go into the spoilboard, mm) is required and always stated; the post refuses by name a move below the sheet bottom less the allowance, or a rapid across below the sheet top plus the clamp clearance. {"clear": true} drops only the record. Sizes in mm. |
++| `face_to_size` | `climb?`, `feed?`, `final_z`, `name?`, `plunge_feed?`, `stepdown`, `stepover`, `stock?`, `tool`, `top_z` | Face a block to height from numbers, as one undo step: optionally set the active setup's stock to a box (stock {dx, dy, dz}, its top at top_z), then add a Face on the stock that steps from top_z down to final_z in passes of stepdown, rows stepover apart. Z values are program Z (from the setup's WCS, else the world origin), sizes in mm, feeds in mm/min. Refused by name: final_z not below top_z, stepdown or stepover not above 0, a missing tool or one narrower than the stepover, no stock and no size, top_z under the stock top, final_z at or under the stock bottom. Not generated until generate runs. |
+ | `rename_operation` | `name`, `new_name` | Change an operation's display name. Its stable key (what scripts, saved files and other tools address it by) and its place in the program do not change; naming it back to its key clears the display name. Names are unique and cannot take another operation's key. One undo step. |
+ | `reorder_operation` | `name`, `place?`, `target` | Move an operation before or after another operation of the SAME setup, as the browser's drag and drop does. The order is saved with the project and is the order the program posts, simulates and computes rest material in; moving between setups is refused. Answers with that setup's operations in their new order. One undo step. |
+ | `mark_operation_reviewed` | `name` | Clear an operation's migration needs-review warning once you have inspected the migrated operation. Refused by name when the operation is not flagged. One undo step. |
+diff --git a/docs/decisions/3196-face-to-size.md b/docs/decisions/3196-face-to-size.md
+new file mode 100644
+index 0000000000..9386fd10de
+--- /dev/null
++++ b/docs/decisions/3196-face-to-size.md
+@@ -0,0 +1,49 @@
++## #3196 - Face to size from numbers (command, MCP tool, Stock page group)
++
++**What was decided.**
++
++- One command, `FaceToSize`, holds an optional `SetStock` and a normal
++  `CreateOperation` (a Face on `SrcRef::Stock`) in one `BatchCommand`.
++  One undo takes back the two. No new operation kind.
++- The Z values are program Z. The command adds the world Z of the active
++  setup's placed WCS (0 when none is placed) and stores the heights as
++  `Fixed` world Z. The top Z is the first stage top (`top_z`), the final
++  Z is `cut_z`, and the depth per pass is `stepdown`.
++- A stated box stock is centred on the old stock's XY centre (on the WCS
++  XY when there is no stock), with its top at the top Z.
++- The command refuses by name, at construction:
++  - a final Z at or above the top Z (the plain Face door accepts a level
++    window, so this guard is new);
++  - a depth per pass, stepover, feed or plunge feed not above 0;
++  - an empty or unknown tool, or a stepover wider than the tool (ribs
++    stay between the rows);
++  - no stock and no stock size;
++  - a top Z under the stock top (the first pass would cut deeper than
++    the depth per pass);
++  - a final Z at or under the stock bottom (the face cuts through).
++- `CreateOperation` validates against the world. When the command sets a
++  new stock, it applies that `SetStock`, builds the operation, and
++  inverts the `SetStock` again before it returns. The world is unchanged
++  after construction, also on a refusal.
++- The UI form is a "Face to size" group on the Stock page, under the
++  stock actions. The MCP tool is `face_to_size`.
++
++**Why.** The issue asks for one undo step over the existing Face, with
++refusals at construction. Program Z is what a machinist types at the
++control. `Fixed` heights keep the cut at the same place on the block if
++the WCS moves later. `WorkOffset` heights were dropped: they refuse when
++no WCS is placed, which is the empty-project case of the issue.
++
++**Dropped.**
++
++- A new "quick op" kind: it would add a file-format word for no new
++  toolpath.
++- `TopOfStock`-relative heights: a top Z that differs from the stock top
++  would read as a different depth than the user typed.
++- A camcraft-mcp skill row for the tool: a process-file change. The tool
++  is in the generated reference and the MCP guide. A skill row can come
++  with the next skill refresh.
++
++**Cost to change later.** Low. The command is one file. The heights are
++ordinary Face fields, so a later change of reference touches only
++`face_params`.
+diff --git a/site/content/guide/automate/mcp.md b/site/content/guide/automate/mcp.md
+index 609dc85890..546c52881e 100644
+--- a/site/content/guide/automate/mcp.md
++++ b/site/content/guide/automate/mcp.md
+@@ -284,7 +284,7 @@ time. The current, authoritative tool list is whatever the client's
+ | Materials and cutting data | `set_work_material`, `set_stock_material`, `suggest_cutting_data`, `apply_cutting_data` |
+ | Tool bodies and numbers | `set_tool_number`, `get_tool_body`, `set_tool_body`, `set_lathe_tool_body`, `attach_tool_body_piece`, `remove_tool_body_piece`, `set_lathe_insert_zone`, `clear_tool_body` |
+ | Tool components and assemblies | `list_tool_components`, `get_tool_assembly`, `set_tool_assembly`, `upsert_tool_component`, `delete_tool_component`, `sync_tool_component`, `save_library_component`, `delete_library_component` |
+-| Operations | `list_operation_types`, `add_operation`, `edit_operation`, `delete_operation`, `rename_operation`, `reorder_operation`, `set_operation_coolant`, `get_thread_infeed`, `set_thread_infeed`, `mark_operation_reviewed`, `electrode_from_faces`, `save_cut_recipe`, `list_cut_recipes`, `apply_cut_recipe` |
++| Operations | `list_operation_types`, `add_operation`, `face_to_size`, `edit_operation`, `delete_operation`, `rename_operation`, `reorder_operation`, `set_operation_coolant`, `get_thread_infeed`, `set_thread_infeed`, `mark_operation_reviewed`, `electrode_from_faces`, `save_cut_recipe`, `list_cut_recipes`, `apply_cut_recipe` |
+ | Pattern folders | `create_pattern_folder`, `edit_pattern_folder`, `set_pattern_members`, `set_pattern_instance_enabled`, `delete_pattern_folder` |
+ | Picking geometry | `list_features`, `get_operation_geometry`, `set_operation_geometry`, `set_operation_area`, `get_operation_do_not_touch`, `set_operation_do_not_touch`, `detect_holes`, `detect_pockets`, `pick_in_box` |
+ | Generate, verify, post | `generate`, `verify`, `render_stock`, `get_post_options`, `set_post_options`, `post` |
+
+From 75e80db5b96c2064567b65c2d0dabbd2a8edafe5 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 15:58:13 -0800
+Subject: [PATCH 2/4] fix(ui): put the Face to size group under the DXF
+ profiles group
+
+The new group pushed the DXF profile rows down, out of the test window.
+It now sits at the end of the Stock page.
+
+Refs #3196
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/ui/src/egui_app/stock_page.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/ui/src/egui_app/stock_page.rs b/crates/ui/src/egui_app/stock_page.rs
+index 73af3fde5e..5c2587a18b 100644
+--- a/crates/ui/src/egui_app/stock_page.rs
++++ b/crates/ui/src/egui_app/stock_page.rs
+@@ -34,11 +34,11 @@ pub(super) fn stock_page(ui: &mut Ui, state: &mut State) {
+         group(ui, "Fit to models", None, |ui| fit_fields(ui, state, u));
+     }
+     actions(ui, state);
+-    // #3196: face this block to height from numbers, one undo step.
+-    group(ui, super::stock_face_to_size::GROUP, None, |ui| super::stock_face_to_size::group_body(ui, state));
+     // #1863: DXF profiles placed on this stock's top, under the stock's
+     // own actions (those act on the stock, not on its profiles).
+     group(ui, "DXF profiles", None, |ui| super::stock_profiles::profiles_group(ui, state));
++    // #3196: face this block to height from numbers, one undo step.
++    group(ui, super::stock_face_to_size::GROUP, None, |ui| super::stock_face_to_size::group_body(ui, state));
+ }
+ 
+ /// Units, the shape choice and the models' size it is sized against.
+
+From d9d5ec8d4c0d2266c1efdcd310594b08335ed4d1 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 16:02:24 -0800
+Subject: [PATCH 3/4] fix(2d): face to size refuses a stock size not above 0 by
+ name
+
+Refs #3196
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/src/commands/face_to_size.rs | 5 +++++
+ crates/app/tests/mcp_face_to_size.rs    | 2 ++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/crates/app/src/commands/face_to_size.rs b/crates/app/src/commands/face_to_size.rs
+index a87eb0e900..dc3784e800 100644
+--- a/crates/app/src/commands/face_to_size.rs
++++ b/crates/app/src/commands/face_to_size.rs
+@@ -94,6 +94,11 @@ fn check_numbers(s: &FaceToSizeSpec) -> Result<(), CommandError> {
+     if s.feed <= 0.0 || s.plunge_feed <= 0.0 {
+         return Err(invalid(format!("the feed {} and the plunge feed {} must be more than 0", s.feed, s.plunge_feed)));
+     }
++    if let Some(size) = s.stock
++        && !size.iter().all(|v| v.is_finite() && *v > 0.0)
++    {
++        return Err(invalid(format!("the stock size {size:?} must be three numbers more than 0")));
++    }
+     if s.tool.trim().is_empty() {
+         return Err(CommandError::Needs("face to size needs a tool - add a facing tool first".into()));
+     }
+diff --git a/crates/app/tests/mcp_face_to_size.rs b/crates/app/tests/mcp_face_to_size.rs
+index c2008d26af..a784f3e690 100644
+--- a/crates/app/tests/mcp_face_to_size.rs
++++ b/crates/app/tests/mcp_face_to_size.rs
+@@ -169,6 +169,8 @@ fn face_to_size_refuses_bad_numbers_by_name_and_changes_nothing() {
+         (with("tool", json!("")), "tool"),
+         (with("tool", json!("NO-SUCH-TOOL")), "NO-SUCH-TOOL"),
+         (with("final_z", json!(-20.0)), "stock bottom"),
++        (with("stock", json!({ "dx": 80.0, "dy": 60.0, "dz": -5.0 })), "stock size"),
++        (with("stock", json!({ "dx": 0.0, "dy": 60.0, "dz": 20.0 })), "stock size"),
+     ];
+     for (args, words) in cases {
+         let why = c.refused("face_to_size", args.clone());
+
+From f74df8a5d6adc7fe3bd338315aa0921b52e76ed6 Mon Sep 17 00:00:00 2001
+From: Mike Kinney <mike.kinney@gmail.com>
+Date: Fri, 27 Nov 2026 16:14:34 -0800
+Subject: [PATCH 4/4] test(mcp): face to size pins join the mcp directory suite
+
+Refs #3196
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/app/tests/mcp.rs                                     | 6 +++++-
+ .../app/tests/{mcp_face_to_size.rs => mcp/face_to_size.rs}  | 2 +-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+ rename crates/app/tests/{mcp_face_to_size.rs => mcp/face_to_size.rs} (98%)
+
+diff --git a/crates/app/tests/mcp.rs b/crates/app/tests/mcp.rs
+index 7605debbbf..347732bf68 100644
+--- a/crates/app/tests/mcp.rs
++++ b/crates/app/tests/mcp.rs
+@@ -8,7 +8,8 @@
+ //! Gate map (M4.4): covers app::mcp, app::script, app::project::json,
+ //! app::cli, app::tool_library, app::commands (tool_import),
+ //! app::operation (detect_holes, #312), app::mcp::pockets (detect_pockets, #35),
+-//! app::pattern_folder, app::commands::pattern_folder, app::mcp::pattern_tools (#3012).
++//! app::pattern_folder, app::commands::pattern_folder, app::mcp::pattern_tools (#3012),
++//! app::commands::face_to_size, app::mcp::face_to_size_tools (#3196).
+ 
+ mod common;
+ #[path = "mcp/add_tool_spindle_warning.rs"]
+@@ -23,6 +24,9 @@ mod mcp_approach_distance;
+ mod mcp_finish3d_direction;
+ #[path = "mcp/finish3d_pass_start.rs"]
+ mod mcp_finish3d_pass_start;
++// #3196: face to size from numbers.
++#[path = "mcp/face_to_size.rs"]
++mod face_to_size;
+ mod mcp_open;
+ // #3449: every accepted field of a kind, optional ones and enum words.
+ #[path = "mcp/op_type_fields.rs"]
+diff --git a/crates/app/tests/mcp_face_to_size.rs b/crates/app/tests/mcp/face_to_size.rs
+similarity index 98%
+rename from crates/app/tests/mcp_face_to_size.rs
+rename to crates/app/tests/mcp/face_to_size.rs
+index a784f3e690..97d6b69318 100644
+--- a/crates/app/tests/mcp_face_to_size.rs
++++ b/crates/app/tests/mcp/face_to_size.rs
+@@ -7,7 +7,7 @@
+ //! Provenance: our own fixture over plain facing practice (top Z, final
+ //! Z, depth per pass); no vendor material consulted.
+ //!
+-//! Gate map: covers app::commands::face_to_size, app::mcp::face_to_size_tools.
++//! Gate map: in the `mcp` suite (crates/app/tests/mcp.rs).
+ 
+ use camcraft_app::mcp::Server;
+ 
